@@ -830,6 +830,18 @@ const resolveCallTarget = (
 
   let filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, call.callForm);
 
+  // Swift/Kotlin: constructor calls look like free function calls (no `new` keyword).
+  // If free-form filtering found no callable candidates but the symbol resolves to a
+  // Class/Struct, retry with constructor form so CONSTRUCTOR_TARGET_TYPES applies.
+  if (filteredCandidates.length === 0 && call.callForm === 'free') {
+    const hasTypeTarget = tiered.candidates.some(c =>
+      c.type === 'Class' || c.type === 'Struct' || c.type === 'Enum',
+    );
+    if (hasTypeTarget) {
+      filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, 'constructor');
+    }
+  }
+
   // Module-qualified constructor pattern: e.g. Python `import models; models.User()`.
   // The attribute access gives callForm='member', but the callee may be a Class — a valid
   // constructor target. Re-try with constructor-form filtering so that `module.ClassName()`
@@ -904,7 +916,20 @@ const resolveCallTarget = (
     if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
   }
 
-  if (filteredCandidates.length !== 1) return null;
+  if (filteredCandidates.length !== 1) {
+    // Deduplicate: Swift extensions create multiple Class nodes with the same name.
+    // When all candidates share the same type and differ only by file (extension vs
+    // primary definition), they represent the same symbol. Prefer the primary
+    // definition (shortest file path: Product.swift over ProductExtension.swift).
+    if (filteredCandidates.length > 1) {
+      const allSameType = filteredCandidates.every(c => c.type === filteredCandidates[0].type);
+      if (allSameType && (filteredCandidates[0].type === 'Class' || filteredCandidates[0].type === 'Struct')) {
+        const sorted = [...filteredCandidates].sort((a, b) => a.filePath.length - b.filePath.length);
+        return toResolveResult(sorted[0], tiered.tier);
+      }
+    }
+    return null;
+  }
 
   return toResolveResult(filteredCandidates[0], tiered.tier);
 };
