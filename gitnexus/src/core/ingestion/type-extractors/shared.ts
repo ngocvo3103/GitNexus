@@ -620,13 +620,76 @@ export function extractElementTypeFromString(typeStr: string, pos: TypeArgPositi
 // SymbolDefinition (e.g. "User", "Promise<User>", "User | null", "*User").
 // Extracts the base user-defined type name.
 
-/** Primitive / built-in types that should NOT produce a receiver binding. */
-const PRIMITIVE_TYPES = new Set([
-  'string', 'number', 'boolean', 'void', 'int', 'float', 'double', 'long',
-  'short', 'byte', 'char', 'bool', 'str', 'i8', 'i16', 'i32', 'i64',
-  'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'usize', 'isize',
-  'undefined', 'null', 'None', 'nil',
+/**
+ * Primitive / built-in types that should NOT produce a receiver binding.
+ * These are language primitives (int, string, boolean, etc.) that have no methods.
+ * Container types (List, Map, Array) are NOT included — they produce receiver bindings.
+ */
+export const PRIMITIVE_TYPES = new Set([
+  // Java/Kotlin primitives and wrapper types
+  'String', 'Integer', 'int', 'Long', 'long', 'Double', 'double', 'Float', 'float',
+  'Boolean', 'boolean', 'Byte', 'byte', 'Short', 'short', 'Character', 'char',
+  'void', 'Void', 'Object', 'Number', 'BigDecimal', 'BigInteger',
+  'Date', 'LocalDate', 'LocalDateTime', 'Instant', 'ZonedDateTime', 'UUID',
+  // TypeScript/JavaScript primitives
+  'string', 'number', 'boolean', 'null', 'undefined',
+  // Rust primitives
+  'bool', 'str', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64',
+  'f32', 'f64', 'usize', 'isize', 'None',
+  // PHP types
+  'mixed', 'callable', 'resource',
+  // C# primitives (via lowercase aliases)
+  // Other common
+  'Object[]', 'byte[]', 'Byte[]',
 ]);
+
+/**
+ * Common library/container types that don't need schema resolution.
+ * Used by trace-executor and document-endpoint to skip field lookups.
+ * These are NOT primitives (they produce receiver bindings) but have no user-defined fields.
+ */
+export const SKIP_SCHEMA_TYPES = new Set([
+  // Container types
+  'Map', 'List', 'Set', 'Optional', 'Iterable', 'Collection', 'Array',
+  'ArrayList', 'LinkedList', 'HashSet', 'TreeSet', 'HashMap', 'TreeMap',
+  // Common library types with no user-defined fields
+  'Object', 'Object[]', 'byte[]', 'Byte[]',
+]);
+
+/**
+ * Check if a type should be skipped for schema resolution.
+ * Combines PRIMITIVE_TYPES and SKIP_SCHEMA_TYPES.
+ */
+export function shouldSkipSchema(typeName: string): boolean {
+  return PRIMITIVE_TYPES.has(typeName) || 
+         PRIMITIVE_TYPES.has(typeName.toLowerCase()) ||
+         SKIP_SCHEMA_TYPES.has(typeName);
+}
+
+/**
+ * Extracts the inner type from generic wrapper types like List<UserDTO> -> UserDTO.
+ * Handles nested generics: Map<String, List<OrderDTO>> -> OrderDTO (returns last type arg).
+ * Also handles array suffix: UserDTO[] -> UserDTO.
+ * 
+ * For multi-arg generics like Map<K, V>, returns the LAST type argument (value type).
+ */
+export function extractGenericInnerType(typeName: string): string | null {
+  if (typeName.endsWith('[]')) {
+    return typeName.slice(0, -2);
+  }
+
+  const genericMatch = typeName.match(/<([^<>]+)>$/);
+  if (genericMatch) {
+    const inner = genericMatch[1];
+    if (inner.includes(',')) {
+      const parts = inner.split(',').map(s => s.trim());
+      return parts[parts.length - 1]; // Return last type arg for Map<K,V>
+    }
+    return inner.trim();
+  }
+
+  return null;
+}
 
 /**
  * Extract a simple type name from raw return-type text.

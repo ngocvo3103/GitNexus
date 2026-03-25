@@ -19,6 +19,8 @@ import {
   cleanupOldKuzuFiles,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
+import { documentEndpoint, type DocumentEndpointOptions } from './document-endpoint.js';
+import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -107,7 +109,7 @@ export interface CodebaseContext {
   };
 }
 
-interface RepoHandle {
+export interface RepoHandle {
   id: string;          // unique key = repo name (basename)
   name: string;
   repoPath: string;
@@ -393,6 +395,10 @@ export class LocalBackend {
         return this.detectChanges(repo, params);
       case 'rename':
         return this.rename(repo, params);
+      case 'endpoints':
+        return this.endpoints(repo, params);
+      case 'document-endpoint':
+        return this.documentEndpoint(repo, params);
       // Legacy aliases for backwards compatibility
       case 'search':
         return this.query(repo, params);
@@ -2448,6 +2454,34 @@ export class LocalBackend {
         step: s.step || s[3], name: s.name || s[0], type: s.type || s[1], filePath: s.filePath || s[2],
       })),
     };
+  }
+
+  /**
+   * Document Endpoint tool — Generate API documentation JSON.
+   */
+  private async documentEndpoint(repo: RepoHandle, params: any): Promise<any> {
+    await this.ensureInitialized(repo.id);
+    
+    const options: DocumentEndpointOptions = {
+      method: params.method,
+      path: params.path,
+      depth: params.depth ?? 10,
+      include_context: params.include_context ?? false,
+      compact: params.compact ?? false,
+      repo: params.repo,
+    };
+    return documentEndpoint(repo, options);
+  }
+
+  /**
+   * Endpoints tool — query Route nodes for HTTP endpoints.
+   */
+  private async endpoints(
+    repo: RepoHandle,
+    params?: { method?: string; path?: string }
+  ): Promise<{ endpoints: EndpointInfo[] }> {
+    await this.ensureInitialized(repo.id);
+    return queryEndpoints(repo, params);
   }
 
   async disconnect(): Promise<void> {

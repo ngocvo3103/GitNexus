@@ -29,13 +29,11 @@ export type NodeLabel =
   | 'Static'
   | 'Property'
   | 'Record'
+  | 'Route'
   | 'Delegate'
   | 'Annotation'
   | 'Constructor'
-  | 'Template'
-  | 'Section'
-  | 'Route'        // API route endpoint (e.g., /api/grants)
-  | 'Tool';        // MCP tool definition
+  | 'Template';
 
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
@@ -68,20 +66,14 @@ export type NodeProperties = {
   entryPointReason?: string,
   // Method signature (for MRO disambiguation)
   parameterCount?: number,
-  // Section-specific (markdown heading level, 1-6)
-  level?: number,
   returnType?: string,
-  // Field/property metadata (populated by FieldExtractor)
-  declaredType?: string,
-  visibility?: string,       // 'public' | 'private' | 'protected' | 'internal' etc.
-  isStatic?: boolean,
-  isReadonly?: boolean,
-  // Response shape (top-level keys from NextResponse.json({...}) / res.json({...}))
-  responseKeys?: string[],
-  // Error response shape (top-level keys from .json() calls with status >= 400)
-  errorKeys?: string[],
-  // Middleware wrapper chain (outermost first): ['withRateLimit', 'withCSRF', 'withAuth']
-  middleware?: string[],
+  // Route-specific properties (for HTTP endpoints)
+  httpMethod?: string,
+  routePath?: string,
+  controllerName?: string,
+  methodName?: string,
+  lineNumber?: number,
+  isInherited?: boolean,
 }
 
 export type RelationshipType =
@@ -96,16 +88,8 @@ export type RelationshipType =
   | 'IMPLEMENTS'
   | 'EXTENDS'
   | 'HAS_METHOD'
-  | 'HAS_PROPERTY'
-  | 'ACCESSES'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
-  | 'HANDLES_ROUTE'  // Function/File → Route (handler serves this endpoint)
-  | 'FETCHES'        // Function/File → Route (consumer calls this endpoint)
-  | 'HANDLES_TOOL'   // Function/File → Tool (handler implements this tool)
-  | 'ENTRY_POINT_OF'  // Route/Tool → Process (this endpoint starts this execution flow)
-  | 'WRAPS'           // Function → Function (middleware wrapper chain) — Reserved: future middleware graph traversal (not yet emitted)
-  | 'QUERIES'          // File/Function → CodeElement (ORM query to model/table)
 
 export interface GraphNode {
   id:  string,
@@ -120,7 +104,7 @@ export interface GraphRelationship {
   type: RelationshipType,
   /** Confidence score 0-1 (1.0 = certain, lower = uncertain resolution) */
   confidence: number,
-  /** Semantics are edge-type-dependent: CALLS uses resolution tier, ACCESSES uses 'read'/'write', OVERRIDES uses MRO reason */
+  /** Resolution reason: 'import-resolved', 'same-file', 'fuzzy-global', or empty for non-CALLS */
   reason: string,
   /** Step number for STEP_IN_PROCESS relationships (1-indexed) */
   step?: number,
@@ -146,5 +130,4 @@ export interface KnowledgeGraph {
   addRelationship: (relationship: GraphRelationship) => void,
   removeNode: (nodeId: string) => boolean,
   removeNodesByFile: (filePath: string) => number,
-  removeRelationship: (relationshipId: string) => boolean,
 }

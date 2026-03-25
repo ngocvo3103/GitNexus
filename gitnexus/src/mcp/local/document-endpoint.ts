@@ -12,16 +12,66 @@ import { executeParameterized } from '../core/lbug-adapter.js';
 import { executeTrace, type ChainNode } from './trace-executor.js';
 import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
 import { generateId } from '../../lib/utils.js';
+import { shouldSkipSchema, extractGenericInnerType } from '../../core/ingestion/type-extractors/shared.js';
+
+/** Placeholder for AI enrichment - used throughout for fields requiring manual input */
+const TODO_AI_ENRICH = 'TODO_AI_ENRICH';
+
+/** Spring annotations that map request parameters */
+const REQUEST_PARAM_ANNOTATIONS = new Set([
+  '@PathVariable', '@RequestParam', '@RequestHeader', '@CookieValue'
+]);
+
+/** Event listener annotations for inbound messaging detection */
+const EVENT_LISTENER_ANNOTATIONS = new Set([
+  '@EventListener', '@TransactionalEventListener', '@RabbitListener', '@KafkaListener'
+]);
+
+/** Pre-compiled regex patterns for imperative validation detection */
+const IMPERATIVE_VALIDATION_PATTERNS = [
+  // Framework validation methods (global flag for while loop)
+  /TcbsValidator\.(validate|doValidate)\s*\(/g,
+  /ValidationUtils\.(validate|check)\s*\(/g,
+  /\.\s*validate\s*\(/g,
+  /Validator\.(validate|check)\s*\(/g,
+
+  // Custom validation service fields: suggestionValidationServiceImpl.process()
+  /\w*ValidationServiceImpl\s*\.\s*process\s*\(/g,
+  
+  // Custom validation methods: .validateJWT(), .validateRequest()
+  /\.\s*validate[A-Z]\w*\s*\(/g,
+];
 
 // ============================================================================
 // Types
 // ============================================================================
+
+/**
+ * Remove empty arrays from an object at specified paths.
+ * Used to clean up JSON output by omitting empty arrays.
+ */
+function removeEmptyArrays(obj: any, paths: string[][]): void {
+  for (const path of paths) {
+    let current = obj;
+    for (let i = 0; i < path.length - 1; i++) {
+      current = current?.[path[i]];
+      if (!current) break;
+    }
+    if (current) {
+      const key = path[path.length - 1];
+      if (Array.isArray(current[key]) && current[key].length === 0) {
+        delete current[key];
+      }
+    }
+  }
+}
 
 export interface DocumentEndpointOptions {
   method: string;
   path: string;
   depth?: number;
   include_context?: boolean;
+  compact?: boolean;
   repo?: string;
 }
 
@@ -30,6 +80,7 @@ export interface ParamInfo {
   type: string;
   required: boolean;
   description: string;
+  _context?: string;
 }
 
 export interface ValidationRule {
@@ -37,6 +88,7 @@ export interface ValidationRule {
   type: string;
   required: boolean;
   rules: string;
+  _context?: string;
 }
 
 export interface ResponseCode {
@@ -75,6 +127,7 @@ export interface MessagingInbound {
   topic: string;
   payload: string;
   consumptionLogic: string;
+  _context?: string;
 }
 
 export interface PersistenceInfo {
@@ -330,7 +383,7 @@ export async function documentEndpoint(
   repo: RepoHandle,
   options: DocumentEndpointOptions
 ): Promise<{ result: DocumentEndpointResult; error?: string }> {
-  const { method, path, depth = 10, include_context = false } = options;
+  const { method, path, depth = 10, include_context = false, compact = false } = options;
 
   // Step 1: Try to find the Route node (may fail if Route table doesn't exist)
   let route: EndpointInfo | undefined;
@@ -380,7 +433,7 @@ export async function documentEndpoint(
   const traceResult = await executeTrace(
     executeQuery,
     repo.id,
-    { uid: handlerUid, maxDepth: depth, include_content: true }
+    { uid: handlerUid, maxDepth: depth, include_content: true, compact }
   );
 
   if (traceResult.error) {
@@ -392,7 +445,7 @@ export async function documentEndpoint(
 
   // Step 4: Build the documentation
   // Use route.path (actual endpoint path) instead of input pattern
-  const result = await buildDocumentation(method, route.path, route, traceResult.chain, include_context, executeQuery, repo.id);
+  const result = await buildDocumentation(method, route.path, route, traceResult.chain, include_context, compact, executeQuery, repo.id);
 
   return { result };
 }
@@ -405,7 +458,7 @@ function createEmptyResult(method: string, path: string): DocumentEndpointResult
   return {
     method,
     path,
-    summary: 'TODO_AI_ENRICH',
+    summary: TODO_AI_ENRICH,
     specs: {
       request: {
         params: [],
@@ -422,7 +475,7 @@ function createEmptyResult(method: string, path: string): DocumentEndpointResult
       messaging: { outbound: [], inbound: [] },
       persistence: [],
     },
-    logicFlow: 'TODO_AI_ENRICH',
+    logicFlow: TODO_AI_ENRICH,
     codeDiagram: '',
     cacheStrategy: { population: [], invalidation: [], update: [], flow: '' },
     retryLogic: [],
@@ -436,6 +489,7 @@ async function buildDocumentation(
   route: EndpointInfo,
   chain: ChainNode[],
   includeContext: boolean,
+  compact: boolean,
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
   repoId: string
 ): Promise<DocumentEndpointResult> {
@@ -443,7 +497,7 @@ async function buildDocumentation(
 
   // Extract HTTP calls for downstreamApis
   const downstreamApis = await extractDownstreamApis(chain, executeQuery, repoId, includeContext);
-  
+
   // Filter internal fields for schema compliance when includeContext is false
   if (includeContext) {
     result.externalDependencies.downstreamApis = downstreamApis;
@@ -458,7 +512,7 @@ async function buildDocumentation(
   }
 
   // Extract messaging for outbound/inbound
-  const { outbound, inbound } = extractMessaging(chain, includeContext);
+  const { outbound, inbound } = await extractMessaging(chain, includeContext, executeQuery, repoId);
   result.externalDependencies.messaging.outbound = outbound;
   result.externalDependencies.messaging.inbound = inbound;
 
@@ -493,20 +547,63 @@ async function buildDocumentation(
     result.specs.response.body = bodySchemaToJsonExample(responseBody);
   }
 
+  // Extract request parameters (PathVariable, RequestParam, RequestHeader, CookieValue)
+  const handler = chain.find(n => n.depth === 0);
+  if (handler) {
+    result.specs.request.params = extractRequestParams(handler, includeContext);
+    // Extract validation rules from handler parameters and body schema fields
+    result.specs.request.validation = extractValidationRules(handler, requestBody, chain, includeContext);
+  }
+
   // Generate code diagram
   result.codeDiagram = generateCodeDiagram(chain);
 
   // Generate logic flow placeholder
-  result.logicFlow = 'TODO_AI_ENRICH';
+  result.logicFlow = TODO_AI_ENRICH;
 
   // Add context if requested
   if (includeContext) {
+    // When compact mode, omit content from chain nodes to reduce memory
+    const callChain = compact
+      ? chain.map(node => ({
+          uid: node.uid,
+          name: node.name,
+          filePath: node.filePath,
+          depth: node.depth,
+          kind: node.kind,
+          startLine: node.startLine,
+          endLine: node.endLine,
+          parameterCount: node.parameterCount,
+          returnType: node.returnType,
+          parameters: node.parameters,
+          annotations: node.annotations,
+          callees: node.callees,
+          metadata: node.metadata,
+          // content is omitted for compact mode
+        }))
+      : chain;
+
     result._context = {
-      callChain: chain,
+      callChain,
       resolvedProperties: {},
     };
     result._context.summaryContext = `Handler: ${route.controller}.${route.handler}() → Chain: ${chain.map(n => n.name).join(' → ')}`;
   }
+
+  // Omit empty arrays for cleaner output
+  removeEmptyArrays(result, [
+    ['specs', 'request', 'validation'],
+    ['externalDependencies', 'persistence'],
+    ['externalDependencies', 'messaging', 'outbound'],
+    ['externalDependencies', 'messaging', 'inbound'],
+    ['retryLogic'],
+    ['keyDetails', 'transactionManagement'],
+    ['keyDetails', 'businessRules'],
+    ['keyDetails', 'security'],
+    ['cacheStrategy', 'population'],
+    ['cacheStrategy', 'invalidation'],
+    ['cacheStrategy', 'update'],
+  ]);
 
   return result;
 }
@@ -584,8 +681,8 @@ async function extractDownstreamApis(
       apis.push({
         serviceName,
         endpoint,
-        condition: 'TODO_AI_ENRICH',
-        purpose: 'TODO_AI_ENRICH',
+        condition: TODO_AI_ENRICH,
+        purpose: TODO_AI_ENRICH,
         resolvedUrl: resolvedUrl !== detail.urlExpression ? resolvedUrl : undefined,
         resolutionDetails: (propertyKey || pathConstants.length > 0) ? {
           serviceField: parsed.serviceName ? parsed.serviceName + 'Service' : undefined,
@@ -785,15 +882,6 @@ async function findEnclosingClass(
   }
 }
 
-/** Primitive and common types that don't need schema resolution */
-const PRIMITIVE_TYPES = new Set([
-  'String', 'string', 'Integer', 'int', 'Long', 'long', 'Double', 'double',
-  'Float', 'float', 'Boolean', 'boolean', 'Void', 'void', 'Object', 'Object[]',
-  'Map', 'List', 'Set', 'Optional', 'Iterable', 'Collection',
-  'BigDecimal', 'BigInteger', 'Date', 'LocalDate', 'LocalDateTime',
-  'Instant', 'ZonedDateTime', 'UUID', 'byte[]', 'Byte[]'
-]);
-
 /**
  * Extract request and response body schemas from the handler method's parameters and return type.
  */
@@ -847,8 +935,8 @@ async function resolveTypeSchema(
   repoId: string,
   visited: Set<string> = new Set()
 ): Promise<BodySchema> {
-  // Check for primitive types
-  if (PRIMITIVE_TYPES.has(typeName)) {
+  // Check for primitive and container types
+  if (shouldSkipSchema(typeName)) {
     return { typeName, source: 'primitive', fields: undefined };
   }
 
@@ -859,7 +947,7 @@ async function resolveTypeSchema(
   visited.add(typeName);
 
   // Extract generic inner type if applicable
-  const innerType = extractGenericInnerTypeLocal(typeName);
+  const innerType = extractGenericInnerType(typeName);
   if (innerType) {
     return resolveTypeSchema(innerType, executeQuery, repoId, visited);
   }
@@ -902,52 +990,492 @@ async function resolveTypeSchema(
   }
 }
 
+/** Framework-injected types to skip from parameter extraction */
+const FRAMEWORK_INJECTED_TYPES = new Set([
+  'HttpServletRequest', 'HttpServletResponse', 'Model', 'ModelMap',
+  'Principal', 'Locale', 'BindingResult', 'Errors',
+  'RedirectAttributes', 'SessionStatus', 'WebRequest', 'NativeWebRequest',
+  'InputStream', 'OutputStream', 'Reader', 'Writer', 'HttpSession',
+]);
+
 /**
- * Extract inner type from generic wrapper (local version for body schema).
+ * Extract request parameters from a handler method.
+ * Filters for @PathVariable, @RequestParam, @RequestHeader, @CookieValue annotations.
+ * Skips @RequestBody parameters (handled by body schema) and framework-injected types.
  */
-function extractGenericInnerTypeLocal(typeName: string): string | null {
-  if (typeName.endsWith('[]')) {
-    return typeName.slice(0, -2);
+function extractRequestParams(
+  handler: ChainNode,
+  includeContext: boolean
+): ParamInfo[] {
+  // No parameters JSON available
+  if (!handler.parameters) {
+    return [];
   }
 
-  const genericMatch = typeName.match(/<([^<>]+)>$/);
-  if (genericMatch) {
-    const inner = genericMatch[1];
-    if (inner.includes(',')) {
-      const parts = inner.split(',').map(s => s.trim());
-      return parts[parts.length - 1];
+  // Parse parameters JSON
+  let params: Array<{
+    name: string;
+    type: string;
+    annotations: string[];
+  }>;
+  try {
+    params = JSON.parse(handler.parameters);
+  } catch {
+    return [];
+  }
+
+  const result: ParamInfo[] = [];
+
+  for (const param of params) {
+    // Skip framework-injected types
+    if (FRAMEWORK_INJECTED_TYPES.has(param.type)) {
+      continue;
     }
-    return inner.trim();
+
+    // Skip if no annotations
+    if (!param.annotations || param.annotations.length === 0) {
+      continue;
+    }
+
+    // Find the relevant annotation
+    const annotation = param.annotations.find((ann: string) =>
+      [...REQUEST_PARAM_ANNOTATIONS].some(t => ann.startsWith(t))
+    );
+
+    if (!annotation) {
+      continue;
+    }
+
+    // Skip @RequestBody parameters (handled by body schema)
+    if (param.annotations.includes('@RequestBody')) {
+      continue;
+    }
+
+    // Determine the annotation type
+    const annType = [...REQUEST_PARAM_ANNOTATIONS].find(t => annotation.startsWith(t))!;
+
+    // Determine required flag
+    let required = true; // Default is true for all
+
+    if (annType === '@PathVariable') {
+      // @PathVariable is always required
+      required = true;
+    } else {
+      // @RequestParam, @RequestHeader, @CookieValue - check required attribute
+      // Parse annotation to check for required=false
+      const requiredMatch = annotation.match(/required\s*=\s*(true|false)/i);
+      if (requiredMatch) {
+        required = requiredMatch[1].toLowerCase() === 'true';
+      }
+    }
+
+    // Build the ParamInfo
+    const paramInfo: ParamInfo = {
+      name: param.name,
+      type: param.type,
+      required,
+      description: '',
+    };
+
+    // Add _context if includeContext is true
+    if (includeContext && handler.filePath && handler.startLine) {
+      paramInfo._context = `// ${handler.filePath}:${handler.startLine}\n${annotation}`;
+    }
+
+    result.push(paramInfo);
   }
 
-  return null;
+  return result;
 }
 
-function extractMessaging(chain: ChainNode[], includeContext: boolean): {
+/** Validation annotation names that indicate required fields */
+const REQUIRED_ANNOTATIONS = new Set(['@NotNull', '@NotBlank', '@NotEmpty']);
+
+/** All validation annotation names (excluding @Valid/@Validated which are markers) */
+const VALIDATION_ANNOTATIONS = new Set([
+  '@NotNull', '@NotBlank', '@NotEmpty',
+  '@Size', '@Min', '@Max',
+  '@Positive', '@PositiveOrZero', '@Negative', '@NegativeOrZero',
+  '@Pattern', '@Email',
+  '@Past', '@PastOrPresent', '@Future', '@FutureOrPresent',
+  '@Valid', '@Validated',
+]);
+
+/**
+ * Format a validation annotation to a human-readable rule string.
+ * E.g., "@Size(min=1, max=100)" → "Size: min=1, max=100"
+ */
+function formatValidationRule(annotation: string): string {
+  // Remove @ prefix
+  const withoutAt = annotation.startsWith('@') ? annotation.slice(1) : annotation;
+
+  // Extract annotation name and value
+  const match = withoutAt.match(/^(\w+)(?:\((.+)\))?$/);
+  if (!match) return withoutAt;
+
+  const name = match[1];
+  const value = match[2];
+
+  if (!value) {
+    // No value, just return the name (e.g., "@NotNull" → "NotNull")
+    return name;
+  }
+
+  // Format based on annotation type
+  if (name === 'Size') {
+    return `Size: ${value}`;
+  }
+  if (name === 'Min' || name === 'Max') {
+    return `${name}: ${value}`;
+  }
+  if (name === 'Pattern') {
+    // Extract regexp value
+    const regexpMatch = value.match(/regexp\s*=\s*"([^"]+)"/);
+    if (regexpMatch) {
+      return `Pattern: ${regexpMatch[1]}`;
+    }
+    return `Pattern: ${value}`;
+  }
+
+  // Default: return name with value
+  return `${name}: ${value}`;
+}
+
+/**
+ * Extract ValidationRule from a list of annotations.
+ * Returns empty array if no validation annotations found.
+ */
+function extractValidationFromAnnotations(
+  annotations: string[],
+  fieldName: string,
+  fieldType: string,
+  includeContext: boolean,
+  filePath?: string,
+  startLine?: number
+): ValidationRule[] {
+  // Filter validation annotations
+  const validationAnns = annotations.filter((ann: string) => {
+    const name = ann.startsWith('@') ? ann.slice(1) : ann;
+    const baseName = name.split('(')[0];
+    return VALIDATION_ANNOTATIONS.has(`@${baseName}`);
+  });
+
+  if (validationAnns.length === 0) {
+    return [];
+  }
+
+  // Determine if required
+  const required = validationAnns.some((ann: string) => {
+    const baseName = ann.split('(')[0];
+    return REQUIRED_ANNOTATIONS.has(baseName);
+  });
+
+  // Format rules
+  const formattedRules = validationAnns
+    .map(formatValidationRule)
+    .join(', ');
+
+  const rule: ValidationRule = {
+    field: fieldName,
+    type: fieldType,
+    required,
+    rules: formattedRules,
+  };
+
+  // Add _context if includeContext is true
+  if (includeContext && filePath && startLine) {
+    const annText = validationAnns.join(' ');
+    rule._context = `// ${filePath}:${startLine}\n${annText}`;
+  }
+
+  return [rule];
+}
+
+/**
+ * Find fields from Class nodes in the chain for a given type.
+ */
+function findFieldsInChain(
+  chain: ChainNode[],
+  typeName: string
+): Array<{ name: string; type: string; annotations: string[] }> | null {
+  // Find Class node matching the type name
+  const classNode = chain.find(n => n.name === typeName && n.kind === 'Class');
+  if (!classNode || !classNode.fields) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(classNode.fields);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract validation rules from handler parameters and body schema fields.
+ */
+function extractValidationRules(
+  handler: ChainNode,
+  requestBody: BodySchema | null,
+  chain: ChainNode[],
+  includeContext: boolean
+): ValidationRule[] {
+  const rules: ValidationRule[] = [];
+
+  // Parse parameters JSON
+  if (!handler.parameters) {
+    return rules;
+  }
+
+  let params: Array<{
+    name: string;
+    type: string;
+    annotations: string[];
+  }>;
+  try {
+    params = JSON.parse(handler.parameters);
+  } catch {
+    return rules;
+  }
+
+    for (const param of params) {
+    if (!param.annotations || param.annotations.length === 0) {
+      continue;
+    }
+
+    // Extract validation rules using helper
+    const paramRules = extractValidationFromAnnotations(
+      param.annotations,
+      param.name,
+      param.type,
+      includeContext,
+      handler.filePath,
+      handler.startLine
+    );
+    rules.push(...paramRules);
+  }
+
+  // Include field-level validation rules from BodySchema or chain nodes
+  // Find the @RequestBody parameter to get the param name prefix
+  const bodyParam = params.find((p: { name: string; type: string; annotations: string[] }) =>
+    p.annotations?.includes('@RequestBody')
+  );
+
+  if (bodyParam) {
+    // First try requestBody.fields (from database query)
+    // Then fall back to finding Class nodes in the chain with fields
+    const fields = requestBody?.fields || findFieldsInChain(chain, bodyParam.type);
+
+    if (fields && fields.length > 0) {
+      const prefix = `${bodyParam.name}.`;
+
+      // Find the Class node for context (once, before the loop)
+      const classNode = chain.find(n => n.name === bodyParam.type && n.kind === 'Class');
+
+      for (const field of fields) {
+        if (!field.annotations || field.annotations.length === 0) {
+          continue;
+        }
+
+        // Extract validation rules using helper
+        const fieldRules = extractValidationFromAnnotations(
+          field.annotations,
+          `${prefix}${field.name}`,
+          field.type,
+          includeContext,
+          classNode?.filePath,
+          classNode?.startLine
+        );
+        rules.push(...fieldRules);
+      }
+    }
+  }
+
+  // Part 3: Imperative validation detection (when includeContext)
+  if (includeContext) {
+    for (const node of chain) {
+      if (!node.content) continue;
+      for (const pattern of IMPERATIVE_VALIDATION_PATTERNS) {
+        let match;
+        while ((match = pattern.exec(node.content)) !== null) {
+          rules.push({
+            field: TODO_AI_ENRICH,
+            type: TODO_AI_ENRICH,
+            required: false,
+            rules: TODO_AI_ENRICH,
+            _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content.slice(match.index, match.index + 200)}...`,
+          });
+        }
+      }
+    }
+  }
+
+  return rules;
+}
+
+async function extractMessaging(
+  chain: ChainNode[],
+  includeContext: boolean,
+  executeQuery?: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
+  repoId?: string
+): Promise<{
   outbound: MessagingOutbound[];
   inbound: MessagingInbound[];
-} {
+}> {
   const outbound: MessagingOutbound[] = [];
   const inbound: MessagingInbound[] = [];
   const seenOutbound = new Set<string>();
+  const seenInbound = new Set<string>();
 
   for (const node of chain) {
+    // Extract outbound messaging
     for (const detail of node.metadata.messagingDetails) {
       if (detail.topic && !seenOutbound.has(detail.topic)) {
         seenOutbound.add(detail.topic);
         outbound.push({
           topic: detail.topic,
-          payload: 'TODO_AI_ENRICH',
-          trigger: 'TODO_AI_ENRICH',
+          payload: TODO_AI_ENRICH,
+          trigger: TODO_AI_ENRICH,
           ...(includeContext && {
             _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content?.slice(0, 200)}...`,
           }),
         });
       }
     }
+
+    // Extract inbound messaging from annotations
+    if (node.annotations) {
+      try {
+        const annotations = JSON.parse(node.annotations);
+        for (const ann of annotations) {
+          const annName = ann.name;
+          if (EVENT_LISTENER_ANNOTATIONS.has(annName)) {
+            // Determine topic
+            let topic: string;
+            if (annName === '@EventListener' || annName === '@TransactionalEventListener') {
+              topic = TODO_AI_ENRICH;
+            } else if (annName === '@RabbitListener') {
+              topic = ann.attrs?.queues || TODO_AI_ENRICH;
+            } else if (annName === '@KafkaListener') {
+              topic = ann.attrs?.topics || TODO_AI_ENRICH;
+            } else {
+              continue;
+            }
+
+            const payload = extractPayloadFromParameters(node.parameters);
+            const consumptionLogic = buildConsumptionLogic(node.filePath!, node.name!);
+
+            // Deduplicate by topic + consumptionLogic
+            const key = `${topic}:${consumptionLogic}`;
+            if (seenInbound.has(key)) continue;
+            seenInbound.add(key);
+
+            inbound.push({
+              topic,
+              payload,
+              consumptionLogic,
+              ...(includeContext && {
+                _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content?.slice(0, 200)}...`,
+              }),
+            });
+          }
+        }
+      } catch {
+        // Ignore parse errors for annotations
+      }
+    }
+  }
+
+  // Part 2: Graph query for broker listeners (when includeContext and executeQuery provided)
+  if (includeContext && executeQuery && repoId) {
+    const cypher = `
+      MATCH (m:Method)
+      WHERE m.annotations CONTAINS '@RabbitListener'
+         OR m.annotations CONTAINS '@KafkaListener'
+      RETURN m.name, m.annotations, m.filePath, m.parameters
+    `;
+    try {
+      const results = await executeQuery(repoId, cypher, {});
+      for (const row of results) {
+        // Extract values with array fallback for LadybugDB result format
+        // LadybugDB returns [name, annotations, filePath, parameters] not {name, annotations, ...}
+        // Extract values - Cypher returns columns like m.name, m.filePath, etc.
+        // LadybugDB may return these as row['m.name'] or row[0] depending on format
+        const name = row['m.name'] ?? row.name ?? row[0];
+        const annotations = row['m.annotations'] ?? row.annotations ?? row[1] ?? '';
+        const filePath = row['m.filePath'] ?? row.filePath ?? row[2] ?? '';
+        const parameters = row['m.parameters'] ?? row.parameters ?? row[3];
+
+        // Extract topic using helper
+        const listenerType = annotations.includes('@RabbitListener') ? 'RabbitListener' as const
+          : annotations.includes('@KafkaListener') ? 'KafkaListener' as const
+          : null;
+        const topic = listenerType ? extractListenerTopic(annotations, listenerType) : TODO_AI_ENRICH;
+        const payload = extractPayloadFromParameters(parameters);
+        const consumptionLogic = buildConsumptionLogic(filePath, name);
+
+        // Deduplicate
+        const key = `${topic}:${consumptionLogic}`;
+        if (seenInbound.has(key)) continue;
+        seenInbound.add(key);
+
+        inbound.push({
+          topic,
+          payload,
+          consumptionLogic,
+          _context: `// Graph query result\n// ${filePath}\n@RabbitListener/KafkaListener detected`,
+        });
+      }
+    } catch {
+      // Ignore graph query errors
+    }
   }
 
   return { outbound, inbound };
+}
+
+/**
+ * Extract class name from a file path.
+ * Example: "src/listeners/RabbitConsumer.java" -> "RabbitConsumer"
+ */
+function extractClassNameFromPath(filePath: string): string | null {
+  const fileName = filePath.split('/').pop() || '';
+  const match = fileName.match(/^(.+)\.(java|ts|js|kt|py|php)$/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Extract topic from RabbitListener or KafkaListener annotation string.
+ */
+function extractListenerTopic(annotations: string, listenerType: 'RabbitListener' | 'KafkaListener'): string {
+  const attr = listenerType === 'RabbitListener' ? 'queues' : 'topics';
+  const match1 = annotations.match(new RegExp(`${attr}\\s*=\\s*"([^"]+)"`));
+  if (match1) return match1[1];
+  const match2 = annotations.match(new RegExp(`${attr}\\s*=\\s*\\{([^}]+)\\}`));
+  if (match2) return match2[1].trim();
+  return TODO_AI_ENRICH;
+}
+
+/**
+ * Extract payload type from parameters (string or parsed JSON).
+ */
+function extractPayloadFromParameters(parameters: string | unknown): string {
+  if (!parameters) return TODO_AI_ENRICH;
+  try {
+    const params = typeof parameters === 'string' ? JSON.parse(parameters) : parameters;
+    if (Array.isArray(params) && params.length > 0 && params[0].type) {
+      return params[0].type;
+    }
+  } catch { /* ignore parse errors */ }
+  return TODO_AI_ENRICH;
+}
+
+/**
+ * Build consumptionLogic string from filePath and methodName.
+ */
+function buildConsumptionLogic(filePath: string, methodName: string): string {
+  const className = extractClassNameFromPath(filePath);
+  return className && methodName ? `${className}.${methodName}()` : methodName || TODO_AI_ENRICH;
 }
 
 function extractPersistence(chain: ChainNode[]): PersistenceInfo[] {
@@ -970,7 +1498,7 @@ function extractPersistence(chain: ChainNode[]): PersistenceInfo[] {
   }
 
   return [{
-    database: 'TODO_AI_ENRICH',
+    database: TODO_AI_ENRICH,
     tables: Array.from(tables).join(', ') || 'None detected',
     storedProcedures: 'None detected',
   }];
@@ -1035,7 +1563,7 @@ function extractAnnotations(chain: ChainNode[]): {
                 operation: node.name,
                 maxAttempts: String(maxAttempts),
                 backoff: String(backoff),
-                recovery: 'TODO_AI_ENRICH',
+                recovery: TODO_AI_ENRICH,
               });
             }
           }
@@ -1137,9 +1665,12 @@ function bodySchemaToJsonExample(
 ): Record<string, unknown> | null {
   if (!schema) return null;
 
-  // External types - can't resolve
+  // External types - return TODO_AI_ENRICH marker with type context
   if (schema.source === 'external') {
-    return null;
+    return {
+      _TODO_AI_ENRICH: `Body type '${schema.typeName}' is from an external dependency. Enrich with schema documentation.`,
+      _bodyType: schema.typeName,
+    };
   }
 
   // Primitive types - return null (no body)

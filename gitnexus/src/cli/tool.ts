@@ -17,6 +17,7 @@
 
 import { writeSync } from 'node:fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { ensureHeap } from './heap-utils.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -108,6 +109,8 @@ export async function impactCommand(target: string, options?: {
   depth?: string;
   includeTests?: boolean;
 }): Promise<void> {
+  if (ensureHeap()) return;
+
   if (!target?.trim()) {
     console.error('Usage: gitnexus impact <symbol_name> [--direction upstream|downstream]');
     process.exit(1);
@@ -148,6 +151,39 @@ export async function cypherCommand(query: string, options?: {
   const result = await backend.callTool('cypher', {
     query,
     repo: options?.repo,
+  });
+  output(result);
+}
+
+export async function documentEndpointCommand(options?: {
+  method?: string;
+  path?: string;
+  depth?: string;
+  includeContext?: boolean;
+  compact?: boolean;
+  repo?: string;
+}): Promise<void> {
+  if (ensureHeap()) return;
+
+  if (!options?.method || !options?.path) {
+    console.error('Usage: gitnexus document-endpoint --method <METHOD> --path <path-pattern>');
+    console.error('  --method <METHOD>     HTTP method (GET, POST, PUT, DELETE, PATCH)');
+    console.error('  --path <pattern>      Path pattern to match (e.g., "suggest", "/bookings/{id}")');
+    console.error('  --depth <n>           Max trace depth (default: 10)');
+    console.error('  --include-context     Include source context for AI enrichment');
+    console.error('  --compact             Omit source content and empty arrays (use with --include-context)');
+    console.error('  --repo <name>         Target repository');
+    process.exit(1);
+  }
+
+  const backend = await getBackend();
+  const result = await backend.callTool('document-endpoint', {
+    method: options.method,
+    path: options.path,
+    depth: options.depth ? parseInt(options.depth, 10) : undefined,
+    include_context: options.includeContext ?? false,
+    compact: options.compact ?? false,
+    repo: options.repo,
   });
   output(result);
 }

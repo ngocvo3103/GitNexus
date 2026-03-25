@@ -75,10 +75,10 @@ WHEN TO USE: Complex structural queries that search/explore can't answer. READ g
 AFTER THIS: Use context() on result symbols for deeper context.
 
 SCHEMA:
-- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, Route, Tool
+- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process
 - Multi-language nodes (use backticks): \`Struct\`, \`Enum\`, \`Trait\`, \`Impl\`, etc.
 - All edges via single CodeRelation table with 'type' property
-- Edge types: CONTAINS, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, ACCESSES, OVERRIDES, MEMBER_OF, STEP_IN_PROCESS, HANDLES_ROUTE, FETCHES, HANDLES_TOOL, ENTRY_POINT_OF
+- Edge types: CONTAINS, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, OVERRIDES, MEMBER_OF, STEP_IN_PROCESS
 - Edge properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32)
 
 EXAMPLES:
@@ -94,12 +94,6 @@ EXAMPLES:
 • Find all methods of a class:
   MATCH (c:Class {name: "UserService"})-[r:CodeRelation {type: 'HAS_METHOD'}]->(m:Method) RETURN m.name, m.parameterCount, m.returnType
 
-• Find all properties of a class:
-  MATCH (c:Class {name: "User"})-[r:CodeRelation {type: 'HAS_PROPERTY'}]->(p:Property) RETURN p.name, p.declaredType
-
-• Find all writers of a field:
-  MATCH (f:Function)-[r:CodeRelation {type: 'ACCESSES', reason: 'write'}]->(p:Property) WHERE p.name = "address" RETURN f.name, f.filePath
-
 • Find method overrides (MRO resolution):
   MATCH (winner:Method)-[r:CodeRelation {type: 'OVERRIDES'}]->(loser:Method) RETURN winner.name, winner.filePath, loser.filePath, r.reason
 
@@ -110,8 +104,8 @@ OUTPUT: Returns { markdown, row_count } — results formatted as a Markdown tabl
 
 TIPS:
 - All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
-- Community = auto-detected functional area (Leiden algorithm). Properties: heuristicLabel, cohesion, symbolCount, keywords, description, enrichedBy
-- Process = execution flow trace from entry point to terminal. Properties: heuristicLabel, processType, stepCount, communities, entryPointId, terminalId
+- Community = auto-detected functional area (Leiden algorithm)
+- Process = execution flow trace from entry point to terminal
 - Use heuristicLabel (not label) for human-readable community/process names`,
     inputSchema: {
       type: 'object',
@@ -125,14 +119,12 @@ TIPS:
   {
     name: 'context',
     description: `360-degree view of a single code symbol.
-Shows categorized incoming/outgoing references (calls, imports, extends, implements, methods, properties, overrides), process participation, and file location.
+Shows categorized incoming/outgoing references (calls, imports, extends, implements), process participation, and file location.
 
 WHEN TO USE: After query() to understand a specific symbol in depth. When you need to know all callers, callees, and what execution flows a symbol participates in.
 AFTER THIS: Use impact() if planning changes, or READ gitnexus://repo/{name}/process/{processName} for full execution trace.
 
-Handles disambiguation: if multiple symbols share the same name, returns candidates for you to pick from. Use uid param for zero-ambiguity lookup from prior results.
-
-NOTE: ACCESSES edges (field read/write tracking) are included in context results with reason 'read' or 'write'. CALLS edges resolve through field access chains and method-call chains (e.g., user.address.getCity().save() produces CALLS edges at each step).`,
+Handles disambiguation: if multiple symbols share the same name, returns candidates for you to pick from. Use uid param for zero-ambiguity lookup from prior results.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -208,9 +200,7 @@ Depth groups:
 - d=2: LIKELY AFFECTED (indirect)
 - d=3: MAY NEED TESTING (transitive)
 
-TIP: Default traversal uses CALLS/IMPORTS/EXTENDS/IMPLEMENTS. For class members, include HAS_METHOD and HAS_PROPERTY in relationTypes. For field access analysis, include ACCESSES in relationTypes.
-
-EdgeType: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, OVERRIDES, ACCESSES
+EdgeType: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, OVERRIDES
 Confidence: 1.0 = certain, <0.8 = fuzzy match`,
     inputSchema: {
       type: 'object',
@@ -218,7 +208,7 @@ Confidence: 1.0 = certain, <0.8 = fuzzy match`,
         target: { type: 'string', description: 'Name of function, class, or file to analyze' },
         direction: { type: 'string', description: 'upstream (what depends on this) or downstream (what this depends on)' },
         maxDepth: { type: 'number', description: 'Max relationship depth (default: 3)', default: 3 },
-        relationTypes: { type: 'array', items: { type: 'string' }, description: 'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, OVERRIDES, ACCESSES (default: usage-based, ACCESSES excluded by default)' },
+        relationTypes: { type: 'array', items: { type: 'string' }, description: 'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, OVERRIDES (default: usage-based)' },
         includeTests: { type: 'boolean', description: 'Include test files (default: false)' },
         minConfidence: { type: 'number', description: 'Minimum confidence 0-1 (default: 0.7)' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
@@ -227,70 +217,48 @@ Confidence: 1.0 = certain, <0.8 = fuzzy match`,
     },
   },
   {
-    name: 'route_map',
-    description: `Show API route mappings: which components/hooks fetch which API endpoints, and which handler files serve them.
+    name: 'document-endpoint',
+    description: `Generate API documentation JSON for an HTTP endpoint.
 
-WHEN TO USE: Understanding API consumption patterns, finding orphaned routes. For pre-change analysis, prefer \`api_impact\` which combines this data with mismatch detection and risk assessment.
-AFTER THIS: Use impact() on specific route handlers to see full blast radius.
+Returns schema-valid JSON with:
+- Request/response specifications (params, body, validation, response codes)
+- External dependencies (downstream APIs, messaging, persistence)
+- Logic flow placeholder and code diagram
+- Retry logic, transaction management, security annotations
 
-Returns: route nodes with their handlers, middleware wrapper chains (e.g., withAuth, withRateLimit), and consumers.`,
+Two modes:
+- Minimal (default): JSON with TODO_AI_ENRICH placeholders for non-mechanical fields
+- Context-enriched (--include-context): Same JSON + _context fields with source snippets
+
+Use this to quickly document an endpoint's complete call chain and dependencies.`,
     inputSchema: {
       type: 'object',
       properties: {
-        route: { type: 'string', description: 'Filter by route path (e.g., "/api/grants"). Omit for all routes.' },
+        method: { type: 'string', description: 'HTTP method (GET, POST, PUT, DELETE, PATCH)' },
+        path: { type: 'string', description: 'Path or path keyword to match (e.g., "users", "/api/users/{id}")' },
+        depth: { type: 'number', description: 'Max call chain depth to trace (default: 10)', default: 10 },
+        include_context: { type: 'boolean', description: 'Include _context fields with source snippets (default: false)', default: false },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
-      required: [],
+      required: ['method', 'path'],
     },
   },
   {
-    name: 'tool_map',
-    description: `Show MCP/RPC tool definitions: which tools are defined, where they're handled, and their descriptions.
+    name: 'endpoints',
+    description: `Query API endpoints by HTTP method and/or path pattern.
 
-WHEN TO USE: Understanding tool APIs, finding tool implementations, impact analysis for tool changes.
+Returns matching Route nodes with controller class, handler method, file path, and line number.
 
-Returns: tool nodes with their handler files and descriptions.`,
+WHEN TO USE: Find the entry point for an API endpoint before tracing its call chain.
+AFTER THIS: Use context() on the handler method for deeper analysis, or document-endpoint for full documentation.
+
+Supports partial path matching (e.g., "users" matches "/api/users/{id}").`,
     inputSchema: {
       type: 'object',
       properties: {
-        tool: { type: 'string', description: 'Filter by tool name. Omit for all tools.' },
-        repo: { type: 'string', description: 'Repository name or path.' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'shape_check',
-    description: `Check response shapes for API routes against their consumers' property accesses.
-
-WHEN TO USE: Detecting mismatches between what an API route returns and what consumers expect. Finding shape drift. For pre-change analysis, prefer \`api_impact\` which combines this data with mismatch detection and risk assessment.
-REQUIRES: Route nodes with responseKeys (extracted from .json({...}) calls during indexing).
-
-Returns routes that have both detected response keys AND consumers. Shows top-level keys each endpoint returns (e.g., data, pagination, error) and what keys each consumer accesses. Reports MISMATCH status when a consumer accesses keys not present in the route's response shape.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        route: { type: 'string', description: 'Check a specific route (e.g., "/api/grants"). Omit to check all routes.' },
+        method: { type: 'string', description: 'HTTP method (GET, POST, PUT, DELETE, PATCH)', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] },
+        path: { type: 'string', description: 'Path or path keyword to match (e.g., "users", "/api/users/{id}")' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'api_impact',
-    description: `Pre-change impact report for an API route handler.
-
-WHEN TO USE: BEFORE modifying any API route handler. Shows what consumers depend on, what response fields they access, what middleware protects the route, and what execution flows it triggers. Requires at least "route" or "file" parameter.
-
-Risk levels: LOW (0-3 consumers), MEDIUM (4-9 or any mismatches), HIGH (10+ consumers or mismatches with 4+ consumers). Mismatches with confidence "low" indicate the consumer file fetches multiple routes — property attribution is approximate.
-
-Returns: single route object when one match, or { routes: [...], total: N } for multiple matches. Combines route_map, shape_check, and impact data.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        route: { type: 'string', description: 'Route path (e.g., "/api/grants")' },
-        file: { type: 'string', description: 'Handler file path (alternative to route)' },
-        repo: { type: 'string', description: 'Repository name or path.' },
       },
       required: [],
     },

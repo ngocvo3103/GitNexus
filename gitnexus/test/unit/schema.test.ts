@@ -39,8 +39,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('has expected total count', () => {
-      // 9 core + 18 multi-language + Route + Tool = 30
-      expect(NODE_TABLES).toHaveLength(30);
+      // 9 core + 1 Route + 18 multi-language = 28
+      expect(NODE_TABLES).toHaveLength(28);
     });
   });
 
@@ -122,11 +122,11 @@ describe('LadybugDB Schema', () => {
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {
       // HAS_METHOD sources: Class, Interface, Struct, Trait, Impl, Record
-      // HAS_METHOD targets: Method, Constructor (Property is now HAS_PROPERTY)
+      // HAS_METHOD targets: Method, Constructor, Property
       const sources = ['Class', 'Interface'];
       const backtickSources = ['Struct', 'Trait', 'Impl', 'Record'];
       const targets = ['Method'];
-      const backtickTargets = ['Constructor'];
+      const backtickTargets = ['Constructor', 'Property'];
 
       // Non-backtick source → non-backtick target
       for (const src of sources) {
@@ -164,7 +164,7 @@ describe('LadybugDB Schema', () => {
 
   describe('schema query ordering', () => {
     it('NODE_SCHEMA_QUERIES has correct count', () => {
-      expect(NODE_SCHEMA_QUERIES).toHaveLength(30);
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(28);
     });
 
     it('REL_SCHEMA_QUERIES has one relation table', () => {
@@ -172,8 +172,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('SCHEMA_QUERIES includes all node + rel + embedding schemas', () => {
-      // 30 node + 1 rel + 1 embedding = 32
-      expect(SCHEMA_QUERIES).toHaveLength(32);
+      // 28 node + 1 rel + 1 embedding = 30
+      expect(SCHEMA_QUERIES).toHaveLength(30);
     });
 
     it('node schemas come before relation schemas in SCHEMA_QUERIES', () => {
