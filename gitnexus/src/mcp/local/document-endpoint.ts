@@ -8,11 +8,12 @@
  */
 
 import type { RepoHandle } from './local-backend.js';
+import type { CrossRepoContext } from './cross-repo-context.js';
 import { executeParameterized } from '../core/lbug-adapter.js';
 import { executeTrace, type ChainNode } from './trace-executor.js';
 import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
 import { generateId } from '../../lib/utils.js';
-import { shouldSkipSchema, extractGenericInnerType } from '../../core/ingestion/type-extractors/shared.js';
+import { shouldSkipSchema, extractGenericInnerType, extractPackagePrefix } from '../../core/ingestion/type-extractors/shared.js';
 
 /** Placeholder for AI enrichment - used throughout for fields requiring manual input */
 const TODO_AI_ENRICH = 'TODO_AI_ENRICH';
@@ -35,11 +36,14 @@ const IMPERATIVE_VALIDATION_PATTERNS = [
   /\.\s*validate\s*\(/g,
   /Validator\.(validate|check)\s*\(/g,
 
+  // Validation service: validationService.process(), ValidationService.process()
+  /\w*[Vv]alidation[Ss]ervice\w*\s*\.\s*process\s*\(/g,
+  
   // Custom validation service fields: suggestionValidationServiceImpl.process()
   /\w*ValidationServiceImpl\s*\.\s*process\s*\(/g,
   
-  // Custom validation methods: .validateJWT(), .validateRequest()
-  /\.\s*validate[A-Z]\w*\s*\(/g,
+  // Custom validation methods: .validateJWT(), validateJWT(), .validateRequest()
+  /(?:\.\s*)?validate[A-Z]\w*\s*\(/g,
 ];
 
 // ============================================================================
@@ -73,6 +77,10 @@ export interface DocumentEndpointOptions {
   include_context?: boolean;
   compact?: boolean;
   repo?: string;
+  /** Optional injected query executor for testing */
+  executeQuery?: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>;
+  /** Optional cross-repo resolution capabilities */
+  crossRepo?: CrossRepoContext;
 }
 
 export interface ParamInfo {
@@ -100,6 +108,10 @@ export interface BodySchema {
   typeName: string;
   source: 'indexed' | 'external' | 'primitive';
   fields?: Array<{ name: string; type: string; annotations: string[] }>;
+  /** Attribution for cross-repo resolution — repoId where the type was found */
+  repoId?: string;
+  /** Indicates the original type was a container (List, Set, array, etc.) */
+  isContainer?: boolean;
 }
 
 export interface DownstreamApi {
@@ -118,14 +130,14 @@ export interface DownstreamApi {
 
 export interface MessagingOutbound {
   topic: string;
-  payload: string;
+  payload: string | BodySchema | Record<string, unknown> | Record<string, unknown>[];
   trigger: string;
   _context?: string;
 }
 
 export interface MessagingInbound {
   topic: string;
-  payload: string;
+  payload: string | BodySchema | Record<string, unknown> | Record<string, unknown>[];
   consumptionLogic: string;
   _context?: string;
 }
@@ -176,11 +188,11 @@ export interface DocumentEndpointResult {
   specs: {
     request: {
       params: ParamInfo[];
-      body: Record<string, unknown> | BodySchema | null;
+      body: Record<string, unknown> | Record<string, unknown>[] | BodySchema | null;
       validation: ValidationRule[];
     };
     response: {
-      body: Record<string, unknown> | BodySchema | null;
+      body: Record<string, unknown> | Record<string, unknown>[] | BodySchema | null;
       codes: ResponseCode[];
     };
   };
@@ -287,23 +299,21 @@ async function findHandlerByPathPattern(
             // Extract the path from the annotation
             const pathMatch = content.match(new RegExp(`@(?:${upperMethod}Mapping|RequestMapping)\\s*\\(\\s*[^)]*value\\s*=\\s*["']([^"']+)["']`, 'i'))
               || content.match(new RegExp(`@(?:${upperMethod}Mapping|RequestMapping)\\s*\\(\\s*["']([^"']+)["']`, 'i'));
+            const annotationPath = pathMatch?.[1];  // Safe extraction
             
-            // Store extracted path for returning in result
-            const annotationPath = pathMatch ? pathMatch[1] : undefined;
-            
-            if (pathMatch) {
+            if (annotationPath) {
               // Check if path ends with key segments
               const lastPathSegment = paths[paths.length - 1];
-              if (annotationPath!.includes(lastPathSegment)) score += 100;
+              if (annotationPath.includes(lastPathSegment)) score += 100;
               
               // Check for exact suffix match (ignoring class-level prefix)
               const searchSuffix = '/' + paths.slice(-2).join('/');
-              if (annotationPath!.endsWith(searchSuffix) || annotationPath === '/' + paths[paths.length - 1]) {
+              if (annotationPath.endsWith(searchSuffix) || annotationPath === '/' + paths[paths.length - 1]) {
                 score += 200;
               }
               
               // Penalize length difference
-              const lengthDiff = Math.abs(annotationPath!.length - pathPattern.length);
+              const lengthDiff = Math.abs(annotationPath.length - pathPattern.length);
               score -= Math.min(lengthDiff, 50); // Cap penalty
             }
 
@@ -379,11 +389,23 @@ async function findHandlerByPathPattern(
 // Main Function
 // ============================================================================
 
+/** Valid HTTP methods for endpoint documentation */
+const VALID_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
+
 export async function documentEndpoint(
   repo: RepoHandle,
   options: DocumentEndpointOptions
 ): Promise<{ result: DocumentEndpointResult; error?: string }> {
-  const { method, path, depth = 10, include_context = false, compact = false } = options;
+  const { method, path, depth = 10, include_context = false, compact = false, crossRepo } = options;
+
+  // Validate HTTP method
+  const upperMethod = method.toUpperCase();
+  if (!VALID_METHODS.has(upperMethod)) {
+    return {
+      result: createEmptyResult(method, path),
+      error: `Invalid HTTP method: ${method}`
+    };
+  }
 
   // Step 1: Try to find the Route node (may fail if Route table doesn't exist)
   let route: EndpointInfo | undefined;
@@ -424,10 +446,10 @@ export async function documentEndpoint(
     };
   }
 
-  // Step 2: Build the executeQuery function from repo
-  const executeQuery = async (_repoId: string, query: string, params: Record<string, any>) => {
+  // Step 2: Build the executeQuery function from repo (or use injected one for testing)
+  const executeQuery = options.executeQuery ?? (async (_repoId: string, query: string, params: Record<string, any>) => {
     return executeParameterized(repo.id, query, params);
-  };
+  });
 
   // Step 3: Trace the handler method
   const traceResult = await executeTrace(
@@ -445,7 +467,7 @@ export async function documentEndpoint(
 
   // Step 4: Build the documentation
   // Use route.path (actual endpoint path) instead of input pattern
-  const result = await buildDocumentation(method, route.path, route, traceResult.chain, include_context, compact, executeQuery, repo.id);
+  const result = await buildDocumentation(method, route.path, route, traceResult.chain, include_context, compact, executeQuery, repo.id, crossRepo);
 
   return { result };
 }
@@ -491,7 +513,8 @@ async function buildDocumentation(
   includeContext: boolean,
   compact: boolean,
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
-  repoId: string
+  repoId: string,
+  crossRepo?: CrossRepoContext
 ): Promise<DocumentEndpointResult> {
   const result = createEmptyResult(method, path);
 
@@ -511,10 +534,51 @@ async function buildDocumentation(
     }));
   }
 
-  // Extract messaging for outbound/inbound
-  const { outbound, inbound } = await extractMessaging(chain, includeContext, executeQuery, repoId);
-  result.externalDependencies.messaging.outbound = outbound;
-  result.externalDependencies.messaging.inbound = inbound;
+  // Extract request and response body schemas with nested type resolution FIRST
+  // This creates the main nestedSchemas map that we'll merge into
+  const { requestBody, responseBody, nestedSchemas } = await extractBodySchemas(chain, executeQuery, repoId, crossRepo);
+
+  // Extract messaging for outbound/inbound and merge nestedSchemas
+  const { outbound, inbound, nestedSchemas: messagingNestedSchemas } = await extractMessaging(chain, includeContext, executeQuery, repoId, crossRepo);
+  
+  // Merge messaging nestedSchemas into main nestedSchemas from body schemas
+  for (const [typeName, schema] of messagingNestedSchemas) {
+    nestedSchemas.set(typeName, schema);
+  }
+  
+  // Convert payloads for compact mode, keep BodySchema for with-context mode
+  if (includeContext) {
+    result.externalDependencies.messaging.outbound = outbound;
+    result.externalDependencies.messaging.inbound = inbound;
+  } else {
+    // Compact mode: convert BodySchema payloads to JSON examples
+    // For external types (no fields), return just the type name string
+    result.externalDependencies.messaging.outbound = outbound.map(msg => {
+      if (typeof msg.payload === 'object' && msg.payload !== null) {
+        const schema = msg.payload as BodySchema;
+        // External types (not indexed) - return type name string
+        if (schema.source === 'external' || !schema.fields) {
+          return { topic: msg.topic, payload: schema.typeName, trigger: msg.trigger };
+        }
+        // Indexed types with fields - return JSON example
+        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), trigger: msg.trigger };
+      }
+      return { topic: msg.topic, payload: msg.payload, trigger: msg.trigger };
+    });
+    
+    result.externalDependencies.messaging.inbound = inbound.map(msg => {
+      if (typeof msg.payload === 'object' && msg.payload !== null) {
+        const schema = msg.payload as BodySchema;
+        // External types (not indexed) - return type name string
+        if (schema.source === 'external' || !schema.fields) {
+          return { topic: msg.topic, payload: schema.typeName, consumptionLogic: msg.consumptionLogic };
+        }
+        // Indexed types with fields - return JSON example
+        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), consumptionLogic: msg.consumptionLogic };
+      }
+      return { topic: msg.topic, payload: msg.payload, consumptionLogic: msg.consumptionLogic };
+    });
+  }
 
   // Extract persistence (repository calls)
   const persistence = extractPersistence(chain);
@@ -533,18 +597,15 @@ async function buildDocumentation(
   result.retryLogic = retry;
   result.keyDetails.security = security;
 
-  // Extract request and response body schemas
-  const { requestBody, responseBody } = await extractBodySchemas(chain, executeQuery, repoId);
-
   // Convert to JSON example for schema-compliant output
   // When includeContext is true, keep full BodySchema for AI enrichment
   // When includeContext is false, output JSON example or null
   if (includeContext) {
-    result.specs.request.body = requestBody;
-    result.specs.response.body = responseBody;
+    result.specs.request.body = embedNestedSchemas(requestBody, nestedSchemas);
+    result.specs.response.body = embedNestedSchemas(responseBody, nestedSchemas);
   } else {
-    result.specs.request.body = bodySchemaToJsonExample(requestBody);
-    result.specs.response.body = bodySchemaToJsonExample(responseBody);
+    result.specs.request.body = bodySchemaToJsonExample(requestBody, nestedSchemas);
+    result.specs.response.body = bodySchemaToJsonExample(responseBody, nestedSchemas);
   }
 
   // Extract request parameters (PathVariable, RequestParam, RequestHeader, CookieValue)
@@ -592,11 +653,9 @@ async function buildDocumentation(
 
   // Omit empty arrays for cleaner output
   removeEmptyArrays(result, [
-    ['specs', 'request', 'validation'],
+    // Keep validation, messaging.inbound, retryLogic even when empty - API contract requires them
     ['externalDependencies', 'persistence'],
     ['externalDependencies', 'messaging', 'outbound'],
-    ['externalDependencies', 'messaging', 'inbound'],
-    ['retryLogic'],
     ['keyDetails', 'transactionManagement'],
     ['keyDetails', 'businessRules'],
     ['keyDetails', 'security'],
@@ -888,14 +947,20 @@ async function findEnclosingClass(
 async function extractBodySchemas(
   chain: ChainNode[],
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
-  repoId: string
-): Promise<{ requestBody: BodySchema | null; responseBody: BodySchema | null }> {
+  repoId: string,
+  crossRepo?: CrossRepoContext
+): Promise<{ requestBody: BodySchema | null; responseBody: BodySchema | null; nestedSchemas: Map<string, BodySchema> }> {
   // Find handler node (depth 0)
   const handler = chain.find(n => n.depth === 0);
-  if (!handler) return { requestBody: null, responseBody: null };
+  if (!handler) return { requestBody: null, responseBody: null, nestedSchemas: new Map() };
 
   let requestBody: BodySchema | null = null;
   let responseBody: BodySchema | null = null;
+
+  // Use separate visited sets for request and response body resolution
+  // This allows the same type to be resolved for both request and response
+  let requestVisited = new Set<string>();
+  let responseVisited = new Set<string>();
 
   // Resolve @RequestBody parameter
   if (handler.parameters) {
@@ -903,7 +968,7 @@ async function extractBodySchemas(
       const params = JSON.parse(handler.parameters);
       const bodyParam = params.find((p: any) => p.annotations?.includes('@RequestBody'));
       if (bodyParam?.type) {
-        requestBody = await resolveTypeSchema(bodyParam.type, executeQuery, repoId);
+        requestBody = await resolveTypeSchema(bodyParam.type, executeQuery, repoId, requestVisited, crossRepo);
       }
     } catch {
       // Ignore parse errors
@@ -920,10 +985,32 @@ async function extractBodySchemas(
       returnType = wrapperMatch[2];
     }
 
-    responseBody = await resolveTypeSchema(returnType, executeQuery, repoId);
+    responseBody = await resolveTypeSchema(returnType, executeQuery, repoId, responseVisited, crossRepo);
   }
 
-  return { requestBody, responseBody };
+  // Resolve all nested types for both request and response bodies
+  const nestedSchemas = new Map<string, BodySchema>();
+  
+  // Use shared visited set for nested types to avoid redundant resolution
+  const allVisited = new Set<string>();
+  
+  // Resolve nested types from request body
+  if (requestBody) {
+    const requestNested = await resolveAllNestedTypes(requestBody, executeQuery, repoId, allVisited, crossRepo);
+    for (const [typeName, schema] of requestNested) {
+      nestedSchemas.set(typeName, schema);
+    }
+  }
+  
+  // Resolve nested types from response body
+  if (responseBody) {
+    const responseNested = await resolveAllNestedTypes(responseBody, executeQuery, repoId, allVisited, crossRepo);
+    for (const [typeName, schema] of responseNested) {
+      nestedSchemas.set(typeName, schema);
+    }
+  }
+
+  return { requestBody, responseBody, nestedSchemas };
 }
 
 /**
@@ -933,7 +1020,8 @@ async function resolveTypeSchema(
   typeName: string,
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
   repoId: string,
-  visited: Set<string> = new Set()
+  visited: Set<string> = new Set(),
+  crossRepo?: CrossRepoContext
 ): Promise<BodySchema> {
   // Check for primitive and container types
   if (shouldSkipSchema(typeName)) {
@@ -949,7 +1037,8 @@ async function resolveTypeSchema(
   // Extract generic inner type if applicable
   const innerType = extractGenericInnerType(typeName);
   if (innerType) {
-    return resolveTypeSchema(innerType, executeQuery, repoId, visited);
+    const innerSchema = await resolveTypeSchema(innerType, executeQuery, repoId, visited, crossRepo);
+    return { ...innerSchema, isContainer: true };
   }
 
   // Query for class fields
@@ -966,7 +1055,87 @@ async function resolveTypeSchema(
       typePattern: '.' + typeName
     });
 
-    if (rows.length === 0) {
+    if (!rows || rows.length === 0) {
+      // Try cross-repo resolution if type not found locally
+      if (crossRepo) {
+        const packagePrefix = extractPackagePrefix(typeName);
+        const DEBUG = process.env.GITNEXUS_DEBUG === 'true';
+
+        if (DEBUG) {
+          console.error(`[GitNexus DEBUG] resolveTypeSchema: typeName=${typeName}, packagePrefix=${packagePrefix || 'none'}`);
+        }
+
+        // Determine which repos to search
+        let depRepoIds: string[] = [];
+
+        if (packagePrefix) {
+          // Try to find the specific repo by package prefix
+          const depRepoId = await crossRepo.findDepRepo(packagePrefix);
+          if (DEBUG) {
+            console.error(`[GitNexus DEBUG] findDepRepo(${packagePrefix}) -> ${depRepoId || 'null'}`);
+          }
+          if (depRepoId && depRepoId !== repoId) {
+            depRepoIds = [depRepoId];
+          } else {
+            // FALLBACK: Package prefix not found in registry, search all dependency repos
+            // This handles cases where fully qualified names aren't mapped but simple names work
+            depRepoIds = await crossRepo.listDepRepos();
+            if (DEBUG) {
+              console.error(`[GitNexus DEBUG] listDepRepos() fallback -> [${depRepoIds.join(', ')}]`);
+            }
+          }
+        } else {
+          // For simple class names, search all dependency repos
+          depRepoIds = await crossRepo.listDepRepos();
+          if (DEBUG) {
+            console.error(`[GitNexus DEBUG] listDepRepos() (no packagePrefix) -> [${depRepoIds.join(', ')}]`);
+          }
+        }
+        
+        if (depRepoIds.length > 0) {
+          if (DEBUG) {
+            console.error(`[GitNexus DEBUG] Querying repos: [${depRepoIds.join(', ')}] for type: ${typeName}`);
+          }
+
+          const depResults = await crossRepo.queryMultipleRepos(
+            depRepoIds,
+            query,
+            { typeName, typePattern: '.' + typeName }
+          );
+
+          if (DEBUG) {
+            for (const r of depResults) {
+              console.error(`[GitNexus DEBUG] Result from ${r.repoId}: ${r.results?.length || 0} rows, error=${(r as any)._error || 'none'}`);
+            }
+          }
+
+          // Find first result that matches
+          for (const result of depResults) {
+            if (result.results?.length > 0) {
+              const found = result.results[0] as { name: string; fields: string };
+              const fieldsJson = found.fields;
+              if (fieldsJson) {
+                try {
+                  const fields = JSON.parse(fieldsJson);
+                  return {
+                    typeName: found.name || typeName,
+                    source: 'indexed',
+                    fields: fields.map((f: any) => ({
+                      name: f.name,
+                      type: f.type,
+                      annotations: f.annotations || []
+                    })),
+                    repoId: result.repoId
+                  };
+                } catch {
+                  // JSON parse error — continue to next result
+                }
+              }
+              return { typeName: found.name || typeName, source: 'indexed', fields: undefined, repoId: result.repoId };
+            }
+          }
+        }
+      }
       return { typeName, source: 'external', fields: undefined };
     }
 
@@ -988,6 +1157,151 @@ async function resolveTypeSchema(
   } catch {
     return { typeName, source: 'external', fields: undefined };
   }
+}
+
+/**
+ * Recursively resolves all nested types using BFS traversal.
+ * Returns a Map of typeName → BodySchema for all resolved nested types.
+ */
+async function resolveAllNestedTypes(
+  rootSchema: BodySchema | null,
+  executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
+  repoId: string,
+  visited: Set<string>,
+  crossRepo?: CrossRepoContext,
+  options?: { maxDepth?: number; maxTypes?: number }
+): Promise<Map<string, BodySchema>> {
+  const nestedSchemas = new Map<string, BodySchema>();
+  
+  // Skip if no root schema or if it's not indexed
+  if (!rootSchema || rootSchema.source !== 'indexed' || !rootSchema.fields) {
+    return nestedSchemas;
+  }
+
+  const maxDepth = options?.maxDepth ?? 10;
+  const maxTypes = options?.maxTypes ?? 100;
+
+  // BFS queue: { typeName, depth }
+  const queue: Array<{ typeName: string; depth: number }> = [];
+  
+  // Initialize queue with field types from root schema
+  for (const field of rootSchema.fields) {
+    if (!shouldSkipSchema(field.type)) {
+      queue.push({ typeName: field.type, depth: 1 });
+    }
+  }
+
+  while (queue.length > 0 && nestedSchemas.size < maxTypes) {
+    const { typeName, depth } = queue.shift()!;
+    
+    // Skip if already visited (cycle detection)
+    if (visited.has(typeName)) {
+      continue;
+    }
+    
+    // Skip if depth exceeded
+    if (depth > maxDepth) {
+      continue;
+    }
+    
+    // Skip primitives
+    if (shouldSkipSchema(typeName)) {
+      continue;
+    }
+    
+    // Extract generic inner type if applicable (List<X>, Optional<X>, X[])
+    const innerType = extractGenericInnerType(typeName);
+    if (innerType) {
+      if (!shouldSkipSchema(innerType) && !visited.has(innerType)) {
+        queue.push({ typeName: innerType, depth: depth + 1 });
+      }
+      continue;
+    }
+    
+    // Resolve the type schema first (pass a copy of visited set without current type)
+    const schema = await resolveTypeSchema(typeName, executeQuery, repoId, new Set(visited), crossRepo);
+    
+    // Mark as visited after resolution (prevents cycles in BFS, not in the resolution itself)
+    visited.add(typeName);
+    
+    // If indexed and has fields, add to nested schemas
+    if (schema.source === 'indexed' && schema.fields && schema.fields.length > 0) {
+      nestedSchemas.set(typeName, schema);
+      // Queue field types for further resolution
+      for (const field of schema.fields) {
+        if (!shouldSkipSchema(field.type) && !visited.has(field.type)) {
+          queue.push({ typeName: field.type, depth: depth + 1 });
+        }
+      }
+    }
+  }
+
+  return nestedSchemas;
+}
+
+/**
+ * Recursively embeds nested schemas into field objects for with-context mode.
+ * Transforms:
+ *   { name: "data", type: "FooDto" }
+ * Into:
+ *   { name: "data", type: "FooDto", fields: [...], source: "indexed" }
+ */
+function embedNestedSchemas(
+  schema: BodySchema | null,
+  nestedSchemas: Map<string, BodySchema>,
+  visited: Set<string> = new Set()
+): BodySchema | null {
+  // Handle null schema (no body)
+  if (!schema) {
+    return null;
+  }
+
+  // No fields to embed
+  if (!schema.fields) {
+    return schema;
+  }
+
+  // Prevent circular references
+  if (visited.has(schema.typeName)) {
+    return schema;
+  }
+
+  const newVisited = new Set(visited);
+  newVisited.add(schema.typeName);
+
+  const expandedFields = schema.fields.map(field => {
+    // Extract inner type for generics/arrays
+    const innerType = extractGenericInnerType(field.type);
+    const fieldType = innerType || field.type;
+
+    // Skip primitives and already-visited types
+    if (shouldSkipSchema(fieldType)) {
+      return field;
+    }
+
+    // Look up the nested schema
+    const nestedSchema = nestedSchemas.get(fieldType);
+    if (!nestedSchema) {
+      return field;
+    }
+
+    // Recursively embed
+    const embedded = embedNestedSchemas(nestedSchema, nestedSchemas, newVisited);
+
+    // Return field with embedded nested data
+    return {
+      ...field,
+      fields: embedded.fields,
+      source: embedded.source,
+      ...(embedded.isContainer !== undefined && { isContainer: embedded.isContainer }),
+      ...(embedded.repoId && { repoId: embedded.repoId })
+    };
+  });
+
+  return {
+    ...schema,
+    fields: expandedFields
+  };
 }
 
 /** Framework-injected types to skip from parameter extraction */
@@ -1296,6 +1610,7 @@ function extractValidationRules(
     for (const node of chain) {
       if (!node.content) continue;
       for (const pattern of IMPERATIVE_VALIDATION_PATTERNS) {
+        pattern.lastIndex = 0;  // Reset regex state for reuse
         let match;
         while ((match = pattern.exec(node.content)) !== null) {
           rules.push({
@@ -1317,27 +1632,49 @@ async function extractMessaging(
   chain: ChainNode[],
   includeContext: boolean,
   executeQuery?: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
-  repoId?: string
+  repoId?: string,
+  crossRepo?: CrossRepoContext
 ): Promise<{
   outbound: MessagingOutbound[];
   inbound: MessagingInbound[];
+  nestedSchemas: Map<string, BodySchema>;
 }> {
   const outbound: MessagingOutbound[] = [];
   const inbound: MessagingInbound[] = [];
   const seenOutbound = new Set<string>();
   const seenInbound = new Set<string>();
+  const visited = new Set<string>();
+  const nestedSchemas = new Map<string, BodySchema>();
+
+  // Helper to resolve payload type to BodySchema (always when executeQuery available)
+  const resolvePayload = async (typeName: string): Promise<string | BodySchema> => {
+    if (typeName === TODO_AI_ENRICH) {
+      return TODO_AI_ENRICH;
+    }
+    if (!executeQuery || !repoId) {
+      return typeName;
+    }
+    const resolved = await resolveTypeSchema(typeName, executeQuery, repoId, visited, crossRepo);
+    return resolved;
+  };
 
   for (const node of chain) {
     // Extract outbound messaging
     for (const detail of node.metadata.messagingDetails) {
       if (detail.topic && !seenOutbound.has(detail.topic)) {
         seenOutbound.add(detail.topic);
+        const payloadTypeName = detail.payload || TODO_AI_ENRICH;
+        // Always resolve payload to BodySchema when executeQuery available
+        const payload = executeQuery && repoId && payloadTypeName !== TODO_AI_ENRICH
+          ? await resolvePayload(payloadTypeName)
+          : payloadTypeName;
+
         outbound.push({
           topic: detail.topic,
-          payload: TODO_AI_ENRICH,
+          payload,
           trigger: TODO_AI_ENRICH,
           ...(includeContext && {
-            _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content?.slice(0, 200)}...`,
+            _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\\n${node.content?.slice(0, 200)}...`,
           }),
         });
       }
@@ -1362,7 +1699,7 @@ async function extractMessaging(
               continue;
             }
 
-            const payload = extractPayloadFromParameters(node.parameters);
+            const payloadTypeName = extractPayloadFromParameters(node.parameters);
             const consumptionLogic = buildConsumptionLogic(node.filePath!, node.name!);
 
             // Deduplicate by topic + consumptionLogic
@@ -1370,12 +1707,17 @@ async function extractMessaging(
             if (seenInbound.has(key)) continue;
             seenInbound.add(key);
 
+            // Always resolve payload to BodySchema when executeQuery available
+            const payload = executeQuery && repoId
+              ? await resolvePayload(payloadTypeName)
+              : payloadTypeName;
+
             inbound.push({
               topic,
               payload,
               consumptionLogic,
               ...(includeContext && {
-                _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content?.slice(0, 200)}...`,
+                _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\\n${node.content?.slice(0, 200)}...`,
               }),
             });
           }
@@ -1386,8 +1728,10 @@ async function extractMessaging(
     }
   }
 
-  // Part 2: Graph query for broker listeners (when includeContext and executeQuery provided)
-  if (includeContext && executeQuery && repoId) {
+  // Part 2: Graph query for broker listeners (when executeQuery provided)
+  // This must run even in compact mode (includeContext=false) to detect inbound events
+  // that aren't in the call chain (e.g., @RabbitListener/@KafkaListener methods)
+  if (executeQuery && repoId) {
     const cypher = `
       MATCH (m:Method)
       WHERE m.annotations CONTAINS '@RabbitListener'
@@ -1411,7 +1755,7 @@ async function extractMessaging(
           : annotations.includes('@KafkaListener') ? 'KafkaListener' as const
           : null;
         const topic = listenerType ? extractListenerTopic(annotations, listenerType) : TODO_AI_ENRICH;
-        const payload = extractPayloadFromParameters(parameters);
+        const payloadTypeName = extractPayloadFromParameters(parameters);
         const consumptionLogic = buildConsumptionLogic(filePath, name);
 
         // Deduplicate
@@ -1419,11 +1763,18 @@ async function extractMessaging(
         if (seenInbound.has(key)) continue;
         seenInbound.add(key);
 
+        // Always resolve payload to BodySchema when executeQuery available
+        const payload = executeQuery && repoId
+          ? await resolvePayload(payloadTypeName)
+          : payloadTypeName;
+
         inbound.push({
           topic,
           payload,
           consumptionLogic,
-          _context: `// Graph query result\n// ${filePath}\n@RabbitListener/KafkaListener detected`,
+          ...(includeContext && {
+            _context: `// Graph query result\\n// ${filePath}\\n@RabbitListener/KafkaListener detected`,
+          }),
         });
       }
     } catch {
@@ -1431,7 +1782,47 @@ async function extractMessaging(
     }
   }
 
-  return { outbound, inbound };
+  // Resolve nested types for all payloads when executeQuery available
+  // This ensures messaging payloads have full type resolution like request/response bodies
+  if (executeQuery && repoId) {
+    const allVisited = new Set<string>();
+
+    // Collect all BodySchema payloads from outbound
+    for (const msg of outbound) {
+      if (typeof msg.payload === 'object' && msg.payload !== null && 'fields' in msg.payload) {
+        const nested = await resolveAllNestedTypes(msg.payload as BodySchema, executeQuery, repoId, allVisited, crossRepo);
+        for (const [typeName, schema] of nested) {
+          nestedSchemas.set(typeName, schema);
+        }
+      }
+    }
+
+    // Collect all BodySchema payloads from inbound
+    for (const msg of inbound) {
+      if (typeof msg.payload === 'object' && msg.payload !== null && 'fields' in msg.payload) {
+        const nested = await resolveAllNestedTypes(msg.payload as BodySchema, executeQuery, repoId, allVisited, crossRepo);
+        for (const [typeName, schema] of nested) {
+          nestedSchemas.set(typeName, schema);
+        }
+      }
+    }
+
+    // Embed nested schemas into payload fields when includeContext
+    if (includeContext) {
+      for (const msg of outbound) {
+        if (typeof msg.payload === 'object' && msg.payload !== null && 'fields' in msg.payload) {
+          msg.payload = embedNestedSchemas(msg.payload as BodySchema, nestedSchemas);
+        }
+      }
+      for (const msg of inbound) {
+        if (typeof msg.payload === 'object' && msg.payload !== null && 'fields' in msg.payload) {
+          msg.payload = embedNestedSchemas(msg.payload as BodySchema, nestedSchemas);
+        }
+      }
+    }
+  }
+
+  return { outbound, inbound, nestedSchemas };
 }
 
 /**
@@ -1449,10 +1840,27 @@ function extractClassNameFromPath(filePath: string): string | null {
  */
 function extractListenerTopic(annotations: string, listenerType: 'RabbitListener' | 'KafkaListener'): string {
   const attr = listenerType === 'RabbitListener' ? 'queues' : 'topics';
-  const match1 = annotations.match(new RegExp(`${attr}\\s*=\\s*"([^"]+)"`));
+  
+  // Try JSON format first: [{ name: '@RabbitListener', attrs: { queues: 'value' } }]
+  try {
+    const parsed = JSON.parse(annotations);
+    if (Array.isArray(parsed)) {
+      for (const ann of parsed) {
+        if (ann.name === `@${listenerType}` && ann.attrs?.[attr]) {
+          return ann.attrs[attr];
+        }
+      }
+    }
+  } catch {
+    // Not JSON, try regex format
+  }
+  
+  // Regex format: queues="value" or queues={value}
+  const match1 = annotations.match(new RegExp(`${attr}\\\\s*=\\\\s*"([^"]+)"`));
   if (match1) return match1[1];
-  const match2 = annotations.match(new RegExp(`${attr}\\s*=\\s*\\{([^}]+)\\}`));
+  const match2 = annotations.match(new RegExp(`${attr}\\\\s*=\\\\s*\\{([^}]+)\\}`));
   if (match2) return match2[1].trim();
+  
   return TODO_AI_ENRICH;
 }
 
@@ -1637,20 +2045,96 @@ function getExampleValue(type: string, annotations: string[]): unknown {
 /**
  * Generate a JSON example object from field definitions.
  */
+/**
+ * Recursively unwrap nested generics to find the innermost type.
+ * Returns { innermostType, depth } where depth is the number of wrapper levels.
+ * e.g., 'Optional<List<String>>' → { innermostType: 'String', depth: 2 }
+ * e.g., 'List<ItemDto>' → { innermostType: 'ItemDto', depth: 1 }
+ */
+function unwrapNestedGenerics(typeName: string): { innermostType: string; depth: number } {
+  let currentType = typeName;
+  let depth = 0;
+  
+  while (true) {
+    const innerType = extractGenericInnerType(currentType);
+    if (!innerType) {
+      // No more generic wrappers
+      break;
+    }
+    currentType = innerType;
+    depth++;
+  }
+  
+  return { innermostType: currentType, depth };
+}
+
 function generateJsonExample(
   fields: Array<{ name: string; type: string; annotations: string[] }>,
-  nestedSchemas?: Map<string, { fields: Array<{ name: string; type: string; annotations: string[] }> }>
+  nestedSchemas?: Map<string, BodySchema>,
+  visited: Set<string> = new Set()
 ): Record<string, unknown> {
   const example: Record<string, unknown> = {};
 
   for (const field of fields) {
-    // Check if this field has a nested schema
+    // Check if this field has a nested schema directly
     if (nestedSchemas?.has(field.type)) {
-      const nestedFields = nestedSchemas.get(field.type)!.fields;
-      example[field.name] = generateJsonExample(nestedFields, nestedSchemas);
-    } else {
-      example[field.name] = getExampleValue(field.type, field.annotations || []);
+      // Prevent circular reference - if type already visited, use placeholder
+      if (visited.has(field.type)) {
+        example[field.name] = { _type: field.type };
+        continue;
+      }
+      const nestedSchema = nestedSchemas.get(field.type)!;
+      example[field.name] = generateJsonExample(nestedSchema.fields, nestedSchemas, new Set(visited).add(field.type));
+      continue;
     }
+
+    // Check for generic container types (List<X>, Optional<X>, Set<X>, X[])
+    // Also handle nested generics like Optional<List<String>>
+    const innerType = extractGenericInnerType(field.type);
+    if (innerType) {
+      // Recursively unwrap nested generics
+      const { innermostType, depth } = unwrapNestedGenerics(field.type);
+      
+      // Check if innermost type has a nested schema
+      if (nestedSchemas?.has(innermostType)) {
+        // Prevent circular reference in generic containers
+        if (visited.has(innermostType)) {
+          // Create nested array wrappers matching depth
+          let result: unknown = { _type: innermostType };
+          for (let i = 0; i < depth; i++) {
+            result = [result];
+          }
+          example[field.name] = result;
+          continue;
+        }
+        const nestedSchema = nestedSchemas.get(innermostType)!;
+        const nestedFields = nestedSchema.fields || [];
+        let innerExample: unknown = generateJsonExample(nestedFields, nestedSchemas, new Set(visited).add(innermostType));
+        // Wrap in array for each generic level
+        for (let i = 0; i < depth; i++) {
+          innerExample = [innerExample];
+        }
+        example[field.name] = innerExample;
+      } else if (shouldSkipSchema(innermostType)) {
+        // Innermost type is primitive - wrap in arrays matching generic depth
+        let result: unknown = getExampleValue(innermostType, field.annotations || []);
+        for (let i = 0; i < depth; i++) {
+          result = [result];
+        }
+        example[field.name] = result;
+      } else {
+        // Innermost type is external/unknown - return placeholder with proper nesting
+        let result: unknown = { _type: innermostType };
+        for (let i = 0; i < depth; i++) {
+          result = [result];
+        }
+        example[field.name] = result;
+      }
+      continue;
+    }
+
+    // Fallback to getExampleValue for primitives and unknown types
+    example[field.name] = getExampleValue(field.type, field.annotations || []);
   }
 
   return example;
@@ -1661,16 +2145,13 @@ function generateJsonExample(
  */
 function bodySchemaToJsonExample(
   schema: BodySchema | null,
-  nestedSchemas?: Map<string, { fields: Array<{ name: string; type: string; annotations: string[] }> }>
-): Record<string, unknown> | null {
+  nestedSchemas?: Map<string, BodySchema>
+): Record<string, unknown> | Record<string, unknown>[] | null {
   if (!schema) return null;
 
-  // External types - return TODO_AI_ENRICH marker with type context
+  // External types - return type placeholder
   if (schema.source === 'external') {
-    return {
-      _TODO_AI_ENRICH: `Body type '${schema.typeName}' is from an external dependency. Enrich with schema documentation.`,
-      _bodyType: schema.typeName,
-    };
+    return { _type: schema.typeName };
   }
 
   // Primitive types - return null (no body)
@@ -1680,10 +2161,16 @@ function bodySchemaToJsonExample(
 
   // Indexed type with fields - generate example
   if (schema.fields && schema.fields.length > 0) {
-    return generateJsonExample(schema.fields, nestedSchemas);
+    const example = generateJsonExample(schema.fields, nestedSchemas);
+    // If it was a container type, wrap in array
+    if (schema.isContainer) {
+      return [example];
+    }
+    return example;
   }
 
-  return null;
+  // Indexed type without fields - return type placeholder
+  return { _type: schema.typeName };
 }
 
 function generateCodeDiagram(chain: ChainNode[]): string {

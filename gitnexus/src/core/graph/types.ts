@@ -41,6 +41,8 @@ import { SupportedLanguages } from '../../config/supported-languages.js';
 export type NodeProperties = {
   name: string,
   filePath: string,
+  // Cross-repo resolution — identifies which repo this node belongs to
+  repoId?: string,
   startLine?: number,
   endLine?: number,
   language?: SupportedLanguages,
@@ -90,6 +92,8 @@ export type RelationshipType =
   | 'HAS_METHOD'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
+  // Cross-repo dependency tracking
+  | 'CROSS_IMPORTS'
 
 export interface GraphNode {
   id:  string,

@@ -52,7 +52,10 @@ Returns results grouped by process (execution flow):
 - process_symbols: all symbols in those flows with file locations and module (functional area)
 - definitions: standalone types/interfaces not in any process
 
-Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.`,
+Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.
+
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to query across repositories.
+Results from multi-repo queries include '_repoId' attribution for each item.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -63,6 +66,7 @@ Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank
         max_symbols: { type: 'number', description: 'Max symbols per process (default: 10)', default: 10 },
         include_content: { type: 'boolean', description: 'Include full symbol source code (default: false)', default: false },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+        repos: { type: 'array', items: { type: 'string' }, description: 'Multiple repos for cross-repo queries. When provided, queries all listed repos in parallel and returns aggregated results with repoId attribution.' },
       },
       required: ['query'],
     },
@@ -106,12 +110,16 @@ TIPS:
 - All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
 - Community = auto-detected functional area (Leiden algorithm)
 - Process = execution flow trace from entry point to terminal
-- Use heuristicLabel (not label) for human-readable community/process names`,
+- Use heuristicLabel (not label) for human-readable community/process names
+
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to query across repositories.
+Results from multi-repo queries include '_repoId' attribution for each row.`,
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Cypher query to execute' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+        repos: { type: 'array', items: { type: 'string' }, description: 'Multiple repos for cross-repo queries. When provided, queries all listed repos in parallel and returns aggregated results with repoId attribution.' },
       },
       required: ['query'],
     },
@@ -124,7 +132,10 @@ Shows categorized incoming/outgoing references (calls, imports, extends, impleme
 WHEN TO USE: After query() to understand a specific symbol in depth. When you need to know all callers, callees, and what execution flows a symbol participates in.
 AFTER THIS: Use impact() if planning changes, or READ gitnexus://repo/{name}/process/{processName} for full execution trace.
 
-Handles disambiguation: if multiple symbols share the same name, returns candidates for you to pick from. Use uid param for zero-ambiguity lookup from prior results.`,
+Handles disambiguation: if multiple symbols share the same name, returns candidates for you to pick from. Use uid param for zero-ambiguity lookup from prior results.
+
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to search across repositories.
+Results from multi-repo queries include '_repoId' attribution.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -133,6 +144,7 @@ Handles disambiguation: if multiple symbols share the same name, returns candida
         file_path: { type: 'string', description: 'File path to disambiguate common names' },
         include_content: { type: 'boolean', description: 'Include full symbol source code (default: false)', default: false },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+        repos: { type: 'array', items: { type: 'string' }, description: 'Multiple repos for cross-repo queries. When provided, searches all listed repos in parallel and returns aggregated results with repoId attribution.' },
       },
       required: [],
     },
@@ -201,7 +213,10 @@ Depth groups:
 - d=3: MAY NEED TESTING (transitive)
 
 EdgeType: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, OVERRIDES
-Confidence: 1.0 = certain, <0.8 = fuzzy match`,
+Confidence: 1.0 = certain, <0.8 = fuzzy match
+
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to analyze impact across repositories.
+Results from multi-repo queries include '_repoId' attribution.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -212,6 +227,7 @@ Confidence: 1.0 = certain, <0.8 = fuzzy match`,
         includeTests: { type: 'boolean', description: 'Include test files (default: false)' },
         minConfidence: { type: 'number', description: 'Minimum confidence 0-1 (default: 0.7)' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+        repos: { type: 'array', items: { type: 'string' }, description: 'Multiple repos for cross-repo queries. When provided, analyzes impact across all listed repos in parallel with repoId attribution.' },
       },
       required: ['target', 'direction'],
     },

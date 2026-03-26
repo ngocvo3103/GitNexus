@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.tcbs.bond.trading</groupId>
+  <artifactId>tcbs-bond-trading</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <name>TCBS Bond Trading</name>
+  <description>Bond trading application with external dependencies</description>
+
+  <dependencies>
+    <!-- Production dependency -->
+    <dependency>
+      <groupId>com.tcbs.bond.trading</groupId>
+      <artifactId>exception-handler</artifactId>
+      <version>1.0.0</version>
+      <scope>compile</scope>
+    </dependency>
+
+    <!-- Another production dependency -->
+    <dependency>
+      <groupId>com.tcbs.matching</groupId>
+      <artifactId>matching-client</artifactId>
+      <version>3.0.0</version>
+    </dependency>
+
+    <!-- Test-scoped dependency (should be filtered out) -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.9.0</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- Runtime dependency -->
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <version>42.5.0</version>
+      <scope>runtime</scope>
+    </dependency>
+
+    <!-- Provided dependency (should be included) -->
+    <dependency>
+      <groupId>javax.servlet</groupId>
+      <artifactId>javax.servlet-api</artifactId>
+      <version>4.0.1</version>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+</project>

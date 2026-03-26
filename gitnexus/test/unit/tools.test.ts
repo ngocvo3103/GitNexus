@@ -2,10 +2,11 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 8 tools are defined
+ * - All 9 tools are defined
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
+ * - Cross-repo 'repos' parameter on query, context, impact, cypher
  */
 import { describe, it, expect } from 'vitest';
 import { GITNEXUS_TOOLS, type ToolDefinition } from '../../src/mcp/tools.js';
@@ -105,5 +106,50 @@ describe('GITNEXUS_TOOLS', () => {
     expect(endpointsTool).toBeDefined();
     expect(endpointsTool.inputSchema.properties.method.enum).toEqual(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']);
     expect(endpointsTool.inputSchema.required).toEqual([]);
+  });
+
+  // WI-5: Cross-repo 'repos' parameter tests
+  it('query tool has optional repos array parameter for cross-repo queries', () => {
+    const queryTool = GITNEXUS_TOOLS.find(t => t.name === 'query')!;
+    expect(queryTool.inputSchema.properties.repos).toBeDefined();
+    expect(queryTool.inputSchema.properties.repos.type).toBe('array');
+    expect(queryTool.inputSchema.properties.repos.items).toEqual({ type: 'string' });
+    expect(queryTool.inputSchema.required).not.toContain('repos');
+  });
+
+  it('cypher tool has optional repos array parameter for cross-repo queries', () => {
+    const cypherTool = GITNEXUS_TOOLS.find(t => t.name === 'cypher')!;
+    expect(cypherTool.inputSchema.properties.repos).toBeDefined();
+    expect(cypherTool.inputSchema.properties.repos.type).toBe('array');
+    expect(cypherTool.inputSchema.properties.repos.items).toEqual({ type: 'string' });
+    expect(cypherTool.inputSchema.required).not.toContain('repos');
+  });
+
+  it('context tool has optional repos array parameter for cross-repo queries', () => {
+    const contextTool = GITNEXUS_TOOLS.find(t => t.name === 'context')!;
+    expect(contextTool.inputSchema.properties.repos).toBeDefined();
+    expect(contextTool.inputSchema.properties.repos.type).toBe('array');
+    expect(contextTool.inputSchema.properties.repos.items).toEqual({ type: 'string' });
+    expect(contextTool.inputSchema.required).not.toContain('repos');
+  });
+
+  it('impact tool has optional repos array parameter for cross-repo queries', () => {
+    const impactTool = GITNEXUS_TOOLS.find(t => t.name === 'impact')!;
+    expect(impactTool.inputSchema.properties.repos).toBeDefined();
+    expect(impactTool.inputSchema.properties.repos.type).toBe('array');
+    expect(impactTool.inputSchema.properties.repos.items).toEqual({ type: 'string' });
+    expect(impactTool.inputSchema.required).not.toContain('repos');
+  });
+
+  it('tools without cross-repo support do not have repos parameter', () => {
+    const toolsWithoutRepos = ['detect_changes', 'rename', 'endpoints', 'document-endpoint', 'list_repos'];
+    for (const toolName of toolsWithoutRepos) {
+      const tool = GITNEXUS_TOOLS.find(t => t.name === toolName)!;
+      expect(tool).toBeDefined();
+      // These tools should NOT have repos parameter
+      if (toolName !== 'list_repos') {
+        expect(tool.inputSchema.properties.repos).toBeUndefined();
+      }
+    }
   });
 });

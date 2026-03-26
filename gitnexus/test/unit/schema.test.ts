@@ -19,7 +19,13 @@ import {
   RELATION_SCHEMA,
   EMBEDDING_SCHEMA,
   CREATE_VECTOR_INDEX_QUERY,
+  // WI-1: Migration constants for backward compatibility
+  FILE_SCHEMA_MIGRATION,
+  FOLDER_SCHEMA_MIGRATION,
+  FUNCTION_SCHEMA_MIGRATION,
 } from '../../src/core/lbug/schema.js';
+import { NodeProperties, RelationshipType } from '../../src/core/graph/types.js';
+import { SupportedLanguages } from '../../src/config/supported-languages.js';
 
 describe('LadybugDB Schema', () => {
   describe('NODE_TABLES', () => {
@@ -180,6 +186,138 @@ describe('LadybugDB Schema', () => {
       const relIndex = SCHEMA_QUERIES.indexOf(RELATION_SCHEMA);
       const lastNodeIndex = SCHEMA_QUERIES.indexOf(NODE_SCHEMA_QUERIES[NODE_SCHEMA_QUERIES.length - 1]);
       expect(relIndex).toBeGreaterThan(lastNodeIndex);
+    });
+  });
+
+  // ─── WI-1: Cross-Repo Schema Extensions ─────────────────────────────────────
+
+  describe('NodeProperties type extension (WI-1)', () => {
+    it('accepts repoId as optional string field', () => {
+      // WI-1: NodeProperties must support repoId for cross-repo resolution
+      const nodeWithRepoId: NodeProperties = {
+        name: 'UserService',
+        filePath: '/src/services/UserService.ts',
+        repoId: 'repo-123',
+      };
+      expect(nodeWithRepoId.repoId).toBe('repo-123');
+    });
+
+    it('allows nodes without repoId (backward compatibility)', () => {
+      // WI-1: Nodes without repoId must remain valid for single-repo scenarios
+      const nodeWithoutRepoId: NodeProperties = {
+        name: 'AuthService',
+        filePath: '/src/services/AuthService.ts',
+      };
+      expect(nodeWithoutRepoId.repoId).toBeUndefined();
+    });
+
+    it('repoId is optional in type signature', () => {
+      // Type-level test: TypeScript should accept both forms
+      // This test verifies runtime behavior matches the type
+      const minimalNode: NodeProperties = {
+        name: 'MinimalService',
+        filePath: '/src/MinimalService.ts',
+      };
+      const fullNode: NodeProperties = {
+        name: 'FullService',
+        filePath: '/src/FullService.ts',
+        repoId: 'repo-456',
+        startLine: 1,
+        endLine: 100,
+        language: SupportedLanguages.TypeScript,
+      };
+      expect(minimalNode).toBeDefined();
+      expect(fullNode).toBeDefined();
+    });
+  });
+
+  describe('RelationshipType extension (WI-1)', () => {
+    it('includes CROSS_IMPORTS relationship type', () => {
+      // WI-1: CROSS_IMPORTS is needed for cross-repo dependency tracking
+      const crossImportsRel: RelationshipType = 'CROSS_IMPORTS';
+      expect(crossImportsRel).toBe('CROSS_IMPORTS');
+    });
+
+    it('CROSS_IMPORTS is a valid RelationshipType value', () => {
+      // WI-1: Type-level validation that CROSS_IMPORTS is in the union type
+      // This will fail at compile time if CROSS_IMPORTS is not in the type
+      const allTypes: RelationshipType[] = [
+        'CONTAINS',
+        'CALLS',
+        'INHERITS',
+        'OVERRIDES',
+        'IMPORTS',
+        'USES',
+        'DEFINES',
+        'DECORATES',
+        'IMPLEMENTS',
+        'EXTENDS',
+        'HAS_METHOD',
+        'MEMBER_OF',
+        'STEP_IN_PROCESS',
+        'CROSS_IMPORTS', // WI-1: This must be valid
+      ];
+      expect(allTypes).toContain('CROSS_IMPORTS');
+    });
+  });
+
+  describe('Node schema DDL for cross-repo (WI-1)', () => {
+    // WI-1: All node tables must include repoId column for cross-repo resolution
+
+    it('FILE_SCHEMA includes repoId column', () => {
+      expect(FILE_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('FOLDER_SCHEMA includes repoId column', () => {
+      expect(FOLDER_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('FUNCTION_SCHEMA includes repoId column', () => {
+      expect(FUNCTION_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('CLASS_SCHEMA includes repoId column', () => {
+      expect(CLASS_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('INTERFACE_SCHEMA includes repoId column', () => {
+      expect(INTERFACE_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('METHOD_SCHEMA includes repoId column', () => {
+      expect(METHOD_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('CODE_ELEMENT_SCHEMA includes repoId column', () => {
+      expect(CODE_ELEMENT_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('COMMUNITY_SCHEMA includes repoId column', () => {
+      expect(COMMUNITY_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('PROCESS_SCHEMA includes repoId column', () => {
+      expect(PROCESS_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('uses IF NOT EXISTS for backward compatibility', () => {
+      // WI-1: Schema migrations must use IF NOT EXISTS for repoId column
+      // This allows existing databases to be upgraded without errors
+      // Check that migration schemas use the ALTER TABLE pattern
+      const migrationWithAlter = [
+        FILE_SCHEMA_MIGRATION,
+        FOLDER_SCHEMA_MIGRATION,
+        FUNCTION_SCHEMA_MIGRATION,
+      ].find(migration => migration.includes('ALTER TABLE') && migration.includes('IF NOT EXISTS'));
+
+      expect(migrationWithAlter).toBeDefined();
+    });
+  });
+
+  describe('REL_TYPES extension (WI-1)', () => {
+    it('includes CROSS_IMPORTS in REL_TYPES array', () => {
+      // WI-1: REL_TYPES must include CROSS_IMPORTS for edge creation
+      expect(REL_TYPES).toContain('CROSS_IMPORTS');
     });
   });
 });

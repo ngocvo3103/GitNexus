@@ -12,6 +12,8 @@ import { processHeritage, processHeritageFromExtracted } from './heritage-proces
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
+import { extractDependencies } from './dependency-extractor.js';
+import { writeManifest } from '../../storage/repo-manifest.js';
 import { createResolutionContext } from './resolution-context.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
@@ -121,6 +123,30 @@ export const runPipelineFromRepo = async (
       if (isDev && propertyCount > 0) {
         console.log(`⚙️  Indexed ${propertyCount} properties from ${configFileNames.length} config file${configFileNames.length !== 1 ? 's' : ''}`);
       }
+    }
+
+    // ── Phase 2.5: Dependency Extraction ─────────────────────────────
+    onProgress({
+      phase: 'extracting',
+      percent: 20,
+      message: 'Extracting dependencies...',
+    });
+
+    try {
+      const extractionResult = await extractDependencies(repoPath);
+      // Convert ExtractionResult to RepoManifest format
+      const manifest: import('../../storage/repo-manifest.js').RepoManifest = {
+        repoId: extractionResult.repoId,
+        indexedAt: extractionResult.indexedAt,
+        dependencies: extractionResult.dependencies.map(d => d.name),
+      };
+      await writeManifest(repoPath, manifest);
+      if (isDev && manifest.dependencies.length > 0) {
+        console.log(`📦 Extracted ${manifest.dependencies.length} dependencies from ${extractionResult.ecosystem}`);
+      }
+    } catch (err) {
+      // Non-fatal: dependency extraction failure shouldn't stop indexing
+      if (isDev) console.warn('Dependency extraction failed:', (err as Error).message);
     }
 
     // ── Phase 3+4: Chunked read + parse ────────────────────────────────

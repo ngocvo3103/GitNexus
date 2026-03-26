@@ -50,6 +50,8 @@ export interface MessagingDetail {
   topicIsVariable: boolean;
   /** Method used for publishing (convertAndSend, send, publishEvent, etc.) */
   callerMethod: string;
+  /** Payload type name (when determinable from call site) */
+  payload?: string;
 }
 
 export interface ExceptionDetail {
@@ -207,8 +209,14 @@ const TOPIC_VAR_PATTERN = /convertAndSend\s*\(\s*(\w+)/g;
 /** WI-3: Kafka send pattern - kafkaTemplate.send("topic", message) */
 const KAFKA_SEND_PATTERN = /kafkaTemplate\.send\s*\(\s*"([^"]+)"|kafkaTemplate\.send\s*\(\s*'([^']+)'|kafkaTemplate\.send\s*\(\s*(\w+)/g;
 
-/** WI-3: publishEvent pattern - publishEvent(new XxxEvent(...)) */
+/** WI-2: publishEvent pattern - publishEvent(new XxxEvent(...)) */
 const PUBLISH_EVENT_PATTERN = /publishEvent\s*\(\s*new\s+(\w+)Event/g;
+
+/** WI-2: publishEvent with variable - publishEvent(varName) where varName was assigned earlier */
+const PUBLISH_EVENT_VAR_PATTERN = /publishEvent\s*\(\s*(\w+)\s*\)/g;
+
+/** WI-2: Event variable declaration - XxxEvent varName = ... or XxxEvent varName = method(...) */
+const EVENT_VARIABLE_PATTERN = /(\w+Event)\s+(\w+)\s*=/g;
 
 /** WI-3: StreamBridge send pattern - streamBridge.send("binding", message) */
 const STREAM_BRIDGE_PATTERN = /streamBridge\.send\s*\(\s*"([^"]+)"|streamBridge\.send\s*\(\s*'([^']+)'|streamBridge\.send\s*\(\s*(\w+)/g;
@@ -375,7 +383,44 @@ function extractMetadata(content: string | undefined): ChainNode['metadata'] {
         topic,
         topicIsVariable: false,
         callerMethod: 'publishEvent',
+        payload: eventClass + 'Event', // Reconstruct full event class name
       });
+    }
+  }
+
+  // WI-2: Extract publishEvent(variable) patterns
+  // First, scan for event variable declarations to build a map
+  const eventVarMap: Map<string, string> = new Map();
+  EVENT_VARIABLE_PATTERN.lastIndex = 0;
+  let eventVarMatch;
+  while ((eventVarMatch = EVENT_VARIABLE_PATTERN.exec(content)) !== null) {
+    // Groups: 1=EventClass (e.g., "OrderCreated"), 2=varName (e.g., "event")
+    const eventClass = eventVarMatch[1].replace(/Event$/, ''); // Strip 'Event' suffix if present
+    const varName = eventVarMatch[2];
+    eventVarMap.set(varName, eventClass);
+  }
+
+  // Now match publishEvent(varName) and look up the event class
+  PUBLISH_EVENT_VAR_PATTERN.lastIndex = 0;
+  let pubEventVarMatch;
+  while ((pubEventVarMatch = PUBLISH_EVENT_VAR_PATTERN.exec(content)) !== null) {
+    const varName = pubEventVarMatch[1];
+    // Skip if this is actually a 'new' expression (already handled by PUBLISH_EVENT_PATTERN)
+    // Check if this looks like a class name (starts with uppercase) - likely a new expression that didn't match
+    if (varName[0] === varName[0].toUpperCase() && varName[0] !== varName[0].toLowerCase()) {
+      continue; // Likely a class name like 'OrderCreatedEvent' without 'new' - skip
+    }
+    const eventClass = eventVarMap.get(varName);
+    if (eventClass) {
+      const topic = camelCaseToKebab(eventClass);
+      if (!metadata.messagingDetails.some(d => d.topic === topic && d.callerMethod === 'publishEvent')) {
+        metadata.messagingDetails.push({
+          topic,
+          topicIsVariable: false,
+          callerMethod: 'publishEvent',
+          payload: eventClass + 'Event',
+        });
+      }
     }
   }
 

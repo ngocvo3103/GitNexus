@@ -930,6 +930,117 @@ describe('executeTrace', () => {
       expect(result.chain[0].metadata.messagingDetails[0].callerMethod).toBe('publishEvent');
     });
 
+    // WI-2: publishEvent(variable) patterns
+    it('should extract publishEvent with event variable assignment', async () => {
+      const symbols: MockSymbol[] = [
+        {
+          id: 'Function:src/event.ts:publishWithVariable',
+          name: 'publishWithVariable',
+          filePath: 'src/event.ts',
+          label: 'Function',
+          content: 'HoldSuggestionOrderMarketEvent event = matchingService.holdSuggestOrder(prm, false); publisher.publishEvent(event);',
+        },
+      ];
+      mockExecutor = createMockExecutor(symbols, []);
+
+      const result = await executeTrace(mockExecutor, 'test-repo', { symbol: 'publishWithVariable', include_content: true });
+
+      expect(result.chain[0].metadata.messagingDetails).toHaveLength(1);
+      // HoldSuggestionOrderMarketEvent → topic "hold-suggestion-order-market"
+      expect(result.chain[0].metadata.messagingDetails[0].topic).toBe('hold-suggestion-order-market');
+      expect(result.chain[0].metadata.messagingDetails[0].topicIsVariable).toBe(false);
+      expect(result.chain[0].metadata.messagingDetails[0].callerMethod).toBe('publishEvent');
+      expect(result.chain[0].metadata.messagingDetails[0].payload).toBe('HoldSuggestionOrderMarketEvent');
+    });
+
+    it('should extract publishEvent with simple event variable', async () => {
+      const symbols: MockSymbol[] = [
+        {
+          id: 'Function:src/event.ts:publishSimpleVariable',
+          name: 'publishSimpleVariable',
+          filePath: 'src/event.ts',
+          label: 'Function',
+          content: 'OrderCreatedEvent evt = new OrderCreatedEvent(order); publishEvent(evt);',
+        },
+      ];
+      mockExecutor = createMockExecutor(symbols, []);
+
+      const result = await executeTrace(mockExecutor, 'test-repo', { symbol: 'publishSimpleVariable', include_content: true });
+
+      expect(result.chain[0].metadata.messagingDetails).toHaveLength(1);
+      expect(result.chain[0].metadata.messagingDetails[0].topic).toBe('order-created');
+      expect(result.chain[0].metadata.messagingDetails[0].callerMethod).toBe('publishEvent');
+    });
+
+    it('should extract multiple publishEvent with variables in same method', async () => {
+      const symbols: MockSymbol[] = [
+        {
+          id: 'Function:src/event.ts:publishMultiple',
+          name: 'publishMultiple',
+          filePath: 'src/event.ts',
+          label: 'Function',
+          content: `
+            OrderCreatedEvent evt1 = new OrderCreatedEvent(o1);
+            PaymentProcessedEvent evt2 = new PaymentProcessedEvent(p1);
+            publishEvent(evt1);
+            publishEvent(evt2);
+          `,
+        },
+      ];
+      mockExecutor = createMockExecutor(symbols, []);
+
+      const result = await executeTrace(mockExecutor, 'test-repo', { symbol: 'publishMultiple', include_content: true });
+
+      expect(result.chain[0].metadata.messagingDetails).toHaveLength(2);
+      const topics = result.chain[0].metadata.messagingDetails.map(d => d.topic);
+      expect(topics).toContain('order-created');
+      expect(topics).toContain('payment-processed');
+    });
+
+    it('should still extract publishEvent(new XxxEvent()) alongside variable pattern', async () => {
+      const symbols: MockSymbol[] = [
+        {
+          id: 'Function:src/event.ts:publishMixed',
+          name: 'publishMixed',
+          filePath: 'src/event.ts',
+          label: 'Function',
+          content: `
+            publishEvent(new OrderCreatedEvent(order));
+            PaymentEvent pmt = new PaymentEvent(data);
+            publishEvent(pmt);
+          `,
+        },
+      ];
+      mockExecutor = createMockExecutor(symbols, []);
+
+      const result = await executeTrace(mockExecutor, 'test-repo', { symbol: 'publishMixed', include_content: true });
+
+      expect(result.chain[0].metadata.messagingDetails).toHaveLength(2);
+      const topics = result.chain[0].metadata.messagingDetails.map(d => d.topic);
+      expect(topics).toContain('order-created');
+      expect(topics).toContain('payment');
+    });
+
+    it('should not extract publishEvent with unknown variable', async () => {
+      const symbols: MockSymbol[] = [
+        {
+          id: 'Function:src/event.ts:publishUnknown',
+          name: 'publishUnknown',
+          filePath: 'src/event.ts',
+          label: 'Function',
+          content: 'publishEvent(someUnknownVariable);',
+        },
+      ];
+      mockExecutor = createMockExecutor(symbols, []);
+
+      const result = await executeTrace(mockExecutor, 'test-repo', { symbol: 'publishUnknown', include_content: true });
+
+      // Should not have messagingDetails for unknown variable (no event class resolution)
+      expect(result.chain[0].metadata.messagingDetails).toHaveLength(0);
+      // But eventPublishing should still capture the call
+      expect(result.chain[0].metadata.eventPublishing).toContain('publishEvent');
+    });
+
     it('should extract streamBridge.send with literal binding name', async () => {
       const symbols: MockSymbol[] = [
         {

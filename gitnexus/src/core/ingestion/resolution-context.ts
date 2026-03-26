@@ -17,15 +17,19 @@ import type { SymbolTable, SymbolDefinition } from './symbol-table.js';
 import { createSymbolTable } from './symbol-table.js';
 import type { NamedImportBinding } from './import-processor.js';
 import { isFileInPackageDir } from './import-processor.js';
-import { walkBindingChain } from './named-binding-processor.js';
+import { walkBindingChain } from './named-binding-extraction.js';
 
 /** Resolution tier for tracking, logging, and test assertions. */
-export type ResolutionTier = 'same-file' | 'import-scoped' | 'global';
+export type ResolutionTier = 'same-file' | 'import-scoped' | 'global' | 'external';
 
 /** Tier-selected candidates with metadata. */
 export interface TieredCandidates {
   readonly candidates: readonly SymbolDefinition[];
   readonly tier: ResolutionTier;
+  /** Repository ID for external tier (cross-repo resolution) */
+  readonly repoId?: string;
+  /** Confidence score (0-1) based on tier */
+  readonly confidence: number;
 }
 
 /** Confidence scores per resolution tier. */
@@ -33,15 +37,13 @@ export const TIER_CONFIDENCE: Record<ResolutionTier, number> = {
   'same-file': 0.95,
   'import-scoped': 0.9,
   'global': 0.5,
+  'external': 0.35,
 };
 
 // --- Map types ---
 export type ImportMap = Map<string, Set<string>>;
 export type PackageMap = Map<string, Set<string>>;
 export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
-/** Maps callerFile → (moduleAlias → sourceFilePath) for Python namespace imports.
- *  e.g. `import models` in app.py → moduleAliasMap.get('app.py')?.get('models') === 'models.py' */
-export type ModuleAliasMap = Map<string, Map<string, string>>;
 
 export interface ResolutionContext {
   /**
@@ -59,8 +61,6 @@ export interface ResolutionContext {
   readonly importMap: ImportMap;
   readonly packageMap: PackageMap;
   readonly namedImportMap: NamedImportMap;
-  /** Module-alias map for Python namespace imports: callerFile → (alias → sourceFile). */
-  readonly moduleAliasMap: ModuleAliasMap;
 
   // --- Per-file cache lifecycle ---
   enableCache(filePath: string): void;
@@ -76,7 +76,6 @@ export const createResolutionContext = (): ResolutionContext => {
   const importMap: ImportMap = new Map();
   const packageMap: PackageMap = new Map();
   const namedImportMap: NamedImportMap = new Map();
-  const moduleAliasMap: ModuleAliasMap = new Map();
 
   // Per-file cache state
   let cacheFile: string | null = null;
@@ -87,10 +86,10 @@ export const createResolutionContext = (): ResolutionContext => {
   // --- Core resolution (single implementation of tier logic) ---
 
   const resolveUncached = (name: string, fromFile: string): TieredCandidates | null => {
-    // Tier 1: Same file — authoritative match (returns all overloads)
-    const localDefs = symbols.lookupExactAll(fromFile, name);
-    if (localDefs.length > 0) {
-      return { candidates: localDefs, tier: 'same-file' };
+    // Tier 1: Same file — authoritative match
+    const localDef = symbols.lookupExactFull(fromFile, name);
+    if (localDef) {
+      return { candidates: [localDef], tier: 'same-file', confidence: TIER_CONFIDENCE['same-file'] };
     }
 
     // Get all global definitions for subsequent tiers
@@ -101,7 +100,7 @@ export const createResolutionContext = (): ResolutionContext => {
     // can resolve via the exported name.
     const chainResult = walkBindingChain(name, fromFile, symbols, namedImportMap, allDefs);
     if (chainResult && chainResult.length > 0) {
-      return { candidates: chainResult, tier: 'import-scoped' };
+      return { candidates: chainResult, tier: 'import-scoped', confidence: TIER_CONFIDENCE['import-scoped'] };
     }
 
     if (allDefs.length === 0) return null;
@@ -111,7 +110,7 @@ export const createResolutionContext = (): ResolutionContext => {
     if (importedFiles) {
       const importedDefs = allDefs.filter(def => importedFiles.has(def.filePath));
       if (importedDefs.length > 0) {
-        return { candidates: importedDefs, tier: 'import-scoped' };
+        return { candidates: importedDefs, tier: 'import-scoped', confidence: TIER_CONFIDENCE['import-scoped'] };
       }
     }
 
@@ -125,13 +124,13 @@ export const createResolutionContext = (): ResolutionContext => {
         return false;
       });
       if (packageDefs.length > 0) {
-        return { candidates: packageDefs, tier: 'import-scoped' };
+        return { candidates: packageDefs, tier: 'import-scoped', confidence: TIER_CONFIDENCE['import-scoped'] };
       }
     }
 
     // Tier 3: Global — pass all candidates through.
     // Consumers must check candidate count and refuse ambiguous matches.
-    return { candidates: allDefs, tier: 'global' };
+    return { candidates: allDefs, tier: 'global', confidence: TIER_CONFIDENCE['global'] };
   };
 
   const resolve = (name: string, fromFile: string): TieredCandidates | null => {
@@ -179,7 +178,6 @@ export const createResolutionContext = (): ResolutionContext => {
     importMap.clear();
     packageMap.clear();
     namedImportMap.clear();
-    moduleAliasMap.clear();
     clearCache();
     cacheHits = 0;
     cacheMisses = 0;
@@ -191,7 +189,6 @@ export const createResolutionContext = (): ResolutionContext => {
     importMap,
     packageMap,
     namedImportMap,
-    moduleAliasMap,
     enableCache,
     clearCache,
     getStats,

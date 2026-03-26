@@ -48,7 +48,7 @@ interface SharedDB {
 const dbCache = new Map<string, SharedDB>();
 
 /** Max repos in the pool (LRU eviction) */
-const MAX_POOL_SIZE = 5;
+const MAX_POOL_SIZE = 16; // Increased from 5 to support cross-repo queries with many dependencies
 /** Idle timeout before closing a repo's connections */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 /** Max connections per repo (caps concurrent queries per repo) */

@@ -27,7 +27,7 @@ export type NodeTableName = typeof NODE_TABLES[number];
 export const REL_TABLE_NAME = 'CodeRelation';
 
 // Valid relation types
-export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS'] as const;
+export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS', 'CROSS_IMPORTS'] as const;
 export type RelType = typeof REL_TYPES[number];
 
 // ============================================================================
@@ -39,22 +39,32 @@ export const EMBEDDING_TABLE_NAME = 'CodeEmbedding';
 // NODE TABLE SCHEMAS
 // ============================================================================
 
+// Cross-repo support - repoId column for multi-repo resolution
+// Migration (for existing databases): ALTER TABLE File ADD COLUMN IF NOT EXISTS repoId STRING
 export const FILE_SCHEMA = `
 CREATE NODE TABLE File (
   id STRING,
   name STRING,
   filePath STRING,
   content STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration statement for backward compatibility with existing databases
+export const FILE_SCHEMA_MIGRATION = `
+ALTER TABLE File ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 export const FOLDER_SCHEMA = `
 CREATE NODE TABLE Folder (
   id STRING,
   name STRING,
   filePath STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const FOLDER_SCHEMA_MIGRATION = `
+ALTER TABLE Folder ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 export const FUNCTION_SCHEMA = `
 CREATE NODE TABLE Function (
@@ -66,8 +76,12 @@ CREATE NODE TABLE Function (
   isExported BOOLEAN,
   content STRING,
   description STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const FUNCTION_SCHEMA_MIGRATION = `
+ALTER TABLE Function ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 export const CLASS_SCHEMA = `
 CREATE NODE TABLE Class (
@@ -81,8 +95,12 @@ CREATE NODE TABLE Class (
   description STRING,
   fields STRING,
   annotations STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const CLASS_SCHEMA_MIGRATION = `
+ALTER TABLE Class ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 export const INTERFACE_SCHEMA = `
 CREATE NODE TABLE Interface (
@@ -94,8 +112,12 @@ CREATE NODE TABLE Interface (
   isExported BOOLEAN,
   content STRING,
   description STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const INTERFACE_SCHEMA_MIGRATION = `
+ALTER TABLE Interface ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 export const METHOD_SCHEMA = `
 CREATE NODE TABLE Method (
@@ -111,8 +133,12 @@ CREATE NODE TABLE Method (
   returnType STRING,
   parameters STRING,
   annotations STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const METHOD_SCHEMA_MIGRATION = `
+ALTER TABLE Method ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 export const CODE_ELEMENT_SCHEMA = `
 CREATE NODE TABLE CodeElement (
@@ -124,8 +150,12 @@ CREATE NODE TABLE CodeElement (
   isExported BOOLEAN,
   content STRING,
   description STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const CODE_ELEMENT_SCHEMA_MIGRATION = `
+ALTER TABLE CodeElement ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 // ============================================================================
 // COMMUNITY NODE TABLE (for Leiden algorithm clusters)
@@ -141,8 +171,12 @@ CREATE NODE TABLE Community (
   enrichedBy STRING,
   cohesion DOUBLE,
   symbolCount INT32,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const COMMUNITY_SCHEMA_MIGRATION = `
+ALTER TABLE Community ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 // ============================================================================
 // PROCESS NODE TABLE (for execution flow detection)
@@ -158,8 +192,12 @@ CREATE NODE TABLE Process (
   communities STRING[],
   entryPointId STRING,
   terminalId STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const PROCESS_SCHEMA_MIGRATION = `
+ALTER TABLE Process ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 // ============================================================================
 // ROUTE NODE TABLE SCHEMA (Spring, Laravel, etc. HTTP endpoints)
@@ -177,14 +215,18 @@ CREATE NODE TABLE Route (
   startLine INT64,
   lineNumber INT64,
   isInherited BOOLEAN,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const ROUTE_SCHEMA_MIGRATION = `
+ALTER TABLE Route ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 // ============================================================================
 // MULTI-LANGUAGE NODE TABLE SCHEMAS
 // ============================================================================
 
-// Generic code element with startLine/endLine for C, C++, Rust, Go, Java, C#
+// Generic code element with startLine/endLine and repoId for cross-repo support
 // description: optional metadata (e.g. Eloquent $fillable fields, relationship targets)
 const CODE_ELEMENT_BASE = (name: string) => `
 CREATE NODE TABLE \`${name}\` (
@@ -195,8 +237,12 @@ CREATE NODE TABLE \`${name}\` (
   endLine INT64,
   content STRING,
   description STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration helper for cross-repo support
+const CODE_ELEMENT_MIGRATION = (name: string) => `
+ALTER TABLE \`${name}\` ADD COLUMN IF NOT EXISTS repoId STRING`;
 
 export const STRUCT_SCHEMA = CODE_ELEMENT_BASE('Struct');
 export const ENUM_SCHEMA = CODE_ELEMENT_BASE('Enum');
@@ -216,6 +262,26 @@ export const ANNOTATION_SCHEMA = CODE_ELEMENT_BASE('Annotation');
 export const CONSTRUCTOR_SCHEMA = CODE_ELEMENT_BASE('Constructor');
 export const TEMPLATE_SCHEMA = CODE_ELEMENT_BASE('Template');
 export const MODULE_SCHEMA = CODE_ELEMENT_BASE('Module');
+
+// Migration exports for multi-language schemas
+export const STRUCT_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Struct');
+export const ENUM_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Enum');
+export const MACRO_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Macro');
+export const TYPEDEF_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Typedef');
+export const UNION_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Union');
+export const NAMESPACE_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Namespace');
+export const TRAIT_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Trait');
+export const IMPL_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Impl');
+export const TYPE_ALIAS_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('TypeAlias');
+export const CONST_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Const');
+export const STATIC_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Static');
+export const PROPERTY_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Property');
+export const RECORD_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Record');
+export const DELEGATE_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Delegate');
+export const ANNOTATION_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Annotation');
+export const CONSTRUCTOR_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Constructor');
+export const TEMPLATE_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Template');
+export const MODULE_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Module');
 
 // ============================================================================
 // RELATION TABLE SCHEMA

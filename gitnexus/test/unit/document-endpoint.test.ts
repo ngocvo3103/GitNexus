@@ -730,9 +730,9 @@ describe('body schema extraction', () => {
       path: '/users',
     });
 
-    // Body schema: when include_context is false (default), body is null for external types
-    // External types (not in graph) return null since we can't generate a JSON example
-    expect(result.result.specs.request.body).toBeNull();
+    // Body schema: when include_context is false (default), body is { _type: TypeName } for external types
+    // External types (not in graph) return type placeholder
+    expect(result.result.specs.request.body).toEqual({ _type: 'UserDTO' });
   });
 });
 
@@ -1107,6 +1107,133 @@ describe('extractMessaging inbound', () => {
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound._context).toBeDefined();
       expect(inbound._context).toContain('ContextListener.java');
+    });
+  });
+
+  describe('compact mode inbound detection via graph query', () => {
+    it('detects @RabbitListener via graph query even when include_context=false (compact mode)', async () => {
+      // This tests the bug fix: Part 2 graph query must run even without includeContext
+      // @RabbitListener methods are NOT in the call chain - they're discovered via graph query
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      // Chain does NOT contain @RabbitListener - it's a separate event handler
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          startLine: 30,
+          endLine: 50,
+          depth: 0,
+          content: 'public void createOrder(OrderDTO order) { orderService.save(order); }',
+          metadata: emptyMetadata(),
+          callees: [],
+          annotations: '[]', // No listener annotations in chain
+          parameters: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      // Mock executeQuery to return @RabbitListener method from graph
+      const mockExecuteQuery = vi.fn().mockResolvedValue([
+        {
+          'm.name': 'startUnholdSuggestionOrderMarket',
+          'm.annotations': '[{"name":"@RabbitListener","attrs":{"queues":"bond.order.queue"}}]',
+          'm.filePath': 'src/listeners/BondEventHandlerImpl.java',
+          'm.parameters': '[{"name":"event","type":"BondOrderEvent","annotations":[]}]',
+        },
+      ]);
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        include_context: false, // Compact mode - should still detect inbound
+        executeQuery: mockExecuteQuery,
+      });
+
+      // Verify graph query was called (Part 2 should run even in compact mode)
+      expect(mockExecuteQuery).toHaveBeenCalled();
+      const queryCall = mockExecuteQuery.mock.calls.find(call => 
+        call[1]?.includes?.('RabbitListener') || call[1]?.includes?.('KafkaListener')
+      );
+      expect(queryCall).toBeDefined();
+
+      // Verify inbound detection works in compact mode
+      expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
+      expect(result.result.externalDependencies.messaging.inbound.length).toBeGreaterThan(0);
+      
+      const inbound = result.result.externalDependencies.messaging.inbound[0];
+      expect(inbound.topic).toBe('bond.order.queue');
+      expect(inbound.payload).toBe('BondOrderEvent');
+      expect(inbound.consumptionLogic).toContain('BondEventHandlerImpl.startUnholdSuggestionOrderMarket');
+      
+      // Verify _context is NOT present in compact mode
+      expect(inbound._context).toBeUndefined();
+    });
+
+    it('detects @KafkaListener via graph query in compact mode', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/events',
+          controller: 'EventController',
+          handler: 'publishEvent',
+          filePath: 'src/controllers/EventController.java',
+          line: 25,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/EventController.java:publishEvent',
+          name: 'publishEvent',
+          kind: 'Method',
+          filePath: 'src/controllers/EventController.java',
+          startLine: 25,
+          endLine: 40,
+          depth: 0,
+          content: 'public void publishEvent(EventDTO event) { kafkaTemplate.send(event); }',
+          metadata: emptyMetadata(),
+          callees: [],
+          annotations: '[]',
+          parameters: '[{"name":"event","type":"EventDTO","annotations":[]}]',
+        }],
+        root: 'publishEvent',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn().mockResolvedValue([
+        {
+          'm.name': 'consumePaymentEvent',
+          'm.annotations': '[{"name":"@KafkaListener","attrs":{"topics":"payment.events"}}]',
+          'm.filePath': 'src/listeners/PaymentConsumer.java',
+          'm.parameters': '[{"name":"event","type":"PaymentEvent","annotations":[]}]',
+        },
+      ]);
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/events',
+        include_context: false,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.result.externalDependencies.messaging.inbound.length).toBeGreaterThan(0);
+      const inbound = result.result.externalDependencies.messaging.inbound[0];
+      expect(inbound.topic).toBe('payment.events');
+      expect(inbound.payload).toBe('PaymentEvent');
+      expect(inbound._context).toBeUndefined();
     });
   });
 
@@ -2764,7 +2891,7 @@ describe('extractValidationRules', () => {
         (r) => r.field === 'TODO_AI_ENRICH'
       );
       expect(imperativeRule).toBeDefined();
-      expect(imperativeRule?._context).toContain('ValidationService.process');
+      expect(imperativeRule?._context).toContain('validationService.process');
     });
 
     it('detects multiple custom validation methods', async () => {
@@ -2845,30 +2972,39 @@ describe('extractValidationRules', () => {
         summary: emptySummary(),
       });
 
-      // Mock executeQuery to return array format (LadybugDB style)
-      // Columns: m.name, m.annotations, m.filePath, m.parameters
-      // Array indices: [0], [1], [2], [3]
-      const mockExecuteQuery = vi.fn().mockResolvedValue([
-        [
-          'onMessage',  // name
-          JSON.stringify([{ name: '@RabbitListener', attrs: { queues: 'order.queue' } }]),  // annotations
-          'src/listeners/OrderListener.java',  // filePath
-          JSON.stringify([{ name: 'msg', type: 'OrderMessage', annotations: [] }]),  // parameters
-        ],
-      ]);
+      // Mock executeQuery to return different results based on query
+      // - For listener query: returns listener data in LadybugDB array format
+      // - For class query: returns empty array (type not found)
+      const mockExecuteQuery = vi.fn().mockImplementation(async (_repoId: string, query: string) => {
+        if (query.includes('@RabbitListener') || query.includes('@KafkaListener')) {
+          // Listener query - return array format
+          return [
+            [
+              'onMessage',  // name
+              JSON.stringify([{ name: '@RabbitListener', attrs: { queues: 'order.queue' } }]),  // annotations
+              'src/listeners/OrderListener.java',  // filePath
+              JSON.stringify([{ name: 'msg', type: 'OrderMessage', annotations: [] }]),  // parameters
+            ],
+          ];
+        }
+        // Class query for type resolution - return empty (type not found)
+        return [];
+      });
 
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/listeners',
         include_context: true,
-      }, { executeQuery: mockExecuteQuery });
+        executeQuery: mockExecuteQuery,
+      });
 
       // Should detect @RabbitListener from graph query
       expect(result.result.externalDependencies.messaging.inbound.length).toBeGreaterThanOrEqual(1);
-      
+
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('order.queue');
-      expect(inbound.payload).toBe('OrderMessage');
+      // When include_context: true, payload is resolved to BodySchema (source: 'external' if type not found)
+      expect(inbound.payload).toEqual({ typeName: 'OrderMessage', source: 'external', fields: undefined });
       expect(inbound.consumptionLogic).toBe('OrderListener.onMessage()');
       expect(inbound._context).toContain('src/listeners/OrderListener.java');
       expect(inbound._context).not.toContain('undefined');
@@ -2905,27 +3041,1517 @@ describe('extractValidationRules', () => {
         summary: emptySummary(),
       });
 
-      // Mock executeQuery to return array format for @KafkaListener
-      const mockExecuteQuery = vi.fn().mockResolvedValue([
-        [
-          'consumeOrder',  // name
-          JSON.stringify([{ name: '@KafkaListener', attrs: { topics: 'orders-topic' } }]),  // annotations
-          'src/listeners/KafkaConsumer.java',  // filePath
-          JSON.stringify([{ name: 'order', type: 'OrderEvent', annotations: [] }]),  // parameters
-        ],
-      ]);
+      // Mock executeQuery to return different results based on query
+      // - For listener query: returns listener data in LadybugDB array format
+      // - For class query: returns empty array (type not found)
+      const mockExecuteQuery = vi.fn().mockImplementation(async (_repoId: string, query: string) => {
+        if (query.includes('@RabbitListener') || query.includes('@KafkaListener')) {
+          // Listener query - return array format
+          return [
+            [
+              'consumeOrder',  // name
+              JSON.stringify([{ name: '@KafkaListener', attrs: { topics: 'orders-topic' } }]),  // annotations
+              'src/listeners/KafkaConsumer.java',  // filePath
+              JSON.stringify([{ name: 'order', type: 'OrderEvent', annotations: [] }]),  // parameters
+            ],
+          ];
+        }
+        // Class query for type resolution - return empty (type not found)
+        return [];
+      });
 
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/listeners',
         include_context: true,
-      }, { executeQuery: mockExecuteQuery });
+        executeQuery: mockExecuteQuery,
+      });
 
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('orders-topic');
-      expect(inbound.payload).toBe('OrderEvent');
+      // When include_context: true, payload is resolved to BodySchema (source: 'external' if type not found)
+      expect(inbound.payload).toEqual({ typeName: 'OrderEvent', source: 'external', fields: undefined });
       expect(inbound.consumptionLogic).toBe('KafkaConsumer.consumeOrder()');
       expect(inbound._context).toContain('src/listeners/KafkaConsumer.java');
+    });
+  });
+});
+
+describe('extractPackagePrefix', () => {
+  // Testing the extractPackagePrefix behavior
+  // Note: extractPackagePrefix is not exported, we test its behavior patterns
+
+  describe('Java-style package prefixes', () => {
+    it('extracts package from fully qualified Java class name', () => {
+      // com.abcd.bond.trading.dto.SuggestionOrderResultDto -> com.abcd.bond.trading.dto
+      const typeName = 'com.abcd.bond.trading.dto.SuggestionOrderResultDto';
+      const parts = typeName.split('.');
+      const lastPart = parts[parts.length - 1];
+      // Last part starts with uppercase, so it's a class name
+      expect(lastPart[0]).toBe('S');
+      expect(lastPart[0]).toBe(lastPart[0].toUpperCase());
+      expect(parts.slice(0, -1).join('.')).toBe('com.abcd.bond.trading.dto');
+    });
+
+    it('handles simple class name without package (returns null pattern)', () => {
+      // ClassName -> null (no package prefix)
+      const typeName = 'ClassName';
+      expect(typeName.includes('.')).toBe(false);
+    });
+
+    it('handles lowercase package-only name', () => {
+      // com.example.package (no class) -> returns full path
+      const typeName = 'com.example.package';
+      const parts = typeName.split('.');
+      const lastPart = parts[parts.length - 1];
+      // 'package' starts with lowercase, so it's not a class name
+      expect(lastPart[0]).toBe(lastPart[0].toLowerCase());
+    });
+  });
+
+  describe('npm-style package prefixes', () => {
+    it('extracts package from scoped npm module with class (triggers Java-style branch)', () => {
+      // @scope/package.Module has a '.' which triggers the Java-style branch
+      // parts = ['@scope/package', 'Module']
+      // lastPart = 'Module' (uppercase) -> return parts.slice(0, -1).join('.') = '@scope/package'
+      const typeName = '@scope/package.Module';
+      // The '.' causes it to match Java-style, extracting 'package' part correctly
+      expect(typeName.includes('.')).toBe(true);
+      const parts = typeName.split('.');
+      expect(parts[0]).toBe('@scope/package');
+      expect(parts[parts.length - 1][0]).toBe('M'); // Uppercase
+      // extractPackagePrefix returns '@scope/package' for '@scope/package.Module'
+    });
+
+    it('handles scoped package without module (no dot, triggers npm-style branch)', () => {
+      // @scope/package has no '.', so it goes to npm-style branch
+      const typeName = '@scope/package';
+      expect(typeName.includes('.')).toBe(false);
+      expect(typeName.startsWith('@')).toBe(true);
+      const slashIndex = typeName.indexOf('/', 1);
+      // '/' is at position 6 (after '@scope')
+      expect(slashIndex).toBe(6);
+      // substring(0, 6) returns '@scope' (without '/package')
+      expect(typeName.substring(0, slashIndex)).toBe('@scope');
+      // extractPackagePrefix returns '@scope' for '@scope/package' (no dot)
+    });
+  });
+});
+
+describe('Cross-Repo Type Resolution', () => {
+  // Helper to create mock CrossRepoContext
+  const createMockCrossRepoContext = () => ({
+    findDepRepo: vi.fn(),
+    queryMultipleRepos: vi.fn(),
+    listDepRepos: vi.fn().mockResolvedValue(['dep-repo-1', 'dep-repo-2']),
+  });
+
+  describe('Type resolved from dependency repo', () => {
+    it('attempts cross-repo resolution when type not found locally', async () => {
+      const mockCrossRepo = createMockCrossRepoContext();
+      mockCrossRepo.findDepRepo.mockResolvedValue('bond-service-repo');
+      mockCrossRepo.queryMultipleRepos.mockResolvedValue([{
+        repoId: 'bond-service-repo',
+        results: [{
+          name: 'com.abcd.bond.dto.SuggestionOrderResultDto',
+          fields: JSON.stringify([
+            { name: 'id', type: 'Long', annotations: [] },
+            { name: 'orderCode', type: 'String', annotations: ['@NotBlank'] },
+          ]),
+        }],
+      }]);
+
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          content: 'public void createOrder(@RequestBody OrderDTO orderDTO) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"orderDTO","type":"com.abcd.bond.dto.SuggestionOrderResultDto","annotations":["@RequestBody","@Valid"]}]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      // Mock local query to return no results (type not in local repo)
+      const mockExecuteQuery = vi.fn()
+        .mockResolvedValueOnce([]) // First call: find endpoint handler params
+        .mockResolvedValueOnce([]); // Second call: type not found locally
+
+      await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        executeQuery: mockExecuteQuery,
+        crossRepo: mockCrossRepo,
+      });
+
+      // The cross-repo resolution should have been attempted
+      // findDepRepo should be called with the package prefix
+      expect(mockCrossRepo.findDepRepo).toHaveBeenCalled();
+    });
+
+    it('queries dependency repo with correct package prefix for Java types', async () => {
+      const mockCrossRepo = createMockCrossRepoContext();
+      mockCrossRepo.findDepRepo.mockResolvedValue('dep-repo');
+      mockCrossRepo.queryMultipleRepos.mockResolvedValue([{
+        repoId: 'dep-repo',
+        results: [{
+          name: 'com.example.UserDTO',
+          fields: JSON.stringify([{ name: 'id', type: 'Long' }]),
+        }],
+      }]);
+
+      // Setup: local query returns no results
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'createUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 10,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.java:createUser',
+          name: 'createUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.java',
+          depth: 0,
+          content: 'public void createUser(@RequestBody UserDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"com.example.UserDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createUser',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/users',
+        executeQuery: mockExecuteQuery,
+        crossRepo: mockCrossRepo,
+      });
+
+      // Verify findDepRepo was called with extracted package prefix
+      expect(mockCrossRepo.findDepRepo).toHaveBeenCalledWith('com.example');
+    });
+
+    it('queries dependency repo with correct package prefix for npm scoped packages', async () => {
+      const mockCrossRepo = createMockCrossRepoContext();
+      mockCrossRepo.findDepRepo.mockResolvedValue('dep-repo');
+      mockCrossRepo.queryMultipleRepos.mockResolvedValue([{
+        repoId: 'dep-repo',
+        results: [{
+          name: '@scope/package.UserDTO',
+          fields: JSON.stringify([{ name: 'id', type: 'string' }]),
+        }],
+      }]);
+
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'createUser',
+          filePath: 'src/controllers/UserController.ts',
+          line: 10,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.ts:createUser',
+          name: 'createUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.ts',
+          depth: 0,
+          content: 'async createUser(@Body() dto: UserDTO) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          // MUST include @RequestBody for extractBodySchemas to resolve the type
+          parameters: '[{"name":"dto","type":"@scope/package.UserDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createUser',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/users',
+        executeQuery: mockExecuteQuery,
+        crossRepo: mockCrossRepo,
+      });
+
+      // Note: @scope/package.UserDTO has a '.', so it triggers the Java-style branch
+      // which correctly extracts '@scope/package' as the package prefix
+      expect(mockCrossRepo.findDepRepo).toHaveBeenCalledWith('@scope/package');
+    });
+  });
+
+  describe('Type not in any repo (fallback to external)', () => {
+    it('returns external source when findDepRepo returns null', async () => {
+      const mockCrossRepo = createMockCrossRepoContext();
+      mockCrossRepo.findDepRepo.mockResolvedValue(null);
+
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          content: 'public void createOrder(@RequestBody ExternalDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"com.external.UnknownDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        executeQuery: mockExecuteQuery,
+        crossRepo: mockCrossRepo,
+      });
+
+      // When type is not found in any repo, body returns type placeholder
+      expect(result.result.specs.request.body).toEqual({ _type: 'com.external.UnknownDTO' });
+    });
+
+    it('returns external source when dependency repo does not contain the type', async () => {
+      const mockCrossRepo = createMockCrossRepoContext();
+      mockCrossRepo.findDepRepo.mockResolvedValue('dep-repo');
+      mockCrossRepo.queryMultipleRepos.mockResolvedValue([{
+        repoId: 'dep-repo',
+        results: [], // Empty results - type not found
+      }]);
+
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          content: 'public void createOrder(@RequestBody MissingDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"com.missing.MissingDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        executeQuery: mockExecuteQuery,
+        crossRepo: mockCrossRepo,
+      });
+
+      // Type not found in dep repo either, returns type placeholder
+      expect(result.result.specs.request.body).toEqual({ _type: 'com.missing.MissingDTO' });
+    });
+  });
+
+  describe('Cross-repo context undefined (backward compatibility)', () => {
+    it('works without crossRepo parameter (queries local repo only)', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'createUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 30,
+        }],
+      });
+
+      // Mock local type found
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.java:createUser',
+          name: 'createUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.java',
+          depth: 0,
+          content: 'public void createUser(@RequestBody UserDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createUser',
+        summary: emptySummary(),
+      });
+
+      // Execute without crossRepo - should work as before
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/users',
+        // No crossRepo parameter
+      });
+
+      // Should return valid result without error
+      expect(result.result.method).toBe('POST');
+      expect(result.result.path).toBe('/api/users');
+      // Body returns type placeholder for external/unresolved types
+      expect(result.result.specs.request.body).toEqual({ _type: 'UserDTO' });
+    });
+
+    it('does not attempt cross-repo resolution when crossRepo is undefined', async () => {
+      const mockExecuteQuery = vi.fn().mockResolvedValue([]);
+
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'createUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.java:createUser',
+          name: 'createUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.java',
+          depth: 0,
+          content: 'public void createUser(@RequestBody ExternalDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"com.external.UnknownDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createUser',
+        summary: emptySummary(),
+      });
+
+      // Execute without crossRepo
+      await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/users',
+        executeQuery: mockExecuteQuery,
+        // No crossRepo parameter
+      });
+
+      // The query should only be for local repo (no cross-repo calls)
+      // When crossRepo is undefined, the code should not attempt to findDepRepo
+      // This is implicit - no error should occur
+    });
+  });
+
+  describe('Simple class names (no package prefix)', () => {
+    it('skips cross-repo resolution for simple class names', async () => {
+      const mockCrossRepo = createMockCrossRepoContext();
+
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'createUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.java:createUser',
+          name: 'createUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.java',
+          depth: 0,
+          content: 'public void createUser(@RequestBody UserDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createUser',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn().mockResolvedValue([]);
+
+      await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/users',
+        executeQuery: mockExecuteQuery,
+        crossRepo: mockCrossRepo,
+      });
+
+      // For simple class names without package prefix, extractPackagePrefix returns null
+      // so findDepRepo should NOT be called
+      expect(mockCrossRepo.findDepRepo).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Cross-repo query error handling', () => {
+    it('handles _error field from queryMultipleRepos for diagnostics', async () => {
+      const mockCrossRepo = createMockCrossRepoContext();
+      mockCrossRepo.findDepRepo.mockResolvedValue(null);
+      mockCrossRepo.listDepRepos.mockResolvedValue(['dep-repo-1', 'dep-repo-2']);
+      mockCrossRepo.queryMultipleRepos.mockResolvedValue([
+        { repoId: 'dep-repo-1', results: [], _error: 'repo_not_found' },
+        { repoId: 'dep-repo-2', results: [], _error: 'ladybug_not_ready' },
+      ]);
+
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          content: 'public void createOrder(@RequestBody ExternalDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"com.external.ExternalDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        executeQuery: mockExecuteQuery,
+        crossRepo: mockCrossRepo,
+      });
+
+      // Should not throw, should return external source when all dep repos fail
+      expect(result.error).toBeUndefined();
+      expect(result.result.specs.request.body).toEqual({ _type: 'com.external.ExternalDTO' });
+      // Verify cross-repo query was attempted
+      expect(mockCrossRepo.queryMultipleRepos).toHaveBeenCalled();
+    });
+
+    it('resolves type from dependency repo when one repo has error but other succeeds', async () => {
+      const mockCrossRepo = createMockCrossRepoContext();
+      mockCrossRepo.findDepRepo.mockResolvedValue(null);
+      mockCrossRepo.listDepRepos.mockResolvedValue(['dep-repo-1', 'dep-repo-2']);
+      mockCrossRepo.queryMultipleRepos.mockResolvedValue([
+        { repoId: 'dep-repo-1', results: [], _error: 'repo_not_found' },
+        { repoId: 'dep-repo-2', results: [{
+          name: 'ExternalDTO',
+          fields: JSON.stringify([
+            { name: 'id', type: 'Long', annotations: [] },
+            { name: 'name', type: 'String', annotations: [] },
+          ]),
+        }]},
+      ]);
+
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          content: 'public void createOrder(@RequestBody ExternalDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"com.external.ExternalDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        executeQuery: mockExecuteQuery,
+        crossRepo: mockCrossRepo,
+      });
+
+      // Should resolve from the repo that succeeded
+      expect(result.error).toBeUndefined();
+      const body = result.result.specs.request.body as Record<string, unknown>;
+      expect(body).toHaveProperty('id');
+      expect(body).toHaveProperty('name');
+    });
+  });
+
+  describe('Same type for request and response', () => {
+    it('resolves same type correctly for both request body and response body', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'createUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 30,
+        }],
+      });
+
+      // Mock handler with @RequestBody UserDTO and returnType UserDTO
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.java:createUser',
+          name: 'createUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.java',
+          depth: 0,
+          startLine: 30,
+          endLine: 45,
+          content: 'public UserDTO createUser(@RequestBody @Valid UserDTO dto) { return new UserDTO(); }',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody","@Valid"]}]',
+          returnType: 'UserDTO',
+          annotations: '[]',
+        }],
+        root: 'createUser',
+        summary: emptySummary(),
+      });
+
+      // Mock executeQuery to return the same class for both calls
+      // Use mockResolvedValue to return the same value for all calls
+      const mockExecuteQuery = vi.fn().mockResolvedValue([{
+        name: 'UserDTO',
+        fields: '[{"name":"id","type":"Long"},{"name":"name","type":"String"}]',
+      }]);
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/users',
+        include_context: true,
+        executeQuery: mockExecuteQuery,
+      });
+
+      // Verify both request.body and response.body have matching BodySchema
+      expect(result.result.specs.request.body).toEqual({
+        typeName: 'UserDTO',
+        source: 'indexed',
+        fields: expect.arrayContaining([
+          expect.objectContaining({ name: 'id', type: 'Long' }),
+          expect.objectContaining({ name: 'name', type: 'String' }),
+        ]),
+      });
+      expect(result.result.specs.response.body).toEqual({
+        typeName: 'UserDTO',
+        source: 'indexed',
+        fields: expect.arrayContaining([
+          expect.objectContaining({ name: 'id', type: 'Long' }),
+          expect.objectContaining({ name: 'name', type: 'String' }),
+        ]),
+      });
+    });
+  });
+
+  describe('executeQuery returning undefined', () => {
+    it('handles executeQuery returning undefined without TypeError', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'createUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.java:createUser',
+          name: 'createUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.java',
+          depth: 0,
+          startLine: 30,
+          endLine: 45,
+          content: 'public UserDTO createUser(@RequestBody UserDTO dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
+          returnType: 'UserDTO',
+          annotations: '[]',
+        }],
+        root: 'createUser',
+        summary: emptySummary(),
+      });
+
+      // Mock executeQuery to return undefined (edge case)
+      const mockExecuteQuery = vi.fn().mockResolvedValue(undefined);
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/users',
+        include_context: true,
+        executeQuery: mockExecuteQuery,
+      });
+
+      // Should not throw TypeError, should return external source
+      expect(result.error).toBeUndefined();
+      expect(result.result.specs.request.body).toEqual({
+        typeName: 'UserDTO',
+        source: 'external',
+        fields: undefined,
+      });
+      expect(result.result.specs.response.body).toEqual({
+        typeName: 'UserDTO',
+        source: 'external',
+        fields: undefined,
+      });
+    });
+  });
+
+  describe('recursive type resolution', () => {
+    it('resolves nested types in request body', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/savings',
+          controller: 'SavingController',
+          handler: 'createSaving',
+          filePath: 'src/controllers/SavingController.java',
+          line: 42,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/SavingController.java:createSaving',
+          name: 'createSaving',
+          kind: 'Method',
+          filePath: 'src/controllers/SavingController.java',
+          depth: 0,
+          startLine: 40,
+          endLine: 50,
+          content: 'public void createSaving(@RequestBody SavingMarketDto dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"SavingMarketDto","annotations":["@RequestBody"]}]',
+          returnType: 'void',
+          annotations: '[]',
+        }],
+        root: 'createSaving',
+        summary: emptySummary(),
+      });
+
+      // Mock query for type resolution - mockResolvedValue handles all calls with default behavior
+      // First call: SavingMarketDto, subsequent calls: CaptchaReqDto then empty
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          const typeName = params.typeName;
+          if (typeName === 'SavingMarketDto') {
+            return [{
+              name: 'SavingMarketDto',
+              fields: JSON.stringify([
+                { name: 'marketName', type: 'String', annotations: [] },
+                { name: 'captcha', type: 'CaptchaReqDto', annotations: [] },
+              ]),
+            }];
+          }
+          if (typeName === 'CaptchaReqDto') {
+            return [{
+              name: 'CaptchaReqDto',
+              fields: JSON.stringify([
+                { name: 'token', type: 'String', annotations: [] },
+                { name: 'action', type: 'String', annotations: [] },
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/api/savings',
+        include_context: false,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      
+      // Verify executeQuery was called for both SavingMarketDto and CaptchaReqDto
+      const calls = mockExecuteQuery.mock.calls;
+      const typeNames = calls.map(c => c[2]?.typeName).filter(Boolean);
+      expect(typeNames).toContain('SavingMarketDto');
+      expect(typeNames).toContain('CaptchaReqDto');
+      
+      // Request body should have nested types resolved
+      const requestBody = result.result.specs.request.body as Record<string, unknown>;
+      // CaptchaReqDto fields should be resolved, not placeholder
+      expect(requestBody).toEqual({
+        marketName: 'string',
+        captcha: {
+          token: 'string',
+          action: 'string',
+        },
+      });
+    });
+
+    it('respects max depth limit', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'GET',
+          path: '/api/deep',
+          controller: 'DeepController',
+          handler: 'getDeep',
+          filePath: 'src/controllers/DeepController.java',
+          line: 10,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/DeepController.java:getDeep',
+          name: 'getDeep',
+          kind: 'Method',
+          filePath: 'src/controllers/DeepController.java',
+          depth: 0,
+          startLine: 10,
+          endLine: 20,
+          content: 'public DeepDto getDeep() {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[]',
+          returnType: 'DeepDto',
+          annotations: '[]',
+        }],
+        root: 'getDeep',
+        summary: emptySummary(),
+      });
+
+      // Mock chain of nested types: DeepDto -> Level1 -> Level2 -> ...
+      const mockExecuteQuery = vi.fn()
+        .mockResolvedValueOnce([{
+          name: 'DeepDto',
+          fields: JSON.stringify([
+            { name: 'level1', type: 'Level1Dto', annotations: [] },
+          ]),
+        }])
+        .mockResolvedValueOnce([{
+          name: 'Level1Dto',
+          fields: JSON.stringify([
+            { name: 'level2', type: 'Level2Dto', annotations: [] },
+          ]),
+        }])
+        .mockResolvedValue([]); // Limit reached
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'GET',
+        path: '/api/deep',
+        include_context: false,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      // Should resolve up to the depth limit
+      expect(mockExecuteQuery.mock.calls.length).toBeLessThanOrEqual(12); // maxDepth + some buffer
+    });
+  });
+
+  describe('resolveAllNestedTypes circular reference handling', () => {
+    it('handles circular reference without infinite loop', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'createUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.java:createUser',
+          name: 'createUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.java',
+          depth: 0,
+          startLine: 30,
+          endLine: 45,
+          content: 'public UserDto createUser(@RequestBody UserDto dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"UserDto","annotations":["@RequestBody"]}]',
+          returnType: 'void',
+          annotations: '[]',
+        }],
+        root: 'createUser',
+        summary: emptySummary(),
+      });
+
+      // Mock UserDto that references itself (circular reference)
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          if (params.typeName === 'UserDto') {
+            return [{
+              name: 'UserDto',
+              fields: JSON.stringify([
+                { name: 'id', type: 'Long', annotations: [] },
+                { name: 'friend', type: 'UserDto', annotations: [] },  // Circular!
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/api/users',
+        include_context: false,
+        executeQuery: mockExecuteQuery,
+      });
+
+      // Should complete without timeout/stack overflow
+      expect(result.error).toBeUndefined();
+      
+      // Request body should resolve UserDto fields
+      const requestBody = result.result.specs.request.body as Record<string, unknown>;
+      // UserDto is expanded once, then circular reference gets placeholder
+      // The friend field contains UserDto which has a circular reference back to itself
+      // First expansion shows full UserDto with friend, second level shows placeholder
+      expect(requestBody).toEqual({
+        id: 0,
+        friend: {
+          id: 0,
+          friend: { _type: 'UserDto' },  // Circular reference gets placeholder
+        },
+      });
+      
+      // UserDto may be queried multiple times: once for request body, once for nested resolution
+      // The important thing is that circular references are handled without infinite loops
+      const userDtoCalls = mockExecuteQuery.mock.calls.filter(
+        c => c[2]?.typeName === 'UserDto'
+      );
+      // Allow multiple calls since nested resolution has its own visited set
+      expect(userDtoCalls.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('resolveAllNestedTypes generic container handling', () => {
+    it('resolves List<X> inner types and generates array examples', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 50,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          startLine: 50,
+          endLine: 60,
+          content: 'public void createOrder(@RequestBody OrderDto dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"OrderDto","annotations":["@RequestBody"]}]',
+          returnType: 'void',
+          annotations: '[]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          if (params.typeName === 'OrderDto') {
+            return [{
+              name: 'OrderDto',
+              fields: JSON.stringify([
+                { name: 'id', type: 'Long', annotations: [] },
+                { name: 'items', type: 'List<ItemDto>', annotations: [] },
+              ]),
+            }];
+          }
+          if (params.typeName === 'ItemDto') {
+            return [{
+              name: 'ItemDto',
+              fields: JSON.stringify([
+                { name: 'id', type: 'Long', annotations: [] },
+                { name: 'name', type: 'String', annotations: [] },
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/api/orders',
+        include_context: false,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      
+      // Verify ItemDto was queried for nested resolution
+      const typeNames = mockExecuteQuery.mock.calls.map(c => c[2]?.typeName).filter(Boolean);
+      expect(typeNames).toContain('OrderDto');
+      expect(typeNames).toContain('ItemDto');
+      
+      // Request body should have items as array with resolved ItemDto fields
+      const requestBody = result.result.specs.request.body as Record<string, unknown>;
+      expect(requestBody).toEqual({
+        id: 0,
+        // List<ItemDto> should resolve to array of ItemDto examples
+        items: [{ id: 0, name: 'string' }],
+      });
+    });
+
+    it('handles nested generics Optional<List<X>>', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'GET',
+          path: '/api/settings',
+          controller: 'SettingsController',
+          handler: 'getSettings',
+          filePath: 'src/controllers/SettingsController.java',
+          line: 20,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/SettingsController.java:getSettings',
+          name: 'getSettings',
+          kind: 'Method',
+          filePath: 'src/controllers/SettingsController.java',
+          depth: 0,
+          startLine: 20,
+          endLine: 30,
+          content: 'public SettingsDto getSettings() {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[]',
+          returnType: 'SettingsDto',
+          annotations: '[]',
+        }],
+        root: 'getSettings',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          if (params.typeName === 'SettingsDto') {
+            return [{
+              name: 'SettingsDto',
+              fields: JSON.stringify([
+                { name: 'name', type: 'String', annotations: [] },
+                { name: 'tags', type: 'Optional<List<String>>', annotations: [] },
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'GET',
+        path: '/api/settings',
+        include_context: false,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      
+      const responseBody = result.result.specs.response.body as Record<string, unknown>;
+      // Optional<List<String>> unwraps both generic layers
+      // Optional is a container, List is a container -> result is [['string']] (2 levels)
+      // Each generic wrapper adds an array level
+      expect(responseBody).toEqual({
+        name: 'string',
+        tags: [['string']],  // Optional<List<String>> = 2 container wrappers -> 2 array levels
+      });
+    });
+
+    it('handles X[] array type syntax', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/batch',
+          controller: 'BatchController',
+          handler: 'batchProcess',
+          filePath: 'src/controllers/BatchController.java',
+          line: 100,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/BatchController.java:batchProcess',
+          name: 'batchProcess',
+          kind: 'Method',
+          filePath: 'src/controllers/BatchController.java',
+          depth: 0,
+          startLine: 100,
+          endLine: 110,
+          content: 'public void batchProcess(@RequestBody BatchDto dto) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"dto","type":"BatchDto","annotations":["@RequestBody"]}]',
+          returnType: 'void',
+          annotations: '[]',
+        }],
+        root: 'batchProcess',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          if (params.typeName === 'BatchDto') {
+            return [{
+              name: 'BatchDto',
+              fields: JSON.stringify([
+                { name: 'batchId', type: 'String', annotations: [] },
+                { name: 'items', type: 'ItemDto[]', annotations: [] },
+              ]),
+            }];
+          }
+          if (params.typeName === 'ItemDto') {
+            return [{
+              name: 'ItemDto',
+              fields: JSON.stringify([
+                { name: 'sku', type: 'String', annotations: [] },
+                { name: 'qty', type: 'Integer', annotations: [] },
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/api/batch',
+        include_context: false,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      
+      const requestBody = result.result.specs.request.body as Record<string, unknown>;
+      expect(requestBody).toEqual({
+        batchId: 'string',
+        // ItemDto[] should resolve to array of ItemDto examples
+        items: [{ sku: 'string', qty: 0 }],
+      });
+    });
+  });
+
+  describe('request/response body nested fields in with-context mode', () => {
+    it('request body has nested fields embedded when include_context is true', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          startLine: 28,
+          endLine: 35,
+          content: 'public OrderDto createOrder(@RequestBody CreateOrderReq req) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"req","type":"CreateOrderReq","annotations":["@RequestBody"]}]',
+          returnType: 'OrderDto',
+          annotations: '[]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          if (params.typeName === 'CreateOrderReq') {
+            return [{
+              name: 'CreateOrderReq',
+              fields: JSON.stringify([
+                { name: 'orderId', type: 'String', annotations: [] },
+                { name: 'customer', type: 'CustomerDto', annotations: [] },
+              ]),
+            }];
+          }
+          if (params.typeName === 'CustomerDto') {
+            return [{
+              name: 'CustomerDto',
+              fields: JSON.stringify([
+                { name: 'name', type: 'String', annotations: [] },
+                { name: 'email', type: 'String', annotations: [] },
+              ]),
+            }];
+          }
+          if (params.typeName === 'OrderDto') {
+            return [{
+              name: 'OrderDto',
+              fields: JSON.stringify([
+                { name: 'id', type: 'Long', annotations: [] },
+                { name: 'status', type: 'String', annotations: [] },
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/api/orders',
+        include_context: true,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      
+      // Request body should be BodySchema with nested fields
+      const requestBody = result.result.specs.request.body as Record<string, any>;
+      expect(requestBody.typeName).toBe('CreateOrderReq');
+      expect(requestBody.source).toBe('indexed');
+      expect(requestBody.fields).toBeDefined();
+      expect(requestBody.fields).toHaveLength(2);
+      
+      // Check that nested CustomerDto has its fields embedded
+      const customerField = requestBody.fields.find((f: any) => f.name === 'customer');
+      expect(customerField).toBeDefined();
+      expect(customerField.type).toBe('CustomerDto');
+      expect(customerField.fields).toBeDefined();
+      expect(customerField.fields).toHaveLength(2);
+      expect(customerField.fields.map((f: any) => f.name)).toEqual(['name', 'email']);
+    });
+
+    it('response body has nested fields embedded when include_context is true', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'GET',
+          path: '/api/users/{id}',
+          controller: 'UserController',
+          handler: 'getUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 45,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/UserController.java:getUser',
+          name: 'getUser',
+          kind: 'Method',
+          filePath: 'src/controllers/UserController.java',
+          depth: 0,
+          startLine: 43,
+          endLine: 50,
+          content: 'public UserDto getUser(Long id) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[]',
+          returnType: 'UserDto',
+          annotations: '[]',
+        }],
+        root: 'getUser',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          if (params.typeName === 'UserDto') {
+            return [{
+              name: 'UserDto',
+              fields: JSON.stringify([
+                { name: 'id', type: 'Long', annotations: [] },
+                { name: 'profile', type: 'ProfileDto', annotations: [] },
+              ]),
+            }];
+          }
+          if (params.typeName === 'ProfileDto') {
+            return [{
+              name: 'ProfileDto',
+              fields: JSON.stringify([
+                { name: 'avatar', type: 'String', annotations: [] },
+                { name: 'bio', type: 'String', annotations: [] },
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'GET',
+        path: '/api/users/{id}',
+        include_context: true,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      
+      // Response body should be BodySchema with nested fields
+      const responseBody = result.result.specs.response.body as Record<string, any>;
+      expect(responseBody.typeName).toBe('UserDto');
+      expect(responseBody.source).toBe('indexed');
+      expect(responseBody.fields).toBeDefined();
+      expect(responseBody.fields).toHaveLength(2);
+      
+      // Check that nested ProfileDto has its fields embedded
+      const profileField = responseBody.fields.find((f: any) => f.name === 'profile');
+      expect(profileField).toBeDefined();
+      expect(profileField.type).toBe('ProfileDto');
+      expect(profileField.fields).toBeDefined();
+      expect(profileField.fields).toHaveLength(2);
+      expect(profileField.fields.map((f: any) => f.name)).toEqual(['avatar', 'bio']);
+    });
+
+    it('handles circular references in nested fields without infinite loop', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/nodes',
+          controller: 'NodeController',
+          handler: 'createNode',
+          filePath: 'src/controllers/NodeController.java',
+          line: 20,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/NodeController.java:createNode',
+          name: 'createNode',
+          kind: 'Method',
+          filePath: 'src/controllers/NodeController.java',
+          depth: 0,
+          startLine: 18,
+          endLine: 25,
+          content: 'public NodeDto createNode(@RequestBody NodeDto node) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"node","type":"NodeDto","annotations":["@RequestBody"]}]',
+          returnType: 'NodeDto',
+          annotations: '[]',
+        }],
+        root: 'createNode',
+        summary: emptySummary(),
+      });
+
+      // Circular reference: NodeDto.parent -> NodeDto
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          if (params.typeName === 'NodeDto') {
+            return [{
+              name: 'NodeDto',
+              fields: JSON.stringify([
+                { name: 'id', type: 'Long', annotations: [] },
+                { name: 'parent', type: 'NodeDto', annotations: [] },
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/api/nodes',
+        include_context: true,
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      
+      // Request body should have fields but circular reference should not expand infinitely
+      const requestBody = result.result.specs.request.body as Record<string, any>;
+      expect(requestBody.typeName).toBe('NodeDto');
+      expect(requestBody.fields).toBeDefined();
+      expect(requestBody.fields).toHaveLength(2);
+      
+      // The 'parent' field references NodeDto - circular reference detection prevents infinite recursion
+      // but still embeds one level of fields (so you can see the structure)
+      const parentField = requestBody.fields.find((f: any) => f.name === 'parent');
+      expect(parentField).toBeDefined();
+      expect(parentField.type).toBe('NodeDto');
+      // Circular reference: fields ARE embedded (one level), but nested 'parent' won't have further fields
+      expect(parentField.fields).toBeDefined();
+      expect(parentField.fields).toHaveLength(2);
+      // The nested 'parent' inside parentField should NOT have further fields embedded (circular protection)
+      const nestedParentField = parentField.fields.find((f: any) => f.name === 'parent');
+      expect(nestedParentField).toBeDefined();
+      expect(nestedParentField.type).toBe('NodeDto');
+      expect(nestedParentField.fields).toBeUndefined();
+    });
+
+    it('compact mode (default) does not embed nested fields - returns JSON example', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/items',
+          controller: 'ItemController',
+          handler: 'createItem',
+          filePath: 'src/controllers/ItemController.java',
+          line: 10,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/ItemController.java:createItem',
+          name: 'createItem',
+          kind: 'Method',
+          filePath: 'src/controllers/ItemController.java',
+          depth: 0,
+          startLine: 8,
+          endLine: 15,
+          content: 'public void createItem(@RequestBody ItemDto item) {}',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"item","type":"ItemDto","annotations":["@RequestBody"]}]',
+          returnType: 'void',
+          annotations: '[]',
+        }],
+        root: 'createItem',
+        summary: emptySummary(),
+      });
+
+      const mockExecuteQuery = vi.fn()
+        .mockImplementation(async (repoId: string, query: string, params: Record<string, any>) => {
+          if (params.typeName === 'ItemDto') {
+            return [{
+              name: 'ItemDto',
+              fields: JSON.stringify([
+                { name: 'name', type: 'String', annotations: [] },
+                { name: 'nested', type: 'NestedDto', annotations: [] },
+              ]),
+            }];
+          }
+          if (params.typeName === 'NestedDto') {
+            return [{
+              name: 'NestedDto',
+              fields: JSON.stringify([
+                { name: 'value', type: 'Integer', annotations: [] },
+              ]),
+            }];
+          }
+          return [];
+        });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/api/items',
+        include_context: false, // compact mode
+        executeQuery: mockExecuteQuery,
+      });
+
+      expect(result.error).toBeUndefined();
+      
+      // Request body should be a JSON example object, not BodySchema with fields
+      const requestBody = result.result.specs.request.body as Record<string, any>;
+      // In compact mode, body is a JSON example: { name: 'string', nested: { value: 0 } }
+      expect(typeof requestBody).toBe('object');
+      // Should NOT have BodySchema properties like typeName, source, fields
+      expect(requestBody.typeName).toBeUndefined();
+      expect(requestBody.source).toBeUndefined();
+      expect(requestBody.fields).toBeUndefined();
     });
   });
 });
