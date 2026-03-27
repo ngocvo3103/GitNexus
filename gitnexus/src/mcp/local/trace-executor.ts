@@ -1004,20 +1004,36 @@ export async function executeTrace(
     }
   }
 
-  // Step 3: Fetch content for all discovered nodes if needed
+  // Step 2a: Fetch line numbers for all discovered nodes
+  const nodeInfoMap = await fetchNodeInfo(
+    executeQuery,
+    repoId,
+    Array.from(discoveredNodes.keys())
+  );
+  for (const [uid, info] of nodeInfoMap) {
+    const existing = discoveredNodes.get(uid);
+    if (existing && info.startLine !== undefined) {
+      discoveredNodes.set(uid, {
+        ...existing,
+        startLine: info.startLine,
+        endLine: info.endLine,
+      });
+    }
+  }
+
+  // Step 3: Fetch content for all discovered nodes
+  // Always fetch content for internal processing (validation detection),
+  // even if not requested for output
   let contentMap = new Map<string, string>();
-  if (include_content) {
-    // Fetch content for each node individually to work with the mock's pattern
-    for (const [uid] of discoveredNodes) {
-      const content = await fetchContentForUid(executeQuery, repoId, uid);
-      if (content) {
-        contentMap.set(uid, content);
-      }
+  for (const [uid] of discoveredNodes) {
+    const content = await fetchContentForUid(executeQuery, repoId, uid);
+    if (content) {
+      contentMap.set(uid, content);
     }
-    // Also fetch start symbol content if not already fetched
-    if (startSymbol.content) {
-      contentMap.set(startSymbol.uid, startSymbol.content);
-    }
+  }
+  // Also fetch start symbol content if not already fetched
+  if (startSymbol.content) {
+    contentMap.set(startSymbol.uid, startSymbol.content);
   }
 
   // Step 4: Build chain nodes in BFS order
@@ -1053,8 +1069,9 @@ export async function executeTrace(
       metadata: extractMetadata(content),
     };
 
-    if (include_content && content && !compact) {
-      // Only store content in output when not compacting
+    if (content) {
+      // Content is always needed for internal processing (validation detection, etc.)
+      // Stripping for compact output happens in buildDocumentation
       chainNode.content = content;
     }
 

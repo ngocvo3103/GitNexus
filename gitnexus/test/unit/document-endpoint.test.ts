@@ -2542,8 +2542,8 @@ describe('extractValidationRules', () => {
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
       expect(result.result.specs.request.validation[0]._context).toBeDefined();
-      expect(result.result.specs.request.validation[0]._context).toContain('@NotNull');
-      expect(result.result.specs.request.validation[0]._context).toContain('src/controllers/UserController.java');
+      expect(result.result.specs.request.validation[0]._context?.[0]).toContain('@NotNull');
+      expect(result.result.specs.request.validation[0]._context?.[0]).toContain('src/controllers/UserController.java');
     });
   });
 
@@ -2704,13 +2704,15 @@ describe('extractValidationRules', () => {
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
-      // Should have the imperative validation rule with TODO_AI_ENRICH
+      // Should have the imperative validation rule with extracted field/rules
       const imperativeRule = result.result.specs.request.validation.find(
-        (r: any) => r.field === 'TODO_AI_ENRICH'
+        (r: any) => r.rules === 'TcbsValidator.doValidate'
       );
       expect(imperativeRule).toBeDefined();
+      expect(imperativeRule?.field).toBe('OrderDTO'); // Type from handler params
+      expect(imperativeRule?.type).toBe('Custom');
       expect(imperativeRule?._context).toBeDefined();
-      expect(imperativeRule?._context).toContain('TcbsValidator.doValidate');
+      expect(imperativeRule?._context?.[0]).toContain('TcbsValidator.doValidate');
     });
 
     it('detects ValidationUtils.validate calls when include_context is true', async () => {
@@ -2753,13 +2755,15 @@ describe('extractValidationRules', () => {
 
       expect(result.result.specs.request.validation).toBeDefined();
       const imperativeRule = result.result.specs.request.validation.find(
-        (r: any) => r.field === 'TODO_AI_ENRICH'
+        (r: any) => r.rules === 'ValidationUtils.validate'
       );
       expect(imperativeRule).toBeDefined();
-      expect(imperativeRule?._context).toContain('ValidationUtils.validate');
+      expect(imperativeRule?.field).toBe('UserDTO'); // Type from handler params
+      expect(imperativeRule?.type).toBe('Custom');
+      expect(imperativeRule?._context?.[0]).toContain('ValidationUtils.validate');
     });
 
-    it('does not detect imperative validation when include_context is false', async () => {
+    it('detects imperative validation even when include_context is false', async () => {
       vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
         endpoints: [{
           method: 'POST',
@@ -2797,8 +2801,72 @@ describe('extractValidationRules', () => {
         include_context: false,
       });
 
-      // Should not have any validation rules since no annotations and imperative detection is off
-      expect(result.result.specs.request.validation).toHaveLength(0);
+      // With the fix, imperative validation IS detected even without include_context
+      // because content is always fetched for internal processing
+      expect(result.result.specs.request.validation).toHaveLength(1);
+      expect(result.result.specs.request.validation[0]).toMatchObject({
+        field: 'OrderDTO',
+        type: 'Custom',
+        required: false,
+        rules: 'TcbsValidator.doValidate',
+      });
+    });
+
+    it('detects imperative validation in compact mode (content stripped from output)', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [
+          {
+            uid: 'Method:src/controllers/OrderController.java:createOrder',
+            name: 'createOrder',
+            kind: 'Method',
+            filePath: 'src/controllers/OrderController.java',
+            depth: 0,
+            startLine: 30,
+            endLine: 45,
+            // Use Validator.check pattern which only matches once
+            content: 'public void createOrder(OrderDTO order) { Validator.check(order); }',
+            metadata: emptyMetadata(),
+            callees: [],
+            parameters: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
+          },
+        ],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        include_context: true,
+        compact: true,
+      });
+
+      // Validation entries should be populated even in compact mode
+      expect(result.result.specs.request.validation).toHaveLength(1);
+      expect(result.result.specs.request.validation[0]).toMatchObject({
+        field: 'OrderDTO',
+        type: 'Custom',
+        required: false,
+        rules: 'Validator.check',
+      });
+
+      // Content should NOT be in the chain output when compact=true
+      if (result.result._context?.callChain) {
+        for (const node of result.result._context.callChain) {
+          expect(node.content).toBeUndefined();
+        }
+      }
     });
 
     it('detects .validateJWT() custom validation calls', async () => {
@@ -2839,13 +2907,16 @@ describe('extractValidationRules', () => {
         include_context: true,
       });
 
-      // Should have the imperative validation rule with TODO_AI_ENRICH
+      // Should have the imperative validation rule with extracted field/rules
+      // Note: method path is extracted from regex match, which captures .validateJWT, stripped to validateJWT
       const imperativeRule = result.result.specs.request.validation.find(
-        (r) => r.field === 'TODO_AI_ENRICH'
+        (r) => r.rules === 'validateJWT'
       );
       expect(imperativeRule).toBeDefined();
+      expect(imperativeRule?.field).toBe('OrderDTO'); // Type from handler params
+      expect(imperativeRule?.type).toBe('Custom');
       expect(imperativeRule?._context).toBeDefined();
-      expect(imperativeRule?._context).toContain('validateJWT');
+      expect(imperativeRule?._context?.[0]).toContain('validateJWT');
     });
 
     it('detects ValidationService.process() calls', async () => {
@@ -2886,12 +2957,14 @@ describe('extractValidationRules', () => {
         include_context: true,
       });
 
-      // Should have the imperative validation rule with TODO_AI_ENRICH
+      // Should have the imperative validation rule with extracted field/rules
       const imperativeRule = result.result.specs.request.validation.find(
-        (r) => r.field === 'TODO_AI_ENRICH'
+        (r) => r.rules === 'validationService.process'
       );
       expect(imperativeRule).toBeDefined();
-      expect(imperativeRule?._context).toContain('validationService.process');
+      expect(imperativeRule?.field).toBe('OrderDTO'); // Type from handler params
+      expect(imperativeRule?.type).toBe('Custom');
+      expect(imperativeRule?._context?.[0]).toContain('validationService.process');
     });
 
     it('detects multiple custom validation methods', async () => {
@@ -2932,13 +3005,210 @@ describe('extractValidationRules', () => {
         include_context: true,
       });
 
-      // Should have multiple imperative validation rules
+      // Should have multiple imperative validation rules with extracted fields/rules
       const imperativeRules = result.result.specs.request.validation.filter(
-        (r) => r.field === 'TODO_AI_ENRICH'
+        (r) => r.type === 'Custom' && (r.rules === 'validateJWT' || r.rules === 'validateRequest')
       );
       expect(imperativeRules.length).toBeGreaterThanOrEqual(2);
+      // Verify extracted fields
+      const jwtRule = imperativeRules.find(r => r.rules === 'validateJWT');
+      expect(jwtRule?.field).toBe('jwt'); // Not in params, stays as param name
+      const requestRule = imperativeRules.find(r => r.rules === 'validateRequest');
+      expect(requestRule?.field).toBe('OrderDTO'); // Found in params, uses type
     });
   });
+
+    it('deduplicates overlapping patterns - TcbsValidator.validate produces ONE entry', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'PUT',
+          path: '/api/bookings/{productCode}/suggest',
+          controller: 'BookingController',
+          handler: 'suggest',
+          filePath: 'src/controllers/BookingController.java',
+          line: 100,
+        }],
+      });
+
+      // This content would match both:
+      // - Pattern 1: /TcbsValidator\.(validate|doValidate)\s*\(/g
+      // - Pattern 3: /\.\s*validate\s*\(/g
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/BookingController.java:suggest',
+          name: 'suggest',
+          kind: 'Method',
+          filePath: 'src/controllers/BookingController.java',
+          depth: 0,
+          startLine: 100,
+          endLine: 115,
+          content: 'public void suggest(SuggestionOrderResultDto prm) { TcbsValidator.validate(order); }',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"prm","type":"SuggestionOrderResultDto","annotations":[]}]',
+        }],
+        root: 'suggest',
+        summary: emptySummary(),
+      });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'PUT',
+        path: '/bookings/{productCode}/suggest',
+        include_context: true,
+      });
+
+      // Should have exactly ONE validation rule for TcbsValidator.validate
+      const validateRules = result.result.specs.request.validation.filter(
+        (r: any) => r.rules === 'TcbsValidator.validate'
+      );
+      expect(validateRules).toHaveLength(1);
+      expect(validateRules[0]?.field).toBe('order');
+      expect(validateRules[0]?.type).toBe('Custom');
+    });
+
+    it('different validation methods on same line create separate entries', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'process',
+          filePath: 'src/controllers/OrderController.java',
+          line: 50,
+        }],
+      });
+
+      // Two different validation calls on the same line - should create TWO entries
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:process',
+          name: 'process',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          startLine: 50,
+          endLine: 60,
+          content: 'public void process(OrderDTO order, UserDTO user) { TcbsValidator.validate(order); ValidationUtils.check(user); }',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
+        }],
+        root: 'process',
+        summary: emptySummary(),
+      });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        include_context: true,
+      });
+
+      // Should have TWO different validation rules
+      const tcbsRule = result.result.specs.request.validation.find(
+        (r: any) => r.rules === 'TcbsValidator.validate'
+      );
+      const utilsRule = result.result.specs.request.validation.find(
+        (r: any) => r.rules === 'ValidationUtils.check'
+      );
+
+      expect(tcbsRule).toBeDefined();
+      expect(utilsRule).toBeDefined();
+      expect(tcbsRule?.field).toBe('OrderDTO'); // Found in params, uses type
+      expect(utilsRule?.field).toBe('user'); // Not in params, stays as param name
+    });
+
+    it('uses "body" as field when validation param type matches request body type', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      // Content has typed argument: validateJWT(TcbsJWT jwt, SuggestionOrderResultDto prm)
+      // SuggestionOrderResultDto matches the @RequestBody type
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          startLine: 30,
+          endLine: 45,
+          content: 'public void createOrder(@RequestBody SuggestionOrderResultDto body) { validateJWT(TcbsJWT jwt, SuggestionOrderResultDto prm); }',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"body","type":"SuggestionOrderResultDto","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        include_context: true,
+      });
+
+      // Should use "body" as field since SuggestionOrderResultDto matches request body type
+      const imperativeRule = result.result.specs.request.validation.find(
+        (r) => r.rules === 'validateJWT'
+      );
+      expect(imperativeRule).toBeDefined();
+      expect(imperativeRule?.field).toBe('body');
+      expect(imperativeRule?.type).toBe('Custom');
+    });
+
+    it('uses type name as field when validation param type does NOT match request body', async () => {
+      vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+        endpoints: [{
+          method: 'POST',
+          path: '/api/orders',
+          controller: 'OrderController',
+          handler: 'createOrder',
+          filePath: 'src/controllers/OrderController.java',
+          line: 30,
+        }],
+      });
+
+      // Content: validateJWT(TcbsJWT jwt) - TcbsJWT does NOT match request body type
+      vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+        chain: [{
+          uid: 'Method:src/controllers/OrderController.java:createOrder',
+          name: 'createOrder',
+          kind: 'Method',
+          filePath: 'src/controllers/OrderController.java',
+          depth: 0,
+          startLine: 30,
+          endLine: 45,
+          content: 'public void createOrder(@RequestBody OrderDTO order) { validateJWT(TcbsJWT jwt); }',
+          metadata: emptyMetadata(),
+          callees: [],
+          parameters: '[{"name":"order","type":"OrderDTO","annotations":["@RequestBody"]}]',
+        }],
+        root: 'createOrder',
+        summary: emptySummary(),
+      });
+
+      const result = await documentEndpoint(mockRepo, {
+        method: 'POST',
+        path: '/orders',
+        include_context: true,
+      });
+
+      // Should use type name "TcbsJWT" since it doesn't match request body type
+      const imperativeRule = result.result.specs.request.validation.find(
+        (r) => r.rules === 'validateJWT'
+      );
+      expect(imperativeRule).toBeDefined();
+      expect(imperativeRule?.field).toBe('TcbsJWT');
+      expect(imperativeRule?.type).toBe('Custom');
+    });
 
   describe('inbound messaging array fallback', () => {
     it('handles LadybugDB array format for graph query results', async () => {

@@ -96,7 +96,7 @@ export interface ValidationRule {
   type: string;
   required: boolean;
   rules: string;
-  _context?: string;
+  _context?: string[];
 }
 
 export interface ResponseCode {
@@ -1496,10 +1496,10 @@ function extractValidationFromAnnotations(
     rules: formattedRules,
   };
 
-  // Add _context if includeContext is true
+  // Add _context if includeContext is true (as array for grouping)
   if (includeContext && filePath && startLine) {
     const annText = validationAnns.join(' ');
-    rule._context = `// ${filePath}:${startLine}\n${annText}`;
+    rule._context = [`// ${filePath}:${startLine}\n${annText}`];
   }
 
   return [rule];
@@ -1605,27 +1605,103 @@ function extractValidationRules(
     }
   }
 
-  // Part 3: Imperative validation detection (when includeContext)
-  if (includeContext) {
-    for (const node of chain) {
-      if (!node.content) continue;
-      for (const pattern of IMPERATIVE_VALIDATION_PATTERNS) {
-        pattern.lastIndex = 0;  // Reset regex state for reuse
-        let match;
-        while ((match = pattern.exec(node.content)) !== null) {
-          rules.push({
-            field: TODO_AI_ENRICH,
-            type: TODO_AI_ENRICH,
-            required: false,
-            rules: TODO_AI_ENRICH,
-            _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content.slice(match.index, match.index + 200)}...`,
-          });
+  // Part 3: Imperative validation detection
+  // Always run this - it's the primary validation source for Java codebases
+  // (which use imperative validation via method calls, not annotation-based validation)
+  const seenValidations = new Set<string>();  // Dedup by (filePath, line, match.index)
+
+  for (const node of chain) {
+    if (!node.content) continue;
+    for (const pattern of IMPERATIVE_VALIDATION_PATTERNS) {
+      pattern.lastIndex = 0;  // Reset regex state for reuse
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(node.content)) !== null) {
+        // WI-3: Extract meaningful field and rules from validation calls
+        const matchedText = match[0];
+
+        // Extract method name/path (e.g., "TcbsValidator.validate" or "process")
+        // Strip leading dot if present (from patterns like .validateJWT)
+        const methodMatch = matchedText.match(/([\w.]+)\s*\(/);
+        const rawPath = methodMatch?.[1] || TODO_AI_ENRICH;
+        const methodPath = rawPath.startsWith('.') ? rawPath.slice(1) : rawPath;
+
+        // Dedup by (file, line, method name) to prevent overlapping patterns from creating duplicates
+        const key = `${node.filePath}:${node.startLine}:${methodPath}`;
+        if (seenValidations.has(key)) continue;
+        seenValidations.add(key);
+
+        // Extract type from last parameter to determine what's being validated
+        const argsMatch = node.content.slice(match.index).match(/\(([^)]*)\)/);
+        let fieldName = TODO_AI_ENRICH;
+        let paramType: string | undefined;
+
+        if (argsMatch) {
+          const args = argsMatch[1].split(',').map(a => a.trim());
+          if (args.length > 0) {
+            const lastArg = args[args.length - 1];
+            // Handle both "Type name" and just "name" formats
+            const parts = lastArg.split(/\s+/);
+            if (parts.length >= 2) {
+              // "SuggestionOrderResultDto prm" → type=SuggestionOrderResultDto, name=prm
+              paramType = parts[0];
+              fieldName = parts[parts.length - 1];
+            } else {
+              // Just "prm" → no type info
+              fieldName = parts[0];
+            }
+          }
         }
+
+        // If we have a fieldName but no paramType, look it up in handler parameters
+        if (fieldName !== TODO_AI_ENRICH && !paramType) {
+          const param = params.find((p: { name: string; type: string }) => p.name === fieldName);
+          if (param) {
+            paramType = param.type;
+          }
+        }
+
+        // Map type to request body if it matches
+        if (paramType && requestBody?.typeName && paramType === requestBody.typeName) {
+          fieldName = 'body';  // Validates the whole request body
+        } else if (paramType) {
+          // Use the type name for other types (e.g., TcbsJWT → "TcbsJWT")
+          fieldName = paramType;
+        }
+        // else: keep fieldName as TODO_AI_ENRICH or the parameter name
+
+        // Build rule object conditionally
+        const rule: ValidationRule = {
+          field: fieldName,
+          type: 'Custom',
+          required: false,
+          rules: methodPath,
+        };
+        if (includeContext) {
+          rule._context = [`// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content.slice(match.index, match.index + 200)}...`];
+        }
+        rules.push(rule);
       }
     }
   }
 
-  return rules;
+  // WI-2: Group validations by (field, rules) - collect contexts as array
+  const grouped = new Map<string, ValidationRule>();
+  for (const rule of rules) {
+    const key = `${rule.field}|${rule.rules}`;
+    if (grouped.has(key)) {
+      const existing = grouped.get(key)!;
+      // Append context to array if present
+      if (rule._context) {
+        if (!existing._context) {
+          existing._context = [];
+        }
+        existing._context.push(...(Array.isArray(rule._context) ? rule._context : [rule._context]));
+      }
+    } else {
+      grouped.set(key, { ...rule });
+    }
+  }
+  return Array.from(grouped.values());
 }
 
 async function extractMessaging(
