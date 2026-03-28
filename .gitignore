@@ -33,8 +33,6 @@ coverage/
 
 # Misc
 *.local
-HANDOFF.md
-HANDOFF*.md
 
 .vercel
 
@@ -59,14 +57,6 @@ assets/
 # Generated files (should not be indexed)
 repomix-output*
 
-# Playwright artifacts
-gitnexus-web/playwright-report/
-gitnexus-web/test-results/
-
-# Python test artifacts
-eval/.coverage
-eval/.hypothesis/
-
 # Design docs (local only)
 docs/plans/
 
@@ -81,16 +71,11 @@ GitNexus.sln
 # Git worktrees
 .worktrees/
 
-/github/scripts/triage/__pycache__/
+# Claude Code hooks and workflows (copied from truth-teller)
+.claude/hooks/
+.claude/workflows/
 
-.claude-flow/
-
+# Claude Code agents and skills (copied from truth-teller)
 .claude/agents/
-.claude/commands/
-.claude/helpers
 .claude/skills/
 !.claude/skills/gitnexus/
-
-.history/
-
-.swarm/
