@@ -230,16 +230,25 @@ export const streamAllCSVsToDisk = async (
   const folderWriter = new BufferedCSVWriter(path.join(csvDir, 'folder.csv'), 'id,name,filePath');
   const codeElementHeader = 'id,name,filePath,startLine,endLine,isExported,content,description';
   const functionWriter = new BufferedCSVWriter(path.join(csvDir, 'function.csv'), codeElementHeader);
-  const classHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,fields,annotations';
-  const classWriter = new BufferedCSVWriter(path.join(csvDir, 'class.csv'), classHeader);
+  const classWriter = new BufferedCSVWriter(path.join(csvDir, 'class.csv'), codeElementHeader);
   const interfaceWriter = new BufferedCSVWriter(path.join(csvDir, 'interface.csv'), codeElementHeader);
-  const methodHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType,parameters,annotations';
+  const methodHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType';
   const methodWriter = new BufferedCSVWriter(path.join(csvDir, 'method.csv'), methodHeader);
   const codeElemWriter = new BufferedCSVWriter(path.join(csvDir, 'codeelement.csv'), codeElementHeader);
   const communityWriter = new BufferedCSVWriter(path.join(csvDir, 'community.csv'), 'id,label,heuristicLabel,keywords,description,enrichedBy,cohesion,symbolCount');
   const processWriter = new BufferedCSVWriter(path.join(csvDir, 'process.csv'), 'id,label,heuristicLabel,processType,stepCount,communities,entryPointId,terminalId');
-  const routeHeader = 'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited';
-  const routeWriter = new BufferedCSVWriter(path.join(csvDir, 'route.csv'), routeHeader);
+
+  // Section nodes have an extra 'level' column
+  const sectionWriter = new BufferedCSVWriter(path.join(csvDir, 'section.csv'), 'id,name,filePath,startLine,endLine,level,content,description');
+
+  // Route nodes for API endpoint mapping
+  const routeWriter = new BufferedCSVWriter(
+    path.join(csvDir, 'route.csv'),
+    'id,name,filePath,httpMethod,handler,controller,framework,prefix,lineNumber,responseKeys,errorKeys,middleware',
+  );
+
+  // Tool nodes for MCP tool definitions
+  const toolWriter = new BufferedCSVWriter(path.join(csvDir, 'tool.csv'), 'id,name,filePath,description');
 
   // Multi-language node types share the same CSV shape (no isExported column)
   const multiLangHeader = 'id,name,filePath,startLine,endLine,content,description';
@@ -252,6 +261,7 @@ export const streamAllCSVsToDisk = async (
 
   const codeWriterMap: Record<string, BufferedCSVWriter> = {
     'Function': functionWriter,
+    'Class': classWriter,
     'Interface': interfaceWriter,
     'CodeElement': codeElemWriter,
   };
@@ -323,45 +333,64 @@ export const streamAllCSVsToDisk = async (
           escapeCSVField((node.properties as any).description || ''),
           escapeCSVNumber(node.properties.parameterCount, 0),
           escapeCSVField(node.properties.returnType || ''),
-          escapeCSVField((node.properties as any).parameters || ''),
-          escapeCSVField((node.properties as any).annotations || ''),
-          escapeCSVField((node.properties as any).parameterAnnotations || ''),
         ].join(','));
         break;
       }
-      case 'Class': {
+      case 'Section': {
         const content = await extractContent(node, contentCache);
-        await classWriter.addRow([
+        await sectionWriter.addRow([
           escapeCSVField(node.id),
           escapeCSVField(node.properties.name || ''),
           escapeCSVField(node.properties.filePath || ''),
           escapeCSVNumber(node.properties.startLine, -1),
           escapeCSVNumber(node.properties.endLine, -1),
-          node.properties.isExported ? 'true' : 'false',
+          escapeCSVNumber((node.properties as any).level, 1),
           escapeCSVField(content),
           escapeCSVField((node.properties as any).description || ''),
-          escapeCSVField((node.properties as any).fields || ''),
-          escapeCSVField((node.properties as any).annotations || ''),
         ].join(','));
         break;
       }
       case 'Route': {
+        const responseKeys = (node.properties as any).responseKeys || [];
+        // LadybugDB array literal inside a quoted CSV field: escapeCSVField wraps in "..."
+        // and the array uses single-quoted elements
+        const keysStr = `[${responseKeys.map((k: string) => `'${k.replace(/'/g, "''")}'`).join(',')}]`;
+        const errorKeys = (node.properties as any).errorKeys || [];
+        const errorKeysStr = `[${errorKeys.map((k: string) => `'${k.replace(/'/g, "''")}'`).join(',')}]`;
+        const middleware = (node.properties as any).middleware || [];
+        const middlewareStr = `[${middleware.map((m: string) => `'${m.replace(/'/g, "''")}'`).join(',')}]`;
+        const httpMethod = (node.properties as any).httpMethod || '';
+        const handler = (node.properties as any).handler || '';
+        const controller = (node.properties as any).controller || '';
+        const framework = (node.properties as any).framework || '';
+        const prefix = (node.properties as any).prefix || '';
+        const lineNumber = (node.properties as any).lineNumber ?? -1;
         await routeWriter.addRow([
           escapeCSVField(node.id),
           escapeCSVField(node.properties.name || ''),
-          escapeCSVField((node.properties as any).httpMethod || ''),
-          escapeCSVField((node.properties as any).routePath || ''),
-          escapeCSVField((node.properties as any).controllerName || ''),
-          escapeCSVField((node.properties as any).methodName || ''),
           escapeCSVField(node.properties.filePath || ''),
-          escapeCSVNumber(node.properties.startLine, -1),
-          escapeCSVNumber((node.properties as any).lineNumber, -1),
-          (node.properties as any).isInherited ? 'true' : 'false',
+          escapeCSVField(httpMethod),
+          escapeCSVField(handler),
+          escapeCSVField(controller),
+          escapeCSVField(framework),
+          escapeCSVField(prefix),
+          escapeCSVNumber(lineNumber, -1),
+          escapeCSVField(keysStr),
+          escapeCSVField(errorKeysStr),
+          escapeCSVField(middlewareStr),
         ].join(','));
         break;
       }
+      case 'Tool':
+        await toolWriter.addRow([
+          escapeCSVField(node.id),
+          escapeCSVField(node.properties.name || ''),
+          escapeCSVField(node.properties.filePath || ''),
+          escapeCSVField((node.properties as any).description || ''),
+        ].join(','));
+        break;
       default: {
-        // Code element nodes (Function, Interface, CodeElement)
+        // Code element nodes (Function, Class, Interface, CodeElement)
         const writer = codeWriterMap[node.label];
         if (writer) {
           const content = await extractContent(node, contentCache);
@@ -397,7 +426,7 @@ export const streamAllCSVsToDisk = async (
   }
 
   // Finish all node writers
-  const allWriters = [fileWriter, folderWriter, functionWriter, classWriter, interfaceWriter, methodWriter, codeElemWriter, communityWriter, processWriter, routeWriter, ...multiLangWriters.values()];
+  const allWriters = [fileWriter, folderWriter, functionWriter, classWriter, interfaceWriter, methodWriter, codeElemWriter, communityWriter, processWriter, sectionWriter, routeWriter, toolWriter, ...multiLangWriters.values()];
   await Promise.all(allWriters.map(w => w.finish()));
 
   // --- Stream relationship CSV ---
@@ -423,7 +452,9 @@ export const streamAllCSVsToDisk = async (
     ['Interface', interfaceWriter], ['Method', methodWriter],
     ['CodeElement', codeElemWriter],
     ['Community', communityWriter], ['Process', processWriter],
-    ['Route', routeWriter],
+    ['Section' as NodeTableName, sectionWriter],
+    ['Route' as NodeTableName, routeWriter],
+    ['Tool' as NodeTableName, toolWriter],
     ...Array.from(multiLangWriters.entries()).map(([name, w]) => [name as NodeTableName, w] as [NodeTableName, BufferedCSVWriter]),
   ];
   for (const [name, writer] of tableMap) {
