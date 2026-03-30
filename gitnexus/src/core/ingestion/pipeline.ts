@@ -33,6 +33,7 @@ import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { extractSpringRoutes } from './route-extractors/spring.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -693,6 +694,30 @@ async function runChunkedParseAndResolve(
         workerPool,
       );
 
+      // --- SPRING BOOT ROUTE EXTRACTION ---
+      for (const file of chunkFiles) {
+        if (file.path.endsWith('.java')) {
+          const springRoutesPromise = extractSpringRoutes(file.content);
+          const springRoutes = await springRoutesPromise;
+          if (springRoutes.length > 0) {
+            console.log('[Spring Extractor] springRoutes:', JSON.stringify(springRoutes, null, 2));
+            allExtractedRoutes.push(...springRoutes.map(r => {
+              return {
+                framework: r.framework || 'spring',
+                httpMethod: r.method, // mapping đúng trường
+                routePath: r.path,
+                controllerName: r.controller, // mapping đúng trường
+                methodName: r.handler, // mapping đúng trường
+                filePath: file.path,
+                middleware: [],
+                prefix: '',
+                lineNumber: r.lineNumber ?? 0, // mapping đúng trường
+              };
+            }));
+          }
+        }
+      }
+
       const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
 
       if (chunkWorkerData) {
@@ -910,7 +935,7 @@ async function runGraphAnalysisPhases(
   communityResult: Awaited<ReturnType<typeof processCommunities>>;
   processResult: Awaited<ReturnType<typeof processProcesses>>;
 }> {
-  // ── Phase 4.5: Method Resolution Order ──────────────────────────────
+  // ── Phase 4.5: Method Resolution Order ────────────���─────────────────
   onProgress({
     phase: 'parsing',
     percent: 81,
@@ -1032,13 +1057,21 @@ async function runGraphAnalysisPhases(
 
   // Link Route and Tool nodes to Processes via reverse index (file → node id)
   if ((routeRegistry?.size ?? 0) > 0 || (toolDefs?.length ?? 0) > 0) {
+    const parseRouteRegistryKey = (routeKey: string): { routeURL: string } => {
+      const parts = routeKey.split(' ');
+      if (parts.length >= 2) return { routeURL: parts.slice(1).join(' ') };
+      return { routeURL: routeKey };
+    };
+
     // Reverse indexes: file → all route URLs / tool names (handles multi-route files)
     const routesByFile = new Map<string, string[]>();
     if (routeRegistry) {
-      for (const [url, entry] of routeRegistry) {
+      for (const [routeKey, entry] of routeRegistry) {
+        const { routeURL } = parseRouteRegistryKey(routeKey);
         let list = routesByFile.get(entry.filePath);
         if (!list) { list = []; routesByFile.set(entry.filePath, list); }
-        list.push(url);
+        // Route nodes are keyed by URL only, so avoid duplicating the same URL.
+        if (!list.includes(routeURL)) list.push(routeURL);
       }
     }
     const toolsByFile = new Map<string, string[]>();
@@ -1104,6 +1137,22 @@ export const runPipelineFromRepo = async (
   onProgress: (progress: PipelineProgress) => void,
   options?: PipelineOptions,
 ): Promise<PipelineResult> => {
+  // Normalize route registry keys into a consistent { httpMethod, routeURL } shape.
+  // routeRegistry keys are currently mixed:
+  // - URL-only: "/api/grants" (filesystem/nextjs/php/expo routes)
+  // - METHOD + URL: "GET /api/grants" (decorator/extracted routes)
+  // Several downstream phases assume URL-only keys; parsing them makes keys consistent.
+  const parseRouteRegistryKey = (routeKey: string): { httpMethod: string; routeURL: string } => {
+    const parts = routeKey.split(' ');
+    if (parts.length >= 2) {
+      return {
+        httpMethod: (parts[0] || 'ANY').toUpperCase(),
+        routeURL: parts.slice(1).join(' '),
+      };
+    }
+    return { httpMethod: 'ANY', routeURL: routeKey };
+  };
+
   const graph = createKnowledgeGraph();
   const ctx = createResolutionContext();
   const pipelineStart = Date.now();
@@ -1118,7 +1167,21 @@ export const runPipelineFromRepo = async (
     );
 
     // ── Phase 3.5: Route Registry (Next.js + PHP + Laravel + decorators) ──
-    type RouteEntry = { filePath: string; source: string };
+    // Mở rộng RouteEntry để chấp nhận các trường mở rộng
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    type RouteEntry = {
+      filePath: string;
+      source: string;
+      httpMethod?: string;
+      methodName?: string;
+      handler?: string;
+      controllerName?: string;
+      controller?: string;
+      lineNumber?: number;
+      prefix?: string;
+      framework?: string;
+    };
+
     const routeRegistry = new Map<string, RouteEntry>();
 
     // Detect Expo Router app/ roots vs Next.js app/ roots (monorepo-safe).
@@ -1165,16 +1228,25 @@ export const runPipelineFromRepo = async (
 
     const ensureSlash = (path: string) => path.startsWith('/') ? path : '/' + path;
     let duplicateRoutes = 0;
-    const addRoute = (url: string, entry: RouteEntry) => {
-      if (routeRegistry.has(url)) { duplicateRoutes++; return; }
-      routeRegistry.set(url, entry);
+    // Use method+path as key to avoid overwriting routes with same path but different method
+    // Sửa addRoute để lưu toàn bộ thông tin route
+    const addRoute = (method: string, url: string, entry: any) => {
+      const key = `${method.toUpperCase()} ${url}`;
+      const existing = routeRegistry.get(key);
+      // Nếu entry mới có httpMethod hoặc handler hoặc controller, thì ghi đè entry cũ
+      if (
+        !existing ||
+        entry.httpMethod || entry.methodName || entry.handler || entry.controllerName || entry.controller
+      ) {
+        routeRegistry.set(key, entry);
+      }
     };
     for (const route of allExtractedRoutes) {
       if (!route.routePath) continue;
-      addRoute(ensureSlash(route.routePath), { filePath: route.filePath, source: 'framework-route' });
+      addRoute(route.httpMethod || 'ANY', ensureSlash(route.routePath), route);
     }
     for (const dr of allDecoratorRoutes) {
-      addRoute(ensureSlash(dr.routePath), { filePath: dr.filePath, source: `decorator-${dr.decoratorName}` });
+      addRoute(dr.httpMethod || 'ANY', ensureSlash(dr.routePath), dr);
     }
 
     let handlerContents: Map<string, string> | undefined;
@@ -1182,8 +1254,10 @@ export const runPipelineFromRepo = async (
       const handlerPaths = [...routeRegistry.values()].map(e => e.filePath);
       handlerContents = await readFileContents(repoPath, handlerPaths);
 
-      for (const [routeURL, entry] of routeRegistry) {
-        const { filePath: handlerPath, source: routeSource } = entry;
+      for (const [routeKey, entry] of routeRegistry) {
+        const { httpMethod, routeURL } = parseRouteRegistryKey(routeKey);
+        const handlerPath = entry.filePath;
+        const routeSource = entry.source;
         const content = handlerContents.get(handlerPath);
 
         const { responseKeys, errorKeys } = content
@@ -1200,6 +1274,12 @@ export const runPipelineFromRepo = async (
           properties: {
             name: routeURL,
             filePath: handlerPath,
+            httpMethod: entry.httpMethod ?? httpMethod,
+            handler: entry.methodName ?? entry.handler ?? undefined,
+            controller: entry.controllerName ?? entry.controller ?? undefined,
+            lineNumber: entry.lineNumber ?? undefined,
+            prefix: entry.prefix ?? undefined,
+            framework: entry.framework ?? undefined,
             ...(responseKeys ? { responseKeys } : {}),
             ...(errorKeys ? { errorKeys } : {}),
             ...(middleware && middleware.length > 0 ? { middleware } : {}),
@@ -1219,6 +1299,7 @@ export const runPipelineFromRepo = async (
 
       if (isDev) {
         console.log(`🗺️ Route registry: ${routeRegistry.size} routes${duplicateRoutes > 0 ? ` (${duplicateRoutes} duplicate URLs skipped)` : ''}`);
+        console.log('🛠️ Detailed route registry contents:', JSON.stringify([...routeRegistry.entries()], null, 2));
       }
     }
 
@@ -1242,7 +1323,8 @@ export const runPipelineFromRepo = async (
           const compiled = config.matchers.map(compileMatcher).filter((m): m is NonNullable<typeof m> => m !== null);
 
           let linkedCount = 0;
-          for (const [routeURL] of routeRegistry) {
+          for (const [routeKey] of routeRegistry) {
+            const { routeURL } = parseRouteRegistryKey(routeKey);
             const matches = compiled.length === 0 ||
               compiled.some(cm => compiledMatcherMatchesRoute(cm, routeURL));
             if (!matches) continue;
@@ -1309,7 +1391,10 @@ export const runPipelineFromRepo = async (
 
     if (routeRegistry.size > 0 && allFetchCalls.length > 0) {
       const routeURLToFile = new Map<string, string>();
-      for (const [url, entry] of routeRegistry) routeURLToFile.set(url, entry.filePath);
+      for (const [routeKey, entry] of routeRegistry) {
+        const { routeURL } = parseRouteRegistryKey(routeKey);
+        routeURLToFile.set(routeURL, entry.filePath);
+      }
 
       // Read consumer file contents so we can extract property access patterns
       const consumerPaths = [...new Set(allFetchCalls.map(c => c.filePath))];

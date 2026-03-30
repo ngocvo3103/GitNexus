@@ -1388,6 +1388,27 @@ export const processRoutesFromExtracted = async (
       await yieldToEventLoop();
     }
 
+    // Tạo node Route với đầy đủ thông tin
+    console.log('[CallProcessor] Creating Route node:', JSON.stringify(route, null, 2));
+    const routeNodeId = generateId('Route', `${route.routePath}:${route.httpMethod}:${route.filePath}`);
+    graph.addNode({
+      id: routeNodeId,
+      label: 'Route',
+      properties: {
+        name: route.routePath,
+        filePath: route.filePath,
+        httpMethod: route.httpMethod,
+        handler: route.methodName,
+        controller: route.controllerName,
+        lineNumber: route.lineNumber ?? null,
+        responseKeys: route.responseKeys ?? [],
+        errorKeys: route.errorKeys ?? [],
+        middleware: route.middleware ?? [],
+        framework: route.framework ?? '',
+        prefix: route.prefix ?? '',
+      },
+    });
+
     if (!route.controllerName || !route.methodName) continue;
 
     const controllerResolved = ctx.resolve(route.controllerName, route.filePath);
