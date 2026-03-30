@@ -376,9 +376,46 @@ async function findHandlerByPathPattern(
   candidates.sort((a, b) => b.score - a.score);
   const best = candidates[0];
 
+  // Extract class-level @RequestMapping prefix from file content
+  // to combine with method-level path
+  let fullPath = best.annotationPath || pathPattern;
+
+  if (best.filePath && best.annotationPath) {
+    // Query for class-level RequestMapping prefix
+    try {
+      const classCypher = `
+        MATCH (c:Class)
+        WHERE c.filePath = $filePath
+        RETURN c.content AS classContent
+        LIMIT 1
+      `;
+      const classRows = await executeParameterized(repo.id, classCypher, { filePath: best.filePath });
+
+      if (classRows && classRows.length > 0) {
+        const classContent = classRows[0].classContent ?? classRows[0][0] ?? '';
+
+        // Extract class-level @RequestMapping path (must be before 'class' or 'interface' keyword)
+        // Match pattern: @RequestMapping("/path") before class declaration
+        const classPathMatch = classContent.match(/@RequestMapping\s*\(\s*["']([^"']+)["']\s*\)\s*(?:\n\s*)*(?:@\w+\s*(?:\([^)]*\)\s*)?\s*)*(?:public\s+)?(?:class|interface)/i)
+          || classContent.match(/@RequestMapping\s*\(\s*[^)]*value\s*=\s*["']([^"']+)["'][^)]*\)\s*(?:\n\s*)*(?:@\w+\s*(?:\([^)]*\)\s*)?\s*)*(?:public\s+)?(?:class|interface)/i);
+
+        if (classPathMatch?.[1]) {
+          const classPath = classPathMatch[1];
+          // Combine class prefix with method path
+          // Normalize paths: ensure class path ends without slash, method path starts with slash
+          const normalizedClassPath = classPath.replace(/\/$/, '');
+          const normalizedMethodPath = best.annotationPath.startsWith('/') ? best.annotationPath : '/' + best.annotationPath;
+          fullPath = normalizedClassPath + normalizedMethodPath;
+        }
+      }
+    } catch {
+      // If class query fails, use method path as-is
+    }
+  }
+
   return {
     method: method.toUpperCase(),
-    path: best.annotationPath || pathPattern,
+    path: fullPath,
     handler: best.handler,
     filePath: best.filePath,
     line: best.line,
@@ -1869,29 +1906,35 @@ async function extractMessaging(
   // This must run even in compact mode (includeContext=false) to detect inbound events
   // that aren't in the call chain (e.g., @RabbitListener/@KafkaListener methods)
   if (executeQuery && repoId) {
+    // Query using content since annotations may not be stored
+    // RabbitListener pattern: @RabbitListener(queues = { "topic" })
+    // KafkaListener pattern: @KafkaListener(topics = { "topic" })
     const cypher = `
       MATCH (m:Method)
-      WHERE m.annotations CONTAINS '@RabbitListener'
-         OR m.annotations CONTAINS '@KafkaListener'
-      RETURN m.name, m.annotations, m.filePath, m.parameterAnnotations
+      WHERE m.content CONTAINS '@RabbitListener'
+         OR m.content CONTAINS '@KafkaListener'
+      RETURN m.id, m.name, m.content, m.filePath, m.parameterAnnotations
     `;
     try {
       const results = await executeQuery(repoId, cypher, {});
       for (const row of results) {
-        // Extract values with array fallback for LadybugDB result format
-        // LadybugDB returns [name, annotations, filePath, parameterAnnotations] not {name, annotations, ...}
-        // Extract values - Cypher returns columns like m.name, m.filePath, etc.
-        // LadybugDB may return these as row['m.name'] or row[0] depending on format
-        const name = row['m.name'] ?? row.name ?? row[0];
-        const annotations = row['m.annotations'] ?? row.annotations ?? row[1] ?? '';
-        const filePath = row['m.filePath'] ?? row.filePath ?? row[2] ?? '';
-        const parameterAnnotations = row['m.parameterAnnotations'] ?? row.parameterAnnotations ?? row[3];
+        // Extract values - Cypher returns columns like m.id, m.name, m.content, etc.
+        const name = row['m.name'] ?? row.name ?? row[1];
+        const content = row['m.content'] ?? row.content ?? row[2] ?? '';
+        const filePath = row['m.filePath'] ?? row.filePath ?? row[3] ?? '';
+        const parameterAnnotations = row['m.parameterAnnotations'] ?? row.parameterAnnotations ?? row[4];
 
-        // Extract topic using helper
-        const listenerType = annotations.includes('@RabbitListener') ? 'RabbitListener' as const
-          : annotations.includes('@KafkaListener') ? 'KafkaListener' as const
+        // Determine listener type from content
+        const listenerType = content.includes('@RabbitListener') ? 'RabbitListener' as const
+          : content.includes('@KafkaListener') ? 'KafkaListener' as const
           : null;
-        const topic = listenerType ? extractListenerTopic(annotations, listenerType) : TODO_AI_ENRICH;
+
+        if (!listenerType) continue;
+
+        // Extract topic from content
+        // RabbitListener: @RabbitListener(queues = { "topic" }) or queues = "topic"
+        // KafkaListener: @KafkaListener(topics = { "topic" }) or topics = "topic"
+        const topic = extractListenerTopicFromContent(content, listenerType);
         const payloadTypeName = extractPayloadFromParameters(parameterAnnotations);
         const consumptionLogic = buildConsumptionLogic(filePath, name);
 
@@ -1910,7 +1953,7 @@ async function extractMessaging(
           payload,
           consumptionLogic,
           ...(includeContext && {
-            _context: `// Graph query result\\n// ${filePath}\\n@RabbitListener/KafkaListener detected`,
+            _context: `// Graph query result\\n// ${filePath}\\n@${listenerType} detected`,
           }),
         });
       }
@@ -1997,7 +2040,44 @@ function extractListenerTopic(annotations: string, listenerType: 'RabbitListener
   if (match1) return match1[1];
   const match2 = annotations.match(new RegExp(`${attr}\\\\s*=\\\\s*\\{([^}]+)\\}`));
   if (match2) return match2[1].trim();
-  
+
+  return TODO_AI_ENRICH;
+}
+
+/**
+ * Extract topic from method content containing @RabbitListener or @KafkaListener.
+ * Handles formats like:
+ * - @RabbitListener(queues = { "topic1", "topic2" })
+ * - @RabbitListener(queues = "topic")
+ * - @KafkaListener(topics = { "topic1", "topic2" })
+ * - @KafkaListener(topics = "${kafka.topic}")
+ */
+function extractListenerTopicFromContent(content: string, listenerType: 'RabbitListener' | 'KafkaListener'): string {
+  const attr = listenerType === 'RabbitListener' ? 'queues' : 'topics';
+
+  // Pattern: @RabbitListener(queues = { "topic" }) or @KafkaListener(topics = { "topic" })
+  // Also handles: queues = "topic", topics = "${property}"
+  const arrayPattern = new RegExp(`@${listenerType}[^)]*${attr}\\s*=\\s*\\{\\s*"([^"]+)"`);
+  const stringPattern = new RegExp(`@${listenerType}[^)]*${attr}\\s*=\\s*"([^"]+)"`);
+  const placeholderPattern = new RegExp(`@${listenerType}[^)]*${attr}\\s*=\\s*\\{\\s*\\$\\{([^}]+)\\}\\s*\\}`);
+  const placeholderStringPattern = new RegExp(`@${listenerType}[^)]*${attr}\\s*=\\s*"\\$\\{([^}]+)\\}"`);
+
+  // Try array format first: { "topic" }
+  const arrayMatch = content.match(arrayPattern);
+  if (arrayMatch) return arrayMatch[1];
+
+  // Try string format: "topic"
+  const stringMatch = content.match(stringPattern);
+  if (stringMatch) return stringMatch[1];
+
+  // Try placeholder in array: { "${property}" }
+  const placeholderMatch = content.match(placeholderPattern);
+  if (placeholderMatch) return `\${${placeholderMatch[1]}}`;
+
+  // Try placeholder in string: "${property}"
+  const placeholderStringMatch = content.match(placeholderStringPattern);
+  if (placeholderStringMatch) return `\${${placeholderStringMatch[1]}}`;
+
   return TODO_AI_ENRICH;
 }
 
