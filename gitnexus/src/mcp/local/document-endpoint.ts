@@ -825,7 +825,12 @@ async function extractDownstreamApis(
       // Resolve service variable if present
       let serviceValue: string | null = null;
       let propertyKey: string | null = null;
+      let resolvedFieldName: string | null = null;
+      let resolvedValue: string | null = null;
 
+      // ============================================
+      // Pass 1: Current resolution (@Value + static final in same class)
+      // ============================================
       if (parsed.serviceName && className) {
         // Try to resolve @Value annotation for the service field
         const resolved = await resolveValueAnnotation(executeQuery, repoId, className, parsed.serviceName + 'Service');
@@ -835,13 +840,63 @@ async function extractDownstreamApis(
         }
       }
 
+      // ============================================
+      // Pass 2: Variable assignment trace (heuristics + cross-class)
+      // ============================================
+      if (!propertyKey && className && parsed.variableRefs.length > 0) {
+        // Try each variable reference with heuristic patterns
+        for (const varRef of parsed.variableRefs) {
+          const traced = await traceVariableAssignment(executeQuery, repoId, className, varRef);
+          if (traced.propertyKey) {
+            propertyKey = traced.propertyKey;
+            serviceValue = traced.rawValue;
+            resolvedFieldName = traced.fieldName;
+            break;
+          }
+        }
+      }
+
+      // ============================================
+      // Pass 1b: Resolve actual property value from config files
+      // ============================================
+      if (propertyKey) {
+        const propValue = await resolvePropertyValue(executeQuery, repoId, propertyKey);
+        if (propValue.value) {
+          resolvedValue = propValue.value;
+        } else {
+          // Try to parse default value from ${key:default} syntax
+          if (serviceValue) {
+            const parsedPlaceholder = parsePropertyPlaceholder(serviceValue);
+            if (parsedPlaceholder.defaultValue) {
+              resolvedValue = parsedPlaceholder.defaultValue;
+            }
+          }
+        }
+      }
+
       // Resolve URI constants
-      const pathConstants: { name: string; value: string }[] = [];
+      const pathConstants: { name: string; value: string; declaringClass?: string }[] = [];
+      
+      // Pass 1: Same-class static final resolution (existing)
       for (const varRef of parsed.variableRefs) {
         if (className) {
           const value = await resolveStaticFieldValue(executeQuery, repoId, className, varRef);
           if (value) {
             pathConstants.push({ name: varRef, value });
+          }
+        }
+      }
+
+      // Pass 2: Cross-class static final resolution for unresolved constants
+      for (const varRef of parsed.variableRefs) {
+        if (!pathConstants.find(pc => pc.name === varRef) && className) {
+          const resolved = await resolveStaticFieldValueCrossClass(executeQuery, repoId, className, varRef);
+          if (resolved.value) {
+            pathConstants.push({ 
+              name: varRef, 
+              value: resolved.value, 
+              declaringClass: resolved.declaringClass ?? undefined 
+            });
           }
         }
       }
@@ -871,17 +926,33 @@ async function extractDownstreamApis(
         endpoint = `${detail.httpMethod} ${detail.urlExpression}`;
       }
 
+      // ============================================
+      // Pass 3: Context enrichment for unresolved cases
+      // ============================================
+      let resolutionDetails: any = undefined;
+      if (propertyKey || pathConstants.length > 0) {
+        resolutionDetails = {
+          serviceField: resolvedFieldName || (parsed.serviceName ? parsed.serviceName + 'Service' : undefined),
+          serviceValue: serviceValue || undefined,
+          resolvedValue: resolvedValue || undefined,
+          pathConstants: pathConstants.length > 0 ? pathConstants.map(pc => ({ name: pc.name, value: pc.value })) : undefined,
+        };
+      } else if (serviceName === 'unknown-service' && includeContext) {
+        // Enhanced context for manual/AI review
+        resolutionDetails = {
+          attemptedPatterns: parsed.variableRefs,
+          enclosingClass: className,
+          filePath: node.filePath,
+        };
+      }
+
       apis.push({
         serviceName,
         endpoint,
         condition: TODO_AI_ENRICH,
         purpose: TODO_AI_ENRICH,
         resolvedUrl: resolvedUrl !== detail.urlExpression ? resolvedUrl : undefined,
-        resolutionDetails: (propertyKey || pathConstants.length > 0) ? {
-          serviceField: parsed.serviceName ? parsed.serviceName + 'Service' : undefined,
-          serviceValue: serviceValue || undefined,
-          pathConstants: pathConstants.length > 0 ? pathConstants : undefined,
-        } : undefined,
+        resolutionDetails,
         ...(includeContext && {
           _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content?.slice(0, 200)}...`,
         }),
@@ -999,6 +1070,64 @@ async function resolveStaticFieldValue(
 }
 
 /**
+ * Resolves static final field values, searching across all classes if not found in the enclosing class.
+ * This handles cases like PROFILE_URL constants defined in a separate Constants class.
+ * 
+ * @param executeQuery - Graph query executor
+ * @param repoId - Repository ID
+ * @param enclosingClassName - Class name where the reference was found
+ * @param fieldName - Field name to resolve (e.g., "PROFILE_URL")
+ * @returns Field value and declaring class name if found
+ */
+async function resolveStaticFieldValueCrossClass(
+  executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
+  repoId: string,
+  enclosingClassName: string,
+  fieldName: string
+): Promise<{ value: string | null; declaringClass: string | null }> {
+  // 1. Try same class first (existing behavior)
+  const sameClassValue = await resolveStaticFieldValue(executeQuery, repoId, enclosingClassName, fieldName);
+  if (sameClassValue) {
+    return { value: sameClassValue, declaringClass: enclosingClassName };
+  }
+
+  // 2. Query for static final field with matching name across ALL classes
+  const crossClassQuery = `
+    MATCH (c:Class)-[:HAS_FIELD]->(f:Field)
+    WHERE f.name = $fieldName
+      AND 'static' IN f.modifiers
+      AND 'final' IN f.modifiers
+      AND f.value IS NOT NULL
+    RETURN c.name AS className, f.value AS value
+    LIMIT 5
+  `;
+
+  try {
+    const rows = await executeQuery(repoId, crossClassQuery, { fieldName });
+    if (rows.length === 0) {
+      return { value: null, declaringClass: null };
+    }
+
+    // Prefer fields with URL-like values
+    const urlField = rows.find((r: any) => 
+      r.value?.startsWith('http') || 
+      r.value?.includes('/api/') ||
+      r.value?.includes('/v1/') ||
+      r.value?.includes('/v2/')
+    );
+    
+    if (urlField) {
+      return { value: urlField.value, declaringClass: urlField.className };
+    }
+
+    // Fall back to first match
+    return { value: rows[0].value, declaringClass: rows[0].className };
+  } catch {
+    return { value: null, declaringClass: null };
+  }
+}
+
+/**
  * Resolve @Value annotation attribute from a field.
  * Returns the property key like "service.url" from @Value("${service.url}").
  */
@@ -1049,6 +1178,153 @@ async function resolveValueAnnotation(
   } catch {
     return { propertyKey: null, rawValue: null };
   }
+}
+
+/**
+ * Resolves the actual value of a property from Property nodes (application.properties/yml).
+ * Queries the graph for Property nodes with matching key and returns the actual value.
+ * 
+ * @param executeQuery - Graph query executor
+ * @param repoId - Repository ID
+ * @param propertyKey - Property key to look up (e.g., "tcbs.bond.product.url")
+ * @returns The actual property value from config files, or null if not found
+ */
+/**
+ * Resolves the actual value of a property from Property nodes (application.properties/yml).
+ * Queries the graph for Property nodes with matching key and returns the actual value.
+ * 
+ * Note: Property nodes store entire config file sections in content, so we need to parse
+ * the content to extract individual property values.
+ * 
+ * @param executeQuery - Graph query executor
+ * @param repoId - Repository ID
+ * @param propertyKey - Property key to look up (e.g., "tcbs.bond.product.url")
+ * @returns The actual property value from config files, or null if not found
+ */
+async function resolvePropertyValue(
+  executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
+  repoId: string,
+  propertyKey: string
+): Promise<{ value: string | null; filePath: string | null }> {
+  // Query for Property nodes with matching key
+  // Note: Property nodes don't have repoId - they use filePath for identification
+  // Only query default profile (description IS NULL or empty) to avoid profile-specific values
+  const query = `
+    MATCH (p:Property)
+    WHERE p.name = $propertyKey 
+      AND (p.description IS NULL OR p.description = '')
+    RETURN p.content AS content, p.filePath AS filePath
+    LIMIT 5
+  `;
+
+  try {
+    const rows = await executeQuery(repoId, query, {
+      propertyKey,
+    });
+
+    if (rows.length === 0) {
+      return { value: null, filePath: null };
+    }
+
+    // Property node content may contain entire config sections or just the value
+    // Parse line by line to extract the specific property value
+    for (const row of rows) {
+      const content = row.content || '';
+      
+      // Check if content is just a single-line value (no newlines, starts with http or other URL patterns)
+      if (!content.includes('\n') && (content.startsWith('http') || content.startsWith('/') || !content.includes('='))) {
+        // Content is just the value directly
+        return { value: content.trim(), filePath: row.filePath || null };
+      }
+      
+      // Content contains multiple lines - parse to find the specific key
+      const lines = content.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        // Skip comments and empty lines
+        if (trimmed.startsWith('#') || trimmed.startsWith('!') || trimmed === '') {
+          continue;
+        }
+        // Check if line starts with propertyKey=
+        if (trimmed.startsWith(propertyKey + '=') || trimmed.startsWith(propertyKey + ':')) {
+          const separatorIndex = trimmed.indexOf('=') !== -1 ? trimmed.indexOf('=') : trimmed.indexOf(':');
+          if (separatorIndex > 0) {
+            const value = trimmed.substring(separatorIndex + 1).trim();
+            if (value) {
+              return { value, filePath: row.filePath || null };
+            }
+          }
+        }
+      }
+    }
+
+    return { value: null, filePath: null };
+  } catch {
+    return { value: null, filePath: null };
+  }
+}
+
+/**
+ * Parses ${key:default} syntax and extracts key and default value.
+ * Returns { key, defaultValue } where defaultValue may be null if no default specified.
+ */
+function parsePropertyPlaceholder(placeholder: string): { key: string; defaultValue: string | null } {
+  // Match ${key} or ${key:default}
+  const match = placeholder.match(/^\$\{([^}:]+)(?::([^}]*))?\}$/);
+  if (!match) {
+    return { key: placeholder, defaultValue: null };
+  }
+  return {
+    key: match[1],
+    defaultValue: match[2] ?? null,
+  };
+}
+
+/**
+ * Tries variable name patterns to find @Value annotation for service URLs.
+ * This handles cases where the variable name doesn't match the field name directly.
+ * 
+ * @param executeQuery - Graph query executor
+ * @param repoId - Repository ID
+ * @param className - Enclosing class name
+ * @param variableName - Variable name from URL expression (e.g., "matchingUrl")
+ * @returns Resolved property key, raw value, and field name if found
+ */
+async function traceVariableAssignment(
+  executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
+  repoId: string,
+  className: string,
+  variableName: string
+): Promise<{ propertyKey: string | null; rawValue: string | null; fieldName: string | null }> {
+  // Heuristic patterns to try in order of specificity:
+  // 1. Exact match: matchingUrl → field named "matchingUrl"
+  // 2. Strip suffix: matchingUrl → "matching" → field "matchingService"
+  // 3. Add suffix: matchingUrl → "matchingUrlService" (less common)
+  // 4. Strip "Url" suffix and add "Service": matchingUrl → "matching" → "matchingService"
+  
+  const patterns = [
+    variableName,                              // matchingUrl
+    variableName.replace(/Url$/i, ''),        // matchingUrl → matching
+    variableName + 'Service',                  // matchingUrl → matchingUrlService
+    variableName.replace(/Url$/i, '') + 'Service', // matchingUrl → matchingService
+    variableName.replace(/Url$/i, 'ServiceUrl'), // matchingUrl → matchingServiceUrl
+  ];
+
+  // Remove duplicates
+  const uniquePatterns = [...new Set(patterns)];
+
+  for (const pattern of uniquePatterns) {
+    const resolved = await resolveValueAnnotation(executeQuery, repoId, className, pattern);
+    if (resolved.propertyKey) {
+      return {
+        propertyKey: resolved.propertyKey,
+        rawValue: resolved.rawValue,
+        fieldName: pattern,
+      };
+    }
+  }
+
+  return { propertyKey: null, rawValue: null, fieldName: null };
 }
 
 /**
