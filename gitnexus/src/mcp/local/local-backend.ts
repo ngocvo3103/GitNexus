@@ -1922,6 +1922,7 @@ export class LocalBackend {
       depth: params.depth ?? 10,
       include_context: params.include_context ?? false,
       compact: params.compact ?? false,
+      openapi: params.openapi ?? false,
       repo: params.repo,
       crossRepo,
     };
