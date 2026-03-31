@@ -43,11 +43,182 @@ function joinSpringPaths(classPath: string, methodPath: string): string {
   return '/';
 }
 
-export async function extractSpringRoutes(javaSource: string): Promise<SpringRoute[]> {
+/**
+ * Public entry point for the pipeline: parse a Java source string and extract
+ * all `public static final String` constants from every class in the file.
+ *
+ * Used by the pipeline's cross-file pre-pass: scan all .java files first,
+ * merge constants into a repo-wide map, then call extractSpringRoutes() with it.
+ *
+ * @example
+ *   const globalConstants = new Map<string, string>();
+ *   for (const file of javaFiles) {
+ *     for (const [k, v] of extractJavaConstants(file.content)) globalConstants.set(k, v);
+ *   }
+ *   const routes = await extractSpringRoutes(controllerSource, globalConstants);
+ */
+export function extractJavaConstants(javaSource: string): Map<string, string> {
+  const parser = new Parser();
+  parser.setLanguage(Java);
+  const tree = parser.parse(javaSource);
+  return collectFileConstants(tree.rootNode);
+}
+
+/**
+ * Collect all `public static final String CONST_NAME = "value";` declarations
+ * from the parsed Java AST. This covers constants declared in the same file
+ * (e.g. inside the controller class, or in a sibling class in the same file).
+ *
+ * Returns a Map: qualifiedName → value  (e.g. "Config.API_PATH" → "/api/v1")
+ * and also simple name → value          (e.g. "API_PATH" → "/api/v1")
+ */
+export function collectFileConstants(rootNode: any): Map<string, string> {
+  const constants = new Map<string, string>();
+
+  function walk(node: any) {
+    // Look for class declarations to get class name as qualifier
+    if (node.type === 'class_declaration') {
+      const classNameNode = node.namedChildren?.find((n: any) => n.type === 'identifier');
+      const className = classNameNode?.text ?? '';
+      const body = node.namedChildren?.find((n: any) => n.type === 'class_body');
+      if (body) {
+        for (const member of body.namedChildren ?? []) {
+          extractFieldConstant(member, className, constants);
+        }
+      }
+    }
+    // Recurse
+    for (const child of node.namedChildren ?? []) {
+      walk(child);
+    }
+  }
+
+  walk(rootNode);
+  return constants;
+}
+
+/**
+ * Try to extract a `static final String` field and record it in the map.
+ * Handles:
+ *   public static final String FOO = "bar";
+ *   public static final String FOO = OTHER_CONST + "/sub";  (simple concat)
+ */
+function extractFieldConstant(
+  fieldNode: any,
+  className: string,
+  constants: Map<string, string>,
+): void {
+  if (fieldNode.type !== 'field_declaration') return;
+
+  // Check modifiers: must have 'static' and 'final'
+  const modifiersNode = fieldNode.namedChildren?.find((n: any) => n.type === 'modifiers');
+  if (!modifiersNode) return;
+  const modText = modifiersNode.text ?? '';
+  if (!modText.includes('static') || !modText.includes('final')) return;
+
+  // Must be String type
+  const typeNode = fieldNode.namedChildren?.find((n: any) =>
+    n.type === 'type_identifier' || n.type === 'integral_type' || n.type === 'void_type',
+  );
+  if (!typeNode || typeNode.text !== 'String') return;
+
+  // Find declarator(s)
+  for (const decl of fieldNode.namedChildren ?? []) {
+    if (decl.type !== 'variable_declarator') continue;
+    const nameNode = decl.namedChildren?.find((n: any) => n.type === 'identifier');
+    if (!nameNode) continue;
+    const fieldName = nameNode.text;
+    const valueNode = decl.namedChildren?.find((n: any) => n !== nameNode);
+    if (!valueNode) continue;
+
+    // Resolve value — may be a string literal or simple binary concat
+    const resolved = resolveStringNode(valueNode, constants);
+    if (resolved !== null) {
+      constants.set(fieldName, resolved);
+      if (className) {
+        constants.set(`${className}.${fieldName}`, resolved);
+      }
+    }
+  }
+}
+
+/**
+ * Recursively resolve an AST node to a string value using the known constants map.
+ *
+ * Supported node types:
+ *   string_literal           → strip quotes
+ *   identifier               → look up constants map (local/simple name)
+ *   field_access             → look up as "Object.FIELD" or just "FIELD"
+ *   binary_expression (+)    → concatenate two resolved operands
+ */
+function resolveStringNode(node: any, constants: Map<string, string>): string | null {
+  if (!node) return null;
+
+  switch (node.type) {
+    case 'string_literal': {
+      // Java string: "value" — strip surrounding quotes
+      return node.text.replace(/^["']|["']$/g, '');
+    }
+
+    case 'identifier': {
+      // Simple constant name, e.g. PATH_PREFIX
+      return constants.get(node.text) ?? null;
+    }
+
+    case 'field_access': {
+      // e.g. Config.API_PATH_PREFIX
+      // tree-sitter-java: field_access has object (left) and field (identifier on right)
+      const fullText = node.text; // "Config.API_PATH_PREFIX"
+      if (constants.has(fullText)) return constants.get(fullText)!;
+
+      // Try just the field name (right-hand identifier)
+      const fieldNameNode = node.namedChildren?.find((n: any) => n.type === 'identifier');
+      const fieldName = fieldNameNode?.text;
+      if (fieldName && constants.has(fieldName)) return constants.get(fieldName)!;
+
+      return null;
+    }
+
+    case 'binary_expression': {
+      // String concatenation: LEFT + RIGHT
+      const operatorNode = node.children?.find((n: any) => n.type === '+');
+      if (!operatorNode) return null;
+      // namedChildren for binary_expression are the two operands
+      const [left, right] = node.namedChildren ?? [];
+      const leftVal = resolveStringNode(left, constants);
+      const rightVal = resolveStringNode(right, constants);
+      if (leftVal !== null && rightVal !== null) return leftVal + rightVal;
+      if (leftVal !== null) return leftVal; // partial resolve — keep what we can
+      return null;
+    }
+
+    default:
+      return null;
+  }
+}
+
+export async function extractSpringRoutes(
+  javaSource: string,
+  /** Optional pre-built constant map from other files (cross-file resolution) */
+  externalConstants?: ReadonlyMap<string, string>,
+): Promise<SpringRoute[]> {
   const parser = new Parser();
   parser.setLanguage(Java);
   const tree = parser.parse(javaSource);
   const routes: SpringRoute[] = [];
+
+  // ── Phase 1: collect constants from this file ──────────────────────────
+  const fileConstants = collectFileConstants(tree.rootNode);
+
+  // Merge external constants (external wins only when local doesn't have the key)
+  const constants: Map<string, string> = new Map(fileConstants);
+  if (externalConstants) {
+    for (const [k, v] of externalConstants) {
+      if (!constants.has(k)) constants.set(k, v);
+    }
+  }
+
+  // ── AST helper functions ───────────────────────────────────────────────
 
   function getAnnotationName(annotationNode: any): string | null {
     if (!annotationNode) return null;
@@ -56,32 +227,47 @@ export async function extractSpringRoutes(javaSource: string): Promise<SpringRou
     return idNode ? idNode.text : null;
   }
 
+  /**
+   * Extract the string value from an annotation argument.
+   *
+   * If `key` is given, finds a named element_value_pair (e.g. value="...", path="...").
+   * Otherwise, reads the first positional argument.
+   *
+   * Supports: string literals, constants (field_access / identifier), string concatenation.
+   */
   function getAnnotationValue(annotationNode: any, key: string | null = null): string | null {
     if (!annotationNode) return null;
     // For annotation arguments
-    const argsNode = annotationNode.namedChildren?.find((n: any) => n.type === 'argument_list' || n.type === 'annotation_argument_list');
+    const argsNode = annotationNode.namedChildren?.find(
+      (n: any) => n.type === 'argument_list' || n.type === 'annotation_argument_list',
+    );
     if (!argsNode) return null;
+
     if (key) {
       // Find key-value pair
       for (const pair of argsNode.namedChildren) {
         if (pair.type === 'element_value_pair' && pair.namedChildren[0]?.text === key) {
           const valNode = pair.namedChildren[1];
-          if (valNode && valNode.type === 'string_literal') {
-            return valNode.text.replace(/['"]/g, '');
-          }
+          return resolveStringNode(valNode, constants);
         }
       }
     } else {
       // Single value or multiple values
       for (const valNode of argsNode.namedChildren) {
-        if (valNode.type === 'string_literal') {
-          return valNode.text.replace(/['"]/g, '');
-        }
+        // Skip element_value_pair with a key — we want positional only here
+        if (valNode.type === 'element_value_pair') continue;
+
         // Handle array_initializer for multiple paths (take the first one)
         if (valNode.type === 'array_initializer' && valNode.namedChildren.length > 0) {
-          const first = valNode.namedChildren.find((n: any) => n.type === 'string_literal');
-          if (first) return first.text.replace(/['"]/g, '');
+          for (const item of valNode.namedChildren) {
+            const resolved = resolveStringNode(item, constants);
+            if (resolved !== null) return resolved;
+          }
+          continue;
         }
+
+        const resolved = resolveStringNode(valNode, constants);
+        if (resolved !== null) return resolved;
       }
     }
     return null;
