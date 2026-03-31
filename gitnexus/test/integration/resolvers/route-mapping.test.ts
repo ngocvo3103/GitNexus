@@ -32,7 +32,7 @@ describe('Next.js route mapping', () => {
   it('creates FETCHES edge from consumer to Route node', () => {
     const edges = getRelationships(result, 'FETCHES');
     const fetchEdge = edges.find(e =>
-      e.sourceFilePath.includes('useGrants') && e.target === '/api/grants'
+      e.sourceFilePath.includes('useGrants') && e.target === 'Route:/api/grants'
     );
     expect(fetchEdge).toBeDefined();
   });
@@ -49,11 +49,12 @@ describe('Next.js route mapping', () => {
       e.sourceFilePath.includes('GrantsList')
     );
     expect(dynamicFetch).toBeDefined();
-    expect(dynamicFetch!.target).toBe('/api/organizations/[slug]/grants');
+    expect(dynamicFetch!.target).toBe('Route:/api/organizations/[slug]/grants');
   });
 
   it('links project-level middleware.ts to matching API routes', () => {
     const routes = getNodesByLabelFull(result, 'Route');
+    console.log('ROUTE NODES:', routes.map(r => ({ name: r.name, properties: r.properties })));
     const grants = routes.find(r => r.name === '/api/grants');
     expect(grants).toBeDefined();
     expect(grants!.properties.middleware).toBeDefined();
@@ -62,6 +63,7 @@ describe('Next.js route mapping', () => {
 
   it('links middleware to all routes matching the matcher pattern', () => {
     const routes = getNodesByLabelFull(result, 'Route');
+    console.log('ROUTE NODES:', routes.map(r => ({ name: r.name, properties: r.properties })));
     const apiRoutes = routes.filter(r => (r.name as string).startsWith('/api/'));
     expect(apiRoutes.length).toBeGreaterThanOrEqual(2);
     for (const route of apiRoutes) {

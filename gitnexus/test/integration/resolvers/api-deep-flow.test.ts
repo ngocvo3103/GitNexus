@@ -98,9 +98,9 @@ describe('deep flow detection pipeline', () => {
     const edges = getRelationships(result, 'FETCHES');
     expect(edges.length).toBeGreaterThanOrEqual(2);
 
-    // GrantsList → /api/grants
+    // GrantsList → Route:/api/grants
     const grantsListEdge = edges.find(e =>
-      e.sourceFilePath.includes('GrantsList') && e.target === '/api/grants',
+      e.sourceFilePath.includes('GrantsList') && e.target === 'Route:/api/grants',
     );
     expect(grantsListEdge).toBeDefined();
   });
@@ -110,7 +110,7 @@ describe('deep flow detection pipeline', () => {
 
     // GrantsList destructures { data, pagination } from the response
     const grantsListEdge = edges.find(e =>
-      e.sourceFilePath.includes('GrantsList') && e.target === '/api/grants',
+      e.sourceFilePath.includes('GrantsList') && e.target === 'Route:/api/grants',
     );
     expect(grantsListEdge).toBeDefined();
     expect(grantsListEdge!.rel.reason).toContain('keys:');
@@ -128,10 +128,10 @@ describe('deep flow detection pipeline', () => {
 
     // useMulti fetches both /api/grants and /api/secure
     const useMultiGrants = edges.find(e =>
-      e.sourceFilePath.includes('useMulti') && e.target === '/api/grants',
+      e.sourceFilePath.includes('useMulti') && e.target === 'Route:/api/grants',
     );
     const useMultiSecure = edges.find(e =>
-      e.sourceFilePath.includes('useMulti') && e.target === '/api/secure',
+      e.sourceFilePath.includes('useMulti') && e.target === 'Route:/api/secure',
     );
     expect(useMultiGrants).toBeDefined();
     expect(useMultiSecure).toBeDefined();
@@ -159,7 +159,7 @@ describe('deep flow detection pipeline', () => {
     const grants = routes.find(r => r.name === '/api/grants');
     const edges = getRelationships(result, 'FETCHES');
     const useGrantsEdge = edges.find(e =>
-      e.sourceFilePath.includes('useGrants') && e.target === '/api/grants',
+      e.sourceFilePath.includes('useGrants') && e.target === 'Route:/api/grants',
     );
     expect(useGrantsEdge).toBeDefined();
 
