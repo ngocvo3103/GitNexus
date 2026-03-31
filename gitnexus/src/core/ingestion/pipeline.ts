@@ -1057,21 +1057,27 @@ async function runGraphAnalysisPhases(
 
   // Link Route and Tool nodes to Processes via reverse index (file → node id)
   if ((routeRegistry?.size ?? 0) > 0 || (toolDefs?.length ?? 0) > 0) {
-    const parseRouteRegistryKey = (routeKey: string): { routeURL: string } => {
+    const parseRouteRegistryKey = (routeKey: string): { httpMethod: string; routeURL: string } => {
       const parts = routeKey.split(' ');
-      if (parts.length >= 2) return { routeURL: parts.slice(1).join(' ') };
-      return { routeURL: routeKey };
+      if (parts.length >= 2) {
+        return {
+          httpMethod: (parts[0] || 'ANY').toUpperCase(),
+          routeURL: parts.slice(1).join(' '),
+        };
+      }
+      return { httpMethod: 'ANY', routeURL: routeKey };
     };
+
 
     // Reverse indexes: file → all route URLs / tool names (handles multi-route files)
     const routesByFile = new Map<string, string[]>();
     if (routeRegistry) {
       for (const [routeKey, entry] of routeRegistry) {
-        const { routeURL } = parseRouteRegistryKey(routeKey);
+        // Keep the full routeKey (method + URL or URL-only) so we can preserve httpMethod
         let list = routesByFile.get(entry.filePath);
         if (!list) { list = []; routesByFile.set(entry.filePath, list); }
-        // Route nodes are keyed by URL only, so avoid duplicating the same URL.
-        if (!list.includes(routeURL)) list.push(routeURL);
+        // Avoid duplicating the same registry key
+        if (!list.includes(routeKey)) list.push(routeKey);
       }
     }
     const toolsByFile = new Map<string, string[]>();
@@ -1093,8 +1099,9 @@ async function runGraphAnalysisPhases(
 
       const routeURLs = routesByFile.get(entryFile);
       if (routeURLs) {
-        for (const routeURL of routeURLs) {
-          const routeNodeId = generateId('Route', routeURL);
+        for (const routeKey of routeURLs) {
+          const { httpMethod, routeURL } = parseRouteRegistryKey(routeKey);
+          const routeNodeId = generateId('Route', `${httpMethod}:${routeURL}`);
           graph.addRelationship({
             id: generateId('ENTRY_POINT_OF', `${routeNodeId}->${proc.id}`),
             sourceId: routeNodeId,
@@ -1267,7 +1274,7 @@ export const runPipelineFromRepo = async (
         const mwResult = content ? extractMiddlewareChain(content) : undefined;
         const middleware = mwResult?.chain;
 
-        const routeNodeId = generateId('Route', routeURL);
+        const routeNodeId = generateId('Route', `${entry.httpMethod ?? httpMethod}:${routeURL}`);
         graph.addNode({
           id: routeNodeId,
           label: 'Route',
@@ -1329,8 +1336,17 @@ export const runPipelineFromRepo = async (
               compiled.some(cm => compiledMatcherMatchesRoute(cm, routeURL));
             if (!matches) continue;
 
-            const routeNodeId = generateId('Route', routeURL);
-            const existing = graph.getNode(routeNodeId);
+            // Prefer exact method-specific route node if present, otherwise fallback to ANY
+            const { httpMethod } = parseRouteRegistryKey(routeKey);
+            const candidateIds = [
+              generateId('Route', `${httpMethod}:${routeURL}`),
+              generateId('Route', `ANY:${routeURL}`),
+            ];
+            let existing: any = null;
+            for (const id of candidateIds) {
+              existing = graph.getNode(id);
+              if (existing) break;
+            }
             if (!existing) continue;
 
             const currentMw = (existing.properties.middleware as string[] | undefined) ?? [];

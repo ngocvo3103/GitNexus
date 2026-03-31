@@ -1390,7 +1390,9 @@ export const processRoutesFromExtracted = async (
 
     // Tạo node Route với đầy đủ thông tin
     console.log('[CallProcessor] Creating Route node:', JSON.stringify(route, null, 2));
-    const routeNodeId = generateId('Route', `${route.routePath}:${route.httpMethod}:${route.filePath}`);
+    const methodKey = (route.httpMethod || 'ANY').toUpperCase();
+    const normalizedPath = route.routePath || '/';
+    const routeNodeId = generateId('Route', `${methodKey}:${normalizedPath}`);
     graph.addNode({
       id: routeNodeId,
       label: 'Route',
