@@ -33,7 +33,7 @@ import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { extractSpringRoutes } from './route-extractors/spring.js';
+import { extractSpringRoutes, extractJavaConstants } from './route-extractors/spring.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -695,25 +695,35 @@ async function runChunkedParseAndResolve(
       );
 
       // --- SPRING BOOT ROUTE EXTRACTION ---
-      for (const file of chunkFiles) {
-        if (file.path.endsWith('.java')) {
-          const springRoutesPromise = extractSpringRoutes(file.content);
-          const springRoutes = await springRoutesPromise;
+      // Two-pass approach:
+      //   Pass 1: collect all static final String constants from every .java file in the chunk
+      //           so cross-file references (e.g. @GetMapping(Config.PATH)) can be resolved.
+      //   Pass 2: extract routes for each controller file using the merged constants map.
+      const javaFiles = chunkFiles.filter(f => f.path.endsWith('.java'));
+      if (javaFiles.length > 0) {
+        // Pass 1: merge constants from all Java files in this chunk
+        const chunkConstants = new Map<string, string>();
+        for (const jf of javaFiles) {
+          for (const [k, v] of extractJavaConstants(jf.content)) {
+            chunkConstants.set(k, v); // later files may override earlier ones — acceptable
+          }
+        }
+
+        // Pass 2: extract routes, forwarding the merged constant map for cross-file resolution
+        for (const file of javaFiles) {
+          const springRoutes = await extractSpringRoutes(file.content, chunkConstants);
           if (springRoutes.length > 0) {
-            console.log('[Spring Extractor] springRoutes:', JSON.stringify(springRoutes, null, 2));
-            allExtractedRoutes.push(...springRoutes.map(r => {
-              return {
-                framework: r.framework || 'spring',
-                httpMethod: r.method, // mapping đúng trường
-                routePath: r.path,
-                controllerName: r.controller, // mapping đúng trường
-                methodName: r.handler, // mapping đúng trường
-                filePath: file.path,
-                middleware: [],
-                prefix: '',
-                lineNumber: r.lineNumber ?? 0, // mapping đúng trường
-              };
-            }));
+            allExtractedRoutes.push(...springRoutes.map(r => ({
+              framework: r.framework || 'spring',
+              httpMethod: r.method,
+              routePath: r.path,
+              controllerName: r.controller,
+              methodName: r.handler,
+              filePath: file.path,
+              middleware: [],
+              prefix: '',
+              lineNumber: r.lineNumber ?? 0,
+            })));
           }
         }
       }
