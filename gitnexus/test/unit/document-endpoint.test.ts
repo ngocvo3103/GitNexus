@@ -23,7 +23,7 @@ vi.mock('../../src/core/lbug-adapter.js', () => ({
 }));
 
 // Import after mocks are set up
-import { documentEndpoint } from '../../src/mcp/local/document-endpoint.js';
+import { documentEndpoint, extractLocalVariableAssignments } from '../../src/mcp/local/document-endpoint.js';
 import * as endpointQuery from '../../src/mcp/local/endpoint-query.js';
 import * as traceExecutor from '../../src/mcp/local/trace-executor.js';
 
@@ -718,7 +718,7 @@ describe('body schema extraction', () => {
         content: 'public User createUser(@RequestBody UserDTO userDTO) { return userService.create(userDTO); }',
         metadata: emptyMetadata(),
           callees: [],
-        parameters: '[{"name":"userDTO","type":"UserDTO","annotations":["@RequestBody"]}]',
+        parameterAnnotations: '[{"name":"userDTO","type":"UserDTO","annotations":["@RequestBody"]}]',
         returnType: 'User',
       }],
       root: 'testHandler',
@@ -736,6 +736,50 @@ describe('body schema extraction', () => {
   });
 });
 
+describe('extractLocalVariableAssignments', () => {
+  it('extracts simple typed variable assignments', () => {
+    const content = 'String url = matchingUrl + pathSuggestion;';
+    const result = extractLocalVariableAssignments(content);
+    expect(result.get('url')).toBe('matchingUrl + pathSuggestion');
+  });
+
+  it('extracts multiple assignments from content', () => {
+    const content = `
+      String url = matchingUrl + pathSuggestion;
+      String urlAccount = hftKremaServiceUrl + "/customers/{custodyCode}/accounts";
+      String secret = configurationProperties.getRecaptchaSecret();
+    `;
+    const result = extractLocalVariableAssignments(content);
+    expect(result.get('url')).toBe('matchingUrl + pathSuggestion');
+    expect(result.get('urlAccount')).toBe('hftKremaServiceUrl + "/customers/{custodyCode}/accounts"');
+    expect(result.get('secret')).toBe('configurationProperties.getRecaptchaSecret()');
+  });
+
+  it('handles generic types', () => {
+    const content = 'List<String> items = service.getNames();';
+    const result = extractLocalVariableAssignments(content);
+    expect(result.get('items')).toBe('service.getNames()');
+  });
+
+  it('extracts variable with method call expression', () => {
+    const content = 'String secret = configurationProperties.getRecaptchaSecret();';
+    const result = extractLocalVariableAssignments(content);
+    expect(result.get('secret')).toBe('configurationProperties.getRecaptchaSecret()');
+  });
+
+  it('returns empty map for no assignments', () => {
+    const content = 'public void method() { System.out.println("hello"); }';
+    const result = extractLocalVariableAssignments(content);
+    expect(result.size).toBe(0);
+  });
+
+  it('handles TypeScript variable declarations', () => {
+    const content = 'const apiUrl: string = baseUrl + "/api/v1";';
+    const result = extractLocalVariableAssignments(content);
+    expect(result.get('apiUrl')).toBe('baseUrl + "/api/v1"');
+  });
+});
+
 describe('extractMessaging inbound', () => {
   // Helper to create a ChainNode with annotations
   const createHandlerWithAnnotations = (annotations: string[]): any => ({
@@ -749,7 +793,7 @@ describe('extractMessaging inbound', () => {
     content: 'public void handleEvent(OrderEvent event) { processOrder(event); }',
     metadata: emptyMetadata(),
     annotations: JSON.stringify(annotations.map(ann => ({ name: ann, attrs: {} }))),
-    parameters: '[{"name":"event","type":"OrderEvent","annotations":[]}]',
+    parameterAnnotations: '[{"name":"event","type":"OrderEvent","annotations":[]}]',
   });
 
   beforeEach(() => {
@@ -814,7 +858,7 @@ describe('extractMessaging inbound', () => {
           metadata: emptyMetadata(),
           callees: [],
           annotations: JSON.stringify([{ name: '@TransactionalEventListener', attrs: {} }]),
-          parameters: '[{"name":"event","type":"TransactionEvent","annotations":[]}]',
+          parameterAnnotations: '[{"name":"event","type":"TransactionEvent","annotations":[]}]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -858,7 +902,7 @@ describe('extractMessaging inbound', () => {
           metadata: emptyMetadata(),
           callees: [],
           annotations: JSON.stringify([{ name: '@RabbitListener', attrs: { queues: 'order.queue' } }]),
-          parameters: '[{"name":"msg","type":"OrderMessage","annotations":[]}]',
+          parameterAnnotations: '[{"name":"msg","type":"OrderMessage","annotations":[]}]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -902,7 +946,7 @@ describe('extractMessaging inbound', () => {
           metadata: emptyMetadata(),
           callees: [],
           annotations: JSON.stringify([{ name: '@KafkaListener', attrs: { topics: 'payment.events' } }]),
-          parameters: '[{"name":"event","type":"PaymentEvent","annotations":[]}]',
+          parameterAnnotations: '[{"name":"event","type":"PaymentEvent","annotations":[]}]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -945,7 +989,7 @@ describe('extractMessaging inbound', () => {
           metadata: emptyMetadata(),
           callees: [],
           annotations: JSON.stringify([{ name: '@RabbitListener', attrs: { queues: '["queue1", "queue2"]' } }]),
-          parameters: '[{"name":"msg","type":"OrderMessage","annotations":[]}]',
+          parameterAnnotations: '[{"name":"msg","type":"OrderMessage","annotations":[]}]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -987,7 +1031,7 @@ describe('extractMessaging inbound', () => {
           metadata: emptyMetadata(),
           callees: [],
           annotations: JSON.stringify([{ name: '@KafkaListener', attrs: { topics: '["topic1", "topic2"]' } }]),
-          parameters: '[{"name":"event","type":"PaymentEvent","annotations":[]}]',
+          parameterAnnotations: '[{"name":"event","type":"PaymentEvent","annotations":[]}]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -1032,7 +1076,7 @@ describe('extractMessaging inbound', () => {
             metadata: emptyMetadata(),
           callees: [],
             annotations: JSON.stringify([{ name: '@EventListener', attrs: {} }]),
-            parameters: '[{"name":"event","type":"AppEvent","annotations":[]}]',
+            parameterAnnotations: '[{"name":"event","type":"AppEvent","annotations":[]}]',
           },
           {
             uid: 'Method:src/listeners/ComboListener.java:onRabbitMessage',
@@ -1046,7 +1090,7 @@ describe('extractMessaging inbound', () => {
             metadata: emptyMetadata(),
           callees: [],
             annotations: JSON.stringify([{ name: '@RabbitListener', attrs: { queues: 'app.queue' } }]),
-            parameters: '[{"name":"msg","type":"RabbitMsg","annotations":[]}]',
+            parameterAnnotations: '[{"name":"msg","type":"RabbitMsg","annotations":[]}]',
           },
         ],
         root: 'testHandler',
@@ -1090,7 +1134,7 @@ describe('extractMessaging inbound', () => {
           metadata: emptyMetadata(),
           callees: [],
           annotations: JSON.stringify([{ name: '@EventListener', attrs: {} }]),
-          parameters: '[{"name":"event","type":"ContextEvent","annotations":[]}]',
+          parameterAnnotations: '[{"name":"event","type":"ContextEvent","annotations":[]}]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -1139,7 +1183,7 @@ describe('extractMessaging inbound', () => {
           metadata: emptyMetadata(),
           callees: [],
           annotations: '[]', // No listener annotations in chain
-          parameters: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
+          parameterAnnotations: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
         }],
         root: 'createOrder',
         summary: emptySummary(),
@@ -1207,7 +1251,7 @@ describe('extractMessaging inbound', () => {
           metadata: emptyMetadata(),
           callees: [],
           annotations: '[]',
-          parameters: '[{"name":"event","type":"EventDTO","annotations":[]}]',
+          parameterAnnotations: '[{"name":"event","type":"EventDTO","annotations":[]}]',
         }],
         root: 'publishEvent',
         summary: emptySummary(),
@@ -1264,7 +1308,7 @@ describe('extractMessaging inbound', () => {
           callees: [],
           // No listener annotations
           annotations: JSON.stringify([{ name: '@GetMapping', attrs: { value: '/simple' } }]),
-          parameters: '[]',
+          parameterAnnotations: '[]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -1291,7 +1335,7 @@ describe('extractRequestParams', () => {
     depth: 0,
     content: 'public void testHandler() {}',
     metadata: emptyMetadata(),
-    parameters,
+    parameterAnnotations: parameters,
   });
 
   describe('@PathVariable extraction', () => {
@@ -1676,7 +1720,7 @@ describe('extractRequestParams', () => {
           content: 'public User getUser(@PathVariable Long id, @RequestParam(required=false) String filter) { ... }',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"id","type":"Long","annotations":["@PathVariable"]},{"name":"filter","type":"String","annotations":["@RequestParam(required=false)"]}]',
+          parameterAnnotations: '[{"name":"id","type":"Long","annotations":["@PathVariable"]},{"name":"filter","type":"String","annotations":["@RequestParam(required=false)"]}]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -1767,7 +1811,7 @@ describe('extractRequestParams', () => {
       vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
         chain: [{
           ...createHandlerNode('[]'),
-          parameters: 'not valid json',
+          parameterAnnotations: 'not valid json',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -1825,7 +1869,7 @@ describe('extractValidationRules', () => {
     depth: 0,
     content: 'public void testHandler() {}',
     metadata: emptyMetadata(),
-    parameters,
+    parameterAnnotations: parameters,
     startLine,
   });
 
@@ -2527,7 +2571,7 @@ describe('extractValidationRules', () => {
           content: 'public void createUser(@NotNull String name) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"name","type":"String","annotations":["@NotNull"]}]',
+          parameterAnnotations: '[{"name":"name","type":"String","annotations":["@NotNull"]}]',
         }],
         root: 'testHandler',
         summary: emptySummary(),
@@ -2617,7 +2661,7 @@ describe('extractValidationRules', () => {
             content: 'public void createUser(@RequestBody UserDTO userDTO) {}',
             metadata: emptyMetadata(),
           callees: [],
-            parameters: '[{"name":"userDTO","type":"UserDTO","annotations":["@RequestBody","@Valid"]}]',
+            parameterAnnotations: '[{"name":"userDTO","type":"UserDTO","annotations":["@RequestBody","@Valid"]}]',
           },
           {
             uid: 'Class:src/dto/UserDTO.java:UserDTO',
@@ -2690,7 +2734,7 @@ describe('extractValidationRules', () => {
             content: 'public void createOrder(OrderDTO order) { TcbsValidator.doValidate(order); }',
             metadata: emptyMetadata(),
           callees: [],
-            parameters: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
+            parameterAnnotations: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
           },
         ],
         root: 'createOrder',
@@ -2740,7 +2784,7 @@ describe('extractValidationRules', () => {
             content: 'public void updateUser(UserDTO user) { ValidationUtils.validate(user); }',
             metadata: emptyMetadata(),
           callees: [],
-            parameters: '[{"name":"user","type":"UserDTO","annotations":[]}]',
+            parameterAnnotations: '[{"name":"user","type":"UserDTO","annotations":[]}]',
           },
         ],
         root: 'updateUser',
@@ -2788,7 +2832,7 @@ describe('extractValidationRules', () => {
             content: 'public void createOrder(OrderDTO order) { TcbsValidator.doValidate(order); }',
             metadata: emptyMetadata(),
           callees: [],
-            parameters: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
+            parameterAnnotations: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
           },
         ],
         root: 'createOrder',
@@ -2838,7 +2882,7 @@ describe('extractValidationRules', () => {
             content: 'public void createOrder(OrderDTO order) { Validator.check(order); }',
             metadata: emptyMetadata(),
             callees: [],
-            parameters: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
+            parameterAnnotations: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
           },
         ],
         root: 'createOrder',
@@ -2894,7 +2938,7 @@ describe('extractValidationRules', () => {
             content: 'public void createOrder(OrderDTO order) { this.validateJWT(jwt, order); }',
             metadata: emptyMetadata(),
             callees: [],
-            parameters: '[{\"name\":\"order\",\"type\":\"OrderDTO\",\"annotations\":[]}]',
+            parameterAnnotations: '[{\"name\":\"order\",\"type\":\"OrderDTO\",\"annotations\":[]}]',
           },
         ],
         root: 'createOrder',
@@ -2944,7 +2988,7 @@ describe('extractValidationRules', () => {
             content: 'public void createOrder(OrderDTO order) { validationService.process(order); }',
             metadata: emptyMetadata(),
             callees: [],
-            parameters: '[{\"name\":\"order\",\"type\":\"OrderDTO\",\"annotations\":[]}]',
+            parameterAnnotations: '[{\"name\":\"order\",\"type\":\"OrderDTO\",\"annotations\":[]}]',
           },
         ],
         root: 'createOrder',
@@ -2992,7 +3036,7 @@ describe('extractValidationRules', () => {
             content: 'public void createOrder(OrderDTO order) { validateJWT(jwt); validateRequest(order); }',
             metadata: emptyMetadata(),
             callees: [],
-            parameters: '[{\"name\":\"order\",\"type\":\"OrderDTO\",\"annotations\":[]}]',
+            parameterAnnotations: '[{\"name\":\"order\",\"type\":\"OrderDTO\",\"annotations\":[]}]',
           },
         ],
         root: 'createOrder',
@@ -3045,7 +3089,7 @@ describe('extractValidationRules', () => {
           content: 'public void suggest(SuggestionOrderResultDto prm) { TcbsValidator.validate(order); }',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"prm","type":"SuggestionOrderResultDto","annotations":[]}]',
+          parameterAnnotations: '[{"name":"prm","type":"SuggestionOrderResultDto","annotations":[]}]',
         }],
         root: 'suggest',
         summary: emptySummary(),
@@ -3091,7 +3135,7 @@ describe('extractValidationRules', () => {
           content: 'public void process(OrderDTO order, UserDTO user) { TcbsValidator.validate(order); ValidationUtils.check(user); }',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
+          parameterAnnotations: '[{"name":"order","type":"OrderDTO","annotations":[]}]',
         }],
         root: 'process',
         summary: emptySummary(),
@@ -3143,7 +3187,7 @@ describe('extractValidationRules', () => {
           content: 'public void createOrder(@RequestBody SuggestionOrderResultDto body) { validateJWT(TcbsJWT jwt, SuggestionOrderResultDto prm); }',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"body","type":"SuggestionOrderResultDto","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"body","type":"SuggestionOrderResultDto","annotations":["@RequestBody"]}]',
         }],
         root: 'createOrder',
         summary: emptySummary(),
@@ -3189,7 +3233,7 @@ describe('extractValidationRules', () => {
           content: 'public void createOrder(@RequestBody OrderDTO order) { validateJWT(TcbsJWT jwt); }',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"order","type":"OrderDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"order","type":"OrderDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createOrder',
         summary: emptySummary(),
@@ -3235,7 +3279,7 @@ describe('extractValidationRules', () => {
           content: 'public void triggerListener() { /* no inbound listeners in chain */ }',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[]',
+          parameterAnnotations: '[]',
           annotations: '[]',
         }],
         root: 'triggerListener',
@@ -3304,7 +3348,7 @@ describe('extractValidationRules', () => {
           content: 'public void triggerListener() {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[]',
+          parameterAnnotations: '[]',
           annotations: '[]',
         }],
         root: 'triggerListener',
@@ -3452,7 +3496,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createOrder(@RequestBody OrderDTO orderDTO) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"orderDTO","type":"com.abcd.bond.dto.SuggestionOrderResultDto","annotations":["@RequestBody","@Valid"]}]',
+          parameterAnnotations: '[{"name":"orderDTO","type":"com.abcd.bond.dto.SuggestionOrderResultDto","annotations":["@RequestBody","@Valid"]}]',
         }],
         root: 'createOrder',
         summary: emptySummary(),
@@ -3508,7 +3552,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createUser(@RequestBody UserDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"com.example.UserDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"com.example.UserDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createUser',
         summary: emptySummary(),
@@ -3562,7 +3606,7 @@ describe('Cross-Repo Type Resolution', () => {
           metadata: emptyMetadata(),
           callees: [],
           // MUST include @RequestBody for extractBodySchemas to resolve the type
-          parameters: '[{"name":"dto","type":"@scope/package.UserDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"@scope/package.UserDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createUser',
         summary: emptySummary(),
@@ -3611,7 +3655,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createOrder(@RequestBody ExternalDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"com.external.UnknownDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"com.external.UnknownDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createOrder',
         summary: emptySummary(),
@@ -3661,7 +3705,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createOrder(@RequestBody MissingDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"com.missing.MissingDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"com.missing.MissingDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createOrder',
         summary: emptySummary(),
@@ -3707,7 +3751,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createUser(@RequestBody UserDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createUser',
         summary: emptySummary(),
@@ -3751,7 +3795,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createUser(@RequestBody ExternalDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"com.external.UnknownDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"com.external.UnknownDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createUser',
         summary: emptySummary(),
@@ -3796,7 +3840,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createUser(@RequestBody UserDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createUser',
         summary: emptySummary(),
@@ -3848,7 +3892,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createOrder(@RequestBody ExternalDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"com.external.ExternalDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"com.external.ExternalDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createOrder',
         summary: emptySummary(),
@@ -3908,7 +3952,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createOrder(@RequestBody ExternalDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"com.external.ExternalDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"com.external.ExternalDTO","annotations":["@RequestBody"]}]',
         }],
         root: 'createOrder',
         summary: emptySummary(),
@@ -3959,7 +4003,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public UserDTO createUser(@RequestBody @Valid UserDTO dto) { return new UserDTO(); }',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody","@Valid"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody","@Valid"]}]',
           returnType: 'UserDTO',
           annotations: '[]',
         }],
@@ -4026,7 +4070,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public UserDTO createUser(@RequestBody UserDTO dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"UserDTO","annotations":["@RequestBody"]}]',
           returnType: 'UserDTO',
           annotations: '[]',
         }],
@@ -4084,7 +4128,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createSaving(@RequestBody SavingMarketDto dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"SavingMarketDto","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"SavingMarketDto","annotations":["@RequestBody"]}]',
           returnType: 'void',
           annotations: '[]',
         }],
@@ -4169,7 +4213,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public DeepDto getDeep() {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[]',
+          parameterAnnotations: '[]',
           returnType: 'DeepDto',
           annotations: '[]',
         }],
@@ -4231,7 +4275,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public UserDto createUser(@RequestBody UserDto dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"UserDto","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"UserDto","annotations":["@RequestBody"]}]',
           returnType: 'void',
           annotations: '[]',
         }],
@@ -4312,7 +4356,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createOrder(@RequestBody OrderDto dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"OrderDto","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"OrderDto","annotations":["@RequestBody"]}]',
           returnType: 'void',
           annotations: '[]',
         }],
@@ -4390,7 +4434,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public SettingsDto getSettings() {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[]',
+          parameterAnnotations: '[]',
           returnType: 'SettingsDto',
           annotations: '[]',
         }],
@@ -4455,7 +4499,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void batchProcess(@RequestBody BatchDto dto) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"dto","type":"BatchDto","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"dto","type":"BatchDto","annotations":["@RequestBody"]}]',
           returnType: 'void',
           annotations: '[]',
         }],
@@ -4529,7 +4573,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public OrderDto createOrder(@RequestBody CreateOrderReq req) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"req","type":"CreateOrderReq","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"req","type":"CreateOrderReq","annotations":["@RequestBody"]}]',
           returnType: 'OrderDto',
           annotations: '[]',
         }],
@@ -4618,7 +4662,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public UserDto getUser(Long id) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[]',
+          parameterAnnotations: '[]',
           returnType: 'UserDto',
           annotations: '[]',
         }],
@@ -4698,7 +4742,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public NodeDto createNode(@RequestBody NodeDto node) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"node","type":"NodeDto","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"node","type":"NodeDto","annotations":["@RequestBody"]}]',
           returnType: 'NodeDto',
           annotations: '[]',
         }],
@@ -4775,7 +4819,7 @@ describe('Cross-Repo Type Resolution', () => {
           content: 'public void createItem(@RequestBody ItemDto item) {}',
           metadata: emptyMetadata(),
           callees: [],
-          parameters: '[{"name":"item","type":"ItemDto","annotations":["@RequestBody"]}]',
+          parameterAnnotations: '[{"name":"item","type":"ItemDto","annotations":["@RequestBody"]}]',
           returnType: 'void',
           annotations: '[]',
         }],

@@ -1,0 +1,8 @@
+.claude/
+.serena/
+node_modules/
+dist/
+.DS_Store
+
+# Test fixture artifacts (created by ingestion pipeline)
+gitnexus/test/fixtures/**/.gitnexus/

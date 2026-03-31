@@ -70,6 +70,15 @@ export interface RepositoryCallDetail {
   call: string;
 }
 
+export interface BuilderDetail {
+  /** Builder variable name (e.g., "builder") */
+  builderVar: string;
+  /** Base URL expression from fromHttpUrl() (may contain variables) */
+  baseUrlExpression: string;
+  /** Method used to construct URL (e.g., "toUriString") */
+  constructMethod: string;
+}
+
 export interface ChainNode {
   /** Unique identifier (e.g., "Function:src/a.ts:myFunc") */
   uid: string;
@@ -120,6 +129,8 @@ export interface ChainNode {
     valueProperties: string[];
     /** Exception throws with class and error codes */
     exceptions: ExceptionDetail[];
+    /** URI builder pattern details (UriComponentsBuilder, etc.) */
+    builderDetails: BuilderDetail[];
   };
 }
 
@@ -230,6 +241,12 @@ const REPO_PATTERN = /(\w+(?:Repository|Dao|Repo))\.(\w+)/g;
 /** @Value property pattern: @Value("${prop.name}") */
 const VALUE_PATTERN = /@Value\s*\(\s*"\s*\$\{([^}]+)\}\s*"\s*\)/g;
 
+/** WI-4: URI Builder patterns - fromHttpUrl or fromUriString */
+const URI_BUILDER_PATTERN = /(\w+)\s*=\s*UriComponentsBuilder\.(?:fromHttpUrl|fromUriString)\((.+?)\);/g;
+
+/** WI-4: URI Builder toUriString() - captures builder.toUriString() */
+const URI_TO_STRING_PATTERN = /(\w+)\.toUriString\(\)/g;
+
 // ─── Implementation ─────────────────────────────────────────────────────────
 
 /**
@@ -257,6 +274,7 @@ function extractMetadata(content: string | undefined): ChainNode['metadata'] {
     repositoryCallDetails: [],
     valueProperties: [],
     exceptions: [],
+    builderDetails: [],
   };
 
   if (!content) return metadata;
@@ -474,6 +492,21 @@ function extractMetadata(content: string | undefined): ChainNode['metadata'] {
     const errorCode = excMatch[2];
     if (!metadata.exceptions.some(e => e.exceptionClass === exceptionClass && e.errorCode === errorCode)) {
       metadata.exceptions.push({ exceptionClass, errorCode });
+    }
+  }
+
+  // WI-4: Extract URI builder patterns - UriComponentsBuilder.fromHttpUrl(baseUrl)
+  URI_BUILDER_PATTERN.lastIndex = 0;
+  let builderMatch;
+  while ((builderMatch = URI_BUILDER_PATTERN.exec(content)) !== null) {
+    const builderVar = builderMatch[1];
+    const baseUrlExpression = builderMatch[2].trim();
+    if (!metadata.builderDetails.some(b => b.builderVar === builderVar)) {
+      metadata.builderDetails.push({
+        builderVar,
+        baseUrlExpression,
+        constructMethod: 'toUriString',
+      });
     }
   }
 

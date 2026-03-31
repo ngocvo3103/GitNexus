@@ -133,6 +133,7 @@ program
   .option('--depth <n>', 'Max trace depth (default: 10)', '10')
   .option('--include-context', 'Include source context for AI enrichment', false)
   .option('--compact', 'Omit source content and empty arrays (use with --include-context)', false)
+  .option('--openapi', 'Preserve raw BodySchema for OpenAPI generation (includes validation annotations)', false)
   .option('--schema-path <path>', 'Path to custom JSON schema file (default: bundled schema)')
   .option('--strict', 'Fail on schema validation errors (default: warn)', false)
   .option('-r, --repo <name>', 'Target repository')

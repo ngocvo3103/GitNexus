@@ -12,13 +12,14 @@ gitnexus document-endpoint --method <METHOD> --path <pattern> [options]
 
 Analyzes the call chain from an HTTP endpoint handler through all service layers, extracting:
 
-- **Request/Response schemas** - Parameters, body types, validation rules
+- **Request/Response schemas** - Parameters, body types, validation rules, nested field resolution
 - **Call chain** - Complete method call graph from controller to deepest service
-- **Downstream APIs** - External HTTP calls with resolved URLs
-- **Messaging** - Inbound (event listeners) and outbound (event publishers) messaging
+- **Downstream APIs** - External HTTP calls with resolved URLs (service URL resolution)
+- **Messaging** - Inbound (event listeners) and outbound (event publishers) messaging with payload types
 - **Persistence** - Database tables and stored procedures accessed
 - **Exception handling** - Error codes mapped to HTTP responses
 - **Annotations** - Spring annotations (`@Retryable`, `@Cacheable`, `@Transactional`)
+- **Validation** - Method-level and field-level validation annotations
 
 ## Options
 
@@ -28,8 +29,11 @@ Analyzes the call chain from an HTTP endpoint handler through all service layers
 | `--path <pattern>` | Yes | - | Path pattern (fuzzy match supported) |
 | `--depth <n>` | No | 10 | Maximum call chain depth to trace |
 | `--include-context` | No | false | Include source code snippets for AI enrichment |
-| `--compact` | No | false | Omit source content and empty arrays (reduces output size) |
-| `--repo <name>` | No | - | Target repository (if multiple indexed) |
+| `--compact` | No | false | Omit source content and empty arrays (use with `--include-context`) |
+| `--openapi` | No | false | Preserve raw BodySchema for OpenAPI generation (includes validation annotations) |
+| `--schema-path <path>` | No | bundled | Path to custom JSON schema file for output validation |
+| `--strict` | No | warn | Fail on schema validation errors (default: warn only) |
+| `-r, --repo <name>` | No | - | Target repository (if multiple indexed) |
 
 ## Path Matching
 
@@ -42,6 +46,97 @@ The `--path` argument uses fuzzy matching:
 | `/t/v1/orders/cds/sell` | Exact or near-exact match |
 
 When Route nodes exist in the graph, the tool uses them for precise matching. Otherwise, it falls back to searching for `@XxxMapping` annotations in controller classes.
+
+## Output Modes
+
+The tool supports multiple output modes depending on the flags used:
+
+### Default Mode (No Context)
+
+Converts request/response bodies to simplified JSON example format with top-level keys. Best for quick reference and human readability.
+
+```json
+{
+  "specs": {
+    "request": {
+      "body": {
+        "productCode": "String",
+        "quantity": "Integer",
+        "orderType": "String"
+      }
+    }
+  }
+}
+```
+
+### With Context (`--include-context`)
+
+Preserves full `BodySchema` structure with:
+- `typeName` - The DTO/POJO class name
+- `fields` - Nested array with full schema resolution
+- Validation annotations (`@NotEmpty`, `@NotNull`, `@JsonFormat`, etc.)
+- `_context` - Source code snippets for each extracted element
+
+```json
+{
+  "specs": {
+    "request": {
+      "body": {
+        "typeName": "SuggestionOrderDto",
+        "source": "external",
+        "fields": [
+          {
+            "name": "productCode",
+            "type": "String",
+            "annotations": ["@NotEmpty"],
+            "_context": "// SuggestionOrderDto.java:15\n@NotEmpty\nprivate String productCode;"
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+### OpenAPI Mode (`--openapi`)
+
+Preserves raw `BodySchema` structure optimized for OpenAPI 3.0 schema generation:
+- Includes all validation annotations in field metadata
+- Preserves nested type structures for recursive schema generation
+- Suitable for piping to OpenAPI bundler/converter
+
+```json
+{
+  "specs": {
+    "request": {
+      "body": {
+        "typeName": "SuggestionOrderDto",
+        "fields": [
+          {
+            "name": "productCode",
+            "type": "String",
+            "annotations": ["@NotEmpty(message = \"Product code is required\")"],
+            "nullable": false
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+### Strict Mode (`--strict`)
+
+Validates output against JSON schema. By default, validation errors are logged as warnings. With `--strict`:
+- Fails with non-zero exit code on schema violations
+- Useful for CI/CD pipelines requiring valid output
+
+### Compact Mode (`--compact`)
+
+When combined with `--include-context`:
+- Omits source code content from `_context` fields
+- Removes empty arrays from output
+- Reduces output size by ~50%
 
 ## Examples
 
@@ -80,7 +175,30 @@ gitnexus document-endpoint --method POST --path "orders" --depth 5
 
 ```bash
 # Target a specific indexed repository
-gitnexus document-endpoint --method GET --path "bonds" --repo tcbs-bond-trading
+gitnexus document-endpoint --method GET --path "bonds" -r tcbs-bond-trading
+```
+
+### OpenAPI Schema Generation
+
+```bash
+# Generate output suitable for OpenAPI 3.0 schema generation
+gitnexus document-endpoint --method PUT --path "bookings/suggest" --openapi > openapi-schema.json
+```
+
+### Strict Validation
+
+```bash
+# Fail on schema validation errors (useful for CI/CD)
+gitnexus document-endpoint --method GET --path "bonds" --strict
+```
+
+### Custom Schema Validation
+
+```bash
+# Validate against custom schema
+gitnexus document-endpoint --method POST --path "orders" \
+  --schema-path ./schemas/endpoint-output.schema.json \
+  --strict
 ```
 
 ### Redirect to File
@@ -91,6 +209,8 @@ gitnexus document-endpoint --method PUT --path "bookings" --include-context > en
 ```
 
 ## Output Structure
+
+### Complete Output Schema
 
 ```json
 {
@@ -105,24 +225,39 @@ gitnexus document-endpoint --method PUT --path "bookings" --include-context > en
             "name": "productCode",
             "type": "String",
             "required": true,
-            "description": ""
+            "description": "",
+            "_context": "// Controller.java:107\n@PathVariable String productCode"
           }
         ],
         "body": {
-          "typeName": "SuggestionOrderResultDto",
-          "source": "external"
+          "typeName": "SuggestionOrderDto",
+          "source": "external",
+          "sourceRepo": "tcbs-order-service",
+          "fields": [
+            {
+              "name": "orderType",
+              "type": "String",
+              "annotations": ["@NotEmpty"],
+              "_context": "// SuggestionOrderDto.java:25\n@NotEmpty\nprivate String orderType;"
+            }
+          ]
         },
         "validation": [
           {
             "field": "order",
             "type": "Custom",
             "required": true,
-            "rules": "@Valid order validation"
+            "rules": "@Valid order validation",
+            "method": "validateOrder"
           }
         ]
       },
       "response": {
-        "body": { "typeName": "SuggestionOrderResultDto", "source": "external" },
+        "body": {
+          "typeName": "SuggestionOrderResultDto",
+          "source": "external",
+          "fields": []
+        },
         "codes": [
           { "code": 200, "description": "Success" },
           { "code": 400, "description": "TcbsException: ErrorCode.UNKNOWN_ERROR" }
@@ -136,63 +271,58 @@ gitnexus document-endpoint --method PUT --path "bookings" --include-context > en
           "endpoint": "POST /v1/bond-limit/hold-unhold",
           "condition": "TODO_AI_ENRICH",
           "purpose": "TODO_AI_ENRICH",
-          "resolvedUrl": "bondSettlementService.concat(/v1/bond-limit/hold-unhold)"
+          "resolvedUrl": "http://bond-settlement.internal.tcbs.vn/v1/bond-limit/hold-unhold",
+          "resolvedFrom": "@Value annotation"
         }
       ],
       "messaging": {
         "inbound": [
           {
-            "topic": "TODO_AI_ENRICH",
-            "payload": "StartUnholdSuggestionOrderEvent",
+            "topic": "bond.orders.unhold",
+            "payload": {
+              "typeName": "StartUnholdSuggestionOrderEvent",
+              "fields": []
+            },
             "consumptionLogic": "EventHandlerImpl.startUnholdSuggestionOrder()"
           }
         ],
-        "outbound": []
+        "outbound": [
+          {
+            "topic": "bond.orders.created",
+            "payload": {
+              "typeName": "BondOrderCreatedEvent",
+              "fields": []
+            },
+            "publishMethod": "rabbitTemplate.convertAndSend()"
+          }
+        ]
       },
       "persistence": [
         {
-          "database": "TODO_AI_ENRICH",
-          "tables": "trading, tradingAttr, bondProduct",
+          "database": "PostgreSQL",
+          "tables": "trading, trading_attr, bond_product",
           "storedProcedures": "None detected"
         }
       ]
     },
-    "logicFlow": "TODO_AI_ENRICH",
-    "codeDiagram": "graph TB\n  subgraph Controller\n    A[unhold]\n  end\n  subgraph Service\n    B[process]\n  end\n  A --> B",
-    "cacheStrategy": { "flow": "" },
+    "logicFlow": "1. Validate request\n2. Check product exists\n3. Create order\n4. Publish event",
+    "codeDiagram": "graph TB\n  subgraph Controller\n    A[unhold]\n  end\n  subgraph Service\n    B[process]\n    C[validate]\n    D[publishEvent]\n  end\n  A --> B\n  B --> C\n  B --> D",
+    "cacheStrategy": {
+      "flow": "Cache aside pattern with Redis",
+      "annotations": ["@Cacheable(value = \"suggestions\", key = \"#productCode\")"]
+    },
     "retryLogic": [
       {
         "operation": "execPost",
         "maxAttempts": "3",
-        "backoff": "TODO_AI_ENRICH",
-        "recovery": "TODO_AI_ENRICH"
+        "backoff": "1000ms exponential",
+        "recovery": "fallbackToCachedData"
       }
     ],
     "keyDetails": {
-      "transactionManagement": [],
-      "businessRules": [],
-      "security": []
-    }
-  }
-}
-```
-
-### With `--include-context`
-
-When `--include-context` is used, additional `_context` fields are added:
-
-```json
-{
-  "result": {
-    "specs": {
-      "request": {
-        "params": [
-          {
-            "name": "productCode",
-            "_context": "// src/main/java/.../Controller.java:107\n@PathVariable"
-          }
-        ]
-      }
+      "transactionManagement": ["@Transactional(readOnly = true)"],
+      "businessRules": ["Order quantity must be positive"],
+      "security": ["JWT validation required"]
     },
     "_context": {
       "callChain": [
@@ -201,8 +331,7 @@ When `--include-context` is used, additional `_context` fields are added:
           "name": "handler",
           "filePath": "src/main/java/.../Controller.java",
           "depth": 0,
-          "callees": ["Method:.../Service.java:process"],
-          "metadata": { "httpCalls": [], "annotations": [], ... }
+          "callees": ["Method:.../Service.java:process"]
         }
       ]
     }
@@ -235,6 +364,199 @@ This is useful when:
 - Use `--compact` to reduce size
 - Redirect to file: `> output.json`
 
+## Service Resolution Features
+
+The tool performs advanced resolution to determine actual service URLs from Spring patterns:
+
+### @Value Annotation Resolution
+
+Resolves Spring `@Value("${property.key}")` annotations to actual service URLs from application properties:
+
+```java
+@Value("${tcbs.bond.settlement.service.url}")
+private String bondSettlementService;
+```
+
+Resolves to: `http://bond-settlement.internal.tcbs.vn`
+
+### Variable Assignment Tracing
+
+Traces local variable assignments to find base URLs:
+
+```java
+public void processOrder() {
+    String baseUrl = configService.getServiceUrl();
+    String endpoint = baseUrl + "/v1/orders";
+    restTemplate.postForEntity(endpoint, request, Response.class);
+}
+```
+
+### Static Constant Resolution
+
+Resolves static final constants and `@Value`-annotated constants:
+
+```java
+@Component
+public class ApiEndpoints {
+    public static final String ORDERS_PATH = "/v1/orders";
+    
+    @Value("${orders.service.url}")
+    public static String ORDERS_SERVICE_URL;
+}
+```
+
+### URI Builder Pattern Resolution
+
+Resolves `UriComponentsBuilder` patterns:
+
+```java
+URI uri = UriComponentsBuilder
+    .fromHttpUrl(bondServiceUrl)
+    .path("/v1/bonds/{id}")
+    .build(id)
+    .toUri();
+```
+
+### StringBuilder Tracing
+
+Traces `StringBuilder` construction for URL assembly:
+
+```java
+StringBuilder urlBuilder = new StringBuilder(config.getBaseUrl());
+urlBuilder.append("/v1/products/");
+urlBuilder.append(productId);
+String finalUrl = urlBuilder.toString();
+```
+
+## Cross-Repository Resolution
+
+When endpoints reference types from other indexed repositories:
+
+- Automatically resolves types from indexed dependencies
+- Uses Maven dependency coordinates from `repo_manifest.json`
+- Resolves nested DTOs from dependency repositories
+- Traces types across repository boundaries
+
+Example: An endpoint in `tcbs-trading` uses `BondProductDto` from `tcbs-bond-product`:
+
+```json
+{
+  "specs": {
+    "response": {
+      "body": {
+        "typeName": "BondProductDto",
+        "source": "external",
+        "sourceRepo": "tcbs-bond-product"
+      }
+    }
+  }
+}
+```
+
+## Messaging Resolution
+
+Detects and resolves messaging patterns for both inbound and outbound events:
+
+### Inbound Messaging (Event Consumers)
+
+- `@RabbitListener` - RabbitMQ message listeners
+- `@KafkaListener` - Kafka message listeners
+- `@EventListener` - Spring application events
+
+### Outbound Messaging (Event Publishers)
+
+Detects publishing patterns:
+
+| Pattern | Framework |
+|---------|-----------|
+| `rabbitTemplate.convertAndSend()` | RabbitMQ |
+| `kafkaTemplate.send()` | Kafka |
+| `applicationEventPublisher.publishEvent()` | Spring Events |
+| `eventBus.publish()` | Custom event bus |
+
+### Payload Type Resolution
+
+Resolves payload types with nested field schemas:
+
+```json
+{
+  "messaging": {
+    "outbound": [
+      {
+        "topic": "bond.orders.created",
+        "payload": {
+          "typeName": "BondOrderCreatedEvent",
+          "fields": [
+            { "name": "orderId", "type": "String" },
+            { "name": "productCode", "type": "String" },
+            { "name": "timestamp", "type": "LocalDateTime" }
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+## Validation Extraction
+
+### Method-Level Validation
+
+Extracts validation method calls:
+
+```java
+validateJWT(token);
+validateRequest(orderDto);
+validateProductExists(productCode);
+```
+
+Result:
+
+```json
+{
+  "validation": [
+    {
+      "field": "jwt",
+      "type": "Custom",
+      "method": "validateJWT",
+      "required": true
+    }
+  ]
+}
+```
+
+### Field-Level Validation Annotations
+
+Extracts JSR-303/380 annotations:
+
+| Annotation | Extracted Info |
+|------------|----------------|
+| `@NotNull` | Field required |
+| `@NotEmpty` | Non-empty required |
+| `@NotBlank` | Non-blank string required |
+| `@Size(min, max)` | Size constraints |
+| `@Pattern(regexp)` | Pattern constraint |
+| `@Min`, `@Max` | Numeric bounds |
+| `@JsonFormat(pattern)` | Date format |
+| `@Email` | Email validation |
+
+Example:
+
+```json
+{
+  "fields": [
+    {
+      "name": "orderDate",
+      "type": "LocalDateTime",
+      "annotations": [
+        "@JsonFormat(pattern = \"yyyy-MM-dd HH:mm:ss\")",
+        "@NotNull"
+      ]
+    }
+  ]
+}
+```
+
 ## Fields
 
 ### Request Params
@@ -255,9 +577,18 @@ Extracted from:
 ### Downstream APIs
 
 HTTP calls extracted from:
-- `RestTemplate`, `WebClient`, `HttpClient` calls
+- `RestTemplate`, `WebClient`, `HttpClient`, `OkHttpClient` calls
 - `@Value` expressions resolved to application properties
 - Spring constants for URL paths
+- URI builder patterns (`UriComponentsBuilder`)
+- StringBuilder URL construction
+
+Resolution chain:
+1. Extract HTTP call from method body
+2. Resolve base URL from field/variable assignments
+3. Resolve `@Value` annotations to application properties
+4. Trace static constants and service config fields
+5. Include resolved URL in output with resolution source
 
 ### Messaging
 
@@ -281,6 +612,21 @@ Mermaid `graph TB` format showing the call chain from controller to deepest serv
 |------|---------|
 | 0 | Success |
 | 1 | Error (no matching endpoint, invalid arguments, etc.) |
+
+## Missing Features
+
+The following options are NOT currently implemented but may be useful:
+
+| Option | Description | Status |
+|--------|-------------|--------|
+| `--all` | Document all endpoints in the repository | Not implemented |
+| `--format <format>` | Output format: `json` (default) or `yaml` | Not implemented |
+| `--output <file>` | Write output to file instead of stdout | Not implemented |
+
+Workarounds:
+- **Document multiple endpoints**: Use a shell script to iterate over endpoints
+- **YAML output**: Pipe JSON through `yq` or `jq` for conversion
+- **Write to file**: Redirect stdout: `gitnexus document-endpoint ... > output.json`
 
 ## See Also
 

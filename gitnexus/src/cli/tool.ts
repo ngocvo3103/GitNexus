@@ -161,6 +161,7 @@ export async function documentEndpointCommand(options?: {
   depth?: string;
   includeContext?: boolean;
   compact?: boolean;
+  openapi?: boolean;
   repo?: string;
   schemaPath?: string;
   strict?: boolean;
@@ -174,6 +175,7 @@ export async function documentEndpointCommand(options?: {
     console.error('  --depth <n>           Max trace depth (default: 10)');
     console.error('  --include-context     Include source context for AI enrichment');
     console.error('  --compact             Omit source content and empty arrays (use with --include-context)');
+    console.error('  --openapi             Preserve raw BodySchema for OpenAPI generation');
     console.error('  --schema-path <path>  Path to custom JSON schema file (default: bundled schema)');
     console.error('  --strict              Fail on schema validation errors (default: warn)');
     console.error('  --repo <name>         Target repository');
@@ -187,6 +189,7 @@ export async function documentEndpointCommand(options?: {
     depth: options.depth ? parseInt(options.depth, 10) : undefined,
     include_context: options.includeContext ?? false,
     compact: options.compact ?? false,
+    openapi: options.openapi ?? false,
     repo: options.repo,
   });
 

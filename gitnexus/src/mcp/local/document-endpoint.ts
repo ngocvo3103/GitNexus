@@ -10,7 +10,7 @@
 import type { RepoHandle } from './local-backend.js';
 import type { CrossRepoContext } from './cross-repo-context.js';
 import { executeParameterized } from '../core/lbug-adapter.js';
-import { executeTrace, type ChainNode } from './trace-executor.js';
+import { executeTrace, type ChainNode, type BuilderDetail } from './trace-executor.js';
 import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
 import { generateId } from '../../lib/utils.js';
 import { shouldSkipSchema, extractGenericInnerType, extractPackagePrefix } from '../../core/ingestion/type-extractors/shared.js';
@@ -21,6 +21,9 @@ import { shouldSkipSchema, extractGenericInnerType, extractPackagePrefix } from 
 
 /** Placeholder for AI enrichment - used throughout for fields requiring manual input */
 const TODO_AI_ENRICH = 'TODO_AI_ENRICH';
+
+/** Debug mode flag for conditional logging */
+const DEBUG = process.env.GITNEXUS_DEBUG === 'true';
 
 /** Valid HTTP methods for endpoint documentation */
 const VALID_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
@@ -121,6 +124,8 @@ export interface DocumentEndpointOptions {
   include_context?: boolean;
   compact?: boolean;
   repo?: string;
+  /** Preserve raw BodySchema for OpenAPI generation (includes validation annotations) */
+  openapi?: boolean;
   /** Optional injected query executor for testing */
   executeQuery?: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>;
   /** Optional cross-repo resolution capabilities */
@@ -270,6 +275,23 @@ export interface DocumentEndpointResult {
  * /i/v1/customers/{tcbsId} → /i/v1/customers/{}
  * Used for structural path comparison.
  */
+/**
+ * Parameter object for buildDocumentation function.
+ * Consolidates 9 parameters into a single object for better maintainability.
+ */
+interface BuildDocumentationParams {
+  method: string;
+  path: string;
+  route: EndpointInfo;
+  chain: ChainNode[];
+  includeContext: boolean;
+  compact: boolean;
+  openapi: boolean;
+  executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>;
+  repoId: string;
+  crossRepo?: CrossRepoContext;
+}
+
 function normalizePathStructure(path: string): string {
   return path.replace(/\{[^}]+\}/g, '{}');
 }
@@ -412,8 +434,9 @@ async function findHandlerByPathPattern(
 
                   classPath = classPathMatch?.[1];
                 }
-              } catch {
-                // Class query failed - continue without class path
+              } catch (e) {
+                if (DEBUG) console.error('[GitNexus DEBUG] Class path query failed:', e);
+                // Continue without class path
               }
               classPathCache.set(filePath, classPath);
             }
@@ -504,6 +527,7 @@ async function findHandlerByPathPattern(
           }
         }
       } catch (e) {
+        if (DEBUG) console.error('[GitNexus DEBUG] Pattern matching error:', e);
         // Continue to next pattern on error
         continue;
       }
@@ -536,7 +560,7 @@ export async function documentEndpoint(
   repo: RepoHandle,
   options: DocumentEndpointOptions
 ): Promise<{ result: DocumentEndpointResult; error?: string }> {
-  const { method, path, depth = 10, include_context = false, compact = false, crossRepo } = options;
+  const { method, path, depth = 10, include_context = false, compact = false, openapi = false, crossRepo } = options;
 
   // Validate HTTP method
   const upperMethod = method.toUpperCase();
@@ -557,7 +581,8 @@ export async function documentEndpoint(
       route = endpointsResult.endpoints[0];
     }
   } catch (err: any) {
-    // Route table may not exist yet — fall back to handler search
+    if (DEBUG) console.error('[GitNexus DEBUG] Route query failed:', err);
+    // Fall back to handler search
   }
 
   // Fallback: If no Route nodes exist, search for handler methods directly
@@ -607,7 +632,18 @@ export async function documentEndpoint(
 
   // Step 4: Build the documentation
   // Use route.path (actual endpoint path) instead of input pattern
-  const result = await buildDocumentation(method, route.path, route, traceResult.chain, include_context, compact, executeQuery, repo.id, crossRepo);
+  const result = await buildDocumentation({
+    method,
+    path: route.path,
+    route,
+    chain: traceResult.chain,
+    includeContext: include_context,
+    compact,
+    openapi,
+    executeQuery,
+    repoId: repo.id,
+    crossRepo,
+  });
 
   return { result };
 }
@@ -645,21 +681,20 @@ function createEmptyResult(method: string, path: string): DocumentEndpointResult
   };
 }
 
-async function buildDocumentation(
-  method: string,
-  path: string,
-  route: EndpointInfo,
-  chain: ChainNode[],
-  includeContext: boolean,
-  compact: boolean,
-  executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
-  repoId: string,
-  crossRepo?: CrossRepoContext
-): Promise<DocumentEndpointResult> {
+async function buildDocumentation(params: BuildDocumentationParams): Promise<DocumentEndpointResult> {
+  const { method, path, route, chain, includeContext, compact, openapi, executeQuery, repoId, crossRepo } = params;
   const result = createEmptyResult(method, path);
 
-  // Extract HTTP calls for downstreamApis
-  const downstreamApis = await extractDownstreamApis(chain, executeQuery, repoId, includeContext);
+  // Run all three independent async operations in parallel for better performance
+  const [downstreamApis, bodyResult, messagingResult] = await Promise.all([
+    extractDownstreamApis(chain, executeQuery, repoId, includeContext),
+    extractBodySchemas(chain, executeQuery, repoId, crossRepo),
+    extractMessaging(chain, includeContext, executeQuery, repoId, crossRepo),
+  ]);
+
+  // Destructure results from parallel execution
+  const { requestBody, responseBody, nestedSchemas } = bodyResult;
+  const { outbound, inbound, nestedSchemas: messagingNestedSchemas } = messagingResult;
 
   // Filter internal fields for schema compliance when includeContext is false
   if (includeContext) {
@@ -673,13 +708,6 @@ async function buildDocumentation(
       purpose: api.purpose,
     }));
   }
-
-  // Extract request and response body schemas with nested type resolution FIRST
-  // This creates the main nestedSchemas map that we'll merge into
-  const { requestBody, responseBody, nestedSchemas } = await extractBodySchemas(chain, executeQuery, repoId, crossRepo);
-
-  // Extract messaging for outbound/inbound and merge nestedSchemas
-  const { outbound, inbound, nestedSchemas: messagingNestedSchemas } = await extractMessaging(chain, includeContext, executeQuery, repoId, crossRepo);
   
   // Merge messaging nestedSchemas into main nestedSchemas from body schemas
   for (const [typeName, schema] of messagingNestedSchemas) {
@@ -738,9 +766,10 @@ async function buildDocumentation(
   result.keyDetails.security = security;
 
   // Convert to JSON example for schema-compliant output
+  // When openapi=true, keep raw BodySchema for OpenAPI converter (includes validation annotations)
   // When includeContext is true, keep full BodySchema for AI enrichment
-  // When includeContext is false, output JSON example or null
-  if (includeContext) {
+  // When openapi=false and includeContext=false, output JSON example
+  if (openapi || includeContext) {
     result.specs.request.body = embedNestedSchemas(requestBody, nestedSchemas);
     result.specs.response.body = embedNestedSchemas(responseBody, nestedSchemas);
   } else {
@@ -843,10 +872,51 @@ async function extractDownstreamApis(
       // ============================================
       // Pass 2: Variable assignment trace (heuristics + cross-class)
       // ============================================
+      
+      // WI-4: Check for builder.toUriString() pattern first
+      const builderResult = resolveBuilderUrl(detail.urlExpression, node.metadata.builderDetails, node.content);
+      if (builderResult && className) {
+        // Found builder pattern - resolve the base URL
+        let baseField: string | null = null;
+        
+        // Check if baseUrlExpression is a method call like "url.toString()"
+        // If so, trace the StringBuilder construction to find the actual base field
+        const toStringMatch = builderResult.baseUrlExpression.match(/^(\w+)\.toString\(\)$/);
+        if (toStringMatch && node.content) {
+          const varName = toStringMatch[1];
+          baseField = traceStringBuilderConstruction(varName, node.content);
+        }
+        
+        // If no StringBuilder trace, try direct extraction
+        if (!baseField) {
+          baseField = extractBaseField(builderResult.baseUrlExpression);
+        }
+        
+        if (baseField) {
+          // Try to resolve the base field
+          const resolved = await resolveValueAnnotation(executeQuery, repoId, className, baseField);
+          if (resolved.propertyKey) {
+            propertyKey = resolved.propertyKey;
+            serviceValue = resolved.rawValue;
+            resolvedFieldName = baseField;
+          }
+        }
+        // If base field resolution failed, try the full expression
+        if (!propertyKey) {
+          const traced = await traceVariableAssignment(executeQuery, repoId, className, baseField || builderResult.baseUrlExpression, node.content);
+          if (traced.propertyKey) {
+            propertyKey = traced.propertyKey;
+            serviceValue = traced.rawValue;
+            resolvedFieldName = traced.fieldName;
+          }
+        }
+      }
+      
+      // Regular variable assignment trace if builder pattern didn't resolve
       if (!propertyKey && className && parsed.variableRefs.length > 0) {
         // Try each variable reference with heuristic patterns
         for (const varRef of parsed.variableRefs) {
-          const traced = await traceVariableAssignment(executeQuery, repoId, className, varRef);
+          const traced = await traceVariableAssignment(executeQuery, repoId, className, varRef, node.content);
           if (traced.propertyKey) {
             propertyKey = traced.propertyKey;
             serviceValue = traced.rawValue;
@@ -1064,7 +1134,8 @@ async function resolveStaticFieldValue(
     }
 
     return null;
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Static final field query failed:', e);
     return null;
   }
 }
@@ -1122,7 +1193,8 @@ async function resolveStaticFieldValueCrossClass(
 
     // Fall back to first match
     return { value: rows[0].value, declaringClass: rows[0].className };
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Cross-class static field query failed:', e);
     return { value: null, declaringClass: null };
   }
 }
@@ -1175,7 +1247,8 @@ async function resolveValueAnnotation(
     }
 
     return { propertyKey: null, rawValue: null };
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] @Value annotation resolution failed:', e);
     return { propertyKey: null, rawValue: null };
   }
 }
@@ -1259,7 +1332,8 @@ async function resolvePropertyValue(
     }
 
     return { value: null, filePath: null };
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Property resolution failed:', e);
     return { value: null, filePath: null };
   }
 }
@@ -1294,8 +1368,41 @@ async function traceVariableAssignment(
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
   repoId: string,
   className: string,
-  variableName: string
+  variableName: string,
+  content?: string
 ): Promise<{ propertyKey: string | null; rawValue: string | null; fieldName: string | null }> {
+  // Step 1: Try to resolve from local variable assignments if content is available
+  if (content) {
+    const assignments = extractLocalVariableAssignments(content);
+    const expression = assignments.get(variableName);
+    if (expression) {
+      // Extract base field from expression like "matchingUrl + pathSuggestion"
+      const baseField = extractBaseField(expression);
+      if (baseField) {
+        // Step 1a: Check if it's a static constant (UPPER_CASE pattern)
+        if (/^[A-Z][A-Z0-9_]*$/.test(baseField)) {
+          const staticResult = await resolveStaticFieldValueCrossClass(executeQuery, repoId, className, baseField);
+          if (staticResult.value) {
+            // Extract service name from URL if possible
+            const serviceName = extractServiceName(staticResult.value);
+            return {
+              propertyKey: staticResult.value,
+              rawValue: staticResult.value,
+              fieldName: baseField,
+            };
+          }
+        }
+        
+        // Step 1b: Try @Value annotation resolution for regular fields
+        const resolved = await resolveValueAnnotation(executeQuery, repoId, className, baseField);
+        if (resolved.propertyKey) {
+          return { propertyKey: resolved.propertyKey, rawValue: resolved.rawValue, fieldName: baseField };
+        }
+      }
+    }
+  }
+  
+  // Step 2: Fall back to heuristic patterns
   // Heuristic patterns to try in order of specificity:
   // 1. Exact match: matchingUrl → field named "matchingUrl"
   // 2. Strip suffix: matchingUrl → "matching" → field "matchingService"
@@ -1328,6 +1435,155 @@ async function traceVariableAssignment(
 }
 
 /**
+ * Detect if URL expression is a builder.toUriString() pattern and resolve it.
+ * Handles both:
+ * 1. String url = builder.toUriString(); restTemplate.getForObject(url, ...)
+ * 2. restTemplate.getForObject(builder.toUriString(), ...)
+ */
+/**
+ * Detect if URL expression is a builder.toUriString() pattern and resolve it.
+ * Handles both:
+ * 1. String url = builder.toUriString(); restTemplate.getForObject(url, ...)
+ * 2. restTemplate.getForObject(builder.toUriString(), ...)
+ */
+function resolveBuilderUrl(
+  urlExpression: string,
+  builderDetails: BuilderDetail[],
+  content?: string
+): { baseUrlExpression: string; builderVar: string } | null {
+  if (builderDetails.length === 0) {
+    return null;
+  }
+
+  // Pattern 1: Direct builder.toUriString() in URL expression
+  const directBuilderMatch = urlExpression.match(/^(\w+)\.toUriString\(\)$/);
+  if (directBuilderMatch) {
+    const builderVar = directBuilderMatch[1];
+    const builder = builderDetails.find(b => b.builderVar === builderVar);
+    if (builder) {
+      return {
+        baseUrlExpression: builder.baseUrlExpression,
+        builderVar: builder.builderVar,
+      };
+    }
+  }
+
+  // Pattern 2: Variable assigned from builder.toUriString()
+  // Look for: String url = builder.toUriString();
+  if (content) {
+    const toUriStringMatch = content.match(/(\w+)\s*=\s*(\w+)\.toUriString\s*\(\s*\)/);
+    if (toUriStringMatch) {
+      const variableName = toUriStringMatch[1];
+      const builderVar = toUriStringMatch[2];
+      
+      // Check if the URL expression matches this variable
+      if (urlExpression === variableName || urlExpression.includes(variableName)) {
+        const builder = builderDetails.find(b => b.builderVar === builderVar);
+        if (builder) {
+          return {
+            baseUrlExpression: builder.baseUrlExpression,
+            builderVar: builder.builderVar,
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Trace StringBuilder construction to find the base URL field.
+ * Pattern: StringBuilder var = new StringBuilder(baseUrl + path);
+ * Returns the base field name (e.g., "pricingServiceBaseUrl") if found.
+ */
+function traceStringBuilderConstruction(
+  varName: string,
+  content: string
+): string | null {
+  // Pattern: StringBuilder var = new StringBuilder(expr);
+  // Also handles: StringBuilder var = new StringBuilder(); var.append(expr);
+  const sbPattern = new RegExp(
+    `StringBuilder\\s+${varName}\\s*=\\s*new\\s+StringBuilder\\s*\\(\\s*([^)]+)\\s*\\)`,
+    'g'
+  );
+  
+  let match;
+  while ((match = sbPattern.exec(content)) !== null) {
+    const constructorArg = match[1].trim();
+    // The argument could be:
+    // 1. A simple field: pricingServiceBaseUrl
+    // 2. A concatenation: pricingServiceBaseUrl + PATH_CONSTANT
+    // 3. A string literal: "http://..."
+    
+    // Remove trailing .toString() if present
+    const cleanArg = constructorArg.replace(/\.toString\(\)$/, '');
+    
+    // Extract the base field from the expression
+    const baseField = extractBaseField(cleanArg);
+    if (baseField) {
+      return baseField;
+    }
+    
+    // If it's a complex expression, try to find the first identifier
+    const identifierMatch = cleanArg.match(/^([a-zA-Z_][a-zA-Z0-9_]*)/);
+    if (identifierMatch) {
+      return identifierMatch[1];
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Extracts local variable assignments from source content.
+ * Parses patterns like: Type varName = expression;
+ * @param content - Source code content
+ * @returns Map of variable name to its assigned expression
+ */
+export function extractLocalVariableAssignments(content: string): Map<string, string> {
+  const assignments = new Map<string, string>();
+  
+  // Pattern 1: Java style - Type varName = expression; (e.g., String url = matchingUrl + path;)
+  // Pattern 2: TypeScript style - const/let/var varName[: Type] = expression; (e.g., const apiUrl: string = baseUrl + "/api";)
+  const patterns = [
+    /(?:\w+(?:<[^>]+>)?)\s+(\w+)\s*=\s*([^;]+);/g,           // Java: Type varName = expr;
+    /(?:const|let|var)\s+(\w+)(?::\s*\w+(?:<[^>]+>)?)?\s*=\s*([^;]+);/g  // TS: const varName[: Type] = expr;
+  ];
+  
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(content)) !== null) {
+      const varName = match[1];
+      const expression = match[2].trim();
+      assignments.set(varName, expression);
+    }
+  }
+  return assignments;
+}
+
+/**
+ * Extracts the base field name from an expression.
+ * E.g., "matchingUrl + pathSuggestion" → "matchingUrl"
+ * E.g., "baseUrl + '/api'" → "baseUrl"
+ * Returns null for method calls or non-field expressions.
+ */
+function extractBaseField(expression: string): string | null {
+  // Split by concatenation operators
+  const parts = expression.split(/\s*[+&|]\s*/);
+  if (parts.length > 0) {
+    const firstPart = parts[0].trim();
+    // Return if it's a simple field reference (alphanumeric, may include underscores)
+    // Accepts both lowercase fields (matchingUrl) and uppercase constants (PROFILE_URL)
+    // Excludes method calls (contains parentheses) and string literals
+    if (/^[a-zA-Z][a-zA-Z0-9_]*$/.test(firstPart) && !firstPart.includes('(')) {
+      return firstPart;
+    }
+  }
+  return null;
+}
+
+/**
  * Find the class that contains a method at a given file path.
  */
 async function findEnclosingClass(
@@ -1346,7 +1602,8 @@ async function findEnclosingClass(
     const rows = await executeQuery(repoId, query, { filePath });
     if (rows.length === 0) return null;
     return rows[0].name || rows[0][0];
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Enclosing class lookup failed:', e);
     return null;
   }
 }
@@ -1383,7 +1640,8 @@ async function extractBodySchemas(
       if (bodyParam?.type) {
         requestBody = await resolveTypeSchema(bodyParam.type, executeQuery, repoId, requestVisited, crossRepo);
       }
-    } catch {
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Request body resolution failed:', e);
       // Ignore parse errors
     }
   }
@@ -1472,7 +1730,6 @@ async function resolveTypeSchema(
       // Try cross-repo resolution if type not found locally
       if (crossRepo) {
         const packagePrefix = extractPackagePrefix(typeName);
-        const DEBUG = process.env.GITNEXUS_DEBUG === 'true';
 
         if (DEBUG) {
           console.error(`[GitNexus DEBUG] resolveTypeSchema: typeName=${typeName}, packagePrefix=${packagePrefix || 'none'}`);
@@ -1540,8 +1797,9 @@ async function resolveTypeSchema(
                     })),
                     repoId: result.repoId
                   };
-                } catch {
-                  // JSON parse error — continue to next result
+                } catch (e) {
+                  if (DEBUG) console.error('[GitNexus DEBUG] Indexed type field parse error:', e);
+                  // Continue to next result
                 }
               }
               return { typeName: found.name || typeName, source: 'indexed', fields: undefined, repoId: result.repoId };
@@ -1567,7 +1825,8 @@ async function resolveTypeSchema(
         annotations: f.annotations || []
       }))
     };
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Type schema resolution failed:', e);
     return { typeName, source: 'external', fields: undefined };
   }
 }
@@ -1787,7 +2046,8 @@ function extractRequestParams(
   let rawParams: RawParamAnnotation[];
   try {
     rawParams = JSON.parse(handler.parameterAnnotations);
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Parameter annotations parse failed:', e);
     return [];
   }
 
@@ -1963,7 +2223,8 @@ function findFieldsInChain(
 
   try {
     return JSON.parse(classNode.fields);
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Class fields parse failed:', e);
     return null;
   }
 }
@@ -2081,9 +2342,9 @@ function extractFieldName(
       return varName;
     }
 
-    // Return the variable name (not the type name) for field context
-    // The variable name is what gets validated
-    return varName;
+    // Variable not in handler params - return type name instead
+    // When a type is explicitly specified (e.g., "TcbsJWT jwt"), use the type
+    return typeName;
   }
 
   // Handle getter calls (e.g., "dto.getTradingDate()")
@@ -2145,7 +2406,8 @@ function extractValidationRules(
   let rawParams: RawParamAnnotation[];
   try {
     rawParams = JSON.parse(handler.parameterAnnotations);
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Validation parameter annotations parse failed:', e);
     return rules;
   }
 
@@ -2291,8 +2553,9 @@ function extractValidationRules(
         // Map type to request body if it matches
         if (paramType && requestBody?.typeName && paramType === requestBody.typeName) {
           fieldName = 'body';  // Validates the whole request body
-        } else if (paramType && !fieldName) {
-          // Use the type name for other types (e.g., TcbsJWT → "TcbsJWT")
+        } else if (paramType) {
+          // Use the type name for other types (e.g., TcbsJWT → "TcbsJWT", OrderDTO → "OrderDTO")
+          // This handles both cases: variable found in params (use its type) and type name passed directly
           fieldName = paramType;
         }
         // else: keep fieldName as extracted or TODO_AI_ENRICH
@@ -2426,7 +2689,8 @@ async function extractMessaging(
             });
           }
         }
-      } catch {
+      } catch (e) {
+        if (DEBUG) console.error('[GitNexus DEBUG] Annotation parse error:', e);
         // Ignore parse errors for annotations
       }
     }
@@ -2448,11 +2712,39 @@ async function extractMessaging(
     try {
       const results = await executeQuery(repoId, cypher, {});
       for (const row of results) {
-        // Extract values - Cypher returns columns like m.id, m.name, m.content, etc.
-        const name = row['m.name'] ?? row.name ?? row[1];
-        const content = row['m.content'] ?? row.content ?? row[2] ?? '';
-        const filePath = row['m.filePath'] ?? row.filePath ?? row[3] ?? '';
-        const parameterAnnotations = row['m.parameterAnnotations'] ?? row.parameterAnnotations ?? row[4];
+        // Extract values - supports multiple result formats:
+        // 1. Cypher named columns: row['m.name'], row['m.content'], row['m.parameterAnnotations']
+        // 2. Object with m.annotations format: row['m.name'], row['m.annotations'], row['m.parameters']
+        // 3. LadybugDB array format: row[0]=name, row[1]=annotations, row[2]=filePath, row[3]=parameters
+        const name = row['m.name'] ?? row.name ?? row[0];
+        const rawContent = row['m.content'] ?? row.content ?? '';
+        const filePath = row['m.filePath'] ?? row.filePath ?? row[2] ?? '';
+        // Parameters can be in m.parameterAnnotations or m.parameters (different formats)
+        const parameterAnnotations = row['m.parameterAnnotations'] ?? row['m.parameters'] ?? row.parameterAnnotations ?? row.parameters ?? row[3];
+
+        // For LadybugDB/array formats, construct content from annotations JSON
+        // Cypher format returns source code in m.content, but other formats return annotations array
+        let content = rawContent;
+        if (!content) {
+          // Try to construct from annotations - supports both array format and object format
+          // Array format: row[1] contains JSON like [{name: '@RabbitListener', attrs: {queues: '...'}}]
+          // Object format: row['m.annotations'] contains JSON like [{name: '@RabbitListener', attrs: {...}}]
+          const annotationsRaw = row['m.annotations'] ?? row[1];
+          if (annotationsRaw && typeof annotationsRaw === 'string') {
+            try {
+              const annotations = JSON.parse(annotationsRaw);
+              if (Array.isArray(annotations) && annotations.length > 0) {
+                // Construct annotation string for topic extraction
+                const ann = annotations[0];
+                const attrKey = ann.name === '@RabbitListener' ? 'queues' : 'topics';
+                const attrValue = ann.attrs?.[attrKey] ?? ann.attrs?.queues ?? ann.attrs?.topics ?? '';
+                content = `${ann.name}(${attrKey} = "${attrValue}")`;
+              }
+            } catch {
+              // Ignore parse errors
+            }
+          }
+        }
 
         // Determine listener type from content
         const listenerType = content.includes('@RabbitListener') ? 'RabbitListener' as const
@@ -2487,7 +2779,8 @@ async function extractMessaging(
           }),
         });
       }
-    } catch {
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Broker listener graph query failed:', e);
       // Ignore graph query errors
     }
   }
@@ -2561,7 +2854,8 @@ function extractListenerTopic(annotations: string, listenerType: 'RabbitListener
         }
       }
     }
-  } catch {
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Annotation JSON parse failed:', e);
     // Not JSON, try regex format
   }
   
@@ -2621,7 +2915,10 @@ function extractPayloadFromParameters(parameters: string | unknown): string {
     if (Array.isArray(params) && params.length > 0 && params[0].type) {
       return params[0].type;
     }
-  } catch { /* ignore parse errors */ }
+  } catch (e) { 
+    if (DEBUG) console.error('[GitNexus DEBUG] Parameter JSON parse failed:', e);
+    /* ignore parse errors */ 
+  }
   return TODO_AI_ENRICH;
 }
 
@@ -2729,7 +3026,8 @@ function extractAnnotations(chain: ChainNode[]): {
             }
           }
         }
-      } catch {
+      } catch (e) {
+        if (DEBUG) console.error('[GitNexus DEBUG] Transaction annotation parse failed:', e);
         // Ignore parse errors
       }
     }
