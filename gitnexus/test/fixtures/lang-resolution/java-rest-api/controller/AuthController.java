@@ -26,12 +26,14 @@ public class AuthController {
 
     @PostMapping("/login")
     public ResponseEntity<TokenResponse> login(@RequestBody LoginRequest req) {
+        // DEV ONLY: chấp nhận mọi username/password, gán role Admin để demo
         String token = jwtService.generate(req.username(), List.of("Admin"), Map.of());
         return ResponseEntity.ok(new TokenResponse(token));
     }
 
     @PostMapping("/refresh")
     public ResponseEntity<TokenResponse> refresh(@RequestHeader("Authorization") String auth) {
+        // DEV ONLY: refresh = cấp token mới với role Admin
         String token = jwtService.generate("dev", List.of("Admin"), Map.of());
         return ResponseEntity.ok(new TokenResponse(token));
     }
@@ -49,4 +51,3 @@ public class AuthController {
         return ResponseEntity.ok(new MeResponse(username, roles));
     }
 }
-
