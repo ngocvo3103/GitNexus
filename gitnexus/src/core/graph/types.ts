@@ -82,6 +82,13 @@ export type NodeProperties = {
   errorKeys?: string[],
   // Middleware wrapper chain (outermost first): ['withRateLimit', 'withCSRF', 'withAuth']
   middleware?: string[],
+  // Route-specific properties
+  httpMethod?: string,
+  handler?: string,
+  controller?: string,
+  framework?: string,
+  prefix?: string,
+  lineNumber?: number,
 }
 
 export type RelationshipType =

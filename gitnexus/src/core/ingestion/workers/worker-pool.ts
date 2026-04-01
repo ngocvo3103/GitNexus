@@ -105,6 +105,9 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
             }
           } else if (msg && msg.type === 'sub-batch-done') {
             sendNextSubBatch();
+          } else if (msg && msg.type === 'warning') {
+            // Log warning but continue processing - don't settle the promise
+            console.warn(`Worker ${i} warning: ${msg.message}`);
           } else if (msg && msg.type === 'error') {
             settled = true;
             cleanup();
@@ -114,9 +117,9 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
             cleanup();
             resolve(msg.data);
           } else {
-            settled = true;
-            cleanup();
-            resolve(msg);
+            // Unknown message type - this shouldn't happen, log and continue
+            console.warn(`Worker ${i} sent unknown message type:`, msg?.type);
+            // Don't settle - wait for proper result or error
           }
         };
 

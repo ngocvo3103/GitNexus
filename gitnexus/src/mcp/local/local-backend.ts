@@ -1714,6 +1714,7 @@ export class LocalBackend {
     const directCount = (grouped[1] || []).length;
     let affectedProcesses: any[] = [];
     let affectedModules: any[] = [];
+    let affectedRoutes: any[] = [];
 
     if (impacted.length > 0) {
       const CHUNK_SIZE = 100;
@@ -1726,6 +1727,7 @@ export class LocalBackend {
       // process + entry point info in 1 round-trip per chunk. Converted to
       // parameterized queries to avoid manual string escaping and long query strings.
       const entryPointMap = new Map<string, {
+        entryPointId: string;
         name: string; type: string; filePath: string;
         affected_process_count: number;
         total_hits: number;
@@ -1785,6 +1787,7 @@ export class LocalBackend {
              }
              if (!entryPointMap.has(epId)) {
                entryPointMap.set(epId, {
+                 entryPointId: epId,
                  name: epName,
                  type: epType,
                  filePath: epFilePath,
@@ -1843,6 +1846,29 @@ export class LocalBackend {
            earliest_broken_step: ep.earliest_broken_step === Infinity ? null : ep.earliest_broken_step,
          }))
          .sort((a, b) => b.total_hits - a.total_hits);
+
+       // Enrichment Route node
+       try {
+         const entryPointIds = affectedProcesses
+           .map((proc: any) => proc.entryPointId)
+           .filter((id: string | undefined) => !!id);
+         if (entryPointIds.length > 0) {
+           const routeRows = await executeParameterized(repo.id, `
+             MATCH (r:Route)-[:CodeRelation {type: 'ENTRY_POINT_OF'}]->(p:Process)
+             WHERE p.entryPointId IN $entryPointIds
+             RETURN DISTINCT r.id AS id, r.name AS name, r.filePath AS filePath, r.httpMethod AS method, p.entryPointId AS entryPointId
+           `, { entryPointIds });
+           affectedRoutes = routeRows.map((row: any) => ({
+             id: row.id,
+             name: row.name,
+             path: row.name, // Use name as path surrogate if path is missing
+             method: row.method,
+             entryPointId: row.entryPointId,
+           }));
+         }
+       } catch (e) {
+         logQueryError('impact:route-enrichment', e);
+       }
 
       // ── Module enrichment: use same cap as process enrichment and parameterized queries
       const maxItems = Math.min(impacted.length, MAX_CHUNKS * CHUNK_SIZE);
@@ -1933,6 +1959,7 @@ export class LocalBackend {
     // Risk scoring
     const processCount = affectedProcesses.length;
     const moduleCount = affectedModules.length;
+    const routeCount = affectedRoutes.length;
     let risk = 'LOW';
     if (directCount >= 30 || processCount >= 5 || moduleCount >= 5 || impacted.length >= 200) {
       risk = 'CRITICAL';
@@ -1957,9 +1984,11 @@ export class LocalBackend {
         direct: directCount,
         processes_affected: processCount,
         modules_affected: moduleCount,
+        routes_affected: routeCount,
       },
       affected_processes: affectedProcesses,
       affected_modules: affectedModules,
+      affected_routes: affectedRoutes,
       byDepth: grouped,
     };
   }

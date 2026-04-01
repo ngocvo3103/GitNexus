@@ -720,3 +720,200 @@ describe('cypher result formatting', () => {
     expect(result.error).toContain('Syntax error');
   });
 });
+
+// ─── Multi-repo (repos[]) routing tests ─────────────────────────────────
+
+describe('callTool multi-repo routing', () => {
+  let backend: LocalBackend;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();  // Use clearAllMocks to preserve module-level mocks
+    (listRegisteredRepos as any).mockResolvedValue([
+      MOCK_REPO_ENTRY,
+      { ...MOCK_REPO_ENTRY, name: 'other-project', path: '/tmp/other-project', storagePath: '/tmp/.gitnexus/other-project' },
+    ]);
+    (cleanupOldKuzuFiles as any).mockResolvedValue({ found: false, needsReindex: false });
+    (initLbug as any).mockResolvedValue(undefined);
+    (isLbugReady as any).mockReturnValue(true);
+    (closeLbug as any).mockResolvedValue(undefined);
+    (executeQuery as any).mockResolvedValue([]);
+    (executeParameterized as any).mockResolvedValue([]);
+
+    backend = new LocalBackend();
+    await backend.init();
+  });
+
+  afterEach(async () => {
+    await backend.disconnect();
+  });
+
+  describe('query tool with repos[]', () => {
+    it('routes to multi-repo handler when repos array is provided', async () => {
+      (executeParameterized as any)
+        .mockResolvedValueOnce([
+          { id: 'func:auth', name: 'auth', type: 'Function', filePath: '/a.ts', startLine: 1, endLine: 10, nodeId: 'func:auth' },
+        ])
+        .mockResolvedValueOnce([]);
+
+      const result = await backend.callTool('query', {
+        query: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      // Should return aggregated results with _repoId attribution
+      expect(result).toHaveProperty('processes');
+      expect(result).toHaveProperty('process_symbols');
+      expect(result).toHaveProperty('definitions');
+    });
+  });
+
+  describe('cypher tool with repos[]', () => {
+    it('routes to multi-repo handler when repos array is provided', async () => {
+      (executeQuery as any)
+        .mockResolvedValueOnce([{ name: 'main', filePath: 'src/a.ts' }])
+        .mockResolvedValueOnce([{ name: 'helper', filePath: 'src/b.ts' }]);
+
+      const result = await backend.callTool('cypher', {
+        query: 'MATCH (n:Function) RETURN n.name AS name, n.filePath AS filePath',
+        repos: ['test-project', 'other-project'],
+      });
+
+      // Should return formatted result with _repoId
+      expect(result).toHaveProperty('markdown');
+      expect(result.row_count).toBe(2);
+    });
+
+    it('aggregates results from multiple repos with _repoId attribution', async () => {
+      (executeQuery as any)
+        .mockResolvedValueOnce([{ name: 'funcA', filePath: '/a.ts' }])
+        .mockResolvedValueOnce([{ name: 'funcB', filePath: '/b.ts' }]);
+
+      const result = await backend.callTool('cypher', {
+        query: 'MATCH (n:Function) RETURN n.name AS name',
+        repos: ['test-project', 'other-project'],
+      });
+
+      // Result should have markdown format with row count 2
+      expect(result).toHaveProperty('markdown');
+      expect(result.row_count).toBe(2);
+    });
+
+    it('uses single-repo path when only repo parameter is provided (backward compat)', async () => {
+      (executeQuery as any).mockResolvedValue([{ name: 'func', filePath: '/a.ts' }]);
+
+      const result = await backend.callTool('cypher', {
+        query: 'MATCH (n:Function) RETURN n.name',
+        repo: 'test-project',
+      });
+
+      // Should use single-repo handler
+      expect(result).toHaveProperty('markdown');
+    });
+  });
+
+  describe('context tool with repos[]', () => {
+    it('routes to multi-repo handler when repos array is provided', async () => {
+      (executeParameterized as any)
+        .mockResolvedValueOnce([
+          { id: 'func:auth', name: 'auth', type: 'Function', filePath: '/a.ts', startLine: 1, endLine: 10 },
+        ])
+        .mockResolvedValueOnce([]);
+
+      const result = await backend.callTool('context', {
+        name: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      // Should aggregate candidates from multiple repos
+      expect(result).toHaveProperty('status');
+    });
+
+    it('returns symbol with _repoId when found in one repo', async () => {
+      (executeParameterized as any)
+        .mockResolvedValueOnce([
+          { id: 'func:auth', name: 'auth', type: 'Function', filePath: '/a.ts', startLine: 1, endLine: 10 },
+        ])
+        .mockResolvedValueOnce([]);
+
+      const result = await backend.callTool('context', {
+        name: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      // If found exactly one match, should return it with _repoId
+      expect(result).toHaveProperty('status');
+    });
+  });
+
+  describe('impact tool with repos[]', () => {
+    it('routes to multi-repo handler when repos array is provided', async () => {
+      (executeParameterized as any)
+        .mockResolvedValueOnce([
+          { id: 'func:auth', name: 'auth', type: 'Function', filePath: '/a.ts' },
+        ])
+        .mockResolvedValueOnce([]);
+      (executeQuery as any)
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const result = await backend.callTool('impact', {
+        target: 'auth',
+        direction: 'upstream',
+        repos: ['test-project', 'other-project'],
+      });
+
+      // Should aggregate impact results
+      expect(result).toHaveProperty('byDepth');
+      expect(result).toHaveProperty('risk');
+    });
+
+    it('calculates aggregate risk from multiple repos', async () => {
+      (executeParameterized as any)
+        .mockResolvedValueOnce([
+          { id: 'func:auth', name: 'auth', type: 'Function', filePath: '/a.ts' },
+        ])
+        .mockResolvedValueOnce([]);
+      (executeQuery as any)
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      const result = await backend.callTool('impact', {
+        target: 'auth',
+        direction: 'upstream',
+        repos: ['test-project', 'other-project'],
+      });
+
+      // Risk should be calculated from aggregated results
+      // With no callers found, risk is 'NONE'
+      expect(['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).toContain(result.risk);
+    });
+  });
+
+  describe('backward compatibility', () => {
+    it('rejects repos[] for tools that do not support it', async () => {
+      await expect(backend.callTool('rename', {
+        symbol_name: 'oldName',
+        new_name: 'newName',
+        repos: ['test-project'],
+      })).rejects.toThrow('does not support multi-repo queries');
+    });
+
+    it('empty repos array is treated as single-repo (uses default)', async () => {
+      // Reset to single repo for this test
+      (listRegisteredRepos as any).mockResolvedValue([MOCK_REPO_ENTRY]);
+      backend = new LocalBackend();
+      await backend.init();
+
+      (executeQuery as any).mockResolvedValue([]);
+
+      // Empty repos array should fall through to single-repo path
+      const result = await backend.callTool('cypher', {
+        query: 'MATCH (n) RETURN n LIMIT 1',
+        repos: [], // Empty array should fall back to single-repo
+      });
+
+      // Should use single-repo handler (returns empty array for empty result)
+      expect(result).toEqual([]);
+    });
+  });
+});

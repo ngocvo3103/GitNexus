@@ -242,7 +242,10 @@ export const streamAllCSVsToDisk = async (
   const sectionWriter = new BufferedCSVWriter(path.join(csvDir, 'section.csv'), 'id,name,filePath,startLine,endLine,level,content,description');
 
   // Route nodes for API endpoint mapping
-  const routeWriter = new BufferedCSVWriter(path.join(csvDir, 'route.csv'), 'id,name,filePath,responseKeys,errorKeys,middleware');
+  const routeWriter = new BufferedCSVWriter(
+    path.join(csvDir, 'route.csv'),
+    'id,name,filePath,httpMethod,handler,controller,framework,prefix,lineNumber,responseKeys,errorKeys,middleware',
+  );
 
   // Tool nodes for MCP tool definitions
   const toolWriter = new BufferedCSVWriter(path.join(csvDir, 'tool.csv'), 'id,name,filePath,description');
@@ -356,10 +359,22 @@ export const streamAllCSVsToDisk = async (
         const errorKeysStr = `[${errorKeys.map((k: string) => `'${k.replace(/'/g, "''")}'`).join(',')}]`;
         const middleware = (node.properties as any).middleware || [];
         const middlewareStr = `[${middleware.map((m: string) => `'${m.replace(/'/g, "''")}'`).join(',')}]`;
+        const httpMethod = (node.properties as any).httpMethod || '';
+        const handler = (node.properties as any).handler || '';
+        const controller = (node.properties as any).controller || '';
+        const framework = (node.properties as any).framework || '';
+        const prefix = (node.properties as any).prefix || '';
+        const lineNumber = (node.properties as any).lineNumber ?? -1;
         await routeWriter.addRow([
           escapeCSVField(node.id),
           escapeCSVField(node.properties.name || ''),
           escapeCSVField(node.properties.filePath || ''),
+          escapeCSVField(httpMethod),
+          escapeCSVField(handler),
+          escapeCSVField(controller),
+          escapeCSVField(framework),
+          escapeCSVField(prefix),
+          escapeCSVNumber(lineNumber, -1),
           escapeCSVField(keysStr),
           escapeCSVField(errorKeysStr),
           escapeCSVField(middlewareStr),
