@@ -17,6 +17,7 @@
 
 import { writeSync } from 'node:fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { ensureHeap } from './heap-utils.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -108,6 +109,8 @@ export async function impactCommand(target: string, options?: {
   depth?: string;
   includeTests?: boolean;
 }): Promise<void> {
+  if (ensureHeap()) return;
+
   if (!target?.trim()) {
     console.error('Usage: gitnexus impact <symbol_name> [--direction upstream|downstream]');
     process.exit(1);
@@ -149,5 +152,66 @@ export async function cypherCommand(query: string, options?: {
     query,
     repo: options?.repo,
   });
+  output(result);
+}
+
+export async function documentEndpointCommand(options?: {
+  method?: string;
+  path?: string;
+  depth?: string;
+  includeContext?: boolean;
+  compact?: boolean;
+  openapi?: boolean;
+  repo?: string;
+  schemaPath?: string;
+  strict?: boolean;
+}): Promise<void> {
+  if (ensureHeap()) return;
+
+  if (!options?.method || !options?.path) {
+    console.error('Usage: gitnexus document-endpoint --method <METHOD> --path <path-pattern>');
+    console.error('  --method <METHOD>     HTTP method (GET, POST, PUT, DELETE, PATCH)');
+    console.error('  --path <pattern>      Path pattern to match (e.g., "suggest", "/bookings/{id}")');
+    console.error('  --depth <n>           Max trace depth (default: 10)');
+    console.error('  --include-context     Include source context for AI enrichment');
+    console.error('  --compact             Omit source content and empty arrays (use with --include-context)');
+    console.error('  --openapi             Preserve raw BodySchema for OpenAPI generation');
+    console.error('  --schema-path <path>  Path to custom JSON schema file (default: bundled schema)');
+    console.error('  --strict              Fail on schema validation errors (default: warn)');
+    console.error('  --repo <name>         Target repository');
+    process.exit(1);
+  }
+
+  const backend = await getBackend();
+  const response = await backend.callTool('document-endpoint', {
+    method: options.method,
+    path: options.path,
+    depth: options.depth ? parseInt(options.depth, 10) : undefined,
+    include_context: options.includeContext ?? false,
+    compact: options.compact ?? false,
+    openapi: options.openapi ?? false,
+    repo: options.repo,
+  });
+
+  // Extract the inner result from MCP response format: { result: DocumentEndpointResult }
+  const result = response?.result ?? response;
+
+  // Validate against schema if --schema-path or --strict is provided
+  if (options.schemaPath || options.strict) {
+    const { validateAgainstSchema, formatValidationErrors } = await import('../utils/schema-validator.js');
+    const validation = validateAgainstSchema(result, undefined, options.schemaPath);
+
+    if (!validation.valid) {
+      const errorMsg = `Schema validation failed:\n${formatValidationErrors(validation)}`;
+
+      if (options.strict) {
+        console.error(errorMsg);
+        process.exit(1);
+      } else {
+        console.error(`Warning: ${errorMsg}`);
+      }
+    }
+  }
+
   output(result);
 }

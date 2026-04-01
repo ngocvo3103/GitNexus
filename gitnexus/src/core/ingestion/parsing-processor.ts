@@ -14,6 +14,7 @@ import type { FieldInfo, FieldExtractorContext } from './field-types.js';
 import type { LanguageProvider } from './language-provider.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, ExtractedDecoratorRoute, ExtractedToolDef, FileConstructorBindings, FileTypeEnvBindings, ExtractedORMQuery } from './workers/parse-worker.js';
+import { extractClassFields, extractMethodParameterAnnotations } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
@@ -89,7 +90,7 @@ const processParsingWithWorkers = async (
     }
 
     for (const sym of result.symbols) {
-      symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
+      symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type as NodeLabel, {
         parameterCount: sym.parameterCount,
         requiredParameterCount: sym.requiredParameterCount,
         parameterTypes: sym.parameterTypes,
@@ -101,15 +102,15 @@ const processParsingWithWorkers = async (
 
     allImports.push(...result.imports);
     allCalls.push(...result.calls);
-    allAssignments.push(...result.assignments);
+    if (result.assignments) allAssignments.push(...result.assignments);
     allHeritage.push(...result.heritage);
     allRoutes.push(...result.routes);
-    allFetchCalls.push(...result.fetchCalls);
-    allDecoratorRoutes.push(...result.decoratorRoutes);
-    allToolDefs.push(...result.toolDefs);
+    if (result.fetchCalls) allFetchCalls.push(...result.fetchCalls);
+    if (result.decoratorRoutes) allDecoratorRoutes.push(...result.decoratorRoutes);
+    if (result.toolDefs) allToolDefs.push(...result.toolDefs);
     if (result.ormQueries) allORMQueries.push(...result.ormQueries);
     allConstructorBindings.push(...result.constructorBindings);
-    allTypeEnvBindings.push(...result.typeEnvBindings);
+    if (result.typeEnvBindings) allTypeEnvBindings.push(...result.typeEnvBindings);
   }
 
   // Merge and log skipped languages from workers
@@ -304,6 +305,26 @@ const processParsingSequential = async (
         }
       }
 
+      // ── Field extraction for DTO/Entity classes ──
+      let fields: string | undefined;
+      if (nodeLabel === 'Class' && definitionNode) {
+        const classFields = extractClassFields(definitionNode, language);
+        if (classFields.length > 0) {
+          fields = JSON.stringify(classFields);
+        }
+      }
+
+      // ── Parameter annotation extraction for Java/Kotlin methods ──
+      let parameterAnnotations: string | undefined;
+      if ((language === 'java' || language === 'kotlin') &&
+          (nodeLabel === 'Method' || nodeLabel === 'Constructor') &&
+          definitionNode) {
+        const params = extractMethodParameterAnnotations(definitionNode, language);
+        if (params.length > 0) {
+          parameterAnnotations = JSON.stringify(params);
+        }
+      }
+
       const node: GraphNode = {
         id: nodeId,
         label: nodeLabel as any,
@@ -321,9 +342,11 @@ const processParsingSequential = async (
           ...(methodSig ? {
             parameterCount: methodSig.parameterCount,
             ...(methodSig.requiredParameterCount !== undefined ? { requiredParameterCount: methodSig.requiredParameterCount } : {}),
-            ...(methodSig.parameterTypes ? { parameterTypes: methodSig.parameterTypes } : {}),
+            ...(methodSig.parameterTypes ? { parameterTypes: JSON.stringify(methodSig.parameterTypes) } : {}),
             returnType: methodSig.returnType,
           } : {}),
+          ...(fields ? { fields } : {}),
+          ...(parameterAnnotations ? { parameterAnnotations } : {}),
         },
       };
 

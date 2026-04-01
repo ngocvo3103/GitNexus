@@ -63,6 +63,20 @@ export type PackageMap = Map<string, Set<string>>;
 // Stores both the resolved source path and the original exported name so that
 // aliased imports (`import { User as U }`) can resolve U → User in the source file.
 export interface NamedImportBinding { sourcePath: string; exportedName: string }
+
+/**
+ * Represents an import entry with external dependency tracking.
+ * Used to flag imports that reference symbols from external repositories.
+ * 
+ * @property target - The resolved import target (file path or module identifier)
+ * @property isExternal - True if the import is from an external dependency
+ * @property externalRepo - Repository ID (e.g., "bond-exception-handler") if known
+ */
+export interface ImportEntry {
+  target: string;
+  isExternal?: boolean;
+  externalRepo?: string;
+}
 export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
 
 /**

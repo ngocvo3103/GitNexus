@@ -1398,32 +1398,80 @@ export const processRoutesFromExtracted = async (
     const confidence = TIER_CONFIDENCE[controllerResolved.tier];
 
     const methodResolved = ctx.resolve(route.methodName, controllerDef.filePath);
-    const methodId = methodResolved?.tier === 'same-file' ? methodResolved.candidates[0]?.nodeId : undefined;
-    const sourceId = generateId('File', route.filePath);
+    // Accept method resolution from same-file or via imports (for inherited methods)
+    const methodId = methodResolved?.candidates[0]?.nodeId;
 
-    if (!methodId) {
-      const guessedId = generateId('Method', `${controllerDef.filePath}:${route.methodName}`);
-      const relId = generateId('CALLS', `${sourceId}:route->${guessedId}`);
+    // Spring routes (isControllerClass: true) create Route nodes
+    if (route.isControllerClass) {
+      // Skip if method not resolved - can't create valid Route without handler
+      if (!methodId) continue;
+
+      // Create Route node
+      const routeId = generateId('Route', `${route.filePath}:${route.httpMethod}:${route.routePath}`);
+      graph.addNode({
+        id: routeId,
+        label: 'Route',
+        properties: {
+          name: `${route.httpMethod} ${route.routePath}`,
+          httpMethod: route.httpMethod,
+          routePath: route.routePath,
+          controllerName: route.controllerName,
+          methodName: route.methodName,
+          filePath: route.filePath,
+          startLine: route.lineNumber,
+          lineNumber: route.lineNumber,
+          isInherited: route.isInherited ?? false,
+        },
+      });
+
+      // Create DEFINES edge (File → Route)
+      const fileId = generateId('File', route.filePath);
+      graph.addRelationship({
+        id: generateId('DEFINES', `${fileId}:${routeId}`),
+        sourceId: fileId,
+        targetId: routeId,
+        type: 'DEFINES',
+        confidence: 1.0,
+        reason: 'spring-route',
+      });
+
+      // Create CALLS edge (Route → Method)
+      graph.addRelationship({
+        id: generateId('CALLS', `${routeId}:${methodId}`),
+        sourceId: routeId,
+        targetId: methodId,
+        type: 'CALLS',
+        confidence: confidence,
+        reason: 'spring-route',
+      });
+    } else {
+      // Laravel routes: create CALLS edge from File to Method (no Route node)
+      const sourceId = generateId('File', route.filePath);
+
+      if (!methodId) {
+        const guessedId = generateId('Method', `${controllerDef.filePath}:${route.methodName}`);
+        const relId = generateId('CALLS', `${sourceId}:route->${guessedId}`);
+        graph.addRelationship({
+          id: relId,
+          sourceId,
+          targetId: guessedId,
+          type: 'CALLS',
+          confidence: confidence * 0.8,
+          reason: 'laravel-route',
+        });
+        continue;
+      }
+
+      const relId = generateId('CALLS', `${sourceId}:route->${methodId}`);
       graph.addRelationship({
         id: relId,
         sourceId,
-        targetId: guessedId,
+        targetId: methodId,
         type: 'CALLS',
-        confidence: confidence * 0.8,
+        confidence,
         reason: 'laravel-route',
       });
-      continue;
     }
-
-    const relId = generateId('CALLS', `${sourceId}:route->${methodId}`);
-    graph.addRelationship({
-      id: relId,
-      sourceId,
-      targetId: methodId,
-      type: 'CALLS',
-      confidence,
-      reason: 'laravel-route',
-    });
   }
 
   onProgress?.(extractedRoutes.length, extractedRoutes.length);
@@ -1627,6 +1675,9 @@ export const extractFetchCallsFromFiles = async (
         if (urlNode) {
           result.push({
             filePath: file.path,
+            url: urlNode.text,
+            method: 'GET',
+            sourceId: generateId('File', file.path),
             fetchURL: urlNode.text,
             lineNumber: captureMap['route.fetch'].startPosition.row,
           });
@@ -1636,7 +1687,14 @@ export const extractFetchCallsFromFiles = async (
         const url = captureMap['http_client.url'].text;
         const HTTP_CLIENT_ONLY = new Set(['head', 'options', 'request', 'ajax']);
         if (method && HTTP_CLIENT_ONLY.has(method) && url.startsWith('/')) {
-          result.push({ filePath: file.path, fetchURL: url, lineNumber: captureMap['http_client'].startPosition.row });
+          result.push({
+            filePath: file.path,
+            url,
+            method,
+            sourceId: generateId('File', file.path),
+            fetchURL: url,
+            lineNumber: captureMap['http_client'].startPosition.row,
+          });
         }
       }
     }

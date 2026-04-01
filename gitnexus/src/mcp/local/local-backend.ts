@@ -8,8 +8,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady, isWriteQuery } from '../core/lbug-adapter.js';
-export { isWriteQuery };
+import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady } from '../core/lbug-adapter.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
 // git utilities available if needed
@@ -19,6 +18,11 @@ import {
   cleanupOldKuzuFiles,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
+import { readManifest, type RepoManifest } from '../../storage/repo-manifest.js';
+import { CrossRepoRegistry } from '../../core/ingestion/cross-repo-registry.js';
+import { documentEndpoint, type DocumentEndpointOptions } from './document-endpoint.js';
+import type { CrossRepoContext } from './cross-repo-context.js';
+import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -45,51 +49,18 @@ export const VALID_NODE_LABELS = new Set([
   'Community', 'Process', 'Struct', 'Enum', 'Macro', 'Typedef', 'Union',
   'Namespace', 'Trait', 'Impl', 'TypeAlias', 'Const', 'Static', 'Property',
   'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
-  'Route',
-  'Tool',
 ]);
 
 /** Valid relation types for impact analysis filtering */
-export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES', 'HANDLES_ROUTE', 'FETCHES', 'HANDLES_TOOL', 'ENTRY_POINT_OF', 'WRAPS']);
+export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES']);
 
-/**
- * Per-relation-type confidence floor for impact analysis.
- *
- * When the graph stores a relation with a confidence value, that stored
- * value is used as-is (it reflects resolution-tier accuracy from analysis
- * time).  This map provides the floor for each edge type when no stored
- * confidence is available, and is also used for display / tooltip hints.
- *
- * Rationale:
- *   CALLS / IMPORTS  – direct, strongly-typed references → 0.9
- *   EXTENDS          – class hierarchy, statically verifiable → 0.85
- *   IMPLEMENTS       – interface contract, statically verifiable → 0.85
- *   OVERRIDES        – method override, statically verifiable → 0.85
- *   HAS_METHOD       – structural containment → 0.95
- *   HAS_PROPERTY     – structural containment → 0.95
- *   ACCESSES         – field read/write, may be indirect → 0.8
- *   CONTAINS         – folder/file containment → 0.95
- *   (unknown type)   – conservative fallback → 0.5
- */
-export const IMPACT_RELATION_CONFIDENCE: Readonly<Record<string, number>> = {
-  CALLS: 0.9,
-  IMPORTS: 0.9,
-  EXTENDS: 0.85,
-  IMPLEMENTS: 0.85,
-  OVERRIDES: 0.85,
-  HAS_METHOD: 0.95,
-  HAS_PROPERTY: 0.95,
-  ACCESSES: 0.8,
-  CONTAINS: 0.95,
-};
+/** Regex to detect write operations in user-supplied Cypher queries */
+export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
 
-/**
- * Return the confidence floor for a given relation type.
- * Falls back to 0.5 for unknown types so they are not silently elevated.
- */
-const confidenceForRelType = (relType: string | undefined): number =>
-  IMPACT_RELATION_CONFIDENCE[relType ?? ''] ?? 0.5;
-
+/** Check if a Cypher query contains write operations */
+export function isWriteQuery(query: string): boolean {
+  return CYPHER_WRITE_RE.test(query);
+}
 
 /** Structured error logging for query failures — replaces empty catch blocks */
 function logQueryError(context: string, err: unknown): void {
@@ -107,7 +78,7 @@ export interface CodebaseContext {
   };
 }
 
-interface RepoHandle {
+export interface RepoHandle {
   id: string;          // unique key = repo name (basename)
   name: string;
   repoPath: string;
@@ -122,8 +93,8 @@ export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
-  private reinitPromises: Map<string, Promise<void>> = new Map();
-  private lastStalenessCheck: Map<string, number> = new Map();
+  private crossRepoRegistry: CrossRepoRegistry | null = null;
+  private crossRepoInitPromise: Promise<void> | null = null;
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -282,50 +253,11 @@ export class LocalBackend {
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
-    // If a reinit is already in progress for this repo, wait for it
-    const pending = this.reinitPromises.get(repoId);
-    if (pending) return pending;
+    // Always check the actual pool — the idle timer may have evicted the connection
+    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) return;
 
     const handle = this.repos.get(repoId);
     if (!handle) throw new Error(`Unknown repo: ${repoId}`);
-
-    // Check if the index was rebuilt since we opened the connection (#297).
-    // Throttle staleness checks to at most once per 5 seconds per repo to
-    // avoid an fs.readFile round-trip on every tool invocation.
-    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
-      const now = Date.now();
-      const lastCheck = this.lastStalenessCheck.get(repoId) ?? 0;
-      if (now - lastCheck < 5000) return; // Checked recently — skip
-
-      this.lastStalenessCheck.set(repoId, now);
-      try {
-        const metaPath = path.join(handle.storagePath, 'meta.json');
-        const metaRaw = await fs.readFile(metaPath, 'utf-8');
-        const meta = JSON.parse(metaRaw);
-        if (meta.indexedAt && meta.indexedAt !== handle.indexedAt) {
-          // Index was rebuilt — close stale connection and re-init.
-          // Wrap in reinitPromises to prevent TOCTOU race where concurrent
-          // callers both detect staleness and double-close the pool.
-          const reinit = (async () => {
-            try {
-              await closeLbug(repoId);
-              this.initializedRepos.delete(repoId);
-              handle.indexedAt = meta.indexedAt;
-              await initLbug(repoId, handle.lbugPath);
-              this.initializedRepos.add(repoId);
-            } finally {
-              this.reinitPromises.delete(repoId);
-            }
-          })();
-          this.reinitPromises.set(repoId, reinit);
-          return reinit;
-        } else {
-          return; // Pool is current
-        }
-      } catch {
-        return; // Can't read meta — assume pool is fine
-      }
-    }
 
     try {
       await initLbug(repoId, handle.lbugPath);
@@ -375,6 +307,12 @@ export class LocalBackend {
       return this.listRepos();
     }
 
+    // Cross-repo routing: if repos[] is provided, use multi-repo handler
+    if (params?.repos && Array.isArray(params.repos) && params.repos.length > 0) {
+      return this.callToolMultiRepo(method, params);
+    }
+
+    // Single-repo routing (backward compatible)
     // Resolve repo from optional param (re-reads registry on miss)
     const repo = await this.resolveRepo(params?.repo);
 
@@ -393,6 +331,10 @@ export class LocalBackend {
         return this.detectChanges(repo, params);
       case 'rename':
         return this.rename(repo, params);
+      case 'endpoints':
+        return this.endpoints(repo, params);
+      case 'document-endpoint':
+        return this.documentEndpoint(repo, params);
       // Legacy aliases for backwards compatibility
       case 'search':
         return this.query(repo, params);
@@ -400,17 +342,224 @@ export class LocalBackend {
         return this.context(repo, { name: params?.name, ...params });
       case 'overview':
         return this.overview(repo, params);
-      case 'route_map':
-        return this.routeMap(repo, params);
-      case 'shape_check':
-        return this.shapeCheck(repo, params);
-      case 'tool_map':
-        return this.toolMap(repo, params);
-      case 'api_impact':
-        return this.apiImpact(repo, params);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
+  }
+
+  /**
+   * Multi-repo tool dispatch.
+   * Executes queries across multiple repos in parallel and aggregates results.
+   * Each result includes _repoId attribution.
+   */
+  private async callToolMultiRepo(method: string, params: any): Promise<any> {
+    const repoIds: string[] = params.repos;
+
+    switch (method) {
+      case 'query': {
+        // Query each repo in parallel and aggregate results
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              const result = await this.query(handle, params);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        // Aggregate results with _repoId attribution
+        const aggregated = {
+          processes: [] as any[],
+          process_symbols: [] as any[],
+          definitions: [] as any[],
+          errors: [] as { repoId: string; error: string }[],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result) {
+            // Add _repoId to each item
+            if (result.processes) {
+              aggregated.processes.push(...result.processes.map((p: any) => ({ ...p, _repoId: repoId })));
+            }
+            if (result.process_symbols) {
+              aggregated.process_symbols.push(...result.process_symbols.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.definitions) {
+              aggregated.definitions.push(...result.definitions.map((d: any) => ({ ...d, _repoId: repoId })));
+            }
+          }
+        }
+
+        return aggregated;
+      }
+
+      case 'cypher': {
+        // Execute cypher on multiple repos in parallel
+        const cypherQuery = params.query;
+        const raw = await this.queryMultipleRepos(repoIds, cypherQuery);
+        // Aggregate results with _repoId and format as markdown
+        return this.formatMultiRepoCypherResult(raw);
+      }
+
+      case 'context': {
+        // Query context from multiple repos
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              const result = await this.context(handle, params);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        // Aggregate candidates from all repos
+        const aggregated: any = {
+          status: 'found',
+          candidates: [] as any[],
+          errors: [] as { repoId: string; error: string }[],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result) {
+            if (result.status === 'ambiguous' && result.candidates) {
+              // Add _repoId to each candidate
+              aggregated.candidates.push(...result.candidates.map((c: any) => ({ ...c, _repoId: repoId })));
+            } else if (result.status === 'found' && result.symbol) {
+              // Found in one repo, return with _repoId
+              aggregated.symbol = { ...result.symbol, _repoId: repoId };
+              aggregated.repoId = repoId;
+            }
+          }
+        }
+
+        // If we found an exact match, return it
+        if (aggregated.symbol) {
+          return { status: 'found', symbol: aggregated.symbol, _repoId: aggregated.repoId };
+        }
+
+        // Otherwise return aggregated candidates
+        if (aggregated.candidates.length > 0) {
+          aggregated.status = 'ambiguous';
+        } else {
+          aggregated.status = 'not_found';
+        }
+
+        return aggregated;
+      }
+
+      case 'impact': {
+        // Run impact analysis on multiple repos
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              const result = await this.impact(handle, params);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        // Aggregate impact results
+        const aggregated: any = {
+          target: params.target,
+          direction: params.direction,
+          byDepth: { d1: [], d2: [], d3: [] },
+          affected_processes: [],
+          affected_modules: [],
+          errors: [],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result) {
+            // Aggregate byDepth with _repoId
+            if (result.byDepth?.d1) {
+              aggregated.byDepth.d1.push(...result.byDepth.d1.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.byDepth?.d2) {
+              aggregated.byDepth.d2.push(...result.byDepth.d2.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.byDepth?.d3) {
+              aggregated.byDepth.d3.push(...result.byDepth.d3.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.affected_processes) {
+              aggregated.affected_processes.push(...result.affected_processes.map((p: any) => ({ ...p, _repoId: repoId })));
+            }
+            if (result.affected_modules) {
+              aggregated.affected_modules.push(...result.affected_modules.map((m: any) => ({ ...m, _repoId: repoId })));
+            }
+          }
+        }
+
+        // Calculate aggregate risk
+        aggregated.risk = this.calculateAggregateRisk(results.map((r) => r.result));
+
+        return aggregated;
+      }
+
+      default:
+        throw new Error(`Tool '${method}' does not support multi-repo queries. Use single 'repo' parameter instead.`);
+    }
+  }
+
+  /**
+   * Format multi-repo cypher results as markdown.
+   */
+  private formatMultiRepoCypherResult(results: Array<{ repoId: string; results: unknown[] }>): any {
+    // Check if any repo had errors
+    const allRows: any[] = [];
+    const errors: { repoId: string; error: string }[] = [];
+
+    for (const { repoId, results: rows } of results) {
+      if (Array.isArray(rows)) {
+        for (const row of rows) {
+          if (row && typeof row === 'object' && 'error' in row) {
+            errors.push({ repoId, error: (row as any).error });
+          } else {
+            allRows.push({ ...(row as object), _repoId: repoId });
+          }
+        }
+      }
+    }
+
+    if (allRows.length === 0 && errors.length > 0) {
+      return { error: errors.map((e) => `${e.repoId}: ${e.error}`).join('; ') };
+    }
+
+    if (allRows.length === 0) {
+      return [];
+    }
+
+    // Format as markdown table
+    return this.formatCypherAsMarkdown(allRows);
+  }
+
+  /**
+   * Calculate aggregate risk from multi-repo impact results.
+   */
+  private calculateAggregateRisk(results: any[]): string {
+    const risks = results
+      .filter((r) => r && r.risk)
+      .map((r) => r.risk);
+
+    if (risks.includes('CRITICAL')) return 'CRITICAL';
+    if (risks.includes('HIGH')) return 'HIGH';
+    if (risks.includes('MEDIUM')) return 'MEDIUM';
+    if (risks.includes('LOW')) return 'LOW';
+    return 'NONE';
   }
 
   // ─── Tool Implementations ────────────────────────────────────────
@@ -444,13 +593,10 @@ export class LocalBackend {
     
     // Step 1: Run hybrid search to get matching symbols
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25SearchResult, semanticResults] = await Promise.all([
+    const [bm25Results, semanticResults] = await Promise.all([
       this.bm25Search(repo, searchQuery, searchLimit),
       this.semanticSearch(repo, searchQuery, searchLimit),
     ]);
-
-    const bm25Results = bm25SearchResult.results;
-    const ftsUsed = bm25SearchResult.ftsUsed;
     
     // Merge via reciprocal rank fusion
     const scoreMap = new Map<string, { score: number; data: any }>();
@@ -624,24 +770,21 @@ export class LocalBackend {
       processes,
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
-      ...(!ftsUsed && { warning: 'FTS extension unavailable - keyword search degraded. Run: gitnexus analyze --force to rebuild indexes.' }),
     };
   }
 
   /**
    * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
    */
-  private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<{ results: any[]; ftsUsed: boolean }> {
+  private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
     let bm25Results;
     try {
       bm25Results = await searchFTSFromLbug(query, limit, repo.id);
     } catch (err: any) {
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
-      return { results: [], ftsUsed: false };
+      return [];
     }
-
-    const ftsUsed = bm25Results.length === 0 || (bm25Results[0]?.ftsUsed !== false);
     
     const results: any[] = [];
     
@@ -687,7 +830,7 @@ export class LocalBackend {
       }
     }
     
-    return { results, ftsUsed };
+    return results;
   }
 
   /**
@@ -771,7 +914,7 @@ export class LocalBackend {
     }
 
     // Block write operations (defense-in-depth — DB is already read-only)
-    if (isWriteQuery(params.query)) {
+    if (CYPHER_WRITE_RE.test(params.query)) {
       return { error: 'Write operations (CREATE, DELETE, SET, MERGE, REMOVE, DROP, ALTER, COPY, DETACH) are not allowed. The knowledge graph is read-only.' };
     }
 
@@ -966,44 +1109,6 @@ export class LocalBackend {
     }
     
     // Step 2: Disambiguation
-    // When multiple nodes share the same name (e.g. a Java Class and its
-    // Constructor both named 'SessionTracker'), prefer the Class node so
-    // context() returns the semantically meaningful result rather than
-    // triggering ambiguous disambiguation (#480).
-    // labels(n)[0] returns empty string in LadybugDB, so we resolve the
-    // preferred node by re-querying with explicit label filters, scoped to
-    // the candidate IDs already in symbols.
-    //
-    // Guard: only attempt Class-preference when at least one candidate has an
-    // empty/unknown type (LadybugDB limitation) or is a Constructor — meaning
-    // the ambiguity may be a Class/Constructor name collision rather than two
-    // genuinely distinct symbols (e.g. two Functions in different files).
-    //
-    // resolvedLabel is set here and threaded to Step 3 to avoid a redundant
-    // classCheck round-trip later.
-    let resolvedLabel = '';
-    if (symbols.length > 1 && !uid) {
-      const hasAmbiguousType = symbols.some((s: any) => {
-        const t = s.type || s[2] || '';
-        return t === '' || t === 'Constructor';
-      });
-      if (hasAmbiguousType) {
-        const candidateIds = symbols.map((s: any) => s.id || s[0]).filter(Boolean);
-        const PREFER_LABELS = ['Class', 'Interface'];
-        let preferred: any = null;
-        for (const label of PREFER_LABELS) {
-          const match = await executeParameterized(repo.id, `
-            MATCH (n:\`${label}\`) WHERE n.id IN $candidateIds RETURN n.id AS id LIMIT 1
-          `, { candidateIds }).catch(() => []);
-          if (match.length > 0) {
-            preferred = symbols.find((s: any) => (s.id || s[0]) === (match[0].id || match[0][0]));
-            if (preferred) { resolvedLabel = label; break; }
-          }
-        }
-        if (preferred) symbols = [preferred];
-      }
-    }
-
     if (symbols.length > 1 && !uid) {
       return {
         status: 'ambiguous',
@@ -1023,78 +1128,17 @@ export class LocalBackend {
     const symId = sym.id || sym[0];
 
     // Categorized incoming refs
-    let incomingRows = await executeParameterized(repo.id, `
+    const incomingRows = await executeParameterized(repo.id, `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       LIMIT 30
     `, { symId });
 
-    // Fix #480: Class/Interface nodes have no direct CALLS/IMPORTS edges —
-    // those point to Constructor and File nodes respectively. Fetch those
-    // extra incoming refs and merge them in so context() shows real callers.
-    //
-    // Determine if this is a Class/Interface node. If resolvedLabel was set
-    // during disambiguation (Step 2), use it directly — no extra round-trip.
-    // Otherwise fall back to a single label check only when the type field is
-    // empty (LadybugDB labels(n)[0] limitation).
-    const symRawType = sym.type || sym[2] || '';
-    let isClassLike = resolvedLabel === 'Class' || resolvedLabel === 'Interface';
-    if (!isClassLike && symRawType === '') {
-      try {
-        // Single UNION query instead of two serial round-trips.
-        const typeCheck = await executeParameterized(repo.id, `
-          MATCH (n:Class) WHERE n.id = $symId RETURN 'Class' AS label LIMIT 1
-          UNION ALL
-          MATCH (n:Interface) WHERE n.id = $symId RETURN 'Interface' AS label LIMIT 1
-        `, { symId });
-        isClassLike = typeCheck.length > 0;
-      } catch { /* not a Class/Interface node */ }
-    } else if (!isClassLike) {
-      isClassLike = symRawType === 'Class' || symRawType === 'Interface';
-    }
-
-    if (isClassLike) {
-      try {
-        // Run both incoming-ref queries in parallel — they are independent.
-        const [ctorIncoming, fileIncoming] = await Promise.all([
-          executeParameterized(repo.id, `
-            MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
-            WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
-            MATCH (caller)-[r:CodeRelation]->(ctor)
-            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'ACCESSES']
-            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-            LIMIT 30
-          `, { symId }),
-          executeParameterized(repo.id, `
-            MATCH (f:File)-[rel:CodeRelation]->(n)
-            WHERE n.id = $symId AND rel.type = 'DEFINES'
-            MATCH (caller)-[r:CodeRelation]->(f)
-            WHERE r.type IN ['CALLS', 'IMPORTS']
-            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-            LIMIT 30
-          `, { symId }),
-        ]);
-
-        // Deduplicate by (relType, uid) — a caller can have multiple relation
-        // types to the same target (e.g. both IMPORTS and CALLS), and each
-        // must be preserved so every category appears in the output.
-        const seenKeys = new Set(
-          incomingRows.map((r: any) => `${r.relType || r[0]}:${r.uid || r[1]}`),
-        );
-        for (const r of [...ctorIncoming, ...fileIncoming]) {
-          const key = `${r.relType || r[0]}:${r.uid || r[1]}`;
-          if (!seenKeys.has(key)) { seenKeys.add(key); incomingRows.push(r); }
-        }
-      } catch (e) {
-        logQueryError('context:class-incoming-expansion', e);
-      }
-    }
-
     // Categorized outgoing refs
     const outgoingRows = await executeParameterized(repo.id, `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       LIMIT 30
     `, { symId });
@@ -1130,7 +1174,7 @@ export class LocalBackend {
       symbol: {
         uid: sym.id || sym[0],
         name: sym.name || sym[1],
-        kind: isClassLike ? (resolvedLabel || 'Class') : (sym.type || sym[2]),
+        kind: sym.type || sym[2],
         filePath: sym.filePath || sym[3],
         startLine: sym.startLine || sym[4],
         endLine: sym.endLine || sym[5],
@@ -1555,103 +1599,21 @@ export class LocalBackend {
     const relTypeFilter = relationTypes.map(t => `'${t}'`).join(', ');
     const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
 
-    // Resolve target by name, preferring Class/Interface over Constructor
-    // (fix #480: Java class and constructor share the same name).
-    // labels(n)[0] returns empty string in LadybugDB, so we use explicit
-    // label-typed sub-queries in a single UNION ordered by priority to avoid
-    // up to 6 serial round-trips for non-Class targets.
-    let sym: any = null;
-    let symType = '';
-
-    try {
-      const rows = await executeParameterized(repo.id, `
-        MATCH (n:\`Class\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Interface\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Function\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Method\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Constructor\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority LIMIT 1
-      `, { targetName: target }).catch(() => []);
-
-      if (rows.length > 0) {
-        // Pick the row with the lowest priority value (Class wins over Constructor)
-        const best = rows.reduce((a: any, b: any) =>
-          (a.priority ?? a[3] ?? 99) <= (b.priority ?? b[3] ?? 99) ? a : b,
-        );
-        sym = best;
-        const priorityToLabel = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
-        symType = priorityToLabel[best.priority ?? best[3]] ?? '';
-      }
-    } catch { /* fall through to unlabeled match */ }
-
-    // Fall back to unlabeled match for any other node type
-    if (!sym) {
-      const rows = await executeParameterized(repo.id, `
-        MATCH (n)
-        WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath
-        LIMIT 1
-      `, { targetName: target });
-      if (rows.length > 0) sym = rows[0];
-    }
-
-    if (!sym) return { error: `Target '${target}' not found` };
-
+    const targets = await executeParameterized(repo.id, `
+      MATCH (n)
+      WHERE n.name = $targetName
+      RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+      LIMIT 1
+    `, { targetName: target });
+    if (targets.length === 0) return { error: `Target '${target}' not found` };
+    
+    const sym = targets[0];
     const symId = sym.id || sym[0];
-
+    
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
     let frontier = [symId];
     let traversalComplete = true;
-
-    // Fix #480: For Java (and other JVM) Class/Interface nodes, CALLS edges
-    // point to Constructor nodes and IMPORTS edges point to File nodes — not
-    // the Class/Interface itself. Seed the frontier with the Constructor(s)
-    // and owning File so the BFS traversal finds those edges naturally.
-    // The owning File is kept only as an internal seed (frontier/visited) and
-    // is NOT added to impacted — it is the definition container, not an
-    // upstream dependent. The BFS will discover IMPORTS edges on it naturally.
-    if (symType === 'Class' || symType === 'Interface') {
-      try {
-        // Run both seed queries in parallel — they are independent.
-        const [ctorRows, fileRows] = await Promise.all([
-          executeParameterized(repo.id, `
-            MATCH (n)-[hm:CodeRelation]->(c:Constructor)
-            WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
-            RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
-          `, { symId }),
-          // Restrict to DEFINES edges only — other File->Class edge types (if
-          // any) should not be treated as the owning file relationship.
-          executeParameterized(repo.id, `
-            MATCH (f:File)-[rel:CodeRelation]->(n)
-            WHERE n.id = $symId AND rel.type = 'DEFINES'
-            RETURN f.id AS id, f.name AS name, labels(f)[0] AS type, f.filePath AS filePath
-          `, { symId }),
-        ]);
-
-        for (const r of ctorRows) {
-          const rid = r.id || r[0];
-          if (rid && !visited.has(rid)) { visited.add(rid); frontier.push(rid); }
-        }
-        for (const r of fileRows) {
-          const rid = r.id || r[0];
-          if (rid && !visited.has(rid)) {
-            visited.add(rid);
-            frontier.push(rid);
-          }
-        }
-      } catch (e) {
-        logQueryError('impact:class-node-expansion', e);
-      }
-    }
     
     for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
       const nextFrontier: string[] = [];
@@ -1674,22 +1636,14 @@ export class LocalBackend {
           if (!visited.has(relId)) {
             visited.add(relId);
             nextFrontier.push(relId);
-            const storedConfidence = rel.confidence ?? rel[6];
-            const relationType = rel.relType || rel[5];
-            // Prefer the stored confidence from the graph (set at analysis time);
-            // fall back to the per-type floor for edges without a stored value.
-            const effectiveConfidence =
-              typeof storedConfidence === 'number' && storedConfidence > 0
-                ? storedConfidence
-                : confidenceForRelType(relationType);
             impacted.push({
               depth,
               id: relId,
               name: rel.name || rel[2],
               type: rel.type || rel[3],
               filePath,
-              relationType,
-              confidence: effectiveConfidence,
+              relationType: rel.relType || rel[5],
+              confidence: rel.confidence || rel[6] || 1.0,
             });
           }
         }
@@ -1716,219 +1670,49 @@ export class LocalBackend {
     let affectedModules: any[] = [];
 
     if (impacted.length > 0) {
-      const CHUNK_SIZE = 100;
-      // Max number of chunks to process to avoid unbounded DB round-trips.
-      // Configurable via env IMPACT_MAX_CHUNKS, default 10 => max items = 1000
-      const MAX_CHUNKS = parseInt(process.env.IMPACT_MAX_CHUNKS || '10', 10);
+      const allIds = impacted.map(i => `'${i.id.replace(/'/g, "''")}'`).join(', ');
+      const d1Ids = (grouped[1] || []).map((i: any) => `'${i.id.replace(/'/g, "''")}'`).join(', ');
 
-      // ── Process enrichment: batched chunking (bounded by MAX_CHUNKS) ─
-      // Uses merged Cypher query (WITH + OPTIONAL MATCH) to fetch
-      // process + entry point info in 1 round-trip per chunk. Converted to
-      // parameterized queries to avoid manual string escaping and long query strings.
-      const entryPointMap = new Map<string, {
-        name: string; type: string; filePath: string;
-        affected_process_count: number;
-        total_hits: number;
-        earliest_broken_step: number;
-      }>();
+      // Affected processes: which execution flows are broken and at which step
+      const [processRows, moduleRows, directModuleRows] = await Promise.all([
+        executeQuery(repo.id, `
+          MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE s.id IN [${allIds}]
+          RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
+          ORDER BY hits DESC
+          LIMIT 20
+        `).catch(() => []),
+        executeQuery(repo.id, `
+          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE s.id IN [${allIds}]
+          RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
+          ORDER BY hits DESC
+          LIMIT 20
+        `).catch(() => []),
+        d1Ids ? executeQuery(repo.id, `
+          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE s.id IN [${d1Ids}]
+          RETURN DISTINCT c.heuristicLabel AS name
+        `).catch(() => []) : Promise.resolve([]),
+      ]);
 
-      // Map process id -> entryPointId to allow fixing missing minStep values later
-      const processToEntryPoint = new Map<string, string>();
-      // Collect process ids where MIN(r.step) returned null so we can retry in batch
-      const processesMissingMinStep = new Set<string>();
+      affectedProcesses = processRows.map((r: any) => ({
+        name: r.name || r[0],
+        hits: r.hits || r[1],
+        broken_at_step: r.minStep ?? r[2],
+        step_count: r.stepCount ?? r[3],
+      }));
 
-      let chunksProcessed = 0;
-      for (let i = 0; i < impacted.length && chunksProcessed < MAX_CHUNKS; i += CHUNK_SIZE, chunksProcessed++) {
-        const chunk = impacted.slice(i, i + CHUNK_SIZE);
-        const ids = chunk.map(item => String(item.id ?? ''));
-
-        try {
-          // Use parameterized list to avoid building long query strings
-          const rows = await executeParameterized(repo.id, `
-            MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-            WHERE s.id IN $ids
-            WITH p, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep
-            OPTIONAL MATCH (ep {id: p.entryPointId})
-            RETURN p.id AS pId, p.heuristicLabel AS name, p.processType AS processType,
-                   p.entryPointId AS entryPointId, hits, minStep, p.stepCount AS stepCount,
-                   ep.name AS epName, labels(ep)[0] AS epType, ep.filePath AS epFilePath
-          `, { ids }).catch(() => []);
-
-          for (const row of rows) {
-            const pId = row.pId ?? row[0];
-            const epId = row.entryPointId ?? row[3] ?? row.pId ?? row[0];
-            // Track mapping from process -> entryPoint so we can backfill missing minStep
-            if (pId) processToEntryPoint.set(String(pId), String(epId));
-
-             // Normalize epName: prefer epName, fall back to other columns, and
-             // ensure we don't keep an empty string (labels(...) can return "").
-             const epNameRaw = row.epName ?? row[7] ?? row.name ?? row[1] ?? 'unknown';
-             const epName = (typeof epNameRaw === 'string' && epNameRaw.trim().length > 0) ? epNameRaw.trim() : 'unknown';
-
-             // Normalize epType: labels(ep)[0] can return an empty string in
-             // some DBs (LadybugDB). Using nullish coalescing (??) preserves
-             // empty strings, which results in empty `type` values being
-             // propagated. Treat empty-string labels as missing and fall back
-             // to the next candidate or a sensible default.
-             const epTypeRaw = row.epType ?? row[8] ?? '';
-             const epType = (typeof epTypeRaw === 'string' && epTypeRaw.trim().length > 0)
-               ? epTypeRaw.trim()
-               : 'Function';
-
-             const epFilePath = row.epFilePath ?? row[9] ?? '';
-             const hits = row.hits ?? row[4] ?? 0;
-             const minStep = row.minStep ?? row[5];
-             // If the DB returned null for minStep, note the process id so we
-             // can run a follow-up query using a different aggregation strategy.
-             if (minStep === null || minStep === undefined) {
-               if (pId) processesMissingMinStep.add(String(pId));
-             }
-             if (!entryPointMap.has(epId)) {
-               entryPointMap.set(epId, {
-                 name: epName,
-                 type: epType,
-                 filePath: epFilePath,
-                 affected_process_count: 0,
-                 total_hits: 0,
-                 earliest_broken_step: Infinity,
-               });
-             }
-             const ep = entryPointMap.get(epId)!;
-             ep.affected_process_count += 1;
-             ep.total_hits += hits;
-             ep.earliest_broken_step = Math.min(ep.earliest_broken_step, minStep ?? Infinity);
-           }
-         } catch (e) {
-           logQueryError('impact:process-chunk', e);
-         }
-       }
-
-      // If some processes returned null minStep, try a batched follow-up query
-      // using the full impacted id set. This handles older indexes or DBs
-      // where MIN(r.step) can come back null even when step properties exist.
-      if (processesMissingMinStep.size > 0) {
-        try {
-          const pIds = Array.from(processesMissingMinStep);
-          const allImpactedIds = impacted.map(it => String(it.id ?? ''));
-          const missingRows = await executeParameterized(repo.id, `
-            MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-            WHERE p.id IN $pIds AND s.id IN $ids
-            RETURN p.id AS pid, MIN(r.step) AS minStep
-          `, { pIds, ids: allImpactedIds }).catch(() => []);
-
-          for (const mr of missingRows) {
-            const pid = mr.pid ?? mr[0];
-            const minStep = mr.minStep ?? mr[1];
-            const epId = processToEntryPoint.get(String(pid));
-            if (!epId) continue;
-            const ep = entryPointMap.get(epId);
-            if (!ep) continue;
-            if (typeof minStep === 'number') {
-              ep.earliest_broken_step = Math.min(ep.earliest_broken_step, minStep);
-            }
-          }
-        } catch (e) {
-          logQueryError('impact:process-chunk-backfill', e);
-        }
-      }
-
-      // If we capped chunks, mark traversal incomplete so caller knows results are partial
-      if (chunksProcessed * CHUNK_SIZE < impacted.length) {
-        traversalComplete = false;
-      }
-
-       affectedProcesses = Array.from(entryPointMap.values())
-         .map(ep => ({
-           ...ep,
-           earliest_broken_step: ep.earliest_broken_step === Infinity ? null : ep.earliest_broken_step,
-         }))
-         .sort((a, b) => b.total_hits - a.total_hits);
-
-      // ── Module enrichment: use same cap as process enrichment and parameterized queries
-      const maxItems = Math.min(impacted.length, MAX_CHUNKS * CHUNK_SIZE);
-      const cappedImpacted = impacted.slice(0, maxItems);
-      const allIdsArr = cappedImpacted.map((i: any) => String(i.id ?? ''));
-      const d1Items = (grouped[1] || []).slice(0, maxItems);
-      const d1IdsArr = d1Items.map((i: any) => String(i.id ?? ''));
-
-      // Chunked module enrichment: run the MEMBER_OF queries in chunks
-      // to avoid large single queries or concurrent Kuzu calls that can
-      // crash (SIGSEGV) on arm64 macOS; behavior preserves existing maxItems cap and returns equivalent aggregated results.
-      const moduleHitsMap = new Map<string, number>();
-      const directModuleSet = new Set<string>();
-
-      // Helper to run a single module chunk and accumulate hits by name
-      const runModuleChunk = async (idsChunk: string[]) => {
-        if (!idsChunk || idsChunk.length === 0) return;
-        try {
-          const rows = await executeParameterized(repo.id, `
-            MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-            WHERE s.id IN $ids
-            RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
-            ORDER BY hits DESC
-            LIMIT 20
-          `, { ids: idsChunk }).catch(() => []);
-
-          for (const r of rows) {
-            const name = r.name ?? r[0] ?? null;
-            const hits = (r.hits ?? r[1]) || 0;
-            if (!name) continue;
-            moduleHitsMap.set(name, (moduleHitsMap.get(name) || 0) + hits);
-          }
-        } catch (e) {
-          logQueryError('impact:module-chunk', e);
-        }
-      };
-
-      // Run module query chunks sequentially (safe on arm64 macOS)
-      for (let i = 0; i < allIdsArr.length; i += CHUNK_SIZE) {
-        const chunkIds = allIdsArr.slice(i, i + CHUNK_SIZE);
-        await runModuleChunk(chunkIds);
-      }
-
-      // Run direct module query similarly (distinct heuristic labels for depth-1 items)
-      const runDirectModuleChunk = async (idsChunk: string[]) => {
-        if (!idsChunk || idsChunk.length === 0) return;
-        try {
-          const rows = await executeParameterized(repo.id, `
-            MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-            WHERE s.id IN $ids
-            RETURN DISTINCT c.heuristicLabel AS name
-          `, { ids: idsChunk }).catch(() => []);
-          for (const r of rows) {
-            const name = r.name ?? r[0] ?? null;
-            if (name) directModuleSet.add(name);
-          }
-        } catch (e) {
-          logQueryError('impact:direct-module-chunk', e);
-        }
-      };
-
-      for (let i = 0; i < d1IdsArr.length; i += CHUNK_SIZE) {
-        const chunkIds = d1IdsArr.slice(i, i + CHUNK_SIZE);
-        await runDirectModuleChunk(chunkIds);
-      }
-
-      // Build final moduleRows array from aggregated hits map, sorted & limited
-      const moduleRows = Array.from(moduleHitsMap.entries())
-        .map(([name, hits]) => ({ name, hits }))
-        .sort((a, b) => b.hits - a.hits)
-        .slice(0, 20);
-
-      const directModuleRows = Array.from(directModuleSet).map(name => ({ name }));
-
-      // Build affectedModules in the same shape as original implementation
-      const directModuleNameSet = new Set(directModuleRows.map((r: any) => r.name || r[0]));
+      const directModuleSet = new Set(directModuleRows.map((r: any) => r.name || r[0]));
       affectedModules = moduleRows.map((r: any) => {
-        const name = r.name ?? r[0];
-        const hits = r.hits ?? r[1] ?? 0;
+        const name = r.name || r[0];
         return {
           name,
-          hits,
-          impact: directModuleNameSet.has(name) ? 'direct' : 'indirect',
+          hits: r.hits || r[1],
+          impact: directModuleSet.has(name) ? 'direct' : 'indirect',
         };
       });
-     }
+    }
 
     // Risk scoring
     const processCount = affectedProcesses.length;
@@ -1946,8 +1730,8 @@ export class LocalBackend {
       target: {
         id: symId,
         name: sym.name || sym[1],
-        type: symType,
-        filePath: sym.filePath || sym[2],
+        type: sym.type || sym[2],
+        filePath: sym.filePath || sym[3],
       },
       direction,
       impactedCount: impacted.length,
@@ -1962,348 +1746,6 @@ export class LocalBackend {
       affected_modules: affectedModules,
       byDepth: grouped,
     };
-  }
-
-  /**
-   * Fetch Route nodes with their consumers in a single query.
-   * Shared by routeMap and shapeCheck to avoid N+1 query patterns.
-   */
-  private async fetchRoutesWithConsumers(
-    repoId: string,
-    routeFilter: string,
-    params: Record<string, string>,
-  ): Promise<Array<{ id: string; name: string; filePath: string; responseKeys: string[] | null; errorKeys: string[] | null; middleware: string[] | null; consumers: Array<{ name: string; filePath: string; accessedKeys?: string[]; fetchCount?: number }> }>> {
-    const rows = await executeParameterized(repoId, `
-      MATCH (n:Route)
-      WHERE n.id STARTS WITH 'Route:' ${routeFilter}
-      OPTIONAL MATCH (consumer)-[r:CodeRelation]->(n)
-      WHERE r.type = 'FETCHES'
-      RETURN n.id AS routeId, n.name AS routeName, n.filePath AS handlerFile,
-             n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware,
-             consumer.name AS consumerName, consumer.filePath AS consumerFile,
-             r.reason AS fetchReason
-    `, params);
-
-    // Strip wrapping quotes from DB array elements — CSV COPY stores ['key'] which
-    // LadybugDB may return as "'key'" rather than "key"
-    const stripQuotes = (keys: string[] | null): string[] | null =>
-      keys ? keys.map(k => k.replace(/^['"]|['"]$/g, '')) : null;
-
-    const routeMap = new Map<string, { id: string; name: string; filePath: string; responseKeys: string[] | null; errorKeys: string[] | null; middleware: string[] | null; consumers: Array<{ name: string; filePath: string; accessedKeys?: string[]; fetchCount?: number }> }>();
-    for (const row of rows) {
-      const id = row.routeId ?? row[0];
-      const name = row.routeName ?? row[1];
-      const filePath = row.handlerFile ?? row[2];
-      const responseKeys = stripQuotes(row.responseKeys ?? row[3] ?? null);
-      const errorKeys = stripQuotes(row.errorKeys ?? row[4] ?? null);
-      const middleware = stripQuotes(row.middleware ?? row[5] ?? null);
-      const consumerName = row.consumerName ?? row[6];
-      const consumerFile = row.consumerFile ?? row[7];
-      const fetchReason: string | null = row.fetchReason ?? row[8] ?? null;
-
-      if (!routeMap.has(id)) {
-        routeMap.set(id, { id, name, filePath, responseKeys, errorKeys, middleware, consumers: [] });
-      }
-      if (consumerName && consumerFile) {
-        // Parse accessed keys from reason field: "fetch-url-match|keys:data,pagination|fetches:3"
-        let accessedKeys: string[] | undefined;
-        let fetchCount: number | undefined;
-        if (fetchReason) {
-          const keysMatch = fetchReason.match(/\|keys:([^|]+)/);
-          if (keysMatch) {
-            accessedKeys = keysMatch[1].split(',').filter(k => k.length > 0);
-          }
-          const fetchesMatch = fetchReason.match(/\|fetches:(\d+)/);
-          if (fetchesMatch) {
-            fetchCount = parseInt(fetchesMatch[1], 10);
-          }
-        }
-        routeMap.get(id)!.consumers.push({
-          name: consumerName,
-          filePath: consumerFile,
-          ...(accessedKeys ? { accessedKeys } : {}),
-          ...(fetchCount && fetchCount > 1 ? { fetchCount } : {}),
-        });
-      }
-    }
-
-    return [...routeMap.values()];
-  }
-
-  /**
-   * Batch-fetch execution flows linked to a set of Route or Tool nodes.
-   * Single query instead of N+1.
-   */
-  private async fetchLinkedFlowsBatch(repoId: string, nodeIds: string[]): Promise<Map<string, string[]>> {
-    const result = new Map<string, string[]>();
-    if (nodeIds.length === 0) return result;
-    try {
-      // Use list_contains to filter at DB level instead of fetching all and filtering in memory
-      const rows = await executeParameterized(repoId, `
-        MATCH (source)-[r:CodeRelation]->(proc:Process)
-        WHERE r.type = 'ENTRY_POINT_OF'
-          AND list_contains($nodeIds, source.id)
-        RETURN source.id AS sourceId, proc.label AS name
-      `, { nodeIds });
-      for (const row of rows) {
-        const sourceId = row.sourceId ?? row[0];
-        const name = row.name ?? row[1];
-        if (!name) continue;
-        let list = result.get(sourceId);
-        if (!list) { list = []; result.set(sourceId, list); }
-        list.push(name);
-      }
-    } catch { /* no ENTRY_POINT_OF edges yet */ }
-    return result;
-  }
-
-  private async routeMap(repo: RepoHandle, params: { route?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
-    const queryParams = params.route ? { route: params.route } : {};
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
-
-    if (routes.length === 0) {
-      return { routes: [], total: 0, message: params.route ? `No routes matching "${params.route}"` : 'No routes found in this project.' };
-    }
-
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, routes.map(r => r.id));
-
-    return {
-      routes: routes.map(r => ({
-        route: r.name, handler: r.filePath,
-        middleware: r.middleware || [],
-        consumers: r.consumers,
-        flows: flowMap.get(r.id) || [],
-      })),
-      total: routes.length,
-    };
-  }
-
-  private async shapeCheck(repo: RepoHandle, params: { route?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
-    const queryParams = params.route ? { route: params.route } : {};
-    const allRoutes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
-
-    const results = allRoutes
-      .filter(r => ((r.responseKeys && r.responseKeys.length > 0) || (r.errorKeys && r.errorKeys.length > 0)) && r.consumers.length > 0)
-      .map(r => {
-        // Keys already normalized by fetchRoutesWithConsumers (quotes stripped)
-        const responseKeys = r.responseKeys ?? [];
-        const errorKeys = r.errorKeys ?? [];
-        // Combined set: consumer accessing either success or error keys is valid
-        const allKnownKeys = new Set([...responseKeys, ...errorKeys]);
-
-        // Check each consumer's accessed keys against the route's response shape
-        const responseKeySet = new Set(responseKeys);
-        const consumers = r.consumers.map(c => {
-          if (!c.accessedKeys || c.accessedKeys.length === 0) {
-            return { name: c.name, filePath: c.filePath };
-          }
-          const mismatched = c.accessedKeys.filter(k => !allKnownKeys.has(k));
-          // Keys in allKnownKeys but not in responseKeys — error-path access (e.g., .error from errorKeys)
-          const errorPathKeys = c.accessedKeys.filter(k => allKnownKeys.has(k) && !responseKeySet.has(k));
-          const isMultiFetch = (c.fetchCount ?? 1) > 1;
-          return {
-            name: c.name,
-            filePath: c.filePath,
-            accessedKeys: c.accessedKeys,
-            ...(mismatched.length > 0 ? { mismatched, mismatchConfidence: isMultiFetch ? 'low' as const : 'high' as const } : {}),
-            ...(errorPathKeys.length > 0 ? { errorPathKeys } : {}),
-            ...(isMultiFetch ? { attributionNote: `This file fetches ${c.fetchCount} routes — accessed keys may belong to a different route.` } : {}),
-          };
-        });
-
-        const hasMismatches = consumers.some(c => 'mismatched' in c && (c as any).mismatched.length > 0);
-
-        return {
-          route: r.name,
-          handler: r.filePath,
-          ...(responseKeys.length > 0 ? { responseKeys } : {}),
-          ...(errorKeys.length > 0 ? { errorKeys } : {}),
-          consumers,
-          ...(hasMismatches ? { status: 'MISMATCH' as const } : {}),
-        };
-      });
-
-    const mismatchCount = results.filter(r => r.status === 'MISMATCH').length;
-
-    return {
-      routes: results,
-      total: results.length,
-      routesWithShapes: results.length,
-      ...(mismatchCount > 0 ? { mismatches: mismatchCount } : {}),
-      message: results.length === 0
-        ? 'No routes with both response shapes and consumers found.'
-        : mismatchCount > 0
-          ? `Found ${results.length} route(s) with response shape data. ${mismatchCount} route(s) have consumer/shape mismatches.`
-          : `Found ${results.length} route(s) with response shape data and consumers.`,
-    };
-  }
-
-  private async toolMap(repo: RepoHandle, params: { tool?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    const toolFilter = params.tool ? `AND n.name CONTAINS $tool` : '';
-    const queryParams = params.tool ? { tool: params.tool } : {};
-
-    const rows = await executeParameterized(repo.id, `
-      MATCH (n:Tool)
-      WHERE n.id STARTS WITH 'Tool:' ${toolFilter}
-      RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.description AS description
-    `, queryParams);
-
-    if (rows.length === 0) {
-      return { tools: [], total: 0, message: params.tool ? `No tools matching "${params.tool}"` : 'No tool definitions found.' };
-    }
-
-    const toolIds = rows.map((r: any) => r.id ?? r[0]);
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, toolIds);
-
-    return {
-      tools: rows.map((r: any) => {
-        const id = r.id ?? r[0];
-        return {
-          name: r.name ?? r[1],
-          filePath: r.filePath ?? r[2],
-          description: (r.description ?? r[3] ?? '').slice(0, 200),
-          flows: flowMap.get(id) || [],
-        };
-      }),
-      total: rows.length,
-    };
-  }
-
-  private async apiImpact(repo: RepoHandle, params: { route?: string; file?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    if (!params.route && !params.file) {
-      return { error: 'Either "route" or "file" parameter is required.' };
-    }
-
-    // If file is provided but route is not, look up the route by file path
-    let routeFilter = '';
-    const queryParams: Record<string, string> = {};
-
-    if (params.route) {
-      routeFilter = `AND n.name CONTAINS $route`;
-      queryParams.route = params.route;
-    } else if (params.file) {
-      routeFilter = `AND n.filePath CONTAINS $file`;
-      queryParams.file = params.file;
-    }
-
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
-
-    if (routes.length === 0) {
-      const target = params.route || params.file;
-      return { error: `No routes found matching "${target}".` };
-    }
-
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, routes.map(r => r.id));
-
-    // Count how many routes share the same handler file (for middleware partial detection)
-    const routeCountByHandler = new Map<string, number>();
-    for (const r of routes) {
-      if (r.filePath) {
-        routeCountByHandler.set(r.filePath, (routeCountByHandler.get(r.filePath) ?? 0) + 1);
-      }
-    }
-
-    const results = routes.map(r => {
-      // Keys already normalized by fetchRoutesWithConsumers (quotes stripped)
-      const responseKeys = r.responseKeys ?? [];
-      const errorKeys = r.errorKeys ?? [];
-      const allKnownKeys = new Set([...responseKeys, ...errorKeys]);
-
-      // Build consumer list with mismatch detection
-      const consumers = r.consumers.map(c => ({
-        name: c.name,
-        file: c.filePath,
-        accesses: c.accessedKeys ?? [],
-        ...(c.fetchCount && c.fetchCount > 1 ? { attributionNote: `This file fetches ${c.fetchCount} routes — accessed keys may belong to a different route.` } : {}),
-      }));
-
-      // Detect mismatches: consumer accesses keys not in response shape
-      const mismatches: Array<{ consumer: string; field: string; reason: string; confidence: 'high' | 'low' }> = [];
-      if (allKnownKeys.size > 0) {
-        for (const c of r.consumers) {
-          if (!c.accessedKeys) continue;
-          const isMultiFetch = (c.fetchCount ?? 1) > 1;
-          for (const key of c.accessedKeys) {
-            if (!allKnownKeys.has(key)) {
-              mismatches.push({
-                consumer: c.filePath,
-                field: key,
-                reason: 'accessed but not in response shape',
-                confidence: isMultiFetch ? 'low' : 'high',
-              });
-            }
-          }
-        }
-      }
-
-      const flows = flowMap.get(r.id) || [];
-      const consumerCount = r.consumers.length;
-
-      // Risk level heuristic
-      let riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
-      if (consumerCount >= 10) {
-        riskLevel = 'HIGH';
-      } else if (consumerCount >= 4) {
-        riskLevel = 'MEDIUM';
-      } else {
-        riskLevel = 'LOW';
-      }
-      // Bump up one level if mismatches exist
-      if (mismatches.length > 0) {
-        if (riskLevel === 'LOW') riskLevel = 'MEDIUM';
-        else if (riskLevel === 'MEDIUM') riskLevel = 'HIGH';
-      }
-
-      const warning = consumerCount > 0
-        ? `Changing response shape will affect ${consumerCount} component${consumerCount === 1 ? '' : 's'}`
-        : undefined;
-
-      // Flag when middleware was detected but handler exports multiple HTTP methods
-      // (middleware chain may only reflect one export)
-      const middlewareArr = r.middleware || [];
-      const handlerRouteCount = r.filePath ? (routeCountByHandler.get(r.filePath) ?? 1) : 1;
-      const middlewarePartial = middlewareArr.length > 0 && handlerRouteCount > 1;
-
-      return {
-        route: r.name,
-        handler: r.filePath,
-        responseShape: {
-          success: responseKeys,
-          error: errorKeys,
-        },
-        middleware: middlewareArr,
-        ...(middlewarePartial ? {
-          middlewareDetection: 'partial' as const,
-          middlewareNote: 'Middleware captured from first HTTP method export only — other methods in this handler may use different middleware chains.',
-        } : {}),
-        consumers,
-        ...(mismatches.length > 0 ? { mismatches } : {}),
-        executionFlows: flows,
-        impactSummary: {
-          directConsumers: consumerCount,
-          affectedFlows: flows.length,
-          riskLevel,
-          ...(warning ? { warning } : {}),
-        },
-      };
-    });
-
-    // If a single route was targeted, return it directly (not wrapped in array)
-    if (results.length === 1) {
-      return results[0];
-    }
-
-    return { routes: results, total: results.length };
   }
 
   // ─── Direct Graph Queries (for resources.ts) ────────────────────
@@ -2450,6 +1892,190 @@ export class LocalBackend {
     };
   }
 
+  /**
+   * Document Endpoint tool — Generate API documentation JSON.
+   */
+  private async documentEndpoint(repo: RepoHandle, params: any): Promise<any> {
+    await this.ensureInitialized(repo.id);
+    
+    // Ensure cross-registry is initialized (lazy init on first access)
+    if (!this.crossRepoRegistry) {
+      if (!this.crossRepoInitPromise) {
+        this.crossRepoInitPromise = this.initCrossRepoRegistry();
+      }
+      await this.crossRepoInitPromise;
+    }
+    
+    // Create cross-repo context
+    const crossRepo: CrossRepoContext = {
+      findDepRepo: (prefix) => this.findDepRepo(prefix),
+      queryMultipleRepos: (ids, query, p) => this.queryMultipleRepos(ids, query, p),
+      listDepRepos: async () => {
+        const repos = this.crossRepoRegistry!.listRepos();
+        return repos.map(r => r.repoId).filter(id => id !== repo.id);
+      }
+    };
+
+    const options: DocumentEndpointOptions = {
+      method: params.method,
+      path: params.path,
+      depth: params.depth ?? 10,
+      include_context: params.include_context ?? false,
+      compact: params.compact ?? false,
+      openapi: params.openapi ?? false,
+      repo: params.repo,
+      crossRepo,
+    };
+    return documentEndpoint(repo, options);
+  }
+
+  /**
+   * Endpoints tool — query Route nodes for HTTP endpoints.
+   */
+  private async endpoints(
+    repo: RepoHandle,
+    params?: { method?: string; path?: string }
+  ): Promise<{ endpoints: EndpointInfo[] }> {
+    await this.ensureInitialized(repo.id);
+    return queryEndpoints(repo, params);
+  }
+
+  // ─── Cross-Repo Methods ─────────────────────────────────────────────
+
+  /**
+   * Execute the same Cypher query on multiple repos in parallel.
+   * Each result is attributed with its source repoId.
+   * Failed repos return empty results instead of throwing.
+   *
+   * @param repoIds - List of repo identifiers
+   * @param cypher - Cypher query to execute
+   * @param params - Optional query parameters
+   * @returns Array of { repoId, results } for each repo
+   */
+  async queryMultipleRepos(
+    repoIds: string[],
+    cypher: string,
+    params?: Record<string, unknown>
+  ): Promise<Array<{ repoId: string; results: unknown[] }>> {
+    if (repoIds.length === 0) return [];
+
+    const DEBUG = process.env.GITNEXUS_DEBUG === 'true';
+
+    const queryPromises = repoIds.map(async (repoId) => {
+      try {
+        // First try direct lookup
+        let handle = this.repos.get(repoId);
+
+        // Debug logging
+        if (DEBUG) {
+          console.error(`[GitNexus DEBUG] queryMultipleRepos: repoId=${repoId}, handleFound=${!!handle}`);
+          if (!handle) {
+            console.error(`[GitNexus DEBUG] Available repos: ${[...this.repos.keys()].join(', ')}`);
+          }
+        }
+
+        // If not found, try resolving by name
+        if (!handle) {
+          try {
+            handle = await this.resolveRepo(repoId);
+            if (DEBUG && handle) {
+              console.error(`[GitNexus DEBUG] Resolved repoId=${repoId} to handle.id=${handle.id}`);
+            }
+          } catch {
+            // Resolution failed
+          }
+        }
+
+        if (!handle) {
+          return { repoId, results: [] as unknown[], _error: 'repo_not_found' };
+        }
+
+        await this.ensureInitialized(handle.id);
+
+        if (!isLbugReady(handle.id)) {
+          if (DEBUG) {
+            console.error(`[GitNexus DEBUG] LadybugDB not ready for repo: ${repoId}`);
+          }
+          return { repoId, results: [] as unknown[], _error: 'ladybug_not_ready' };
+        }
+
+        const results = params
+          ? await executeParameterized(handle.id, cypher, params)
+          : await executeQuery(handle.id, cypher);
+
+        if (DEBUG) {
+          console.error(`[GitNexus DEBUG] queryMultipleRepos: repoId=${repoId}, resultCount=${results?.length || 0}`);
+        }
+
+        return { repoId, results: results || [] };
+      } catch (err) {
+        logQueryError(`queryMultipleRepos:${repoId}`, err);
+        return { repoId, results: [] as unknown[], _error: err instanceof Error ? err.message : String(err) };
+      }
+    });
+
+    return Promise.all(queryPromises);
+  }
+
+  /**
+   * Get the manifest for a registered repo.
+   * Returns null if repo is unknown or manifest doesn't exist.
+   *
+   * @param repoId - The repo identifier
+   * @returns RepoManifest or null
+   */
+  async getManifest(repoId: string): Promise<RepoManifest | null> {
+    try {
+      const handle = await this.resolveRepo(repoId);
+      // Manifest is stored at <repoPath>/.gitnexus/repo_manifest.json
+      // Try repoPath first (standard location)
+      let manifest = await readManifest(handle.repoPath);
+      if (!manifest && handle.storagePath) {
+        // Fallback: some test setups use storagePath as the repo root
+        manifest = await readManifest(handle.storagePath);
+      }
+      return manifest;
+    } catch {
+      // Unknown repo or failed to read manifest
+      return null;
+    }
+  }
+
+  /**
+   * Find which repo provides a dependency.
+   * Lazy-initializes the CrossRepoRegistry on first call.
+   *
+   * @param depName - Dependency name (e.g., "shared-utils" or "com.example:lib")
+   * @returns repoId of the providing repo, or null if not found
+   */
+  async findDepRepo(depName: string): Promise<string | null> {
+    if (!depName) return null;
+
+    // Lazy-initialize registry on first access with race condition guard
+    if (!this.crossRepoRegistry) {
+      if (!this.crossRepoInitPromise) {
+        this.crossRepoInitPromise = this.initCrossRepoRegistry();
+      }
+      await this.crossRepoInitPromise;
+    }
+
+    return this.crossRepoRegistry.findDepRepo(depName);
+  }
+
+  /**
+   * Initialize CrossRepoRegistry (extracted for lazy init).
+   */
+  private async initCrossRepoRegistry(): Promise<void> {
+    const registry = new CrossRepoRegistry();
+    const repoInfos = [...this.repos.values()].map((h) => ({
+      repoId: h.id,
+      repoPath: h.repoPath,
+      storagePath: h.storagePath,
+    }));
+    await registry.initialize(repoInfos);
+    this.crossRepoRegistry = registry;
+  }
+
   async disconnect(): Promise<void> {
     await closeLbug(); // close all connections
     // Note: we intentionally do NOT call disposeEmbedder() here.
@@ -2460,5 +2086,10 @@ export class LocalBackend {
     this.repos.clear();
     this.contextCache.clear();
     this.initializedRepos.clear();
+    if (this.crossRepoRegistry) {
+      this.crossRepoRegistry.clear();
+      this.crossRepoRegistry = null;
+    }
+    this.crossRepoInitPromise = null;
   }
 }
