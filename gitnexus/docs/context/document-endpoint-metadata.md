@@ -25,7 +25,6 @@ The `--include-context` flag controls ONLY whether source code snippets are incl
 
 | Field | Gated by --include-context | Description |
 |-------|---------------------------|-------------|
-| `_context.callChain[].content` | Yes | Full source code of each method in chain |
 | `_context.summaryContext` | Yes | Aggregated source snippets |
 | `downstreamApis[]._context` | Yes | Source snippet around HTTP call |
 | `messaging.outbound[]._context` | Yes | Source snippet around publish call |

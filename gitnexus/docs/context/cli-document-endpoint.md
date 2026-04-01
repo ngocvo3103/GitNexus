@@ -325,15 +325,7 @@ gitnexus document-endpoint --method PUT --path "bookings" --include-context > en
       "security": ["JWT validation required"]
     },
     "_context": {
-      "callChain": [
-        {
-          "uid": "Method:src/main/java/.../Controller.java:handler",
-          "name": "handler",
-          "filePath": "src/main/java/.../Controller.java",
-          "depth": 0,
-          "callees": ["Method:.../Service.java:process"]
-        }
-      ]
+      "summaryContext": "Handler: Controller.handler() → Chain: handler → process"
     }
   }
 }

@@ -209,8 +209,6 @@ describe('documentEndpoint', () => {
       });
 
       expect(result.result._context).toBeDefined();
-      expect(result.result._context?.callChain).toBeDefined();
-      expect(result.result._context?.callChain).toHaveLength(1);
       expect(result.result._context?.resolvedProperties).toEqual({});
     });
   });
@@ -2905,12 +2903,6 @@ describe('extractValidationRules', () => {
         rules: 'Validator.check',
       });
 
-      // Content should NOT be in the chain output when compact=true
-      if (result.result._context?.callChain) {
-        for (const node of result.result._context.callChain) {
-          expect(node.content).toBeUndefined();
-        }
-      }
     });
 
     it('detects .validateJWT() custom validation calls', async () => {
