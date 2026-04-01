@@ -260,7 +260,6 @@ export interface DocumentEndpointResult {
   keyDetails: KeyDetails;
   _context?: {
     summaryContext?: string;
-    callChain?: ChainNode[];
     resolvedProperties?: Record<string, string>;
   };
 }
@@ -543,10 +542,15 @@ async function findHandlerByPathPattern(
   const best = validCandidates[0];
 
   // Use the full path (already computed during validation)
+  // Extract controller name from filePath (e.g., "BookingIConnectExtControllerV2" from path)
+  const fileName = best.filePath.split('/').pop() ?? 'Unknown';
+  const controller = fileName.replace(/\.[^.]+$/, ''); // Remove file extension
+
   return {
     method: method.toUpperCase(),
     path: best.fullPath,
     handler: best.handler,
+    controller,
     filePath: best.filePath,
     line: best.line,
   };
@@ -793,31 +797,10 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
 
   // Add context if requested
   if (includeContext) {
-    // When compact mode, omit content from chain nodes to reduce memory
-    const callChain = compact
-      ? chain.map(node => ({
-          uid: node.uid,
-          name: node.name,
-          filePath: node.filePath,
-          depth: node.depth,
-          kind: node.kind,
-          startLine: node.startLine,
-          endLine: node.endLine,
-          parameterCount: node.parameterCount,
-          returnType: node.returnType,
-          parameterAnnotations: node.parameterAnnotations,
-          annotations: node.annotations,
-          callees: node.callees,
-          metadata: node.metadata,
-          // content is omitted for compact mode
-        }))
-      : chain;
-
     result._context = {
-      callChain,
+      summaryContext: `Handler: ${route.controller ?? 'Unknown'}.${route.handler}() → Chain: ${chain.map(n => n.name).join(' → ')}`,
       resolvedProperties: {},
     };
-    result._context.summaryContext = `Handler: ${route.controller}.${route.handler}() → Chain: ${chain.map(n => n.name).join(' → ')}`;
   }
 
   // Keep all required arrays even if empty - JSON schema requires them
@@ -1202,55 +1185,94 @@ async function resolveStaticFieldValueCrossClass(
 /**
  * Resolve @Value annotation attribute from a field.
  * Returns the property key like "service.url" from @Value("${service.url}").
+ * Traverses the inheritance chain to find fields in parent classes.
  */
 async function resolveValueAnnotation(
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
   repoId: string,
   className: string,
   fieldName: string
-): Promise<{ propertyKey: string | null; rawValue: string | null }> {
-  const query = `
-    MATCH (c:Class)
-    WHERE c.name = $className OR c.name ENDS WITH $classNamePattern
-    RETURN c.fields AS fields
-    LIMIT 1
-  `;
+): Promise<{ propertyKey: string | null; rawValue: string | null; declaringClass: string | null }> {
+  // Track visited classes to avoid infinite loops in case of circular inheritance
+  const visited = new Set<string>();
 
-  try {
-    const rows = await executeQuery(repoId, query, {
-      className,
-      classNamePattern: '.' + className
-    });
+  async function findInClass(cls: string): Promise<{ propertyKey: string | null; rawValue: string | null; declaringClass: string | null }> {
+    if (visited.has(cls)) return { propertyKey: null, rawValue: null, declaringClass: null };
+    visited.add(cls);
 
-    if (rows.length === 0) return { propertyKey: null, rawValue: null };
+    const query = `
+      MATCH (c:Class)
+      WHERE c.name = $className OR c.name ENDS WITH $classNamePattern
+      RETURN c.fields AS fields, c.name AS className
+      LIMIT 1
+    `;
 
-    const fieldsJson = rows[0].fields || rows[0][0];
-    if (!fieldsJson) return { propertyKey: null, rawValue: null };
+    try {
+      const rows = await executeQuery(repoId, query, {
+        className: cls,
+        classNamePattern: '.' + cls
+      });
 
-    const fields = JSON.parse(fieldsJson);
-    const field = fields.find((f: any) => f.name === fieldName);
+      if (rows.length === 0) return { propertyKey: null, rawValue: null, declaringClass: null };
 
-    if (field?.annotationAttrs) {
-      const valueAnn = field.annotationAttrs.find((a: any) => a.name === '@Value');
-      if (valueAnn?.attrs) {
-        // attrs could be { "0": "${service.url}" } or { "value": "${service.url}" }
-        const rawValue = valueAnn.attrs['0'] || valueAnn.attrs['value'];
-        if (rawValue) {
-          // Extract property key from ${...}
-          const match = rawValue.match(/\$\{([^}]+)\}/);
-          return {
-            propertyKey: match ? match[1] : rawValue,
-            rawValue
-          };
+      const fieldsJson = rows[0].fields || rows[0][0];
+      const actualClassName = rows[0].className || rows[0][1] || cls;
+      if (!fieldsJson) {
+        // No fields found, try parent class
+        return findInParent(cls);
+      }
+
+      const fields = JSON.parse(fieldsJson);
+      const field = fields.find((f: any) => f.name === fieldName);
+
+      if (field?.annotationAttrs) {
+        const valueAnn = field.annotationAttrs.find((a: any) => a.name === '@Value');
+        if (valueAnn?.attrs) {
+          // attrs could be { "0": "${service.url}" } or { "value": "${service.url}" }
+          const rawValue = valueAnn.attrs['0'] || valueAnn.attrs['value'];
+          if (rawValue) {
+            // Extract property key from ${...}
+            const match = rawValue.match(/\$\{([^}]+)\}/);
+            return {
+              propertyKey: match ? match[1] : rawValue,
+              rawValue,
+              declaringClass: actualClassName
+            };
+          }
         }
       }
-    }
 
-    return { propertyKey: null, rawValue: null };
-  } catch (e) {
-    if (DEBUG) console.error('[GitNexus DEBUG] @Value annotation resolution failed:', e);
-    return { propertyKey: null, rawValue: null };
+      // Field not found in this class, try parent class
+      return findInParent(cls);
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] @Value annotation resolution failed:', e);
+      return { propertyKey: null, rawValue: null, declaringClass: null };
+    }
   }
+
+  async function findInParent(cls: string): Promise<{ propertyKey: string | null; rawValue: string | null; declaringClass: string | null }> {
+    const parentQuery = `
+      MATCH (child:Class)-[:CodeRelation {type: 'EXTENDS'}]->(parent:Class)
+      WHERE child.name = $className
+      RETURN parent.name AS parentName
+      LIMIT 1
+    `;
+
+    try {
+      const parentRows = await executeQuery(repoId, parentQuery, { className: cls });
+      if (parentRows.length === 0) return { propertyKey: null, rawValue: null, declaringClass: null };
+
+      const parentName = parentRows[0].parentName;
+      if (!parentName) return { propertyKey: null, rawValue: null, declaringClass: null };
+
+      return findInClass(parentName);
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Parent class lookup failed:', e);
+      return { propertyKey: null, rawValue: null, declaringClass: null };
+    }
+  }
+
+  return findInClass(className);
 }
 
 /**
