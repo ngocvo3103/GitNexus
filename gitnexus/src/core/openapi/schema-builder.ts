@@ -1,0 +1,293 @@
+/**
+ * Schema Builder - Convert BodySchema to OpenAPI Schema Object
+ */
+
+import type { OpenAPISchema } from './types.js';
+
+/** Source types from document-endpoint.ts */
+export interface BodySchema {
+  typeName: string;
+  source: 'indexed' | 'external' | 'primitive';
+  fields?: Array<{ name: string; type: string; annotations: string[] }>;
+  repoId?: string;
+  isContainer?: boolean;
+}
+
+export interface ValidationRule {
+  field: string;
+  type: string;
+  required: boolean;
+  rules: string;
+  _context?: string[];
+}
+
+/** Map Java/primitive types to OpenAPI types */
+const TYPE_MAP: Record<string, string> = {
+  // Primitives
+  string: 'string',
+  String: 'string',
+  char: 'string',
+  Character: 'string',
+  
+  // Numbers
+  int: 'integer',
+  Integer: 'integer',
+  long: 'integer',
+  Long: 'integer',
+  short: 'integer',
+  Short: 'integer',
+  byte: 'integer',
+  Byte: 'integer',
+  float: 'number',
+  Float: 'number',
+  double: 'number',
+  Double: 'number',
+  BigDecimal: 'number',
+  BigInteger: 'integer',
+  number: 'number',
+  Number: 'number',
+  
+  // Booleans
+  boolean: 'boolean',
+  Boolean: 'boolean',
+  
+  // Date/Time
+  Date: 'string',
+  LocalDate: 'string',
+  LocalDateTime: 'string',
+  ZonedDateTime: 'string',
+  Instant: 'string',
+  Timestamp: 'string',
+  
+  // Collections (used as hints)
+  List: 'array',
+  Set: 'array',
+  Collection: 'array',
+  Array: 'array',
+  Map: 'object',
+  HashMap: 'object',
+  Optional: 'object',
+  Object: 'object',
+  void: 'object',
+  Void: 'object',
+};
+
+/** Map validation annotations to OpenAPI constraints */
+const ANNOTATION_CONSTRAINTS: Record<string, (schema: OpenAPISchema, value?: string) => void> = {
+  '@NotNull': (s) => { s.minLength = 1; },
+  '@NotEmpty': (s) => { s.minLength = 1; },
+  '@NotBlank': (s) => { s.minLength = 1; },
+  '@Size': (s, value) => {
+    const match = value?.match(/max\s*=\s*(\d+)/);
+    if (match) s.maxLength = parseInt(match[1], 10);
+  },
+  '@Max': (s, value) => {
+    const match = value?.match(/(\d+)/);
+    if (match) s.maximum = parseInt(match[1], 10);
+  },
+  '@Min': (s, value) => {
+    const match = value?.match(/(\d+)/);
+    if (match) s.minimum = parseInt(match[1], 10);
+  },
+  '@Pattern': (s, value) => {
+    const match = value?.match(/regexp\s*=\s*"([^"]+)"/);
+    if (match) s.pattern = match[1];
+  },
+  '@Email': (s) => { s.format = 'email'; },
+  '@Past': (_s) => { /* No direct OpenAPI mapping */ },
+  '@Future': (_s) => { /* No direct OpenAPI mapping */ },
+};
+
+/**
+ * Map a type string to OpenAPI type
+ */
+export function mapType(type: string): string {
+  // Handle generic types like List<User>, Map<String, String>
+  const baseType = type.split('<')[0].trim();
+  
+  // Check direct mapping
+  if (TYPE_MAP[baseType]) {
+    return TYPE_MAP[baseType];
+  }
+  
+  // Check lowercase version
+  const lowerType = baseType.toLowerCase();
+  if (TYPE_MAP[lowerType]) {
+    return TYPE_MAP[lowerType];
+  }
+  
+  // Unknown types default to string
+  return 'string';
+}
+
+/**
+ * Extract format from type string
+ */
+function extractFormat(type: string): string | undefined {
+  const baseType = type.split('<')[0].trim();
+  
+  const FORMAT_MAP: Record<string, string> = {
+    Date: 'date',
+    LocalDate: 'date',
+    LocalDateTime: 'date-time',
+    ZonedDateTime: 'date-time',
+    Instant: 'date-time',
+    Timestamp: 'date-time',
+    email: 'email',
+    Email: 'email',
+    uuid: 'uuid',
+    UUID: 'uuid',
+    uri: 'uri',
+    URI: 'uri',
+  };
+  
+  return FORMAT_MAP[baseType];
+}
+
+/**
+ * Apply validation annotations to schema
+ */
+function applyAnnotations(schema: OpenAPISchema, annotations: string[]): void {
+  for (const annotation of annotations) {
+    const match = annotation.match(/(@\w+)(?:\((.*)\))?/);
+    if (!match) continue;
+
+    const [, name, value] = match;
+    const constraint = ANNOTATION_CONSTRAINTS[name];
+    if (constraint) {
+      constraint(schema, value);
+    }
+  }
+}
+
+/**
+ * Convert BodySchema to OpenAPI Schema Object
+ */
+export function bodySchemaToOpenAPISchema(schema: BodySchema | null | undefined): OpenAPISchema {
+  if (!schema) {
+    return {};
+  }
+
+  if (schema.isContainer) {
+    // Extract inner type from generic like List<User>
+    const match = schema.typeName.match(/<(.+)>/);
+    const innerType = match ? match[1].trim() : 'object';
+
+    return {
+      type: 'array',
+      items: {
+        type: mapType(innerType),
+      },
+    };
+  }
+
+  if (schema.source === 'primitive' || !schema.fields) {
+    const type = mapType(schema.typeName);
+    const openApiSchema: OpenAPISchema = { type };
+
+    const format = extractFormat(schema.typeName);
+    if (format) {
+      openApiSchema.format = format;
+    }
+
+    return openApiSchema;
+  }
+
+  const properties: Record<string, OpenAPISchema> = {};
+  const required: string[] = [];
+
+  for (const field of schema.fields) {
+    const fieldType = mapType(field.type);
+    const fieldSchema: OpenAPISchema = { type: fieldType };
+
+    const format = extractFormat(field.type);
+    if (format) {
+      fieldSchema.format = format;
+    }
+
+    if (field.annotations?.length > 0) {
+      applyAnnotations(fieldSchema, field.annotations);
+    }
+
+    const isRequired = field.annotations?.some(a =>
+      a.includes('@NotNull') ||
+      a.includes('@NotEmpty') ||
+      a.includes('@NotBlank')
+    ) ?? false;
+
+    if (isRequired) {
+      required.push(field.name);
+    }
+    
+    properties[field.name] = fieldSchema;
+  }
+  
+  const result: OpenAPISchema = {
+    type: 'object',
+    properties,
+  };
+  
+  if (required.length > 0) {
+    result.required = required;
+  }
+  
+  return result;
+}
+
+/**
+ * Convert a validation rule to OpenAPI schema constraints
+ */
+export function validationRuleToConstraints(rule: ValidationRule): OpenAPISchema {
+  const schema: OpenAPISchema = {
+    type: mapType(rule.type),
+  };
+  
+  // Apply rules string (contains annotation info)
+  if (rule.rules) {
+    // Parse rules string for constraints
+    applyAnnotations(schema, rule.rules.split(',').map(r => r.trim()));
+  }
+  
+  if (rule.required) {
+    // Mark as required in parent schema, not here
+  }
+  
+  return schema;
+}
+
+/**
+ * Create a schema reference
+ */
+export function createSchemaRef(schemaName: string): OpenAPISchema {
+  return {
+    $ref: `#/components/schemas/${schemaName}`,
+  };
+}
+
+/**
+ * Generate a valid schema name from type name
+ */
+export function generateSchemaName(typeName: string): string {
+  // Remove generic parameters but keep inner type name
+  // List<User> -> ListUser, Map<String, Object> -> MapStringObject
+  const cleaned = typeName
+    .replace(/[<>]/g, '')  // Remove angle brackets but keep inner type
+    .replace(/[, ]/g, '')   // Remove commas and spaces
+    .replace(/[^\w]/g, '')  // Remove other non-word chars
+    .replace(/^(\d)/, '_$1'); // Prefix leading digits with underscore
+  
+  return cleaned || 'UnknownType';
+}
+
+/**
+ * Check if a schema should be extracted to components
+ */
+export function shouldExtractToComponents(schema: BodySchema): boolean {
+  // Extract named types with fields
+  return (
+    schema.source === 'indexed' &&
+    schema.fields !== undefined &&
+    schema.fields.length > 0 &&
+    !schema.isContainer
+  );
+}

@@ -37,6 +37,8 @@ HANDOFF.md
 HANDOFF*.md
 
 .vercel
+.serena/
+*/docs/tmp/
 
 
 

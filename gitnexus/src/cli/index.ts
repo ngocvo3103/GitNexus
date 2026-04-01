@@ -125,6 +125,20 @@ program
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
 
+program
+  .command('document-endpoint')
+  .description('Generate API documentation JSON for an endpoint')
+  .requiredOption('--method <method>', 'HTTP method (GET, POST, PUT, DELETE, PATCH)')
+  .requiredOption('--path <pattern>', 'Path pattern to match (e.g., "suggest", "/bookings/{id}")')
+  .option('--depth <n>', 'Max trace depth (default: 10)', '10')
+  .option('--include-context', 'Include source context for AI enrichment', false)
+  .option('--compact', 'Omit source content and empty arrays (use with --include-context)', false)
+  .option('--openapi', 'Preserve raw BodySchema for OpenAPI generation (includes validation annotations)', false)
+  .option('--schema-path <path>', 'Path to custom JSON schema file (default: bundled schema)')
+  .option('--strict', 'Fail on schema validation errors (default: warn)', false)
+  .option('-r, --repo <name>', 'Target repository')
+  .action(createLazyAction(() => import('./tool.js'), 'documentEndpointCommand'));
+
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 
 program
