@@ -53,7 +53,7 @@ describe('shape_check integration', () => {
   it('creates FETCHES edges with accessedKeys in reason', () => {
     const edges = getRelationships(result, 'FETCHES');
     const searchFetch = edges.find(e =>
-      e.sourceFilePath.includes('SearchBar') && e.target === '/api/search',
+      e.sourceFilePath.includes('SearchBar') && e.target === 'Route:/api/search',
     );
     expect(searchFetch).toBeDefined();
     expect(searchFetch!.rel.reason).toContain('keys:');
@@ -66,7 +66,7 @@ describe('shape_check integration', () => {
   it('does not include DOM methods in consumer accessedKeys', () => {
     const edges = getRelationships(result, 'FETCHES');
     const gdprFetch = edges.find(e =>
-      e.sourceFilePath.includes('GdprExport') && e.target === '/api/gdpr/export',
+      e.sourceFilePath.includes('GdprExport') && e.target === 'Route:/api/gdpr/export',
     );
     expect(gdprFetch).toBeDefined();
     const keysStr = gdprFetch!.rel.reason!.match(/keys:([^|]+)/)?.[1] ?? '';
@@ -81,7 +81,7 @@ describe('shape_check integration', () => {
   it('captures error-path key access from consumers', () => {
     const edges = getRelationships(result, 'FETCHES');
     const userFetch = edges.find(e =>
-      e.sourceFilePath.includes('UserList') && e.target === '/api/users',
+      e.sourceFilePath.includes('UserList') && e.target === 'Route:/api/users',
     );
     expect(userFetch).toBeDefined();
     const keysStr = userFetch!.rel.reason!.match(/keys:([^|]+)/)?.[1] ?? '';

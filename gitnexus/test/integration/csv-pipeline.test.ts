@@ -86,6 +86,44 @@ describe('streamAllCSVsToDisk', () => {
     expect(relLines.length).toBe(4); // header + 3 relationships
   });
 
+  it('writes Route httpMethod/handler properties into route.csv', async () => {
+    const graph = buildTestGraph([
+      {
+        id: 'Route:/v1/foo',
+        label: 'Route',
+        name: '/v1/foo',
+        filePath: 'src/ProjectsController.java',
+        extra: {
+          httpMethod: 'GET',
+          handler: 'get',
+          controller: 'ProjectsController',
+          framework: 'spring',
+          prefix: '/v1',
+          lineNumber: 110,
+          responseKeys: ['id'],
+          errorKeys: [],
+          middleware: [],
+        },
+      },
+    ] as any);
+
+    const result = await streamAllCSVsToDisk(graph, repoDir, csvDir);
+    const routeCsv = result.nodeFiles.get('Route');
+    expect(routeCsv).toBeDefined();
+    expect(routeCsv!.rows).toBe(1);
+
+    const content = await fs.readFile(routeCsv!.csvPath, 'utf-8');
+    const lines = content.trim().split('\n');
+
+    expect(lines[0]).toBe(
+      'id,name,filePath,httpMethod,handler,controller,framework,prefix,lineNumber,responseKeys,errorKeys,middleware',
+    );
+    expect(content).toContain('"GET"');
+    expect(content).toContain('"get"');
+    expect(content).toContain('"ProjectsController"');
+    expect(content).toContain('"/v1",110,');
+  });
+
   it('CSV content is properly escaped', async () => {
     const graph = buildTestGraph([
       {
