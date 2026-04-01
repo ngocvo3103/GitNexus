@@ -61,8 +61,13 @@ function extractStringContent(node: Parser.SyntaxNode | null | undefined): strin
 /**
  * Extracts the first string argument from an annotation.
  * Handles both unnamed first arg and named "value" or "path" attributes.
+ * When encountering an identifier or field_access node, uses resolveStringNode
+ * with the provided constants map to resolve the constant value.
  */
-function extractAnnotationPath(annotationNode: Parser.SyntaxNode): string | null {
+function extractAnnotationPath(
+  annotationNode: Parser.SyntaxNode,
+  constants?: Map<string, string>,
+): string | null {
   // marker_annotation has no arguments
   if (annotationNode.type === 'marker_annotation') {
     return '';
@@ -72,26 +77,54 @@ function extractAnnotationPath(annotationNode: Parser.SyntaxNode): string | null
   const argsList = annotationNode.childForFieldName('arguments') ?? annotationNode.children.find(c => c.type === 'annotation_argument_list');
   if (!argsList) return null;
 
+  // Helper to check if node is a "value" node we can resolve
+  const isValueNode = (node: Parser.SyntaxNode): boolean => {
+    return node.type === 'string_literal' || node.type === 'identifier' ||
+           node.type === 'field_access' || node.type === 'binary_expression';
+  };
+
+  // Helper to skip punctuation (brackets, parens, commas)
+  const isPunctuation = (node: Parser.SyntaxNode): boolean => {
+    const t = node.type;
+    return t === '(' || t === ')' || t === '[' || t === ']' || t === ',' || t === '{' || t === '}';
+  };
+
   // Look for element_value_pair with key "value" or "path"
   for (const child of argsList.children) {
     if (child.type === 'element_value_pair') {
-      // The key is an 'identifier' child, not 'key' field
-      const keyNode = child.children.find(c => c.type === 'identifier');
-      if (keyNode && (keyNode.text === 'value' || keyNode.text === 'path')) {
-        // Find string_literal among children (after the '=')
-        const strNode = child.children.find(c => c.type === 'string_literal');
-        if (strNode) {
-          const str = extractStringContent(strNode);
-          if (str !== null) return str;
+      // The key is an 'identifier' child at index 0, '=' is at index 1
+      // Value is at index 2 or later
+      const keyNode = child.children[0];
+      if (keyNode && keyNode.type === 'identifier' && (keyNode.text === 'value' || keyNode.text === 'path')) {
+        // Value is after key ('=' at index 1)
+        const valueNode = child.children[2];
+        if (valueNode) {
+          if (valueNode.type === 'string_literal') {
+            const str = extractStringContent(valueNode);
+            if (str !== null) return str;
+          }
+          // identifier, field_access, or binary_expression - use resolveStringNode
+          if (constants) {
+            const resolved = resolveStringNode(valueNode, constants);
+            if (resolved !== null) return resolved;
+          }
         }
       }
     }
   }
 
-  // Look for unnamed first string_literal (e.g., @GetMapping("/users"))
+  // Look for unnamed first argument (skip punctuation)
   for (const child of argsList.children) {
+    if (isPunctuation(child)) continue;
     if (child.type === 'string_literal') {
       return extractStringContent(child);
+    }
+    // identifier, field_access, or binary_expression (constant reference)
+    if (constants && isValueNode(child)) {
+      const resolved = resolveStringNode(child, constants);
+      // If resolved is null, the constant wasn't found - return raw text
+      // so caller can distinguish "no value" from "unresolved constant"
+      return resolved ?? child.text;
     }
   }
 
@@ -143,6 +176,185 @@ function extractRequestMappingMethod(annotationNode: Parser.SyntaxNode): string 
   }
 
   return 'GET'; // Default
+}
+
+/**
+ * Resolves an AST node to its string value, using the constants map
+ * for identifier and field_access references.
+ * Handles: string_literal, identifier, field_access, binary_expression (concatenation)
+ *
+ * For identifiers/field_access: returns resolved value if found, otherwise the raw text.
+ * For binary_expression: returns concatenated string if all parts resolve, otherwise null.
+ */
+function resolveStringNode(node: Parser.SyntaxNode, constants: Map<string, string>): string | null {
+  if (!node) return null;
+
+  switch (node.type) {
+    case 'string_literal':
+      return extractStringContent(node);
+
+    case 'identifier': {
+      // Simple constant name, e.g., API_PATH
+      const value = constants.get(node.text);
+      return value !== undefined ? value : node.text;
+    }
+
+    case 'field_access': {
+      // Qualified reference, e.g., Constants.API_PATH
+      const text = node.text;
+      const value = constants.get(text);
+      if (value !== undefined) return value;
+
+      // Also try just the simple name as fallback
+      const parts = text.split('.');
+      const simpleName = parts[parts.length - 1];
+      const simpleValue = constants.get(simpleName);
+      return simpleValue !== undefined ? simpleValue : text;
+    }
+
+    case 'binary_expression': {
+      // String concatenation, e.g., Constants.PREFIX + "/users"
+      // Use namedChildCount and namedChild to avoid non-named children like '+'
+      if (node.namedChildCount < 2) return null;
+
+      const leftNode = node.namedChild(0);
+      const rightNode = node.namedChild(1);
+
+      // Verify it's a '+' operator by checking for binary_operator or literal '+' node
+      let hasPlus = false;
+      for (const child of node.children) {
+        if (!child.isNamed && (child.type === 'binary_operator' || child.type === '+')) {
+          if (child.text === '+') {
+            hasPlus = true;
+            break;
+          }
+        }
+      }
+      if (!hasPlus) return null;
+
+      const left = leftNode ? resolveStringNode(leftNode, constants) : null;
+      const right = rightNode ? resolveStringNode(rightNode, constants) : null;
+
+      if (left !== null && right !== null) {
+        return left + right;
+      }
+      return null;
+    }
+
+    default:
+      return null;
+  }
+}
+
+/**
+ * Extracts a public static final String constant from a field_declaration node.
+ * Adds to the constants map with both simple name and qualified ClassName.CONST name.
+ */
+function extractFieldConstant(
+  fieldNode: Parser.SyntaxNode,
+  className: string,
+  constants: Map<string, string>,
+): void {
+  // Find modifiers to check for public static final
+  let isPublic = false;
+  let isStatic = false;
+  let isFinal = false;
+  let isStringType = false;
+
+  for (const child of fieldNode.children) {
+    if (child.type === 'modifiers') {
+      for (const mod of child.children) {
+        if (mod.type === 'marker_annotation' || mod.type === 'annotation') continue;
+        const modText = mod.text;
+        if (modText === 'public') isPublic = true;
+        if (modText === 'static') isStatic = true;
+        if (modText === 'final') isFinal = true;
+      }
+    } else if (child.type === 'integral_type' || child.type === 'type_identifier') {
+      // Check if it's a String type
+      const typeText = child.text;
+      if (typeText === 'String') isStringType = true;
+    } else if (child.type === 'field_access') {
+      // Could be String -> check if it's java.lang.String
+      const text = child.text;
+      if (text === 'java.lang.String' || text.endsWith('.String')) isStringType = true;
+    }
+  }
+
+  if (!isPublic || !isStatic || !isFinal || !isStringType) return;
+
+  // Find the variable_declarator to get the name and value
+  for (const child of fieldNode.children) {
+    if (child.type === 'variable_declarator') {
+      let nameNode: Parser.SyntaxNode | null = null;
+      let valueNode: Parser.SyntaxNode | null = null;
+
+      for (const vc of child.children) {
+        if (vc.type === 'identifier' && !nameNode) {
+          nameNode = vc;
+        } else if (!valueNode) {
+          valueNode = vc;
+        }
+      }
+
+      if (nameNode) {
+        const constName = nameNode.text;
+        const constValue = valueNode ? resolveStringNode(valueNode, constants) : null;
+
+        if (constValue !== null) {
+          // Add with simple name
+          constants.set(constName, constValue);
+          // Add with qualified name ClassName.CONST
+          if (className) {
+            constants.set(`${className}.${constName}`, constValue);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Collects all public static final String constants from a Java file AST.
+ * Walks the tree for class declarations and extracts constants from field declarations.
+ */
+function collectFileConstants(rootNode: Parser.SyntaxNode): Map<string, string> {
+  const constants = new Map<string, string>();
+
+  function walk(node: Parser.SyntaxNode): void {
+    if (node.type === 'class_declaration' || node.type === 'interface_declaration' || node.type === 'enum_declaration') {
+      // Get class name
+      const className = node.childForFieldName('name')?.text ?? node.children.find(c => c.type === 'identifier')?.text;
+
+      // Find class_body
+      const body = node.children.find(c => c.type === 'class_body' || c.type === 'interface_body' || c.type === 'enum_body');
+
+      if (body) {
+        // Look for field_declarations
+        for (const member of body.children) {
+          if (member.type === 'field_declaration') {
+            extractFieldConstant(member, className ?? '', constants);
+          }
+        }
+      }
+    }
+
+    // Recurse into children
+    for (const child of node.children) {
+      walk(child);
+    }
+  }
+
+  walk(rootNode);
+  return constants;
+}
+
+/**
+ * Extracts all `public static final String` constants from a Java AST.
+ * Returns Map with both simple name -> value and qualified ClassName.CONST -> value.
+ */
+export function extractJavaConstants(tree: Parser.Tree): Map<string, string> {
+  return collectFileConstants(tree.rootNode);
 }
 
 /**
@@ -198,14 +410,17 @@ function getClassAnnotations(classDecl: Parser.SyntaxNode): Parser.SyntaxNode[] 
 /**
  * Extracts the path from a class-level @RequestMapping annotation.
  */
-function getClassRequestMappingPrefix(classDecl: Parser.SyntaxNode): string | null {
+function getClassRequestMappingPrefix(
+  classDecl: Parser.SyntaxNode,
+  constants?: Map<string, string>,
+): string | null {
   const annotations = getClassAnnotations(classDecl);
 
   for (const ann of annotations) {
     // The annotation name is an 'identifier' child, not 'name' field
     const nameNode = ann.children.find(c => c.type === 'identifier');
     if (nameNode && nameNode.text === 'RequestMapping') {
-      return extractAnnotationPath(ann);
+      return extractAnnotationPath(ann, constants);
     }
   }
 
@@ -241,6 +456,7 @@ function getMethodName(methodDecl: Parser.SyntaxNode): string | null {
 function extractRoutesFromClass(
   classDecl: Parser.SyntaxNode,
   filePath: string,
+  constants: Map<string, string>,
 ): ExtractedRoute[] {
   const routes: ExtractedRoute[] = [];
 
@@ -261,7 +477,7 @@ function extractRoutesFromClass(
   });
 
   // Get class-level @RequestMapping prefix
-  const classPrefix = getClassRequestMappingPrefix(classDecl);
+  const classPrefix = getClassRequestMappingPrefix(classDecl, constants);
 
   // Get class name
   const className = classDecl.childForFieldName('name')?.text ?? classDecl.children.find(c => c.type === 'identifier')?.text;
@@ -292,8 +508,10 @@ function extractRoutesFromClass(
 
             // Check for specific HTTP method annotations
             if (HTTP_METHOD_ANNOTATIONS.has(annotationName)) {
-              const methodPath = extractAnnotationPath(ann) ?? '';
-              const fullRoutePath = combinePaths(classPrefix, methodPath);
+              const methodPath = extractAnnotationPath(ann, constants) ?? '';
+              // If methodPath looks like a raw constant reference (contains '.'), use it directly
+              // Otherwise combine with class prefix as normal
+              const fullRoutePath = methodPath.includes('.') ? methodPath : combinePaths(classPrefix, methodPath);
               const lineNumber = ann.startPosition.row + 1; // tree-sitter uses 0-based
 
               routes.push({
@@ -308,9 +526,10 @@ function extractRoutesFromClass(
                 isControllerClass,
               });
             } else if (annotationName === 'RequestMapping') {
-              const methodPath = extractAnnotationPath(ann) ?? '';
+              const methodPath = extractAnnotationPath(ann, constants) ?? '';
               const httpMethod = extractRequestMappingMethod(ann);
-              const fullRoutePath = combinePaths(classPrefix, methodPath);
+              // If methodPath looks like a raw constant reference (contains '.'), use it directly
+              const fullRoutePath = methodPath.includes('.') ? methodPath : combinePaths(classPrefix, methodPath);
               const lineNumber = ann.startPosition.row + 1;
 
               routes.push({
@@ -337,14 +556,21 @@ function extractRoutesFromClass(
 /**
  * Main entry point: extracts Spring routes from a parsed Java file.
  * Walks all class and interface declarations, extracts routes from controller classes.
+ * Optionally accepts a Map of constants for resolving constant references like
+ * @GetMapping(Constants.API_PATH) - pass a Map with entries like 'Constants.API_PATH' -> '/api'
  */
-export function extractSpringRoutes(tree: Parser.Tree, filePath: string): ExtractedRoute[] {
+export function extractSpringRoutes(
+  tree: Parser.Tree,
+  filePath: string,
+  constants?: Map<string, string>,
+): ExtractedRoute[] {
   const routes: ExtractedRoute[] = [];
+  const constantMap = constants ?? new Map<string, string>();
 
   function walk(node: Parser.SyntaxNode): void {
     // Check for class_declaration, interface_declaration, enum_declaration
     if (node.type === 'class_declaration' || node.type === 'interface_declaration' || node.type === 'enum_declaration') {
-      const classRoutes = extractRoutesFromClass(node, filePath);
+      const classRoutes = extractRoutesFromClass(node, filePath, constantMap);
       routes.push(...classRoutes);
       // Continue walking for nested classes
     }

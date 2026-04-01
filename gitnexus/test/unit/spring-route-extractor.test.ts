@@ -6,11 +6,11 @@ import type { ExtractedRoute } from '../../src/core/ingestion/workers/parse-work
 
 /**
  * Test suite for extractSpringRoutes function.
- * 
+ *
  * These tests are currently FAILING because extractSpringRoutes is not yet implemented.
  * The function should extract HTTP routes from Spring Boot controller classes
  * by analyzing tree-sitter AST for Java annotations like @GetMapping, @PostMapping, etc.
- * 
+ *
  * BDD Feature: Spring Route Extraction
  *   As a code intelligence system
  *   I want to extract HTTP routes from Spring Boot controllers
@@ -30,7 +30,7 @@ function parseJava(source: string): Parser.Tree {
 
 /**
  * Feature: Basic Controller Extraction
- * 
+ *
  * Scenario: Extract route from @RestController with @GetMapping
  *   Given a Java class annotated with @RestController
  *   And a method annotated with @GetMapping("/users")
@@ -41,12 +41,12 @@ function parseJava(source: string): Parser.Tree {
  *     - controllerName: the class name
  *     - methodName: the method name
  *     - isControllerClass: true
- * 
+ *
  * Scenario Outline: Extract routes from all HTTP method annotations
  *   Given a @RestController class with a method annotated with <annotation>
  *   When the annotation path is "/test"
  *   Then the extracted route should have httpMethod = <method>
- * 
+ *
  *   Examples:
  *     | annotation      | method |
  *     | @GetMapping     | GET    |
@@ -199,10 +199,10 @@ describe('extractSpringRoutes', () => {
         public class ApiController {
           @GetMapping("/users")
           public List<User> getUsers() { return null; }
-          
+
           @PostMapping("/users")
           public User createUser() { return null; }
-          
+
           @GetMapping("/health")
           public String health() { return "OK"; }
         }
@@ -494,10 +494,10 @@ describe('extractSpringRoutes', () => {
         public interface ProductClient {
           @GetMapping("/products")
           List<Product> getAll();
-          
+
           @GetMapping("/products/{id}")
           Product getById(@PathVariable Long id);
-          
+
           @PostMapping("/products")
           Product create(Product product);
         }
@@ -517,7 +517,7 @@ describe('extractSpringRoutes', () => {
           @GetMapping("/feign")
           String feignMethod();
         }
-        
+
         @RestController
         class RealController {
           @GetMapping("/real")
@@ -636,16 +636,16 @@ describe('extractSpringRoutes', () => {
         public class UserController {
           @GetMapping
           public List<User> list() { return null; }
-          
+
           @GetMapping("/{id}")
           public User get(@PathVariable Long id) { return null; }
-          
+
           @PostMapping
           public User create(@RequestBody User user) { return null; }
-          
+
           @PutMapping("/{id}")
           public User update(@PathVariable Long id) { return null; }
-          
+
           @DeleteMapping("/{id}")
           public void delete(@PathVariable Long id) { }
         }
@@ -654,16 +654,16 @@ describe('extractSpringRoutes', () => {
       const routes = extractSpringRoutes(tree, 'src/UserController.java');
 
       expect(routes).toHaveLength(5);
-      
+
       const getRoutes = routes.filter(r => r.httpMethod === 'GET');
       expect(getRoutes).toHaveLength(2);
-      
+
       const postRoutes = routes.filter(r => r.httpMethod === 'POST');
       expect(postRoutes).toHaveLength(1);
-      
+
       const putRoutes = routes.filter(r => r.httpMethod === 'PUT');
       expect(putRoutes).toHaveLength(1);
-      
+
       const deleteRoutes = routes.filter(r => r.httpMethod === 'DELETE');
       expect(deleteRoutes).toHaveLength(1);
     });
@@ -674,10 +674,10 @@ describe('extractSpringRoutes', () => {
         public class MixedController {
           @GetMapping("/items")
           public List<Item> items() { return null; }
-          
+
           @PostMapping("/items")
           public Item create() { return null; }
-          
+
           @GetMapping("/categories")
           public List<Category> categories() { return null; }
         }
@@ -686,7 +686,7 @@ describe('extractSpringRoutes', () => {
       const routes = extractSpringRoutes(tree, 'src/MixedController.java');
 
       expect(routes).toHaveLength(3);
-      
+
       const routePaths = routes.map(r => r.routePath);
       expect(routePaths).toContain('/items');
       expect(routePaths).toContain('/categories');
@@ -721,10 +721,10 @@ describe('extractSpringRoutes', () => {
         public class MultiController {
           @GetMapping("/first")
           public String first() { return "first"; }
-          
+
           @PostMapping("/second")
           public String second() { return "second"; }
-          
+
           @DeleteMapping("/third")
           public String third() { return "third"; }
         }
@@ -733,11 +733,11 @@ describe('extractSpringRoutes', () => {
       const routes = extractSpringRoutes(tree, 'src/MultiController.java');
 
       expect(routes).toHaveLength(3);
-      
+
       const lineNumbers = routes.map(r => r.lineNumber);
       // Each route should have a distinct line number
       expect(new Set(lineNumbers).size).toBe(3);
-      
+
       // Routes should be in order of appearance
       expect(lineNumbers).toEqual([...lineNumbers].sort((a, b) => a - b));
     });
@@ -753,7 +753,7 @@ describe('extractSpringRoutes', () => {
         @RestController
         public class EmptyController {
           public void noRouteMethod() { }
-          
+
           @Override
           public String toString() { return "EmptyController"; }
         }
@@ -786,7 +786,7 @@ describe('extractSpringRoutes', () => {
         public class OuterController {
           @GetMapping("/outer")
           public String outer() { return "outer"; }
-          
+
           public class InnerController {
             @GetMapping("/inner")
             public String inner() { return "inner"; }
@@ -992,7 +992,7 @@ describe('extractSpringRoutes', () => {
 
       expect(routes).toHaveLength(1);
       const route = routes[0];
-      
+
       // Verify all fields exist and have correct types
       expect(typeof route.filePath).toBe('string');
       expect(typeof route.httpMethod).toBe('string');
@@ -1003,7 +1003,7 @@ describe('extractSpringRoutes', () => {
       expect(typeof route.prefix).toBe('string');
       expect(typeof route.lineNumber).toBe('number');
       expect(typeof route.isControllerClass).toBe('boolean');
-      
+
       // Verify specific values
       expect(route.filePath).toBe('src/CompleteController.java');
       expect(route.httpMethod).toBe('GET');
@@ -1013,6 +1013,77 @@ describe('extractSpringRoutes', () => {
       expect(route.middleware).toEqual([]);
       expect(route.prefix).toBe('/api/v1');
       expect(route.isControllerClass).toBe(true);
+    });
+  });
+
+  // ========================================
+  // 15. Cross-file Constant Resolution
+  // ========================================
+
+  describe('cross-file constant resolution', () => {
+    it('resolves @GetMapping(Constants.API_PATH) using provided constants map', () => {
+      const java = `
+        @RestController
+        class TestController {
+          @GetMapping(Constants.API_PATH)
+          public void test() {}
+        }
+      `;
+      const tree = parseJava(java);
+      const constants = new Map([['Constants.API_PATH', '/api']]);
+      // @ts-expect-error - constants param not yet implemented
+      const routes = extractSpringRoutes(tree, 'TestController.java', constants);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].routePath).toBe('/api');
+    });
+
+    it('resolves qualified reference Config.BASE_URL using constants map', () => {
+      const java = `
+        @RestController
+        class ApiController {
+          @GetMapping(Config.BASE_URL)
+          public void endpoint() {}
+        }
+      `;
+      const tree = parseJava(java);
+      const constants = new Map([['Config.BASE_URL', '/v1/base']]);
+      // @ts-expect-error - constants param not yet implemented
+      const routes = extractSpringRoutes(tree, 'ApiController.java', constants);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].routePath).toBe('/v1/base');
+    });
+
+    it('falls back to raw identifier when constant not in map', () => {
+      const java = `
+        @RestController
+        class UserController {
+          @GetMapping(Constants.UNKNOWN_PATH)
+          public void handle() {}
+        }
+      `;
+      const tree = parseJava(java);
+      const constants = new Map<string, string>();
+      // @ts-expect-error - constants param not yet implemented
+      const routes = extractSpringRoutes(tree, 'UserController.java', constants);
+      expect(routes).toHaveLength(1);
+      // Should return the identifier as-is when constant is not found
+      expect(routes[0].routePath).toBe('Constants.UNKNOWN_PATH');
+    });
+
+    it('resolves concatenated paths: Constants.PREFIX + "/users"', () => {
+      const java = `
+        @RestController
+        class ItemController {
+          @GetMapping(Constants.PREFIX + "/users")
+          public void list() {}
+        }
+      `;
+      const tree = parseJava(java);
+      const constants = new Map([['Constants.PREFIX', '/api']]);
+      // @ts-expect-error - constants param not yet implemented
+      const routes = extractSpringRoutes(tree, 'ItemController.java', constants);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].routePath).toBe('/api/users');
     });
   });
 });
