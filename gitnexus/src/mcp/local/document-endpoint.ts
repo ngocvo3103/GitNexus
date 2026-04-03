@@ -8,6 +8,7 @@
  */
 
 import type { RepoHandle } from './local-backend.js';
+import type { FieldInfo } from '../../core/ingestion/workers/parse-worker.js';
 import type { CrossRepoContext } from './cross-repo-context.js';
 import { executeParameterized } from '../core/lbug-adapter.js';
 import { executeTrace, type ChainNode, type BuilderDetail } from './trace-executor.js';
@@ -258,6 +259,8 @@ export interface DocumentEndpointResult {
   cacheStrategy: CacheStrategy;
   retryLogic: RetryLogic[];
   keyDetails: KeyDetails;
+  handlerClass?: string;
+  handlerMethod?: string;
   _context?: {
     summaryContext?: string;
     resolvedProperties?: Record<string, string>;
@@ -620,11 +623,56 @@ export async function documentEndpoint(
     return executeParameterized(repo.id, query, params);
   });
 
+  // Step 2a: Verify Method node exists before tracing
+  // If Route node UIDs don't match actual Method nodes, fall back to pattern matching
+  // NOTE: Uses executeParameterized directly (not executeQuery) so this verification
+  // always works even when tests inject a custom executeQuery that doesn't handle it.
+  let validHandlerUid: string | undefined = handlerUid;
+  if (handlerUid) {
+    try {
+      const verifyQuery = `MATCH (m:Method) WHERE m.uid = $uid RETURN m.uid LIMIT 1`;
+      const verifyResult = await executeParameterized(repo.id, verifyQuery, { uid: handlerUid });
+      if (!verifyResult || verifyResult.length === 0) {
+        validHandlerUid = undefined; // Method node not found, will fall back
+      }
+    } catch (err: any) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Method verification query failed:', err);
+      // Fall through to fallback on error
+      validHandlerUid = undefined;
+    }
+  }
+
+  // Fall back to pattern matching if handler UID verification failed
+  if (!validHandlerUid) {
+    const fallbackResult = await findHandlerByPathPattern(repo, method, path);
+    if (fallbackResult) {
+      // Construct new handler UID from fallback result
+      validHandlerUid = fallbackResult.handler && fallbackResult.filePath
+        ? generateId('Method', `${fallbackResult.filePath}:${fallbackResult.handler}`)
+        : undefined;
+
+      if (validHandlerUid) {
+        // Use fallback route info for documentation
+        route = fallbackResult;
+      } else {
+        return {
+          result: createEmptyResult(method, path),
+          error: `Could not construct handler UID from fallback for ${method} ${path}`,
+        };
+      }
+    } else {
+      return {
+        result: createEmptyResult(method, path),
+        error: `No handler found for ${method} ${path} (Route UID had no matching Method)`,
+      };
+    }
+  }
+
   // Step 3: Trace the handler method
   const traceResult = await executeTrace(
     executeQuery,
     repo.id,
-    { uid: handlerUid, maxDepth: depth, include_content: true, compact }
+    { uid: validHandlerUid, maxDepth: depth, include_content: true, compact }
   );
 
   if (traceResult.error) {
@@ -792,8 +840,20 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
   // Generate code diagram
   result.codeDiagram = generateCodeDiagram(chain);
 
-  // Generate logic flow placeholder
-  result.logicFlow = TODO_AI_ENRICH;
+  // Generate logic flow from chain
+  if (chain.length > 0) {
+    result.logicFlow = chain.map(n => n.name).join(' → ');
+  } else {
+    result.logicFlow = TODO_AI_ENRICH;
+  }
+
+  // Populate handler info at top level for easy access
+  if (route.controller) {
+    result.handlerClass = route.controller;
+  }
+  if (route.handler) {
+    result.handlerMethod = route.handler;
+  }
 
   // Add context if requested
   if (includeContext) {
@@ -971,6 +1031,9 @@ async function extractDownstreamApis(
       if (pathConstants.length > 0) {
         // Use resolved path constant
         endpoint = `${detail.httpMethod} ${pathConstants[0].value}`;
+      } else if (resolvedValue && (resolvedValue.startsWith('http') || resolvedValue.startsWith('/'))) {
+        // Use resolved value when it contains a complete URL or path prefix
+        endpoint = `${detail.httpMethod} ${resolvedValue}`;
       } else if (parsed.staticParts.length > 0) {
         // Use static parts if available
         endpoint = `${detail.httpMethod} ${parsed.staticParts.join('')}`;
@@ -1147,12 +1210,9 @@ async function resolveStaticFieldValueCrossClass(
 
   // 2. Query for static final field with matching name across ALL classes
   const crossClassQuery = `
-    MATCH (c:Class)-[:HAS_FIELD]->(f:Field)
-    WHERE f.name = $fieldName
-      AND 'static' IN f.modifiers
-      AND 'final' IN f.modifiers
-      AND f.value IS NOT NULL
-    RETURN c.name AS className, f.value AS value
+    MATCH (c:Class)
+    WHERE c.fields CONTAINS $fieldName
+    RETURN c.name AS className, c.fields AS fields
     LIMIT 5
   `;
 
@@ -1162,20 +1222,48 @@ async function resolveStaticFieldValueCrossClass(
       return { value: null, declaringClass: null };
     }
 
+    const results: Array<{ className: string; value: string }> = [];
+
+    for (const row of rows) {
+      try {
+        const fieldsJson = row.fields || row[1];
+        if (!fieldsJson) continue;
+
+        const fields = JSON.parse(fieldsJson) as FieldInfo[];
+        const field = fields.find((f) =>
+          f.name === fieldName &&
+          f.modifiers?.includes('static') &&
+          f.modifiers?.includes('final') &&
+          f.value !== undefined
+        );
+
+        if (field) {
+          results.push({ className: row.className || row[0], value: field.value });
+        }
+      } catch (e) {
+        // Skip malformed JSON
+        if (DEBUG) console.error('[GitNexus DEBUG] Failed to parse fields JSON:', e);
+      }
+    }
+
+    if (results.length === 0) {
+      return { value: null, declaringClass: null };
+    }
+
     // Prefer fields with URL-like values
-    const urlField = rows.find((r: any) => 
-      r.value?.startsWith('http') || 
+    const urlField = results.find((r) =>
+      r.value?.startsWith('http') ||
       r.value?.includes('/api/') ||
       r.value?.includes('/v1/') ||
       r.value?.includes('/v2/')
     );
-    
+
     if (urlField) {
       return { value: urlField.value, declaringClass: urlField.className };
     }
 
     // Fall back to first match
-    return { value: rows[0].value, declaringClass: rows[0].className };
+    return { value: results[0].value, declaringClass: results[0].className };
   } catch (e) {
     if (DEBUG) console.error('[GitNexus DEBUG] Cross-class static field query failed:', e);
     return { value: null, declaringClass: null };

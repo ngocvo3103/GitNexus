@@ -15,8 +15,14 @@ vi.mock('../../src/mcp/local/trace-executor.js', () => ({
   executeTrace: vi.fn(),
 }));
 
-vi.mock('../../src/core/lbug-adapter.js', () => ({
-  executeParameterized: vi.fn(),
+vi.mock('../../src/mcp/core/lbug-adapter.js', () => ({
+  // WI-2: Default mock handles verification query (MATCH (m:Method) WHERE m.uid)
+  executeParameterized: vi.fn().mockImplementation(async (_repoId: string, query: string, params: Record<string, any>) => {
+    if (query.includes('MATCH (m:Method) WHERE m.uid')) {
+      return [{ 'm.uid': params.uid }]; // Verification passes - Method exists
+    }
+    return [];
+  }),
   initLbug: vi.fn(),
   closeLbug: vi.fn(),
   isLbugReady: vi.fn(),

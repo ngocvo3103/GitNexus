@@ -8,6 +8,7 @@ import {
   buildImportResolutionContext
 } from './import-processor.js';
 import { processCalls, processCallsFromExtracted, processRoutesFromExtracted } from './call-processor.js';
+import type { ExtractedRoute } from './workers/parse-worker.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -47,7 +48,7 @@ export const runPipelineFromRepo = async (
   options?: PipelineOptions,
 ): Promise<PipelineResult> => {
   const graph = createKnowledgeGraph();
-  const ctx = createResolutionContext();
+  const ctx = createResolutionContext(graph);
   const symbolTable = ctx.symbols;
   let astCache = createASTCache(AST_CACHE_CAP);
 
@@ -251,6 +252,7 @@ export const runPipelineFromRepo = async (
     // are already registered). This trades ~5% cross-chunk resolution accuracy for
     // 200-400MB less memory — critical for Linux-kernel-scale repos.
     const sequentialChunkPaths: string[][] = [];
+    const sequentialChunkRoutes: ExtractedRoute[][] = [];
 
     try {
       for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
@@ -281,7 +283,8 @@ export const runPipelineFromRepo = async (
 
         const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
 
-        if (chunkWorkerData) {
+        if (workerPool && chunkWorkerData) {
+          // Worker path: use extracted data for imports, heritage, calls, routes
           // Imports
           await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
             onProgress({
@@ -295,54 +298,61 @@ export const runPipelineFromRepo = async (
           // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
           // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
           // and the single-threaded event loop prevents races between synchronous addRelationship calls.
-          await Promise.all([
-            processCallsFromExtracted(
-              graph,
-              chunkWorkerData.calls,
-              ctx,
-              (current, total) => {
-                onProgress({
-                  phase: 'parsing',
-                  percent: Math.round(chunkBasePercent),
-                  message: `Resolving calls (chunk ${chunkIdx + 1}/${numChunks})...`,
-                  detail: `${current}/${total} files`,
-                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-                });
-              },
-              chunkWorkerData.constructorBindings,
-            ),
-            processHeritageFromExtracted(
-              graph,
-              chunkWorkerData.heritage,
-              ctx,
-              (current, total) => {
-                onProgress({
-                  phase: 'parsing',
-                  percent: Math.round(chunkBasePercent),
-                  message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
-                  detail: `${current}/${total} records`,
-                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-                });
-              },
-            ),
-            processRoutesFromExtracted(
-              graph,
-              chunkWorkerData.routes ?? [],
-              ctx,
-              (current, total) => {
-                onProgress({
-                  phase: 'parsing',
-                  percent: Math.round(chunkBasePercent),
-                  message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
-                  detail: `${current}/${total} routes`,
-                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-                });
-              },
-            ),
-          ]);
+
+          // Heritage MUST run before calls: IMPLEMENTS edges (from heritage) are needed
+          // for D5 call resolution to work correctly. Call resolution depends on
+          // interface/implementation edges being established first.
+          await processHeritageFromExtracted(
+            graph,
+            chunkWorkerData.heritage,
+            ctx,
+            (current, total) => {
+              onProgress({
+                phase: 'parsing',
+                percent: Math.round(chunkBasePercent),
+                message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
+                detail: `${current}/${total} records`,
+                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+              });
+            },
+          );
+
+          await processCallsFromExtracted(
+            graph,
+            chunkWorkerData.calls,
+            ctx,
+            (current, total) => {
+              onProgress({
+                phase: 'parsing',
+                percent: Math.round(chunkBasePercent),
+                message: `Resolving calls (chunk ${chunkIdx + 1}/${numChunks})...`,
+                detail: `${current}/${total} files`,
+                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+              });
+            },
+            chunkWorkerData.constructorBindings,
+          );
+
+          await processRoutesFromExtracted(
+            graph,
+            chunkWorkerData.routes ?? [],
+            ctx,
+            (current, total) => {
+              onProgress({
+                phase: 'parsing',
+                percent: Math.round(chunkBasePercent),
+                message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
+                detail: `${current}/${total} routes`,
+                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+              });
+            },
+          );
         } else {
+          // Sequential path: processImports adds symbols, then heritage/calls are resolved
+          // in the sequential fallback loop below (lines 351-365)
           await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
           sequentialChunkPaths.push(chunkPaths);
+          sequentialChunkRoutes.push(chunkWorkerData.routes ?? []);
         }
 
         filesParsedSoFar += chunkFiles.length;
@@ -356,16 +366,21 @@ export const runPipelineFromRepo = async (
     }
 
     // Sequential fallback chunks: re-read source for call/heritage resolution
-    for (const chunkPaths of sequentialChunkPaths) {
+    for (let chunkIdx = 0; chunkIdx < sequentialChunkPaths.length; chunkIdx++) {
+      const chunkPaths = sequentialChunkPaths[chunkIdx];
       const chunkContents = await readFileContents(repoPath, chunkPaths);
       const chunkFiles = chunkPaths
         .filter(p => chunkContents.has(p))
         .map(p => ({ path: p, content: chunkContents.get(p)! }));
       astCache = createASTCache(chunkFiles.length);
-      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx);
       await processHeritage(graph, chunkFiles, astCache, ctx);
+      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx);
       if (rubyHeritage.length > 0) {
         await processHeritageFromExtracted(graph, rubyHeritage, ctx);
+      }
+      const chunkRoutes = sequentialChunkRoutes[chunkIdx];
+      if (chunkRoutes.length > 0) {
+        await processRoutesFromExtracted(graph, chunkRoutes, ctx);
       }
       astCache.clear();
     }

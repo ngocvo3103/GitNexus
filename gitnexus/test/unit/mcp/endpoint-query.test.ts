@@ -79,131 +79,56 @@ describe('queryEndpoints', () => {
     });
   });
 
-  describe('Route empty, fallback to Methods', () => {
-    it('queries Method nodes when Route query returns empty', async () => {
-      // First call: Route query returns empty
+  describe('Route empty', () => {
+    it('returns empty endpoints when Route query returns empty', async () => {
+      // Route query returns empty - queryEndpoints does NOT fall back to Method nodes
+      // (Method fallback is handled at the document-endpoint.ts level, not in queryEndpoints)
       mockExecuteParameterized.mockResolvedValueOnce([]);
-
-      // Second call: Method fallback query returns results
-      mockExecuteParameterized.mockResolvedValueOnce([
-        {
-          method: 'POST',
-          path: '/api/products',
-          controller: 'ProductController',
-          handler: 'createProduct',
-          filePath: 'src/controllers/ProductController.java',
-          line: 78,
-        },
-      ]);
-
-      const result = await queryEndpoints(
-        { id: 'test-repo', path: '/test' }
-      );
-
-      expect(result.endpoints).toHaveLength(1);
-      expect(result.endpoints[0]).toEqual({
-        method: 'POST',
-        path: '/api/products',
-        controller: 'ProductController',
-        handler: 'createProduct',
-        filePath: 'src/controllers/ProductController.java',
-        line: 78,
-      });
-
-      // Verify both queries were called
-      expect(mockExecuteParameterized).toHaveBeenCalledTimes(2);
-    });
-
-    it('filters Method nodes by method when options provided', async () => {
-      mockExecuteParameterized.mockResolvedValueOnce([]); // Route empty
-      mockExecuteParameterized.mockResolvedValueOnce([
-        {
-          method: 'DELETE',
-          path: '/api/items/{id}',
-          controller: 'ItemController',
-          handler: 'deleteItem',
-          filePath: 'src/controllers/ItemController.java',
-          line: 99,
-        },
-      ]);
-
-      const result = await queryEndpoints(
-        { id: 'test-repo', path: '/test' },
-        { method: 'DELETE' }
-      );
-
-      expect(result.endpoints).toHaveLength(1);
-      expect(result.endpoints[0].method).toBe('DELETE');
-    });
-
-    it('filters Method nodes by path when options provided', async () => {
-      mockExecuteParameterized.mockResolvedValueOnce([]); // Route empty
-      mockExecuteParameterized.mockResolvedValueOnce([
-        {
-          method: 'GET',
-          path: '/api/users',
-          controller: 'UserController',
-          handler: 'listUsers',
-          filePath: 'src/controllers/UserController.java',
-          line: 30,
-        },
-      ]);
-
-      const result = await queryEndpoints(
-        { id: 'test-repo', path: '/test' },
-        { path: 'users' }
-      );
-
-      // Verify fallback was called with annotations array and path filter
-      expect(mockExecuteParameterized).toHaveBeenCalledTimes(2);
-      const fallbackCall = mockExecuteParameterized.mock.calls[1];
-      expect(fallbackCall[2]).toMatchObject({ path: 'users' });
-      expect(fallbackCall[2]).toHaveProperty('annotations');
-
-      expect(result.endpoints).toHaveLength(1);
-      expect(result.endpoints[0].path).toBe('/api/users');
-    });
-
-    it('filters Method nodes by both method AND path', async () => {
-      mockExecuteParameterized.mockResolvedValueOnce([]); // Route empty
-      mockExecuteParameterized.mockResolvedValueOnce([
-        {
-          method: 'POST',
-          path: '/api/users',
-          controller: 'UserController',
-          handler: 'createUser',
-          filePath: 'src/controllers/UserController.java',
-          line: 45,
-        },
-      ]);
-
-      const result = await queryEndpoints(
-        { id: 'test-repo', path: '/test' },
-        { method: 'POST', path: 'users' }
-      );
-
-      // Verify fallback was called with both filters plus annotations
-      expect(mockExecuteParameterized).toHaveBeenCalledTimes(2);
-      const fallbackCall = mockExecuteParameterized.mock.calls[1];
-      expect(fallbackCall[2]).toMatchObject({ method: 'POST', path: 'users' });
-      expect(fallbackCall[2]).toHaveProperty('annotations');
-
-      expect(result.endpoints).toHaveLength(1);
-      expect(result.endpoints[0].method).toBe('POST');
-    });
-  });
-
-  describe('Neither Route nor Method nodes', () => {
-    it('returns empty array when both queries return empty', async () => {
-      mockExecuteParameterized.mockResolvedValueOnce([]); // Route empty
-      mockExecuteParameterized.mockResolvedValueOnce([]); // Method empty
 
       const result = await queryEndpoints(
         { id: 'test-repo', path: '/test' }
       );
 
       expect(result.endpoints).toHaveLength(0);
-      expect(mockExecuteParameterized).toHaveBeenCalledTimes(2);
+      // Verify only one query was called (Route only, no Method fallback in queryEndpoints)
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns empty when Route query returns empty with method filter', async () => {
+      mockExecuteParameterized.mockResolvedValueOnce([]);
+
+      const result = await queryEndpoints(
+        { id: 'test-repo', path: '/test' },
+        { method: 'DELETE' }
+      );
+
+      expect(result.endpoints).toHaveLength(0);
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns empty when Route query returns empty with path filter', async () => {
+      mockExecuteParameterized.mockResolvedValueOnce([]);
+
+      const result = await queryEndpoints(
+        { id: 'test-repo', path: '/test' },
+        { path: 'users' }
+      );
+
+      expect(result.endpoints).toHaveLength(0);
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('Neither Route nodes exist', () => {
+    it('returns empty array when Route query returns empty', async () => {
+      mockExecuteParameterized.mockResolvedValueOnce([]); // Route empty
+
+      const result = await queryEndpoints(
+        { id: 'test-repo', path: '/test' }
+      );
+
+      expect(result.endpoints).toHaveLength(0);
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -234,27 +159,6 @@ describe('queryEndpoints', () => {
         line: undefined,
       });
     });
-
-    it('applies defaults for missing method/path in fallback', async () => {
-      mockExecuteParameterized.mockResolvedValueOnce([]); // Route empty
-      mockExecuteParameterized.mockResolvedValueOnce([
-        {
-          // method and path missing/null — should default to 'GET' and '/'
-          controller: 'FallbackController',
-          handler: 'defaultHandler',
-          filePath: 'src/controllers/FallbackController.java',
-          line: 10,
-        },
-      ]);
-
-      const result = await queryEndpoints(
-        { id: 'test-repo', path: '/test' }
-      );
-
-      expect(result.endpoints).toHaveLength(1);
-      expect(result.endpoints[0].method).toBe('GET');
-      expect(result.endpoints[0].path).toBe('/');
-    });
   });
 
   describe('Error handling', () => {
@@ -268,13 +172,15 @@ describe('queryEndpoints', () => {
     });
 
     it('propagates error when fallback query fails', async () => {
+      // Route query returns empty - Method fallback is NOT in queryEndpoints scope
       mockExecuteParameterized.mockResolvedValueOnce([]); // Route empty
-      mockExecuteParameterized.mockRejectedValueOnce(new Error('Query timeout'));
 
-      await expect(queryEndpoints({ id: 'test-repo', path: '/test' }))
-        .rejects.toThrow('Query timeout');
+      // queryEndpoints doesn't fall back to Method, so no second call
+      // and therefore no error to propagate
+      const result = await queryEndpoints({ id: 'test-repo', path: '/test' });
 
-      expect(mockExecuteParameterized).toHaveBeenCalledTimes(2);
+      expect(result.endpoints).toHaveLength(0);
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(1);
     });
   });
 });
