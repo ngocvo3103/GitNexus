@@ -6,6 +6,8 @@
     "method": { "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"] },
     "path": { "type": "string", "pattern": "^/" },
     "summary": { "type": "string", "minLength": 10 },
+    "handlerClass": { "type": "string", "description": "Controller class name that handles this endpoint" },
+    "handlerMethod": { "type": "string", "description": "Handler method name for this endpoint" },
     "specs": {
       "type": "object",
       "required": ["request", "response"],

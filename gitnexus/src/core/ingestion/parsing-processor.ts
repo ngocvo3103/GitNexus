@@ -15,7 +15,11 @@ import type { LanguageProvider } from './language-provider.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, ExtractedDecoratorRoute, ExtractedToolDef, FileConstructorBindings, FileTypeEnvBindings, ExtractedORMQuery } from './workers/parse-worker.js';
 import { extractClassFields, extractMethodParameterAnnotations } from './workers/parse-worker.js';
+import { extractSpringRoutes } from './workers/spring-route-extractor.js';
+import { extractLaravelRoutes } from './workers/parse-worker.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
+import { isVerboseIngestionEnabled } from './utils/verbose.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
 
@@ -76,7 +80,10 @@ const processParsingWithWorkers = async (
   const allORMQueries: ExtractedORMQuery[] = [];
   const allConstructorBindings: FileConstructorBindings[] = [];
   const allTypeEnvBindings: FileTypeEnvBindings[] = [];
+  let symbolCount = 0;
+  let fileCount = 0;
   for (const result of chunkResults) {
+    fileCount++;
     for (const node of result.nodes) {
       graph.addNode({
         id: node.id,
@@ -98,6 +105,7 @@ const processParsingWithWorkers = async (
         declaredType: sym.declaredType,
         ownerId: sym.ownerId,
       });
+      symbolCount++;
     }
 
     allImports.push(...result.imports);
@@ -111,6 +119,20 @@ const processParsingWithWorkers = async (
     if (result.ormQueries) allORMQueries.push(...result.ormQueries);
     allConstructorBindings.push(...result.constructorBindings);
     if (result.typeEnvBindings) allTypeEnvBindings.push(...result.typeEnvBindings);
+  }
+
+  // Count nodes by label
+  const nodesByLabel: Record<string, number> = {};
+  for (const result of chunkResults) {
+    for (const node of result.nodes) {
+      nodesByLabel[node.label] = (nodesByLabel[node.label] || 0) + 1;
+    }
+  }
+  
+  if (isVerboseIngestionEnabled()) {
+    console.debug(`[route-parse] Added ${symbolCount} symbols to symbol table`);
+    console.debug(`[route-parse] Extracted ${allRoutes.length} routes from ${fileCount} files`);
+    console.debug(`[route-parse] Nodes by label: ${JSON.stringify(nodesByLabel)}`);
   }
 
   // Merge and log skipped languages from workers
@@ -200,10 +222,13 @@ const processParsingSequential = async (
   symbolTable: SymbolTable,
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback
-) => {
+): Promise<WorkerExtractedData> => {
   const parser = await loadParser();
   const total = files.length;
   const skippedLanguages = new Map<string, number>();
+
+  // Collect extracted data for routes (imports/calls/heritage are processed via direct graph writes)
+  const allRoutes: ExtractedRoute[] = [];
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -245,6 +270,21 @@ const processParsingSequential = async (
     }
 
     astCache.set(file.path, tree);
+
+    // Extract Laravel routes from route files
+    if (language === SupportedLanguages.PHP && (file.path.includes('/routes/') || file.path.startsWith('routes/')) && file.path.endsWith('.php')) {
+      const extractedRoutes = extractLaravelRoutes(tree, file.path);
+      allRoutes.push(...extractedRoutes);
+    }
+
+    // Extract Spring routes from Java controller files
+    if (language === SupportedLanguages.Java && (file.content.includes('@Controller') || file.content.includes('@RestController'))) {
+      const springRoutes = extractSpringRoutes(tree, file.path);
+      if (isVerboseIngestionEnabled()) {
+        console.debug(`[route-seq] Extracted ${springRoutes.length} Spring routes from ${file.path}`);
+      }
+      allRoutes.push(...springRoutes);
+    }
 
     const provider = getProvider(language);
     const queryString = provider.treeSitterQueries;
@@ -433,6 +473,20 @@ const processParsingSequential = async (
       .join(', ');
     console.warn(`  Skipped unsupported languages: ${summary}`);
   }
+
+  return {
+    imports: [],
+    calls: [],
+    assignments: [],
+    heritage: [],
+    routes: allRoutes,
+    fetchCalls: [],
+    decoratorRoutes: [],
+    toolDefs: [],
+    ormQueries: [],
+    constructorBindings: [],
+    typeEnvBindings: [],
+  };
 };
 
 // ============================================================================
@@ -446,7 +500,7 @@ export const processParsing = async (
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback,
   workerPool?: WorkerPool,
-): Promise<WorkerExtractedData | null> => {
+): Promise<WorkerExtractedData> => {
   if (workerPool) {
     try {
       return await processParsingWithWorkers(graph, files, symbolTable, astCache, workerPool, onFileProgress);
@@ -455,7 +509,6 @@ export const processParsing = async (
     }
   }
 
-  // Fallback: sequential parsing (no pre-extracted data)
-  await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
-  return null;
+  // Fallback: sequential parsing
+  return processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
 };

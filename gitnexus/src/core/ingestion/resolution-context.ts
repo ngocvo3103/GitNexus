@@ -18,6 +18,7 @@ import { createSymbolTable } from './symbol-table.js';
 import type { NamedImportBinding } from './import-processor.js';
 import { isFileInPackageDir } from './import-processor.js';
 import { walkBindingChain } from './named-binding-processor.js';
+import type { KnowledgeGraph } from '../graph/types.js';
 
 /** Resolution tier for tracking, logging, and test assertions. */
 export type ResolutionTier = 'same-file' | 'import-scoped' | 'global' | 'external';
@@ -47,6 +48,9 @@ export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
 export type ModuleAliasMap = Map<string, Map<string, string>>;
 
 export interface ResolutionContext {
+  /** Optional graph for D5 IMPLEMENTS edge lookups. */
+  readonly graph?: KnowledgeGraph;
+
   /**
    * The only resolution API. Returns all candidates at the winning tier.
    *
@@ -72,9 +76,17 @@ export interface ResolutionContext {
   // --- Operational ---
   getStats(): { fileCount: number; globalSymbolCount: number; cacheHits: number; cacheMisses: number };
   clear(): void;
+
+  // --- Knowledge Graph (for IMPLEMENTS traversal) ---
+  /**
+   * Returns node IDs of classes that implement the given interface(s).
+   * Queries IMPLEMENTS edges from the KnowledgeGraph.
+   * Returns empty Set if graph is undefined or no IMPLEMENTS edges exist.
+   */
+  findImplementations(interfaceIds: Set<string>): Set<string>;
 }
 
-export const createResolutionContext = (): ResolutionContext => {
+export const createResolutionContext = (graph?: KnowledgeGraph): ResolutionContext => {
   const symbols = createSymbolTable();
   const importMap: ImportMap = new Map();
   const packageMap: PackageMap = new Map();
@@ -186,6 +198,20 @@ export const createResolutionContext = (): ResolutionContext => {
     cacheMisses = 0;
   };
 
+  // --- Graph-backed IMPLEMENTS traversal ---
+
+  const findImplementations = (interfaceIds: Set<string>): Set<string> => {
+    if (!graph) return new Set<string>();
+
+    const implementingClasses = new Set<string>();
+    graph.forEachRelationship(rel => {
+      if (rel.type === 'IMPLEMENTS' && interfaceIds.has(rel.targetId)) {
+        implementingClasses.add(rel.sourceId);
+      }
+    });
+    return implementingClasses;
+  };
+
   return {
     resolve,
     symbols,
@@ -196,5 +222,8 @@ export const createResolutionContext = (): ResolutionContext => {
     clearCache,
     getStats,
     clear,
+    findImplementations,
+    get graph() { return graph; },
+    set graph(g: KnowledgeGraph | undefined) { graph = g; },
   };
 };

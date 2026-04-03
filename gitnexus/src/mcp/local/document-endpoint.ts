@@ -304,22 +304,45 @@ function normalizePathStructure(path: string): string {
  * Non-placeholder segments must match exactly (case-insensitive).
  * Placeholder segments match any corresponding segment.
  */
-function pathsMatchStructurally(inputPath: string, annotationPath: string): boolean {
+export function pathsMatchStructurally(inputPath: string, annotationPath: string): boolean {
   const normalizedInput = normalizePathStructure(inputPath);
   const normalizedAnnotation = normalizePathStructure(annotationPath);
 
   const inputSegments = normalizedInput.split('/').filter(s => s.length > 0);
   const annotationSegments = normalizedAnnotation.split('/').filter(s => s.length > 0);
 
-  // Must have same number of segments
-  if (inputSegments.length !== annotationSegments.length) {
+  // Empty path check
+  if (inputSegments.length === 0 || annotationSegments.length === 0) {
     return false;
   }
 
-  // Compare each segment
-  for (let i = 0; i < inputSegments.length; i++) {
-    const inputSeg = inputSegments[i];
-    const annoSeg = annotationSegments[i];
+  const inputLen = inputSegments.length;
+  const annoLen = annotationSegments.length;
+
+  // Equal segment count: exact matching (existing behavior preserved)
+  if (inputLen === annoLen) {
+    for (let i = 0; i < inputLen; i++) {
+      const inputSeg = inputSegments[i];
+      const annoSeg = annotationSegments[i];
+
+      if (inputSeg === '{}' || annoSeg === '{}') continue;
+
+      if (inputSeg.toLowerCase() !== annoSeg.toLowerCase()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Suffix matching when counts differ
+  // Determine the overlapping length (shorter array)
+  const overlapLen = Math.min(inputLen, annoLen);
+
+  // Compare from the END of both arrays
+  for (let i = 0; i < overlapLen; i++) {
+    // Index from end: last segment is index [len-1], second-to-last is [len-2], etc.
+    const inputSeg = inputSegments[inputLen - 1 - i];
+    const annoSeg = annotationSegments[annoLen - 1 - i];
 
     // Placeholders match anything
     if (inputSeg === '{}' || annoSeg === '{}') continue;
@@ -1561,7 +1584,7 @@ function resolveBuilderUrl(
   builderDetails: BuilderDetail[],
   content?: string
 ): { baseUrlExpression: string; builderVar: string } | null {
-  if (builderDetails.length === 0) {
+  if (!builderDetails || builderDetails.length === 0) {
     return null;
   }
 
@@ -2705,7 +2728,7 @@ function extractValidationRules(
   return Array.from(grouped.values());
 }
 
-async function extractMessaging(
+export async function extractMessaging(
   chain: ChainNode[],
   includeContext: boolean,
   executeQuery?: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
@@ -2749,7 +2772,7 @@ async function extractMessaging(
         outbound.push({
           topic: detail.topic,
           payload,
-          trigger: TODO_AI_ENRICH,
+          trigger: node.name || 'TODO_AI_ENRICH',
           ...(includeContext && {
             _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\\n${node.content?.slice(0, 200)}...`,
           }),

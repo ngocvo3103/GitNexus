@@ -23,7 +23,7 @@ import {
 import { buildTypeEnv, isSubclassOf } from './type-env.js';
 import type { ConstructorBinding } from './type-env.js';
 import { getTreeSitterBufferSize } from './constants.js';
-import type { ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, FileConstructorBindings } from './workers/parse-worker.js';
+import type { ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, FileConstructorBindings, FileTypeEnvBindings } from './workers/parse-worker.js';
 import { normalizeFetchURL, routeMatches } from './route-extractors/nextjs.js';
 import { extractReturnTypeName, stripNullable } from './type-extractors/shared.js';
 import type { LiteralTypeInferrer } from './type-extractors/types.js';
@@ -942,6 +942,25 @@ const resolveCallTarget = (
       if (ownerFiltered.length === 1) {
         return toResolveResult(ownerFiltered[0], tiered.tier);
       }
+      // D5. Interface implementation lookup: when D4 fails and the receiver type is an
+      // interface, find concrete classes that implement it and filter candidates to those.
+      const primaryCandidate = typeResolved.candidates[0];
+      if (primaryCandidate.type === 'Interface' && ctx.findImplementations) {
+        const implementerIds = ctx.findImplementations(typeNodeIds);
+        if (implementerIds.size > 0) {
+          const interfaceFiltered = pool.filter(c =>
+            c.ownerId && implementerIds.has(c.ownerId),
+          );
+          if (interfaceFiltered.length === 1) {
+            return toResolveResult(interfaceFiltered[0], tiered.tier);
+          }
+          // Multiple implementers - try overload disambiguation
+          if (interfaceFiltered.length > 1 && overloadHints) {
+            const disambiguated = tryOverloadDisambiguation(interfaceFiltered, overloadHints);
+            if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
+          }
+        }
+      }
       // E. Try overload disambiguation on the narrowed pool
       if ((fileFiltered.length > 1 || ownerFiltered.length > 1) && overloadHints) {
         const overloadPool = ownerFiltered.length > 1 ? ownerFiltered : fileFiltered;
@@ -1210,7 +1229,14 @@ export const processCallsFromExtracted = async (
   ctx: ResolutionContext,
   onProgress?: (current: number, total: number) => void,
   constructorBindings?: FileConstructorBindings[],
+  typeEnvBindings?: FileTypeEnvBindings[],
 ) => {
+  const logVerbose = isVerboseIngestionEnabled();
+  let totalCalls = 0;
+  let resolvedCalls = 0;
+  let failedCalls = 0;
+  const failedByReason = new Map<string, number>();
+
   // Scope-aware receiver types: keyed by filePath → "funcName\0varName" → typeName.
   // The scope dimension prevents collisions when two functions in the same file
   // have same-named locals pointing to different constructor types.
@@ -1220,6 +1246,27 @@ export const processCallsFromExtracted = async (
       const verified = verifyConstructorBindings(bindings, filePath, ctx, graph);
       if (verified.size > 0) {
         fileReceiverTypes.set(filePath, buildReceiverTypeIndex(verified));
+      }
+    }
+  }
+
+  // FILE_SCOPE type bindings: keyed by filePath → varName → typeName.
+  // Contains field declarations (e.g., `private CashService cashService;`) and
+  // file-level constants. Used to resolve receiver types for calls like
+  // `cashService.unholdMoney()` where `cashService` is a field.
+  const fileTypeEnv = new Map<string, Map<string, string>>();
+  if (typeEnvBindings) {
+    if (logVerbose) {
+      console.debug(`[call-resolution] Processing ${typeEnvBindings.length} typeEnvBindings files`);
+    }
+    for (const { filePath, bindings } of typeEnvBindings) {
+      fileTypeEnv.set(filePath, bindings);
+      // DEBUG: Log typeEnvBindings for controller files
+      if (logVerbose && filePath.includes('Controller')) {
+        console.debug(`[call-resolution] typeEnvBindings for ${filePath}: ${bindings.size} bindings`);
+        for (const [name, type] of bindings) {
+          console.debug(`[call-resolution]   - ${name} : ${type}`);
+        }
       }
     }
   }
@@ -1243,12 +1290,34 @@ export const processCallsFromExtracted = async (
     ctx.enableCache(filePath);
     const widenCache: WidenCache = new Map();
     const receiverMap = fileReceiverTypes.get(filePath);
+    const typeEnvMap = fileTypeEnv.get(filePath);
+
+    // DEBUG: Log when typeEnvMap is available for files with calls
+    if (logVerbose && typeEnvMap && typeEnvMap.size > 0 && filePath.includes('Controller')) {
+      console.debug(`[call-resolution] File ${filePath}: ${calls.length} calls, typeEnvMap has ${typeEnvMap.size} entries`);
+    }
 
     for (const call of calls) {
       let effectiveCall = call;
 
-      // Step 1: resolve receiver type from constructor bindings
-      if (!call.receiverTypeName && call.receiverName && receiverMap) {
+      // Step 0: resolve receiver type from FILE_SCOPE bindings (field declarations)
+      // This handles Spring DI pattern: @Autowired private CashService cashService;
+      // Fields are captured in FILE_SCOPE and should resolve before constructor bindings.
+      if (!call.receiverTypeName && call.receiverName && typeEnvMap) {
+        const resolvedType = typeEnvMap.get(call.receiverName);
+        if (resolvedType) {
+          if (logVerbose && filePath.includes('Controller')) {
+            console.debug(`[call-resolution] Step 0: resolved receiver '${call.receiverName}' to type '${resolvedType}' from FILE_SCOPE`);
+          }
+          effectiveCall = { ...call, receiverTypeName: resolvedType };
+        } else if (logVerbose && filePath.includes('Controller') && call.receiverName) {
+          // DEBUG: Log when receiver is not found in FILE_SCOPE
+          console.debug(`[call-resolution] Step 0: receiver '${call.receiverName}' NOT FOUND in FILE_SCOPE for ${filePath}`);
+        }
+      }
+
+      // Step 1: resolve receiver type from constructor bindings (var x = new Type())
+      if (!effectiveCall.receiverTypeName && call.receiverName && receiverMap) {
         const callFuncName = extractFuncNameFromSourceId(call.sourceId);
         const resolvedType = lookupReceiverType(receiverMap, callFuncName, call.receiverName);
         if (resolvedType) {
@@ -1296,7 +1365,31 @@ export const processCallsFromExtracted = async (
       }
 
       const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx, undefined, widenCache);
-      if (!resolved) continue;
+      totalCalls++;
+      if (!resolved) {
+        failedCalls++;
+        // Log resolution failure reason
+        if (logVerbose) {
+          const tiered = ctx.resolve(effectiveCall.calledName, effectiveCall.filePath);
+          const reason = !tiered ? 'no-tiered-result'
+            : tiered.candidates.length === 0 ? 'no-candidates'
+            : tiered.candidates.length > 1 ? 'ambiguous-candidates'
+            : 'filtered-out';
+          const count = failedByReason.get(reason) ?? 0;
+          failedByReason.set(reason, count + 1);
+          if (failedCalls <= 10) { // Log first 10 failures
+            console.debug(`[call-resolution] FAILED: calledName="${effectiveCall.calledName}" filePath="${effectiveCall.filePath}" receiverTypeName="${effectiveCall.receiverTypeName ?? 'none'}" reason="${reason}" candidates="${tiered?.candidates.length ?? 0}"`);
+          }
+        }
+        continue;
+      }
+
+      // DEBUG: Log successful resolution for controller calls
+      if (logVerbose && effectiveCall.filePath.includes('Controller') && effectiveCall.receiverTypeName) {
+        console.debug(`[call-resolution] RESOLVED: ${effectiveCall.receiverName}.${effectiveCall.calledName} -> ${resolved.nodeId} (via ${resolved.reason})`);
+      }
+
+      resolvedCalls++;
 
       const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${resolved.nodeId}`);
       graph.addRelationship({
@@ -1313,6 +1406,13 @@ export const processCallsFromExtracted = async (
   }
 
   onProgress?.(totalFiles, totalFiles);
+
+  if (logVerbose) {
+    console.debug(`[call-resolution] Processed ${totalCalls} calls: ${resolvedCalls} resolved, ${failedCalls} failed`);
+    for (const [reason, count] of failedByReason) {
+      console.debug(`[call-resolution]   ${reason}: ${count}`);
+    }
+  }
 };
 
 /**
@@ -1381,6 +1481,14 @@ export const processRoutesFromExtracted = async (
   ctx: ResolutionContext,
   onProgress?: (current: number, total: number) => void,
 ) => {
+  const logVerbose = isVerboseIngestionEnabled();
+  if (logVerbose) {
+    console.debug(`[route-processing] Processing ${extractedRoutes.length} routes`);
+  }
+
+  let created = 0;
+  let skipped = 0;
+
   for (let i = 0; i < extractedRoutes.length; i++) {
     const route = extractedRoutes[i];
     if (i % 50 === 0) {
@@ -1391,8 +1499,22 @@ export const processRoutesFromExtracted = async (
     if (!route.controllerName || !route.methodName) continue;
 
     const controllerResolved = ctx.resolve(route.controllerName, route.filePath);
-    if (!controllerResolved || controllerResolved.candidates.length === 0) continue;
-    if (controllerResolved.tier === 'global' && controllerResolved.candidates.length > 1) continue;
+    // Debug logging for resolution failures
+    if (!controllerResolved || controllerResolved.candidates.length === 0) {
+      if (logVerbose) {
+        console.debug(`[route-resolution] FAILED: controller="${route.controllerName}" from="${route.filePath}" tier="${controllerResolved?.tier ?? 'null'}" candidates="${controllerResolved?.candidates.length ?? 0}"`);
+      }
+      skipped++;
+      continue;
+    }
+    if (controllerResolved.tier === 'global' && controllerResolved.candidates.length > 1) {
+      // Log ambiguous global resolution with candidate file paths
+      if (logVerbose) {
+        const candidatePaths = controllerResolved.candidates.map(c => c.filePath).join(', ');
+        console.debug(`[route-resolution] AMBIGUOUS: controller="${route.controllerName}" from="${route.filePath}" candidates=[${candidatePaths}]`);
+      }
+      continue;
+    }
 
     const controllerDef = controllerResolved.candidates[0];
     const confidence = TIER_CONFIDENCE[controllerResolved.tier];
@@ -1423,6 +1545,7 @@ export const processRoutesFromExtracted = async (
           isInherited: route.isInherited ?? false,
         },
       });
+      created++;
 
       // Create DEFINES edge (File → Route)
       const fileId = generateId('File', route.filePath);
@@ -1472,6 +1595,10 @@ export const processRoutesFromExtracted = async (
         reason: 'laravel-route',
       });
     }
+  }
+
+  if (logVerbose) {
+    console.debug(`[route-processing] Created ${created} Route nodes, skipped ${skipped}`);
   }
 
   onProgress?.(extractedRoutes.length, extractedRoutes.length);

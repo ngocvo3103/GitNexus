@@ -18,6 +18,7 @@ import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
 import type { AnnotationInfo } from '../annotation-extractor.js';
 import { extractSingleAnnotation } from '../annotation-extractor.js';
+import { isVerboseIngestionEnabled } from '../utils/verbose.js';
 
 // tree-sitter-swift is an optionalDependency — may not be installed
 const _require = createRequire(import.meta.url);
@@ -571,6 +572,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     heritage: [],
     routes: [],
     constructorBindings: [],
+    typeEnvBindings: [],
     skippedLanguages: {},
     fileCount: 0,
   };
@@ -647,6 +649,12 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
         result.skippedLanguages[language] = (result.skippedLanguages[language] || 0) + tsxFiles.length;
       }
     }
+  }
+
+  // Verbose logging for call extraction
+  if (isVerboseIngestionEnabled()) {
+    const javaCalls = result.calls.filter(c => c.filePath.endsWith('.java')).length;
+    console.debug(`[parse-worker] Extracted ${result.calls.length} calls (${javaCalls} Java), ${result.nodes.length} nodes, ${result.symbols.length} symbols`);
   }
 
   return result;
@@ -1826,7 +1834,7 @@ function parseArrayGroupArgs(argsNode: any): RouteGroupContext {
   return ctx;
 }
 
-function extractLaravelRoutes(tree: any, filePath: string): ExtractedRoute[] {
+export function extractLaravelRoutes(tree: any, filePath: string): ExtractedRoute[] {
   const routes: ExtractedRoute[] = [];
 
   function resolveStack(stack: RouteGroupContext[]): { middleware: string[]; prefix: string | null; controller: string | null } {
@@ -1960,6 +1968,20 @@ const processFileGroup = (
   try {
     const lang = parser.getLanguage();
     query = new Parser.Query(lang, queryString);
+    if (isVerboseIngestionEnabled() && language === 'java') {
+      console.debug(`[parse-worker] Java query created with language: ${lang ? 'loaded' : 'MISSING'}`);
+      // Test query on a sample to verify it works
+      const testCode = 'public class T { void m() { obj.method(); } }';
+      const testTree = parser.parse(testCode);
+      const testMatches = query.matches(testTree.rootNode);
+      let callCount = 0;
+      for (const m of testMatches) {
+        for (const c of m.captures) {
+          if (c.name === 'call') callCount++;
+        }
+      }
+      console.debug(`[parse-worker] Test query on sample: ${testMatches.length} matches, ${callCount} call captures`);
+    }
   } catch (err) {
     const message = `Query compilation failed for ${language}: ${err instanceof Error ? err.message : String(err)}`;
     if (parentPort) {
@@ -1985,10 +2007,26 @@ const processFileGroup = (
     result.fileCount++;
     onFileProcessed?.();
 
+    // Debug: log Java file processing
+    if (isVerboseIngestionEnabled() && language === 'java') {
+      console.debug(`[parse-worker] Processing Java file: ${file.path}`);
+    }
+
     // Build per-file type environment + constructor bindings in a single AST walk.
     // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
     const typeEnv = buildTypeEnv(tree, language);
     const routerForLanguage = callRouters[language];
+
+    // Extract FILE_SCOPE bindings for field/local variable type resolution
+    // This enables resolution of receiver types for calls like `cashService.unholdMoney()`
+    // where `cashService` is a field declared as `private CashService cashService;`
+    const fileScopeBindings = typeEnv.fileScope();
+    if (fileScopeBindings.size > 0) {
+      result.typeEnvBindings.push({ filePath: file.path, bindings: new Map(fileScopeBindings) });
+      if (isVerboseIngestionEnabled() && language === 'java') {
+        console.debug(`[parse-worker] FILE_SCOPE bindings for ${file.path}: ${fileScopeBindings.size} entries`);
+      }
+    }
 
     if (typeEnv.constructorBindings.length > 0) {
       result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
@@ -1997,9 +2035,32 @@ const processFileGroup = (
     let matches;
     try {
       matches = query.matches(tree.rootNode);
+      if (isVerboseIngestionEnabled() && language === 'java') {
+        console.debug(`[parse-worker] JAVA_MATCH: ${file.path}: ${matches.length} matches returned`);
+      }
     } catch (err) {
       console.warn(`Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
+    }
+
+    // Debug: log Java file processing summary
+    if (isVerboseIngestionEnabled() && language === 'java') {
+      const callCaptures = matches.reduce((count, m) => {
+        const hasCall = m.captures.some((c: any) => c.name === 'call');
+        return hasCall ? count + 1 : count;
+      }, 0);
+
+      // Count method_invocation nodes in tree
+      const countNodes = (node: any, type: string): number => {
+        let count = node.type === type ? 1 : 0;
+        for (let i = 0; i < node.childCount; i++) {
+          count += countNodes(node.child(i), type);
+        }
+        return count;
+      };
+      const methodInvCount = countNodes(tree.rootNode, 'method_invocation');
+
+      console.debug(`[parse-worker] JAVA_ALL: ${file.path}: ${matches.length} matches, ${callCaptures} calls, ${methodInvCount} method_inv`);
     }
 
     for (const match of matches) {
@@ -2115,6 +2176,18 @@ const processFileGroup = (
             const callForm = inferCallForm(callNode, callNameNode);
             let receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
             let receiverTypeName = receiverName ? typeEnv.lookup(receiverName, callNode) : undefined;
+
+            // DEBUG: Log when typeEnv.lookup fails for controller fields
+            if (isVerboseIngestionEnabled() && language === 'java' && receiverName && !receiverTypeName && file.path.includes('Controller')) {
+              const fileScope = typeEnv.fileScope();
+              const inFileScope = fileScope.has(receiverName);
+              console.debug(`[parse-worker] typeEnv.lookup('${receiverName}') returned undefined in ${file.path}`);
+              console.debug(`[parse-worker]   FILE_SCOPE has '${receiverName}': ${inFileScope}`);
+              if (inFileScope) {
+                console.debug(`[parse-worker]   FILE_SCOPE['${receiverName}'] = ${fileScope.get(receiverName)}`);
+              }
+            }
+
             let receiverCallChain: string[] | undefined;
 
             // When the receiver is a call_expression (e.g. svc.getUser().save()),
@@ -2205,6 +2278,12 @@ const processFileGroup = (
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
       if (!nameNode && nodeLabel !== 'Constructor') continue;
       const nodeName = nameNode ? nameNode.text : 'init';
+
+      // Debug: log when Method nodes are created
+      if (isVerboseIngestionEnabled() && nodeLabel === 'Method' && file.path.includes('Controller')) {
+        console.debug(`[parse-worker] Creating Method node: ${nodeName} in ${file.path}`);
+      }
+
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNode ? definitionNode.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
       const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
@@ -2360,7 +2439,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -2373,6 +2452,10 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
+  if (src.typeEnvBindings) {
+    if (!target.typeEnvBindings) target.typeEnvBindings = [];
+    target.typeEnvBindings.push(...src.typeEnvBindings);
+  }
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -2399,7 +2482,7 @@ if (parentPort) {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }

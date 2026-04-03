@@ -247,6 +247,74 @@ const URI_BUILDER_PATTERN = /(\w+)\s*=\s*UriComponentsBuilder\.(?:fromHttpUrl|fr
 /** WI-4: URI Builder toUriString() - captures builder.toUriString() */
 const URI_TO_STRING_PATTERN = /(\w+)\.toUriString\(\)/g;
 
+// ─── Messaging Pattern Constants ──────────────────────────────────────────
+
+/** WI-1: convertAndSend 3-arg form: convertAndSend("exchange", "key", payload) */
+const CONVERT_AND_SEND_3ARG = /convertAndSend\s*\(\s*"([^"]{1,100})"\s*,\s*[^,]+\s*,\s*([\w]+)\s*\)/g;
+/** WI-1: convertAndSend 2-arg form: convertAndSend("key", payload) — routing key is used as topic */
+const CONVERT_AND_SEND_2ARG = /convertAndSend\s*\(\s*"([^"]{4,100})"\s*,\s*([\w]+)\s*\)/g;
+/** WI-1: convertAndSend 3-arg single-quoted: convertAndSend('exchange', 'key', payload) */
+const CONVERT_AND_SEND_3ARG_SQ = /convertAndSend\s*\(\s*'([^']{1,100})'\s*,\s*'[^']*'\s*,\s*([\w]+)(?!\s*,)/g;
+/** WI-1: convertAndSend 2-arg single-quoted: convertAndSend('key', payload) */
+const CONVERT_AND_SEND_2ARG_SQ = /convertAndSend\s*\(\s*'([^']{4,100})'\s*,\s*([\w]+)\s*\)/g;
+
+/** WI-1: kafkaTemplate.send with string literal topic */
+const KAFKA_SEND_WITH_PAYLOAD = /kafkaTemplate\.send\s*\(\s*"([^"]+)"\s*,\s*([\w]+)\s*\)/g;
+/** WI-1: kafkaTemplate.send with single-quoted topic */
+const KAFKA_SEND_WITH_PAYLOAD_SQ = /kafkaTemplate\.send\s*\(\s*'([^']+)'\s*,\s*([\w]+)\s*\)/g;
+/** WI-1: kafkaTemplate.send with variable topic */
+const KAFKA_SEND_VAR_TOPIC = /kafkaTemplate\.send\s*\(\s*(\w+)\s*,\s*([\w]+)\s*\)/g;
+
+/** WI-1: streamBridge.send with string literal binding */
+const STREAM_BRIDGE_WITH_PAYLOAD = /streamBridge\.send\s*\(\s*"([^"]+)"\s*,\s*([\w]+)\s*\)/g;
+/** WI-1: streamBridge.send with single-quoted binding */
+const STREAM_BRIDGE_WITH_PAYLOAD_SQ = /streamBridge\.send\s*\(\s*'([^']+)'\s*,\s*([\w]+)\s*\)/g;
+/** WI-1: streamBridge.send with variable binding */
+const STREAM_BRIDGE_VAR_BINDING = /streamBridge\.send\s*\(\s*(\w+)\s*,\s*([\w]+)\s*\)/g;
+
+/** Common message variable names to skip when extracting variable topics */
+const COMMON_MSG_VARS = new Set(['msg', 'message', 'obj', 'data', 'payload', 'event']);
+
+// ─── Messaging Helper Function ──────────────────────────────────────────────
+
+/**
+ * Extract messaging patterns and populate metadata.messagingDetails.
+ * Replaces 10+ near-identical while-loop blocks.
+ */
+function extractMessagingPattern(
+  content: string,
+  pattern: RegExp,
+  callerMethod: 'convertAndSend' | 'kafkaTemplate.send' | 'streamBridge.send',
+  metadata: ChainNode['metadata'],
+  options: { topicIndex?: number; payloadIndex?: number; isVariable?: boolean } = {}
+): void {
+  const { topicIndex = 1, payloadIndex = 2, isVariable = false } = options;
+  pattern.lastIndex = 0;
+  let match;
+  while ((match = pattern.exec(content)) !== null) {
+    const topic = match[topicIndex];
+    const payload = match[payloadIndex];
+    // Skip string literals (for variable patterns)
+    if (topic.startsWith('"') || topic.startsWith("'")) continue;
+    // Skip common message variable names when extracting variables
+    if (isVariable && COMMON_MSG_VARS.has(topic)) continue;
+
+    const existing = metadata.messagingDetails.find(
+      d => d.topic === topic && d.callerMethod === callerMethod
+    );
+    if (existing) {
+      if (!existing.payload) existing.payload = payload;
+    } else {
+      metadata.messagingDetails.push({
+        topic,
+        topicIsVariable: isVariable,
+        callerMethod,
+        payload,
+      });
+    }
+  }
+}
+
 // ─── Implementation ─────────────────────────────────────────────────────────
 
 /**
@@ -263,7 +331,7 @@ function camelCaseToKebab(str: string): string {
 /**
  * Extract metadata from source content.
  */
-function extractMetadata(content: string | undefined): ChainNode['metadata'] {
+export function extractMetadata(content: string | undefined): ChainNode['metadata'] {
   const metadata: ChainNode['metadata'] = {
     httpCalls: [],
     httpCallDetails: [],
@@ -343,11 +411,19 @@ function extractMetadata(content: string | undefined): ChainNode['metadata'] {
     }
   }
 
-  // Extract detailed messaging with topics - literal topic
+  // WI-1: Extract convertAndSend patterns (3-arg and 2-arg forms, double and single quoted)
+  extractMessagingPattern(content, CONVERT_AND_SEND_3ARG, 'convertAndSend', metadata);
+  extractMessagingPattern(content, CONVERT_AND_SEND_2ARG, 'convertAndSend', metadata);
+  extractMessagingPattern(content, CONVERT_AND_SEND_3ARG_SQ, 'convertAndSend', metadata);
+  extractMessagingPattern(content, CONVERT_AND_SEND_2ARG_SQ, 'convertAndSend', metadata);
+
+  // Legacy convertAndSend patterns (fallback for variable topics and edge cases)
+  // Skip if any entry exists with this topic to avoid adding truncated entries
   TOPIC_LITERAL_PATTERN.lastIndex = 0;
   let topicMatch;
   while ((topicMatch = TOPIC_LITERAL_PATTERN.exec(content)) !== null) {
     const topic = topicMatch[1];
+    if (topic.length < 3) continue; // Skip short topics (likely truncated from legacy pattern)
     if (!metadata.messagingDetails.some(d => d.topic === topic && d.callerMethod === 'convertAndSend')) {
       metadata.messagingDetails.push({
         topic,
@@ -357,12 +433,12 @@ function extractMetadata(content: string | undefined): ChainNode['metadata'] {
     }
   }
 
-  // Extract detailed messaging with topics - variable topic
+  // Variable topic - skip common message variable names
   TOPIC_VAR_PATTERN.lastIndex = 0;
   while ((topicMatch = TOPIC_VAR_PATTERN.exec(content)) !== null) {
     const topicVar = topicMatch[1];
-    // Skip if it's actually a string literal (already captured above)
     if (topicVar.startsWith('"') || topicVar.startsWith("'")) continue;
+    if (COMMON_MSG_VARS.has(topicVar)) continue;
     if (!metadata.messagingDetails.some(d => d.topic === topicVar && d.callerMethod === 'convertAndSend')) {
       metadata.messagingDetails.push({
         topic: topicVar,
@@ -372,61 +448,48 @@ function extractMetadata(content: string | undefined): ChainNode['metadata'] {
     }
   }
 
-  // WI-3: Extract kafkaTemplate.send patterns
-  KAFKA_SEND_PATTERN.lastIndex = 0;
-  let kafkaMatch;
-  while ((kafkaMatch = KAFKA_SEND_PATTERN.exec(content)) !== null) {
-    // Groups: 1="topic", 2='topic', 3=variable
-    const topic = kafkaMatch[1] || kafkaMatch[2] || kafkaMatch[3];
-    const isVariable = !kafkaMatch[1] && !kafkaMatch[2];
-    if (topic && !metadata.messagingDetails.some(d => d.topic === topic && d.callerMethod === 'kafkaTemplate.send')) {
-      metadata.messagingDetails.push({
-        topic,
-        topicIsVariable: isVariable,
-        callerMethod: 'kafkaTemplate.send',
-      });
-    }
-  }
+  // WI-1: Extract kafkaTemplate.send patterns
+  extractMessagingPattern(content, KAFKA_SEND_WITH_PAYLOAD, 'kafkaTemplate.send', metadata);
+  extractMessagingPattern(content, KAFKA_SEND_WITH_PAYLOAD_SQ, 'kafkaTemplate.send', metadata);
+  extractMessagingPattern(content, KAFKA_SEND_VAR_TOPIC, 'kafkaTemplate.send', metadata, { isVariable: true });
+
+  // WI-1: Extract streamBridge.send patterns
+  extractMessagingPattern(content, STREAM_BRIDGE_WITH_PAYLOAD, 'streamBridge.send', metadata);
+  extractMessagingPattern(content, STREAM_BRIDGE_WITH_PAYLOAD_SQ, 'streamBridge.send', metadata);
+  extractMessagingPattern(content, STREAM_BRIDGE_VAR_BINDING, 'streamBridge.send', metadata, { isVariable: true });
 
   // WI-3: Extract publishEvent(new XxxEvent(...)) patterns
   PUBLISH_EVENT_PATTERN.lastIndex = 0;
   let pubEventMatch;
   while ((pubEventMatch = PUBLISH_EVENT_PATTERN.exec(content)) !== null) {
-    // Capture group 1 is the event class name (e.g., "OrderCreated" from "OrderCreatedEvent")
     const eventClass = pubEventMatch[1];
-    // Convert to kebab-case topic: "OrderCreated" → "order-created"
     const topic = camelCaseToKebab(eventClass);
     if (!metadata.messagingDetails.some(d => d.topic === topic && d.callerMethod === 'publishEvent')) {
       metadata.messagingDetails.push({
         topic,
         topicIsVariable: false,
         callerMethod: 'publishEvent',
-        payload: eventClass + 'Event', // Reconstruct full event class name
+        payload: eventClass + 'Event',
       });
     }
   }
 
   // WI-2: Extract publishEvent(variable) patterns
-  // First, scan for event variable declarations to build a map
   const eventVarMap: Map<string, string> = new Map();
   EVENT_VARIABLE_PATTERN.lastIndex = 0;
   let eventVarMatch;
   while ((eventVarMatch = EVENT_VARIABLE_PATTERN.exec(content)) !== null) {
-    // Groups: 1=EventClass (e.g., "OrderCreated"), 2=varName (e.g., "event")
-    const eventClass = eventVarMatch[1].replace(/Event$/, ''); // Strip 'Event' suffix if present
+    const eventClass = eventVarMatch[1].replace(/Event$/, '');
     const varName = eventVarMatch[2];
     eventVarMap.set(varName, eventClass);
   }
 
-  // Now match publishEvent(varName) and look up the event class
   PUBLISH_EVENT_VAR_PATTERN.lastIndex = 0;
   let pubEventVarMatch;
   while ((pubEventVarMatch = PUBLISH_EVENT_VAR_PATTERN.exec(content)) !== null) {
     const varName = pubEventVarMatch[1];
-    // Skip if this is actually a 'new' expression (already handled by PUBLISH_EVENT_PATTERN)
-    // Check if this looks like a class name (starts with uppercase) - likely a new expression that didn't match
     if (varName[0] === varName[0].toUpperCase() && varName[0] !== varName[0].toLowerCase()) {
-      continue; // Likely a class name like 'OrderCreatedEvent' without 'new' - skip
+      continue;
     }
     const eventClass = eventVarMap.get(varName);
     if (eventClass) {
@@ -439,22 +502,6 @@ function extractMetadata(content: string | undefined): ChainNode['metadata'] {
           payload: eventClass + 'Event',
         });
       }
-    }
-  }
-
-  // WI-3: Extract streamBridge.send patterns
-  STREAM_BRIDGE_PATTERN.lastIndex = 0;
-  let streamMatch;
-  while ((streamMatch = STREAM_BRIDGE_PATTERN.exec(content)) !== null) {
-    // Groups: 1="binding", 2='binding', 3=variable
-    const topic = streamMatch[1] || streamMatch[2] || streamMatch[3];
-    const isVariable = !streamMatch[1] && !streamMatch[2];
-    if (topic && !metadata.messagingDetails.some(d => d.topic === topic && d.callerMethod === 'streamBridge.send')) {
-      metadata.messagingDetails.push({
-        topic,
-        topicIsVariable: isVariable,
-        callerMethod: 'streamBridge.send',
-      });
     }
   }
 
