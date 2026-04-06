@@ -274,8 +274,8 @@ interface ParsedNode {
     astFrameworkReason?: string;
     description?: string;
     parameterCount?: number;
-    /** JSON array of parameter type names for method overloading */
-    parameterTypes?: string;
+    /** Array of parameter type names for method overloading */
+    parameterTypes?: string; // JSON array of parameter type names
     returnType?: string;
     /** JSON array of annotations on method/class: [{name: "@Transactional", attrs?: {key: value}}] */
     annotations?: string;
@@ -394,19 +394,30 @@ export interface ExtractedFetchCall {
   lineNumber?: number;
 }
 
-/** Decorator-based route (unused in current implementation) */
+/** Expo Router navigation call (router.push/replace/navigate) */
+export interface ExtractedExpoNav {
+  filePath: string;
+  url: string;
+  method: string;
+  sourceId: string;
+  lineNumber?: number;
+}
+
+/** Decorator-based route (Express/Hono/NestJS route handlers) */
 export interface ExtractedDecoratorRoute {
   filePath: string;
   decorator: string;
   method?: string;
   path?: string;
+  lineNumber?: number;
 }
 
-/** Tool definition for MCP (unused in current implementation) */
+/** Tool definition for MCP */
 export interface ExtractedToolDef {
   filePath: string;
   name: string;
   description?: string;
+  lineNumber?: number;
 }
 
 /** ORM query extraction (unused in current implementation) */
@@ -437,6 +448,7 @@ export interface ParseWorkerResult {
   // Optional fields for future use (currently empty in worker)
   assignments?: ExtractedAssignment[];
   fetchCalls?: ExtractedFetchCall[];
+  expoNavCalls?: ExtractedExpoNav[];
   decoratorRoutes?: ExtractedDecoratorRoute[];
   toolDefs?: ExtractedToolDef[];
   ormQueries?: ExtractedORMQuery[];
@@ -575,6 +587,10 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     typeEnvBindings: [],
     skippedLanguages: {},
     fileCount: 0,
+    ormQueries: [],
+    expoNavCalls: [],
+    fetchCalls: [],
+    decoratorRoutes: [],
   };
 
   // Group by language to minimize setLanguage calls
@@ -959,7 +975,7 @@ function extractAnnotationName(node: Parser.SyntaxNode): string | null {
   // annotation: @ColumnName(args)
   const nameNode = node.childForFieldName?.('name') ??
     node.children.find((c: Parser.SyntaxNode) => c.type === 'identifier' || c.type === 'scoped_identifier');
-  return nameNode?.text ?? null;
+  return nameNode ? '@' + nameNode.text : null;
 }
 
 /** Extract modifiers (static, final, private, public, etc.) from a field declaration */
@@ -1289,14 +1305,14 @@ function extractTypeScriptField(node: Parser.SyntaxNode): FieldInfo | null {
 
   // Get type
   const typeNode = node.childForFieldName?.('type') ??
-    node.children.find((c: Parser.SyntaxNode) => c.type === 'type_annotation')?.children[1];
+    node.children.find((c: Parser.SyntaxNode) => c.type === 'type_annotation');
 
   if (typeNode) {
-    fieldType = typeNode.text;
+    // Handle type_annotation nodes: use firstNamedChild to strip ': ' prefix
+    fieldType = typeNode.type === 'type_annotation'
+      ? (typeNode.firstNamedChild?.text ?? null)
+      : typeNode.text;
   }
-
-  if (!fieldName) return null;
-
   const annotations = extractAnnotationsFromModifiers(node);
 
   return { name: fieldName, type: fieldType, annotations };
@@ -1834,6 +1850,318 @@ function parseArrayGroupArgs(argsNode: any): RouteGroupContext {
   return ctx;
 }
 
+// ============================================================================
+// Express/Hono route extraction
+// ============================================================================
+
+/**
+ * Extract Express/Hono route registrations from JavaScript/TypeScript files via AST walk.
+ * Handles: app.get('/path', handler), app.post('/path', handler), router.get('/path', handler), etc.
+ */
+export function extractExpressRoutes(tree: any, filePath: string): ExtractedDecoratorRoute[] {
+  const routes: ExtractedDecoratorRoute[] = [];
+  const EXPRESS_METHODS = new Set(['get', 'post', 'put', 'delete', 'patch', 'all', 'use', 'route', 'head', 'options']);
+
+  // Non-Express objects that have .get()/.post() etc. methods - these are NOT route registrations
+  const NON_EXPRESS_OBJECTS = new Set([
+    'headers', 'request', 'response', 'req', 'res',  // HTTP request/response
+    'map', 'set', 'weakmap', 'weakset',  // Collections
+    'cache', 'storage',  // Storage APIs
+    'formdata', 'urlsearchparams',  // Form APIs
+    'promise', 'observable',  // Async APIs
+  ]);
+
+  function walk(node: any): void {
+    if (!node) {
+      return;
+    }
+
+    // Check if this is a call_expression with a member_expression function (e.g., app.get)
+    if (node.type === 'call_expression') {
+      const func = node.childForFieldName?.('function') ?? node.children?.[0];
+      if (func?.type === 'member_expression') {
+        const prop = func.childForFieldName?.('property') ?? func.children?.[func.childCount - 1];
+        if (prop?.type === 'property_identifier' && EXPRESS_METHODS.has(prop.text)) {
+          // Check if this is likely NOT an Express route (e.g., request.headers.get())
+          // Get the object of the member expression
+          const obj = func.childForFieldName?.('object') ?? func.children?.[0];
+          if (obj) {
+            // For chained calls like app.route('/path').get(), obj is a call_expression
+            // For direct calls like app.get('/path'), obj is an identifier
+            // For non-Express like request.headers.get(), obj is a member_expression
+
+            // Skip if object is a known non-Express pattern
+            if (obj.type === 'member_expression') {
+              const objProp = obj.childForFieldName?.('property') ?? obj.children?.[obj.childCount - 1];
+              if (objProp?.type === 'property_identifier' && NON_EXPRESS_OBJECTS.has(objProp.text.toLowerCase())) {
+                // This is NOT an Express route - skip it and recurse into children
+                if (node.children) {
+                  for (const child of node.children) {
+                    walk(child);
+                  }
+                }
+                return;
+              }
+            } else if (obj.type === 'identifier' && NON_EXPRESS_OBJECTS.has(obj.text.toLowerCase())) {
+              // Direct call like headers.get() - skip
+              if (node.children) {
+                for (const child of node.children) {
+                  walk(child);
+                }
+              }
+              return;
+            }
+          }
+
+          // Found an Express route registration
+          const args = node.childForFieldName?.('arguments') ?? node.children?.find((c: any) => c.type === 'arguments');
+          if (args && args.children) {
+            for (const arg of args.children) {
+              if (arg.type === 'string') {
+                const routePath = arg.text.replace(/^["']|["']$/g, '');
+                routes.push({
+                  filePath,
+                  decorator: prop.text,
+                  path: routePath,
+                  lineNumber: node.startPosition.row,
+                });
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Recurse into children
+    if (node.children) {
+      for (const child of node.children) {
+        walk(child);
+      }
+    }
+  }
+
+  walk(tree.rootNode);
+  return routes;
+}
+
+// ============================================================================
+// ORM Query extraction (Prisma and Supabase)
+// ============================================================================
+
+/**
+ * Extract ORM queries from TypeScript/JavaScript files.
+ * Detects Prisma: prisma.model.operation()
+ * Detects Supabase: supabase.from('table').select(), etc.
+ */
+export function extractORMQueries(tree: any, filePath: string): ExtractedORMQuery[] {
+  const queries: ExtractedORMQuery[] = [];
+
+  // Prisma patterns: prisma.user.findMany(), prisma.post.create(), etc.
+  // We look for call_expression where:
+  //   - receiver is member_expression: prisma.user
+  //   - property (operation) is one of: findMany, findUnique, findFirst, create, update, delete, upsert, count, etc.
+  function findPrismaCalls(node: any): void {
+    if (!node) return;
+
+    if (node.type === 'call_expression') {
+      const funcNode = node.childForFieldName?.('function');
+      if (funcNode?.type === 'member_expression') {
+        const property = funcNode.childForFieldName?.('property');
+        const receiver = funcNode.childForFieldName?.('object');
+
+        // Check if receiver is "prisma" or "prisma.something"
+        let receiverName = '';
+        let isPrismaChain = false;
+        let modelName = '';
+        if (receiver?.type === 'identifier') {
+          receiverName = receiver.text;
+        } else if (receiver?.type === 'member_expression') {
+          const obj = receiver.childForFieldName?.('object');
+          const prop = receiver.childForFieldName?.('property');
+          // obj should be 'prisma' identifier, prop should be the model name
+          if (obj?.type === 'identifier' && obj.text === 'prisma' && prop?.type === 'property_identifier') {
+            receiverName = 'prisma';
+            modelName = prop.text;
+            isPrismaChain = true;
+          }
+        }
+
+        if ((receiverName === 'prisma' || isPrismaChain) && property?.type === 'property_identifier') {
+          const operation = property.text;
+          // For prisma.user.findMany, the model name is extracted above as 'user'
+
+          if (modelName && isPrismaOperation(operation)) {
+            // Find enclosing function for sourceId
+            let enclosingFunc = node.parent;
+            while (enclosingFunc && !FUNCTION_NODE_TYPES.has(enclosingFunc.type)) {
+              enclosingFunc = enclosingFunc.parent;
+            }
+            let sourceId = generateId('File', filePath);
+            if (enclosingFunc) {
+              const { funcName, label } = extractFunctionName(enclosingFunc);
+              if (funcName) {
+                sourceId = generateId(label, `${filePath}:${funcName}`);
+              }
+            }
+            queries.push({
+              filePath,
+              entityType: modelName,
+              operation: `prisma-${operation}`,
+              sourceId,
+            });
+          }
+        }
+      }
+    }
+
+    // Recurse into children
+    for (const child of node.children ?? []) {
+      findPrismaCalls(child);
+    }
+  }
+
+  // Supabase patterns: supabase.from('table').select(), supabase.from('bookings').insert(), etc.
+  // We look for call_expression where:
+  //   - receiver chain starts with "supabase"
+  //   - first method is "from" with a string argument (table name)
+  //   - subsequent methods are operations like select, insert, update, delete, etc.
+  function findSupabaseCalls(node: any): void {
+    if (!node) return;
+
+    if (node.type === 'call_expression') {
+      const funcNode = node.childForFieldName?.('function');
+      if (funcNode?.type === 'member_expression') {
+        const property = funcNode.childForFieldName?.('property');
+        const receiver = funcNode.childForFieldName?.('object');
+
+        if (property?.type === 'property_identifier' && receiver) {
+          const operation = property.text;
+
+          // Determine if this chain starts from supabase and extract table name from 'from' calls
+          // Walk the receiver chain to find the root and extract tableName from 'from' argument
+          let rootName = '';
+          let tableName = '';
+          let current: any = receiver;
+          let depth = 0;
+          const MAX_DEPTH = 5;
+
+          while (current && depth < MAX_DEPTH) {
+            depth++;
+            if (current.type === 'identifier') {
+              rootName = current.text;
+              break;
+            } else if (current.type === 'member_expression') {
+              const obj = current.childForFieldName?.('object');
+              const prop = current.childForFieldName?.('property');
+              if (obj?.type === 'identifier' && obj.text === 'supabase' && prop?.type === 'property_identifier') {
+                rootName = 'supabase';
+              }
+              current = obj;
+            } else if (current.type === 'call_expression') {
+              // This is a chained method call (e.g. supabase.from('bookings'))
+              const fn = current.childForFieldName?.('function');
+              if (fn?.type === 'member_expression') {
+                const fnProp = fn.childForFieldName?.('property');
+                const fnObj = fn.childForFieldName?.('object');
+                if (fnProp?.type === 'property_identifier' && fnObj?.type === 'identifier' && fnObj.text === 'supabase') {
+                  rootName = 'supabase';
+                  // Extract table name from 'from' or 'rpc' argument
+                  if (fnProp.text === 'from' || fnProp.text === 'rpc') {
+                    const argsNode = current.childForFieldName?.('arguments');
+                    if (argsNode) {
+                      const firstArg = argsNode.namedChildren?.[0];
+                      if (firstArg?.type === 'string') {
+                        tableName = firstArg.text.slice(1, -1);
+                      } else if (firstArg?.type === 'template_string') {
+                        tableName = extractTemplateString(firstArg);
+                      }
+                    }
+                  }
+                }
+                current = fnObj;
+              } else {
+                break;
+              }
+            } else {
+              break;
+            }
+          }
+
+          // For supabase method calls, create QUERIES entries
+          if (rootName === 'supabase' && isSupabaseOperation(operation)) {
+            // Find enclosing function for sourceId
+            let enclosingFunc = node.parent;
+            while (enclosingFunc && !FUNCTION_NODE_TYPES.has(enclosingFunc.type)) {
+              enclosingFunc = enclosingFunc.parent;
+            }
+            let sourceId = generateId('File', filePath);
+            if (enclosingFunc) {
+              const { funcName, label } = extractFunctionName(enclosingFunc);
+              if (funcName) {
+                sourceId = generateId(label, `${filePath}:${funcName}`);
+              }
+            }
+            queries.push({
+              filePath,
+              entityType: tableName,
+              operation: `supabase-${operation}`,
+              sourceId,
+            });
+          }
+        }
+      }
+    }
+
+    // Recurse into children
+    for (const child of node.children ?? []) {
+      findSupabaseCalls(child);
+    }
+  }
+
+  findPrismaCalls(tree.rootNode);
+  findSupabaseCalls(tree.rootNode);
+
+  return queries;
+}
+
+function isPrismaOperation(op: string): boolean {
+  return PRISMA_OPERATIONS.has(op);
+}
+
+function isSupabaseOperation(op: string): boolean {
+  return SUPABASE_OPERATIONS.has(op);
+}
+
+function extractTemplateString(node: any): string {
+  // Handle template strings - extract the template literal content
+  const templateChildren = node.children ?? [];
+  for (const child of templateChildren) {
+    if (child.type === 'template_substitution') {
+      // Dynamic template string - skip
+      return '';
+    }
+    if (child.type === 'string_content') {
+      return child.text;
+    }
+  }
+  return '';
+}
+
+const PRISMA_OPERATIONS = new Set([
+  'findMany', 'findUnique', 'findFirst', 'findFirstOrThrow',
+  'create', 'createMany', 'upsert', 'update', 'updateMany',
+  'delete', 'deleteMany', 'count', 'aggregate',
+  'findRaw', 'aggregateRaw', 'groupBy',
+]);
+
+const SUPABASE_OPERATIONS = new Set([
+  'select', 'insert', 'update', 'delete', 'upsert',
+  'rpc', 'eq', 'neq', 'gt', 'gte', 'lt', 'lte',
+  'order', 'limit', 'range', 'single', 'maybeSingle',
+  'auth', 'storage', 'realtime',
+]);
+
 export function extractLaravelRoutes(tree: any, filePath: string): ExtractedRoute[] {
   const routes: ExtractedRoute[] = [];
 
@@ -2067,6 +2395,125 @@ const processFileGroup = (
       const captureMap: Record<string, any> = {};
       for (const c of match.captures) {
         captureMap[c.name] = c.node;
+      }
+
+      // Extract Express/Hono route registration BEFORE call processing.
+      // Some Express calls (app.get) also match as call expressions, so we
+      // handle them here first to prevent them from being treated as generic calls.
+      if (captureMap['express_route'] && captureMap['express_route.method'] && captureMap['express_route.path']) {
+        const method = captureMap['express_route.method'].text;
+        const routePath = captureMap['express_route.path'].text;
+        result.decoratorRoutes.push({
+          filePath: file.path,
+          decorator: method,
+          path: routePath,
+          lineNumber: captureMap['express_route'].startPosition.row,
+        });
+        continue;
+      }
+
+      // Extract HTTP decorators: @Get('/path'), @Post('/path'), @RequestMapping('/path')
+      if (captureMap['decorator'] && captureMap['decorator.name']) {
+        const decoratorName = captureMap['decorator.name'].text;
+        const ROUTE_DECORATOR_NAMES = new Set(['Get', 'Post', 'Put', 'Delete', 'Patch', 'Route', 'RequestMapping', 'GetMapping', 'PostMapping', 'PutMapping', 'DeleteMapping', 'PatchMapping']);
+        if (ROUTE_DECORATOR_NAMES.has(decoratorName)) {
+          const decoratorArg = captureMap['decorator.arg']?.text;
+          const routePath = decoratorArg || '';
+          const httpMethod = decoratorName.replace(/Mapping$/, '').toUpperCase();
+          result.decoratorRoutes.push({
+            filePath: file.path,
+            decorator: decoratorName,
+            method: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(httpMethod) ? httpMethod : 'GET',
+            path: routePath,
+            lineNumber: captureMap['decorator'].startPosition.row,
+          });
+          continue;
+        }
+      }
+
+      // Extract MCP tool decorators: @mcp.tool() or @tool()
+      if (captureMap['mcp_tool'] && captureMap['mcp_tool.name']) {
+        const funcNameNode = captureMap['mcp_tool.name'];
+        const decoratorNode = captureMap['mcp_tool'];
+
+        // Verify that the decorator is @mcp.tool()
+        const mcpObj = captureMap['_mcp_obj'];
+        const toolMethod = captureMap['_tool_method'];
+        if (mcpObj?.text === 'mcp' && toolMethod?.text === 'tool') {
+          // Extract description from docstring if present
+          let description: string | undefined;
+          const decoratedDef = decoratorNode;
+          const funcDef = decoratedDef.children?.find((c: any) => c.type === 'function_definition');
+          if (funcDef) {
+            const bodyNode = funcDef.childForFieldName?.('body') ?? funcDef.children?.find((c: any) => c.type === 'block' || c.type === 'function_body');
+            if (bodyNode && bodyNode.children) {
+              const firstChild = bodyNode.children.find((c: any) => c.type === 'expression_statement' || c.type === 'string');
+              if (firstChild?.firstChild?.type === 'string') {
+                const stringNode = firstChild.firstChild;
+                const stringContent = stringNode.childForFieldName?.('content') ?? stringNode.children?.find((c: any) => c.type === 'string_content');
+                if (stringContent) {
+                  description = stringContent.text;
+                }
+              }
+            }
+          }
+
+          result.toolDefs.push({
+            filePath: file.path,
+            name: funcNameNode.text,
+            description,
+            lineNumber: decoratorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Extract fetch() calls: fetch('/api/grants')
+      if (captureMap['route.fetch']) {
+        const urlNode = captureMap['route.url'] ?? captureMap['route.template_url'];
+        if (urlNode) {
+          result.fetchCalls.push({
+            filePath: file.path,
+            url: urlNode.text,
+            method: 'GET',
+            sourceId: generateId('File', file.path),
+            fetchURL: urlNode.text,
+            lineNumber: captureMap['route.fetch'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Extract HTTP client calls (axios.get, $.post, etc.) — consumer, not route definition
+      if (captureMap['http_client'] && captureMap['http_client.url']) {
+        const method = captureMap['http_client.method']?.text;
+        const url = captureMap['http_client.url'].text;
+        const EXPRESS_ROUTE_METHODS = new Set(['get', 'post', 'put', 'delete', 'patch', 'all', 'use', 'route']);
+        if (method && !EXPRESS_ROUTE_METHODS.has(method) && url.startsWith('/')) {
+          result.fetchCalls.push({
+            filePath: file.path,
+            url,
+            method: method.toUpperCase(),
+            sourceId: generateId('File', file.path),
+            fetchURL: url,
+            lineNumber: captureMap['http_client'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Extract Expo Router navigation calls: router.push('/path'), router.replace('/path'), router.navigate('/path')
+      if (captureMap['expo_nav'] && captureMap['expo_nav.url']) {
+        const url = captureMap['expo_nav.url'].text;
+        const navMethod = captureMap['expo_nav.method']?.text;
+        result.expoNavCalls.push({
+          filePath: file.path,
+          url,
+          method: navMethod?.toUpperCase() ?? 'PUSH',
+          sourceId: generateId('File', file.path),
+          lineNumber: captureMap['expo_nav'].startPosition.row,
+        });
+        continue;
       }
 
       // Extract import paths before skipping
@@ -2303,15 +2750,17 @@ const processFileGroup = (
 
       let parameterCount: number | undefined;
       let returnType: string | undefined;
-      let parameterTypes: string | undefined;
+      let parameterTypes: string[] | undefined;
+      let requiredParameterCount: number | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
         returnType = sig.returnType;
         // Store parameter types for languages with method overloading
         if (sig.parameterTypes && sig.parameterTypes.length > 0) {
-          parameterTypes = JSON.stringify(sig.parameterTypes);
+          parameterTypes = sig.parameterTypes;
         }
+        requiredParameterCount = sig.requiredParameterCount;
 
         // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
         // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
@@ -2372,7 +2821,7 @@ const processFileGroup = (
           ...(description !== undefined ? { description } : {}),
           ...(parameterCount !== undefined ? { parameterCount } : {}),
           ...(returnType !== undefined ? { returnType } : {}),
-          ...(parameterTypes !== undefined ? { parameterTypes } : {}),
+          ...(parameterTypes !== undefined ? { parameterTypes: JSON.stringify(parameterTypes) } : {}),
           ...(annotations !== undefined ? { annotations } : {}),
           ...(fields !== undefined ? { fields } : {}),
           ...(parameterAnnotations !== undefined ? { parameterAnnotations } : {}),
@@ -2390,6 +2839,8 @@ const processFileGroup = (
         nodeId,
         type: nodeLabel,
         ...(parameterCount !== undefined ? { parameterCount } : {}),
+        ...(requiredParameterCount !== undefined ? { requiredParameterCount } : {}),
+        ...(parameterTypes !== undefined ? { parameterTypes } : {}),
         ...(returnType !== undefined ? { returnType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
@@ -2418,6 +2869,12 @@ const processFileGroup = (
       }
     }
 
+    // Extract ORM queries (Prisma and Supabase)
+    const extractedORMQueries = extractORMQueries(tree, file.path);
+    if (extractedORMQueries.length > 0) {
+      result.ormQueries.push(...extractedORMQueries);
+    }
+
     // Extract Laravel routes from route files via procedural AST walk
     if (language === SupportedLanguages.PHP && (file.path.includes('/routes/') || file.path.startsWith('routes/')) && file.path.endsWith('.php')) {
       const extractedRoutes = extractLaravelRoutes(tree, file.path);
@@ -2428,6 +2885,14 @@ const processFileGroup = (
     if (language === SupportedLanguages.Java && (file.content.includes('@Controller') || file.content.includes('@RestController'))) {
       const springRoutes = extractSpringRoutes(tree, file.path);
       result.routes.push(...springRoutes);
+    }
+
+    // Extract Express/Hono routes via procedural AST walk (fallback when tree-sitter query patterns don't match)
+    if (language === SupportedLanguages.JavaScript || language === SupportedLanguages.TypeScript) {
+      const expressRoutes = extractExpressRoutes(tree, file.path);
+      if (expressRoutes.length > 0) {
+        result.decoratorRoutes.push(...expressRoutes);
+      }
     }
   }
 };
@@ -2440,6 +2905,10 @@ const processFileGroup = (
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
   imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
+  ormQueries: [],
+  fetchCalls: [],
+  expoNavCalls: [],
+  decoratorRoutes: [],
 };
 let cumulativeProcessed = 0;
 
@@ -2452,9 +2921,25 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
+  if (src.ormQueries) {
+    if (!target.ormQueries) target.ormQueries = [];
+    target.ormQueries.push(...src.ormQueries);
+  }
   if (src.typeEnvBindings) {
     if (!target.typeEnvBindings) target.typeEnvBindings = [];
     target.typeEnvBindings.push(...src.typeEnvBindings);
+  }
+  if (src.fetchCalls) {
+    if (!target.fetchCalls) target.fetchCalls = [];
+    target.fetchCalls.push(...src.fetchCalls);
+  }
+  if (src.expoNavCalls) {
+    if (!target.expoNavCalls) target.expoNavCalls = [];
+    target.expoNavCalls.push(...src.expoNavCalls);
+  }
+  if (src.decoratorRoutes) {
+    if (!target.decoratorRoutes) target.decoratorRoutes = [];
+    target.decoratorRoutes.push(...src.decoratorRoutes);
   }
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
@@ -2482,7 +2967,7 @@ if (parentPort) {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0, ormQueries: [] };
       cumulativeProcessed = 0;
       return;
     }

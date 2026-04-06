@@ -7,7 +7,7 @@
  * These are pure unit tests that mock the LadybugDB layer to test
  * the dispatch and error handling logic in isolation.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // We need to mock the LadybugDB adapter and repo-manager BEFORE importing LocalBackend
 vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
@@ -255,19 +255,26 @@ describe('LocalBackend.callTool', () => {
 
   // api_impact tool
   it('dispatches api_impact tool with route param', async () => {
-    (executeParameterized as any).mockResolvedValue([
-      {
-        routeId: 'Route:/api/grants',
-        routeName: '/api/grants',
-        handlerFile: 'app/api/grants/route.ts',
-        responseKeys: ['data', 'pagination'],
-        errorKeys: ['error', 'message'],
-        middleware: ['withAuth'],
-        consumerName: 'GrantsList',
-        consumerFile: 'src/GrantsList.tsx',
-        fetchReason: 'fetch-url-match|keys:data,pagination',
-      },
-    ]);
+    // First call: route query; Second call: consumer query
+    (executeParameterized as any)
+      .mockResolvedValueOnce([
+        {
+          routeId: 'Route:/api/grants',
+          route: '/api/grants',
+          handlerFile: 'app/api/grants/route.ts',
+          responseKeys: ['data', 'pagination'],
+          errorKeys: ['error', 'message'],
+          middleware: ['withAuth'],
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          consumerId: 'func:GrantsList',
+          consumerName: 'GrantsList',
+          consumerFile: 'src/GrantsList.tsx',
+          fetchReason: 'fetch-url-match|keys:data,pagination',
+        },
+      ]);
     const result = await backend.callTool('api_impact', { route: '/api/grants' });
     expect(result).toHaveProperty('route', '/api/grants');
     expect(result).toHaveProperty('handler', 'app/api/grants/route.ts');
@@ -294,19 +301,26 @@ describe('LocalBackend.callTool', () => {
   });
 
   it('api_impact detects mismatches and bumps risk level', async () => {
-    (executeParameterized as any).mockResolvedValue([
-      {
-        routeId: 'Route:/api/data',
-        routeName: '/api/data',
-        handlerFile: 'api/data.ts',
-        responseKeys: ['items'],
-        errorKeys: ['error'],
-        middleware: null,
-        consumerName: 'DataView',
-        consumerFile: 'src/DataView.tsx',
-        fetchReason: 'fetch-url-match|keys:items,meta',
-      },
-    ]);
+    // First call: route query; Second call: consumer query
+    (executeParameterized as any)
+      .mockResolvedValueOnce([
+        {
+          routeId: 'Route:/api/data',
+          route: '/api/data',
+          handlerFile: 'api/data.ts',
+          responseKeys: ['items'],
+          errorKeys: ['error'],
+          middleware: null,
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          consumerId: 'func:DataView',
+          consumerName: 'DataView',
+          consumerFile: 'src/DataView.tsx',
+          fetchReason: 'fetch-url-match|keys:items,meta',
+        },
+      ]);
     const result = await backend.callTool('api_impact', { route: '/api/data' });
     expect(result.mismatches).toBeDefined();
     expect(result.mismatches).toHaveLength(1);
@@ -317,19 +331,19 @@ describe('LocalBackend.callTool', () => {
   });
 
   it('api_impact supports file param lookup', async () => {
-    (executeParameterized as any).mockResolvedValue([
-      {
-        routeId: 'Route:/api/users',
-        routeName: '/api/users',
-        handlerFile: 'app/api/users/route.ts',
-        responseKeys: ['users'],
-        errorKeys: null,
-        middleware: null,
-        consumerName: null,
-        consumerFile: null,
-        fetchReason: null,
-      },
-    ]);
+    // First call: route query; Second call: consumer query (empty)
+    (executeParameterized as any)
+      .mockResolvedValueOnce([
+        {
+          routeId: 'Route:/api/users',
+          route: '/api/users',
+          handlerFile: 'app/api/users/route.ts',
+          responseKeys: ['users'],
+          errorKeys: null,
+          middleware: null,
+        },
+      ])
+      .mockResolvedValueOnce([]); // No consumers
     const result = await backend.callTool('api_impact', { file: 'app/api/users/route.ts' });
     expect(result.route).toBe('/api/users');
     expect(result.impactSummary.directConsumers).toBe(0);
@@ -337,51 +351,55 @@ describe('LocalBackend.callTool', () => {
   });
 
   it('api_impact returns array for multiple matching routes', async () => {
-    (executeParameterized as any).mockResolvedValue([
-      {
-        routeId: 'Route:/api/a',
-        routeName: '/api/a',
-        handlerFile: 'api/a.ts',
-        responseKeys: null,
-        errorKeys: null,
-        middleware: null,
-        consumerName: null,
-        consumerFile: null,
-        fetchReason: null,
-      },
-      {
-        routeId: 'Route:/api/b',
-        routeName: '/api/b',
-        handlerFile: 'api/b.ts',
-        responseKeys: null,
-        errorKeys: null,
-        middleware: null,
-        consumerName: null,
-        consumerFile: null,
-        fetchReason: null,
-      },
-    ]);
+    // First call: route query (2 routes); Second call per route: consumer query (empty)
+    (executeParameterized as any)
+      .mockResolvedValueOnce([
+        {
+          routeId: 'Route:/api/a',
+          route: '/api/a',
+          handlerFile: 'api/a.ts',
+          responseKeys: null,
+          errorKeys: null,
+          middleware: null,
+        },
+        {
+          routeId: 'Route:/api/b',
+          route: '/api/b',
+          handlerFile: 'api/b.ts',
+          responseKeys: null,
+          errorKeys: null,
+          middleware: null,
+        },
+      ])
+      .mockResolvedValueOnce([]) // Consumers for route A
+      .mockResolvedValueOnce([]); // Consumers for route B
     const result = await backend.callTool('api_impact', { route: '/api/' });
     expect(result.routes).toHaveLength(2);
     expect(result.total).toBe(2);
   });
 
   it('api_impact HIGH risk for 10+ consumers', async () => {
-    const rows = [];
-    for (let i = 0; i < 10; i++) {
-      rows.push({
-        routeId: 'Route:/api/popular',
-        routeName: '/api/popular',
-        handlerFile: 'api/popular.ts',
-        responseKeys: ['data'],
-        errorKeys: null,
-        middleware: null,
-        consumerName: `Consumer${i}`,
-        consumerFile: `src/Consumer${i}.tsx`,
-        fetchReason: null,
-      });
-    }
-    (executeParameterized as any).mockResolvedValue(rows);
+    // First call: single route; Second call: 10 consumers
+    (executeParameterized as any)
+      .mockResolvedValueOnce([
+        {
+          routeId: 'Route:/api/popular',
+          route: '/api/popular',
+          handlerFile: 'api/popular.ts',
+          responseKeys: ['data'],
+          errorKeys: null,
+          middleware: null,
+        },
+      ])
+      .mockResolvedValueOnce([
+        // 10 consumers
+        ...Array.from({ length: 10 }, (_, i) => ({
+          consumerId: `func:Consumer${i}`,
+          consumerName: `Consumer${i}`,
+          consumerFile: `src/Consumer${i}.tsx`,
+          fetchReason: null,
+        })),
+      ]);
     const result = await backend.callTool('api_impact', { route: '/api/popular' });
     expect(result.impactSummary.directConsumers).toBe(10);
     expect(result.impactSummary.riskLevel).toBe('HIGH');

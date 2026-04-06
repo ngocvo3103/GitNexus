@@ -262,10 +262,10 @@ export const analyzeCommand = async (
   if (cachedEmbeddings.length > 0) {
     // Check if cached embedding dimensions match current schema
     const cachedDims = cachedEmbeddings[0].embedding.length;
-    const { EMBEDDING_DIMS } = await import('../core/lbug/schema.js');
-    if (cachedDims !== EMBEDDING_DIMS) {
+    const { getEmbeddingDims } = await import('../core/lbug/schema.js');
+    if (cachedDims !== getEmbeddingDims()) {
       // Dimensions changed (e.g. switched embedding model) — discard cache and re-embed all
-      console.error(`⚠️  Embedding dimensions changed (${cachedDims}d → ${EMBEDDING_DIMS}d), discarding cache`);
+      console.error(`⚠️  Embedding dimensions changed (${cachedDims}d → ${getEmbeddingDims()}d), discarding cache`);
       cachedEmbeddings = [];
       cachedEmbeddingNodeIds = new Set();
     } else {

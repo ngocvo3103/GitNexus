@@ -99,7 +99,8 @@ describe('extractClassFields - Java', () => {
 
     const cacheField = fields.find(f => f.name === 'cache');
     expect(cacheField).toBeDefined();
-    expect(cacheField!.type).toBe('Map<String,Object>');
+    // Type preserves original source formatting (space after comma)
+    expect(cacheField!.type).toBe('Map<String, Object>');
 
     const futureField = fields.find(f => f.name === 'future');
     expect(futureField).toBeDefined();

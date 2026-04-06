@@ -290,6 +290,8 @@ function extractFieldConstant(
       let valueNode: Parser.SyntaxNode | null = null;
 
       for (const vc of child.children) {
+        // Skip non-named tokens like '=' punctuation
+        if (!vc.isNamed) continue;
         if (vc.type === 'identifier' && !nameNode) {
           nameNode = vc;
         } else if (!valueNode) {
@@ -318,7 +320,7 @@ function extractFieldConstant(
  * Collects all public static final String constants from a Java file AST.
  * Walks the tree for class declarations and extracts constants from field declarations.
  */
-function collectFileConstants(rootNode: Parser.SyntaxNode): Map<string, string> {
+export function collectFileConstants(rootNode: Parser.SyntaxNode): Map<string, string> {
   const constants = new Map<string, string>();
 
   function walk(node: Parser.SyntaxNode): void {

@@ -95,14 +95,12 @@ describe('streamAllCSVsToDisk', () => {
         filePath: 'src/ProjectsController.java',
         extra: {
           httpMethod: 'GET',
-          handler: 'get',
-          controller: 'ProjectsController',
-          framework: 'spring',
-          prefix: '/v1',
+          routePath: '/v1/foo',
+          controllerName: 'ProjectsController',
+          methodName: 'get',
+          startLine: 100,
           lineNumber: 110,
-          responseKeys: ['id'],
-          errorKeys: [],
-          middleware: [],
+          isInherited: false,
         },
       },
     ] as any);
@@ -116,12 +114,12 @@ describe('streamAllCSVsToDisk', () => {
     const lines = content.trim().split('\n');
 
     expect(lines[0]).toBe(
-      'id,name,filePath,httpMethod,handler,controller,framework,prefix,lineNumber,responseKeys,errorKeys,middleware',
+      'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited',
     );
     expect(content).toContain('"GET"');
     expect(content).toContain('"get"');
     expect(content).toContain('"ProjectsController"');
-    expect(content).toContain('"/v1",110,');
+    expect(content).toContain('100,110,');
   });
 
   it('CSV content is properly escaped', async () => {

@@ -10,11 +10,10 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
 const _require = createRequire(import.meta.url);
-const Ajv2020 = _require('ajv/dist/2020.js');
-const { ErrorObject } = _require('ajv');
+const Ajv = _require('ajv');
 
 // Cache compiled validator and schema for performance
-let cachedValidator: InstanceType<typeof Ajv2020> | null = null;
+let cachedValidator: ReturnType<typeof Ajv> | null = null;
 let cachedSchema: object | null = null;
 
 /**
@@ -54,12 +53,6 @@ export function loadSchema(schemaPath?: string): object {
   const schemaContent = readFileSync(path, 'utf-8');
   const parsed = JSON.parse(schemaContent);
 
-  // Remove $schema to avoid metaschema resolution issues
-  // Ajv2020 doesn't bundle draft-07 metaschema by default
-  if (parsed.$schema) {
-    delete parsed.$schema;
-  }
-
   cachedSchema = parsed;
   return cachedSchema!;
 }
@@ -67,13 +60,13 @@ export function loadSchema(schemaPath?: string): object {
 /**
  * Get or create AJV validator (cached)
  */
-export function getValidator(): InstanceType<typeof Ajv2020> {
+export function getValidator() {
   if (cachedValidator) {
     return cachedValidator;
   }
   // allErrors: true to collect all validation errors
   // strict: false to allow schema extensions
-  cachedValidator = new Ajv2020({ allErrors: true, strict: false });
+  cachedValidator = new Ajv({ allErrors: true, strict: false });
   return cachedValidator;
 }
 
@@ -99,7 +92,7 @@ export function validateAgainstSchema(
       return { valid: true };
     }
 
-    const errors = (validate.errors || []).map((err: typeof ErrorObject) => ({
+    const errors = (validate.errors || []).map((err: any) => ({
       path: err.instancePath || 'root',
       message: err.message || 'Unknown error',
     }));

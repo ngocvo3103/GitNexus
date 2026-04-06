@@ -17,6 +17,8 @@ let db: lbug.Database | null = null;
 let conn: lbug.Connection | null = null;
 let currentDbPath: string | null = null;
 let ftsLoaded = false;
+const DB_LOCK_RETRY_ATTEMPTS = 3;
+const DB_LOCK_RETRY_DELAY_MS = 500;
 
 // Global session lock for operations that touch module-level lbug globals.
 // This guarantees no DB switch can happen while an operation is running.
@@ -47,11 +49,32 @@ export const initLbug = async (dbPath: string) => {
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
  */
+export const isDbBusyError = (err: unknown): boolean => {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('busy') ||
+    msg.includes('lock') ||
+    msg.includes('already in use') ||
+    msg.includes('could not set lock')
+  );
+};
+
 export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>): Promise<T> => {
-  return runWithSessionLock(async () => {
-    await ensureLbugInitialized(dbPath);
-    return operation();
-  });
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await runWithSessionLock(async () => {
+        await ensureLbugInitialized(dbPath);
+        return operation();
+      });
+    } catch (err) {
+      lastError = err;
+      if (!isDbBusyError(err) || attempt === DB_LOCK_RETRY_ATTEMPTS) throw err;
+      // Cleanup and backoff before retry
+      await new Promise(resolve => setTimeout(resolve, DB_LOCK_RETRY_DELAY_MS * attempt));
+    }
+  }
+  throw lastError;
 };
 
 const ensureLbugInitialized = async (dbPath: string) => {
@@ -616,6 +639,12 @@ export const closeLbug = async (): Promise<void> => {
 
 export const isLbugReady = (): boolean => conn !== null && db !== null;
 
+/**
+ * Get the underlying LadybugDB Database instance.
+ * Used by test helpers to share the open Database with pool adapters,
+ * avoiding file-lock conflicts between writable and read-only connections.
+ */
+export const getDatabase = (): lbug.Database | null => db;
 
 /**
  * Delete all nodes (and their relationships) for a specific file from LadybugDB

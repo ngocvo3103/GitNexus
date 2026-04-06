@@ -30,6 +30,7 @@ export type NodeLabel =
   | 'Property'
   | 'Record'
   | 'Route'
+  | 'Tool'
   | 'Delegate'
   | 'Annotation'
   | 'Constructor'
@@ -41,7 +42,7 @@ import { SupportedLanguages } from '../../config/supported-languages.js';
 
 export type NodeProperties = {
   name: string,
-  filePath: string,
+  filePath?: string,
   // Cross-repo resolution — identifies which repo this node belongs to
   repoId?: string,
   startLine?: number,
@@ -78,18 +79,27 @@ export type NodeProperties = {
   isReadonly?: boolean,
   declaredType?: string,
   // Route-specific properties (for HTTP endpoints)
+  routeType?: string,
   httpMethod?: string,
   routePath?: string,
   controllerName?: string,
   methodName?: string,
   lineNumber?: number,
   isInherited?: boolean,
+  // Response shape (top-level keys from NextResponse.json({...}) / res.json({...}))
+  responseKeys?: string[],
+  // Error response shape (top-level keys from .json() calls with status >= 400)
+  errorKeys?: string[],
+  // Middleware wrapper chain (outermost first): ['withRateLimit', 'withCSRF', 'withAuth']
+  middleware?: string[],
   // Class fields (for DTO/Entity schema resolution)
   fields?: string,
   // Annotations (for Java/Kotlin)
   annotations?: string,
   // Section level (for markdown)
   level?: number,
+  // ORM model / entity type name
+  entityType?: string,
 }
 
 export type RelationshipType =
@@ -112,6 +122,11 @@ export type RelationshipType =
   // Additional relationship types
   | 'ACCESSES'
   | 'FETCHES'
+  | 'QUERIES'
+  | 'HANDLES_ROUTE'
+  | 'HANDLES_TOOL'
+  | 'ENTRY_POINT_OF'
+  | 'WRAPS'
 
 export interface GraphNode {
   id:  string,

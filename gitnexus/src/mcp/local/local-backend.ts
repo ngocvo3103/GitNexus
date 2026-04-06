@@ -52,10 +52,32 @@ export const VALID_NODE_LABELS = new Set([
 ]);
 
 /** Valid relation types for impact analysis filtering */
-export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES']);
+export const VALID_RELATION_TYPES = new Set([
+  'CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY',
+  'OVERRIDES', 'ACCESSES', 'HANDLES_ROUTE', 'FETCHES', 'HANDLES_TOOL',
+  'ENTRY_POINT_OF', 'WRAPS', 'CONTAINS'
+]);
+
+/**
+ * Confidence floors per relation type for impact analysis.
+ * Used when no stored graph confidence is available.
+ * Higher = more trustworthy relationship (structural containment).
+ * Lower = potentially indirect/observational relationship.
+ */
+export const IMPACT_RELATION_CONFIDENCE: Record<string, number> = {
+  CALLS: 0.9,          // direct function reference
+  IMPORTS: 0.9,        // direct module import
+  EXTENDS: 0.85,       // statically verifiable inheritance
+  IMPLEMENTS: 0.85,    // statically verifiable contract
+  OVERRIDES: 0.85,     // statically verifiable override
+  HAS_METHOD: 0.95,    // structural containment (method in class)
+  HAS_PROPERTY: 0.95,  // structural containment (field in class)
+  ACCESSES: 0.8,       // may be indirect read/write
+  CONTAINS: 0.95,      // folder/file structural containment
+};
 
 /** Regex to detect write operations in user-supplied Cypher queries */
-export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
+export const CYPHER_WRITE_RE = /(?<!:)\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
 
 /** Check if a Cypher query contains write operations */
 export function isWriteQuery(query: string): boolean {
@@ -335,6 +357,12 @@ export class LocalBackend {
         return this.endpoints(repo, params);
       case 'document-endpoint':
         return this.documentEndpoint(repo, params);
+      case 'api_impact':
+        return this.apiImpact(repo, params);
+      case 'route_map':
+        return this.routeMap(repo, params);
+      case 'shape_check':
+        return this.shapeCheck(repo, params);
       // Legacy aliases for backwards compatibility
       case 'search':
         return this.query(repo, params);
@@ -1108,24 +1136,84 @@ export class LocalBackend {
       return { error: `Symbol '${name || uid}' not found` };
     }
     
-    // Step 2: Disambiguation
+    // context() returns the semantically meaningful result rather than
+    // triggering ambiguous disambiguation (#480).
+    // labels(n)[0] returns empty string in LadybugDB, so we resolve the
+    // preferred node by re-querying with explicit label filters, scoped to
+    // the candidate IDs already in symbols.
+    //
+    // Guard: only attempt Class-preference when at least one candidate has an
+    // empty/unknown type (LadybugDB limitation) or is a Constructor — meaning
+    // the ambiguity may be a Class/Constructor name collision rather than two
+    // genuinely distinct symbols (e.g. two Functions in different files).
+    //
+    // resolvedLabel is set here and threaded to Step 3 to avoid a redundant
+    // classCheck round-trip later.
+    let resolvedLabel = '';
     if (symbols.length > 1 && !uid) {
+      const hasAmbiguousType = symbols.some((s: any) => {
+        const t = s.type || s[2] || '';
+        return t === '' || t === 'Constructor';
+      });
+      if (hasAmbiguousType) {
+        const candidateIds = symbols.map((s: any) => s.id || s[0]).filter(Boolean);
+        const PREFER_LABELS = ['Class', 'Interface'];
+        let preferred: any = null;
+        for (const label of PREFER_LABELS) {
+          const match = await executeParameterized(repo.id, `
+            MATCH (n:\`${label}\`) WHERE n.id IN $candidateIds RETURN n.id AS id LIMIT 1
+          `, { candidateIds }).catch(() => []);
+          if (match.length > 0) {
+            preferred = symbols.find((s: any) => (s.id || s[0]) === (match[0].id || match[0][0]));
+            if (preferred) { resolvedLabel = label; break; }
+          }
+        }
+        if (preferred) symbols = [preferred];
+      }
+    }
+
+    // If still multiple symbols after disambiguation, return ambiguous status
+    if (symbols.length > 1) {
       return {
         status: 'ambiguous',
-        message: `Found ${symbols.length} symbols matching '${name}'. Use uid or file_path to disambiguate.`,
         candidates: symbols.map((s: any) => ({
           uid: s.id || s[0],
           name: s.name || s[1],
           kind: s.type || s[2],
           filePath: s.filePath || s[3],
-          line: s.startLine || s[4],
+          startLine: s.startLine || s[4],
+          endLine: s.endLine || s[5],
         })),
       };
     }
-    
+
     // Step 3: Build full context
     const sym = symbols[0];
     const symId = sym.id || sym[0];
+
+    // Fix #480: Class/Interface nodes have no direct CALLS/IMPORTS edges —
+    // those point to Constructor and File nodes respectively. Fetch those
+    // extra incoming refs and merge them in so context() shows real callers.
+    //
+    // Determine if this is a Class/Interface node. If resolvedLabel was set
+    // during disambiguation (Step 2), use it directly — no extra round-trip.
+    // Otherwise fall back to a single label check only when the type field is
+    // empty (LadybugDB labels(n)[0] limitation).
+    const symRawType = sym.type || sym[2] || '';
+    let isClassLike = resolvedLabel === 'Class' || resolvedLabel === 'Interface';
+    if (!isClassLike && symRawType === '') {
+      try {
+        // Single UNION query instead of two serial round-trips.
+        const typeCheck = await executeParameterized(repo.id, `
+          MATCH (n:Class) WHERE n.id = $symId RETURN 'Class' AS label LIMIT 1
+          UNION ALL
+          MATCH (n:Interface) WHERE n.id = $symId RETURN 'Interface' AS label LIMIT 1
+        `, { symId });
+        isClassLike = typeCheck.length > 0;
+      } catch { /* not a Class/Interface node */ }
+    } else if (!isClassLike) {
+      isClassLike = symRawType === 'Class' || symRawType === 'Interface';
+    }
 
     // Categorized incoming refs
     const incomingRows = await executeParameterized(repo.id, `
@@ -1135,10 +1223,48 @@ export class LocalBackend {
       LIMIT 30
     `, { symId });
 
+    // Expand incoming refs for Class/Interface nodes: callers via Constructor/File
+    if (isClassLike) {
+      try {
+        // Run both incoming-ref queries in parallel — they are independent.
+        const [ctorIncoming, fileIncoming] = await Promise.all([
+          executeParameterized(repo.id, `
+            MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
+            WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+            MATCH (caller)-[r:CodeRelation]->(ctor)
+            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'ACCESSES']
+            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+            LIMIT 30
+          `, { symId }),
+          executeParameterized(repo.id, `
+            MATCH (f:File)-[rel:CodeRelation]->(n)
+            WHERE n.id = $symId AND rel.type = 'DEFINES'
+            MATCH (caller)-[r:CodeRelation]->(f)
+            WHERE r.type IN ['CALLS', 'IMPORTS']
+            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+            LIMIT 30
+          `, { symId }),
+        ]);
+
+        // Deduplicate by (relType, uid) — a caller can have multiple relation
+        // types to the same target (e.g. both IMPORTS and CALLS), and each
+        // must be preserved so every category appears in the output.
+        const seenKeys = new Set(
+          incomingRows.map((r: any) => `${r.relType || r[0]}:${r.uid || r[1]}`),
+        );
+        for (const r of [...ctorIncoming, ...fileIncoming]) {
+          const key = `${r.relType || r[0]}:${r.uid || r[1]}`;
+          if (!seenKeys.has(key)) { seenKeys.add(key); incomingRows.push(r); }
+        }
+      } catch (e) {
+        logQueryError('context:class-incoming-expansion', e);
+      }
+    }
+
     // Categorized outgoing refs
     const outgoingRows = await executeParameterized(repo.id, `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       LIMIT 30
     `, { symId });
@@ -1174,7 +1300,7 @@ export class LocalBackend {
       symbol: {
         uid: sym.id || sym[0],
         name: sym.name || sym[1],
-        kind: sym.type || sym[2],
+        kind: isClassLike ? (resolvedLabel || 'Class') : (sym.type || sym[2]),
         filePath: sym.filePath || sym[3],
         startLine: sym.startLine || sym[4],
         endLine: sym.endLine || sym[5],
@@ -1389,6 +1515,323 @@ export class LocalBackend {
   }
 
   /**
+   * API Impact tool — analyze an HTTP route's response shape, consumers, and mismatches.
+   *
+   * Queries Route nodes and their FETCHES consumer edges to determine:
+   * - Which consumers (fetch() callers) depend on this route
+   * - Whether consumer code accesses fields not present in the handler's response shape
+   * - Risk level based on consumer count and mismatch severity
+   */
+  private async apiImpact(repo: RepoHandle, params: {
+    route?: string;
+    file?: string;
+  }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    if (!params.route && !params.file) {
+      return { error: 'Either "route" or "file" parameter is required.' };
+    }
+
+    // Build the route lookup query
+    let routeWhere = '';
+    const routeParams: Record<string, any> = {};
+
+    if (params.route) {
+      routeWhere = 'WHERE r.name = $route';
+      routeParams.route = params.route;
+    } else if (params.file) {
+      routeWhere = 'WHERE r.filePath = $file';
+      routeParams.file = params.file;
+    }
+
+    // Find the route(s) — may return multiple if same file has multiple methods
+    const routeRows = await executeParameterized(repo.id, `
+      MATCH (r:Route)
+      ${routeWhere}
+      RETURN r.id AS routeId, r.name AS route, r.filePath AS handlerFile,
+             r.responseKeys AS responseKeys, r.errorKeys AS errorKeys,
+             r.middleware AS middleware
+    `, routeParams);
+
+    if (!routeRows || routeRows.length === 0) {
+      return { error: 'No routes found matching the given route or file.' };
+    }
+
+    // Build results — one entry per matched route
+    const routes: any[] = [];
+    let allMismatches: any[] = [];
+    let totalConsumers = 0;
+
+    for (const row of routeRows) {
+      const routeId = row.routeId || row[0];
+      const routeName = row.route || row[1];
+      const handlerFile = row.handlerFile || row[2];
+      const responseKeys: string[] = row.responseKeys || row[3] || [];
+      const errorKeys: string[] = row.errorKeys || row[4] || [];
+      const middleware: string[] = row.middleware || row[5] || [];
+
+      // Find consumers: functions that FETCHES this route (via CodeRelation edges)
+      const consumerRows = await executeParameterized(repo.id, `
+        MATCH (c:Function)-[r:CodeRelation {type: 'FETCHES'}]->(rout:Route)
+        WHERE rout.id = $routeId
+        RETURN c.id AS consumerId, c.name AS consumerName,
+               c.filePath AS consumerFile, r.reason AS fetchReason
+      `, { routeId });
+
+      const consumers: any[] = [];
+      const routeConsumerSet = new Set<string>();
+
+      for (const cres of consumerRows) {
+        const consumerId = cres.consumerId || cres[0];
+        const consumerName = cres.consumerName || cres[1];
+        const consumerFile = cres.consumerFile || cres[2];
+        const fetchReason: string = cres.fetchReason || cres[3] || '';
+
+        // Skip duplicate consumers from same file (multiple methods in same file)
+        if (routeConsumerSet.has(consumerFile)) continue;
+        routeConsumerSet.add(consumerFile);
+
+        // Determine if this is a multi-fetch consumer (fetches multiple routes)
+        const multiMatch = fetchReason.match(/fetches:(\d+)/);
+        const attributionNote = multiMatch && parseInt(multiMatch[1]) > 1
+          ? `fetches ${multiMatch[1]} routes`
+          : undefined;
+
+        // Determine confidence based on multi-fetch
+        const confidence = multiMatch && parseInt(multiMatch[1]) > 1 ? 'low' : 'high';
+
+        consumers.push({
+          name: consumerName,
+          file: consumerFile,
+          attributionNote,
+          confidence,
+        });
+
+        // Check for mismatches: consumer accesses fields not in response shape
+        const keyMatch = fetchReason.match(/keys:([^|]+)/);
+        if (keyMatch) {
+          const accessedKeys = keyMatch[1].split(',').map((k: string) => k.trim());
+          const successSet = new Set(responseKeys);
+          const errorSet = new Set(errorKeys);
+
+          for (const key of accessedKeys) {
+            // Skip if key is a nested property access (e.g., "data.items")
+            const topLevelKey = key.split('.')[0];
+            const isSuccess = successSet.has(topLevelKey);
+            const isError = errorSet.has(topLevelKey);
+
+            if (!isSuccess && !isError) {
+              allMismatches.push({
+                consumer: consumerFile,
+                field: topLevelKey,
+                reason: `${topLevelKey} not in response shape`,
+                confidence,
+              });
+            }
+          }
+        }
+      }
+
+      totalConsumers += consumers.length;
+
+      routes.push({
+        route: routeName,
+        handler: handlerFile,
+        responseShape: {
+          success: responseKeys,
+          error: errorKeys,
+        },
+        middleware,
+        consumers,
+      });
+    }
+
+    // Calculate impact summary
+    const directConsumers = totalConsumers;
+    let riskLevel = 'LOW';
+    if (allMismatches.length > 0) {
+      // Mismatches always bump risk to at least MEDIUM
+      riskLevel = directConsumers >= 10 ? 'HIGH' : 'MEDIUM';
+    } else if (directConsumers >= 10) {
+      riskLevel = 'HIGH';
+    } else if (directConsumers >= 3) {
+      riskLevel = 'MEDIUM';
+    }
+
+    const impactSummary = {
+      directConsumers,
+      riskLevel,
+    };
+
+    // If multiple routes matched, return array format
+    if (routes.length > 1) {
+      return {
+        routes,
+        total: routes.length,
+        mismatches: allMismatches,
+        impactSummary,
+      };
+    }
+
+    // Single route — return flat structure
+    const single = routes[0];
+    return {
+      route: single.route,
+      handler: single.handler,
+      responseShape: single.responseShape,
+      middleware: single.middleware,
+      consumers: single.consumers,
+      mismatches: allMismatches,
+      impactSummary,
+    };
+  }
+
+  /**
+   * route_map tool — list routes with their consumers and middleware.
+   * Simpler than api_impact: just returns route metadata without mismatch analysis.
+   */
+  private async routeMap(repo: RepoHandle, params: { route?: string; file?: string }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    if (!params.route && !params.file) {
+      return { error: 'Either "route" or "file" parameter is required.' };
+    }
+
+    const routeWhere = params.route
+      ? 'WHERE r.name = $route'
+      : 'WHERE r.filePath = $file';
+    const routeParams = { route: params.route, file: params.file };
+    const queryParam = params.route ? 'route' : 'file';
+
+    const routeRows = await executeParameterized(repo.id, `
+      MATCH (r:Route)
+      ${routeWhere}
+      RETURN r.id AS routeId, r.name AS route, r.filePath AS handlerFile,
+             r.responseKeys AS responseKeys, r.errorKeys AS errorKeys,
+             r.middleware AS middleware
+    `, { [queryParam]: params.route ?? params.file });
+
+    if (!routeRows || routeRows.length === 0) {
+      return { error: 'No routes found matching the given route or file.' };
+    }
+
+    const routes: any[] = [];
+
+    for (const row of routeRows) {
+      const routeId = row.routeId || row[0];
+      const routeName = row.route || row[1];
+      const handlerFile = row.handlerFile || row[2];
+      const middleware: string[] = row.middleware || row[5] || [];
+
+      const consumerRows = await executeParameterized(repo.id, `
+        MATCH (c:Function)-[r:CodeRelation {type: 'FETCHES'}]->(rout:Route)
+        WHERE rout.id = $routeId
+        RETURN c.filePath AS consumerFile
+      `, { routeId });
+
+      const consumers = [...new Set(consumerRows.map((r: any) => r.consumerFile || r[0]))];
+
+      routes.push({
+        route: routeName,
+        handler: handlerFile,
+        middleware,
+        consumers: consumers.map(f => ({ file: f })),
+      });
+    }
+
+    return { routes };
+  }
+
+  /**
+   * shape_check tool — list routes with their response shapes.
+   * Analyzes consumer key access and identifies mismatches between
+   * consumer-accessed keys and route response/error keys.
+   */
+  private async shapeCheck(repo: RepoHandle, params: { route?: string; file?: string }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    if (!params.route && !params.file) {
+      return { error: 'Either "route" or "file" parameter is required.' };
+    }
+
+    const routeWhere = params.route
+      ? 'WHERE r.name = $route'
+      : 'WHERE r.filePath = $file';
+    const queryParam = params.route ? 'route' : 'file';
+
+    const routeRows = await executeParameterized(repo.id, `
+      MATCH (r:Route)
+      ${routeWhere}
+      RETURN r.id AS routeId, r.name AS route, r.filePath AS handlerFile,
+             r.responseKeys AS responseKeys, r.errorKeys AS errorKeys
+    `, { [queryParam]: params.route ?? params.file });
+
+    if (!routeRows || routeRows.length === 0) {
+      return { error: 'No routes found matching the given route or file.' };
+    }
+
+    const routes: any[] = [];
+
+    for (const row of routeRows) {
+      const routeId = row.routeId || row[0];
+      const routeName = row.route || row[1];
+      const handlerFile = row.handlerFile || row[2];
+      const responseKeys: string[] = row.responseKeys || row[3] || [];
+      const errorKeys: string[] = row.errorKeys || row[4] || [];
+
+      // Query FETCHES edges with reason field to extract accessed keys
+      const consumerRows = await executeParameterized(repo.id, `
+        MATCH (c:Function)-[rel:CodeRelation {type: 'FETCHES'}]->(r:Route)
+        WHERE r.id = $routeId
+        RETURN c.filePath AS consumerFile, rel.reason AS reason
+      `, { routeId });
+
+      // Build consumer info with key analysis
+      const consumers: any[] = [];
+      for (const consumerRow of consumerRows) {
+        const filePath = consumerRow.consumerFile || consumerRow[0];
+        const reason = consumerRow.reason || consumerRow[1] || '';
+
+        // Parse accessed keys from reason field (format: "fetch-url-match|keys:key1,key2,...")
+        const keysMatch = reason.match(/keys:([^|]+)/);
+        const accessedKeys: string[] = keysMatch
+          ? keysMatch[1].split(',').map(k => k.trim()).filter(k => k.length > 0)
+          : [];
+
+        // Classify keys: errorPathKeys (in errorKeys), mismatched (not in responseKeys or errorKeys)
+        const responseKeySet = new Set(responseKeys);
+        const errorKeySet = new Set(errorKeys);
+
+        const errorPathKeys: string[] = accessedKeys.filter(k => errorKeySet.has(k));
+        const mismatched: string[] = accessedKeys.filter(
+          k => !responseKeySet.has(k) && !errorKeySet.has(k)
+        );
+
+        consumers.push({
+          filePath,
+          accessedKeys,
+          ...(errorPathKeys.length > 0 && { errorPathKeys }),
+          ...(mismatched.length > 0 && { mismatched }),
+        });
+      }
+
+      // Determine route status: MISMATCH if any consumer has mismatched keys
+      const hasMismatches = consumers.some(c => c.mismatched && c.mismatched.length > 0);
+
+      routes.push({
+        route: routeName,
+        handler: handlerFile,
+        responseKeys,
+        errorKeys,
+        consumers,
+        ...(hasMismatches && { status: 'MISMATCH' }),
+      });
+    }
+
+    return { routes };
+  }
+
+  /**
    * Rename tool — multi-file coordinated rename using graph + text search.
    * Graph refs are tagged "graph" (high confidence).
    * Additional refs found via text search are tagged "text_search" (lower confidence).
@@ -1599,22 +2042,104 @@ export class LocalBackend {
     const relTypeFilter = relationTypes.map(t => `'${t}'`).join(', ');
     const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
 
-    const targets = await executeParameterized(repo.id, `
-      MATCH (n)
-      WHERE n.name = $targetName
-      RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-      LIMIT 1
-    `, { targetName: target });
-    if (targets.length === 0) return { error: `Target '${target}' not found` };
-    
-    const sym = targets[0];
+    // Resolve target by name, preferring Class/Interface over Constructor
+    // (fix #480: Java class and constructor share the same name).
+    // labels(n)[0] returns empty string in LadybugDB, so we use explicit
+    // label-typed sub-queries in a single UNION ordered by priority to avoid
+    // up to 6 serial round-trips for non-Class targets.
+    let sym: any = null;
+    let symType = '';
+
+    try {
+      const rows = await executeParameterized(repo.id, `
+        MATCH (n:\`Class\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority LIMIT 1
+        UNION ALL
+        MATCH (n:\`Interface\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority LIMIT 1
+        UNION ALL
+        MATCH (n:\`Function\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority LIMIT 1
+        UNION ALL
+        MATCH (n:\`Method\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority LIMIT 1
+        UNION ALL
+        MATCH (n:\`Constructor\`) WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority LIMIT 1
+      `, { targetName: target }).catch(() => []);
+
+      if (rows.length > 0) {
+        // Pick the row with the lowest priority value (Class wins over Constructor)
+        const best = rows.reduce((a: any, b: any) =>
+          (a.priority ?? a[3] ?? 99) <= (b.priority ?? b[3] ?? 99) ? a : b,
+        );
+        sym = best;
+        const priorityToLabel = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
+        symType = priorityToLabel[best.priority ?? best[3]] ?? '';
+      }
+    } catch { /* fall through to unlabeled match */ }
+
+    // Fall back to unlabeled match for any other node type
+    if (!sym) {
+      const rows = await executeParameterized(repo.id, `
+        MATCH (n)
+        WHERE n.name = $targetName
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+        LIMIT 1
+      `, { targetName: target });
+      if (rows.length > 0) { sym = rows[0]; symType = sym.type || sym[2] || ''; }
+    }
+
+    if (!sym) return { error: `Target '${target}' not found` };
+
     const symId = sym.id || sym[0];
-    
+
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
     let frontier = [symId];
     let traversalComplete = true;
-    
+
+    // Fix #480: For Java (and other JVM) Class/Interface nodes, CALLS edges
+    // point to Constructor nodes and IMPORTS edges point to File nodes — not
+    // the Class/Interface itself. Seed the frontier with the Constructor(s)
+    // and owning File so the BFS traversal finds those edges naturally.
+    // The owning File is kept only as an internal seed (frontier/visited) and
+    // is NOT added to impacted — it is the definition container, not an
+    // upstream dependent. The BFS will discover IMPORTS edges on it naturally.
+    if (symType === 'Class' || symType === 'Interface') {
+      try {
+        // Run both seed queries in parallel — they are independent.
+        const [ctorRows, fileRows] = await Promise.all([
+          executeParameterized(repo.id, `
+            MATCH (n)-[hm:CodeRelation]->(c:Constructor)
+            WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+            RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
+          `, { symId }),
+          // Restrict to DEFINES edges only — other File->Class edge types (if
+          // any) should not be treated as the owning file relationship.
+          executeParameterized(repo.id, `
+            MATCH (f:File)-[rel:CodeRelation]->(n)
+            WHERE n.id = $symId AND rel.type = 'DEFINES'
+            RETURN f.id AS id, f.name AS name, labels(f)[0] AS type, f.filePath AS filePath
+          `, { symId }),
+        ]);
+
+        for (const r of ctorRows) {
+          const rid = r.id || r[0];
+          if (rid && !visited.has(rid)) { visited.add(rid); frontier.push(rid); }
+        }
+        for (const r of fileRows) {
+          const rid = r.id || r[0];
+          if (rid && !visited.has(rid)) {
+            visited.add(rid);
+            frontier.push(rid);
+          }
+        }
+      } catch (e) {
+        logQueryError('impact:class-node-expansion', e);
+      }
+    }
+
     for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
       const nextFrontier: string[] = [];
       
@@ -1670,35 +2195,76 @@ export class LocalBackend {
     let affectedModules: any[] = [];
 
     if (impacted.length > 0) {
-      const allIds = impacted.map(i => `'${i.id.replace(/'/g, "''")}'`).join(', ');
-      const d1Ids = (grouped[1] || []).map((i: any) => `'${i.id.replace(/'/g, "''")}'`).join(', ');
+      const allIdsArr = impacted.map(i => i.id);
+      const d1IdsArr = (grouped[1] || []).map((i: any) => i.id);
+
+      // Chunk IDs into batches of 100 for parameterized queries
+      const CHUNK_SIZE = 100;
+      const chunkIds = (ids: string[]): string[][] => {
+        const chunks: string[][] = [];
+        for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+          chunks.push(ids.slice(i, i + CHUNK_SIZE));
+        }
+        return chunks;
+      };
 
       // Affected processes: which execution flows are broken and at which step
-      const [processRows, moduleRows, directModuleRows] = await Promise.all([
-        executeQuery(repo.id, `
+      const maxChunks = parseInt(process.env.IMPACT_MAX_CHUNKS || '999999', 10);
+      const processChunks = chunkIds(allIdsArr);
+      const processRows: any[] = [];
+      const processedIds: string[] = [];
+      let chunksProcessed = 0;
+      for (const chunk of processChunks) {
+        if (chunksProcessed >= maxChunks) {
+          traversalComplete = false;
+          break;
+        }
+        processedIds.push(...chunk);
+        const result = await executeParameterized(repo.id, `
           MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          WHERE s.id IN [${allIds}]
+          WHERE s.id IN $ids
           RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
           ORDER BY hits DESC
           LIMIT 20
-        `).catch(() => []),
+        `, { ids: chunk }).catch(() => []);
+        processRows.push(...result);
+        chunksProcessed++;
+      }
+
+      // Re-aggregate and limit to top 20 after merging all chunks
+      const aggregatedProcesses = new Map<string, any>();
+      for (const row of processRows) {
+        const key = row.name;
+        if (aggregatedProcesses.has(key)) {
+          const existing = aggregatedProcesses.get(key);
+          existing.hits += row.hits;
+          if (row.minStep < existing.minStep) existing.minStep = row.minStep;
+        } else {
+          aggregatedProcesses.set(key, { ...row });
+        }
+      }
+      const topProcesses = Array.from(aggregatedProcesses.values())
+        .sort((a, b) => b.hits - a.hits)
+        .slice(0, 20);
+
+      const [moduleRows, directModuleRows] = await Promise.all([
         executeQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${allIds}]
+          WHERE s.id IN [${processedIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]
           RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
           ORDER BY hits DESC
           LIMIT 20
         `).catch(() => []),
-        d1Ids ? executeQuery(repo.id, `
+        d1IdsArr.length > 0 ? executeQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${d1Ids}]
+          WHERE s.id IN [${d1IdsArr.filter(id => processedIds.includes(id)).map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]
           RETURN DISTINCT c.heuristicLabel AS name
         `).catch(() => []) : Promise.resolve([]),
       ]);
 
-      affectedProcesses = processRows.map((r: any) => ({
+      affectedProcesses = topProcesses.map((r: any) => ({
         name: r.name || r[0],
-        hits: r.hits || r[1],
+        total_hits: r.hits || r[1],
         broken_at_step: r.minStep ?? r[2],
         step_count: r.stepCount ?? r[3],
       }));

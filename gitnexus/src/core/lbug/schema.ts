@@ -36,7 +36,9 @@ export type RelType = typeof REL_TYPES[number];
 export const EMBEDDING_TABLE_NAME = 'CodeEmbedding';
 
 // Default embedding dimensions (snowflake-arctic-embed-xs)
-export const EMBEDDING_DIMS = 384;
+export function getEmbeddingDims(): number {
+  return parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
+}
 
 // ============================================================================
 // NODE TABLE SCHEMAS
@@ -223,11 +225,17 @@ CREATE NODE TABLE Route (
   lineNumber INT64,
   isInherited BOOLEAN,
   repoId STRING,
+  responseKeys STRING[],
+  errorKeys STRING[],
+  middleware STRING[],
   PRIMARY KEY (id)
 )`;
 // Migration for cross-repo support
 export const ROUTE_SCHEMA_MIGRATION = `
-ALTER TABLE Route ADD COLUMN IF NOT EXISTS repoId STRING`;
+ALTER TABLE Route ADD COLUMN IF NOT EXISTS repoId STRING;
+ALTER TABLE Route ADD COLUMN IF NOT EXISTS responseKeys STRING[];
+ALTER TABLE Route ADD COLUMN IF NOT EXISTS errorKeys STRING[];
+ALTER TABLE Route ADD COLUMN IF NOT EXISTS middleware STRING[]`;
 
 // ============================================================================
 // MULTI-LANGUAGE NODE TABLE SCHEMAS
@@ -343,6 +351,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Function TO \`Typedef\`,
   FROM Function TO \`Union\`,
   FROM Function TO \`Property\`,
+  FROM Function TO Route,
   FROM Class TO Method,
   FROM Class TO Function,
   FROM Class TO Class,

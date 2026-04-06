@@ -66,8 +66,8 @@ export interface ResolutionContext {
   readonly importMap: ImportMap;
   readonly packageMap: PackageMap;
   readonly namedImportMap: NamedImportMap;
-  /** Module alias map — used for Python relative imports */
-  readonly moduleAliasMap?: ModuleAliasMap;
+  /** Module alias map — used for Python module import aliases (import X as Y) */
+  readonly moduleAliasMap: ModuleAliasMap;
 
   // --- Per-file cache lifecycle ---
   enableCache(filePath: string): void;
@@ -91,6 +91,7 @@ export const createResolutionContext = (graph?: KnowledgeGraph): ResolutionConte
   const importMap: ImportMap = new Map();
   const packageMap: PackageMap = new Map();
   const namedImportMap: NamedImportMap = new Map();
+  const moduleAliasMap: ModuleAliasMap = new Map();
 
   // Per-file cache state
   let cacheFile: string | null = null;
@@ -193,6 +194,7 @@ export const createResolutionContext = (graph?: KnowledgeGraph): ResolutionConte
     importMap.clear();
     packageMap.clear();
     namedImportMap.clear();
+    moduleAliasMap.clear();
     clearCache();
     cacheHits = 0;
     cacheMisses = 0;
@@ -218,6 +220,7 @@ export const createResolutionContext = (graph?: KnowledgeGraph): ResolutionConte
     importMap,
     packageMap,
     namedImportMap,
+    moduleAliasMap,
     enableCache,
     clearCache,
     getStats,

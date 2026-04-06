@@ -7,8 +7,8 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processRoutesFromExtracted } from './call-processor.js';
-import type { ExtractedRoute } from './workers/parse-worker.js';
+import { processCalls, processCallsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutes, processExpoRouterNavigations, processDecoratorRoutes, processPHPRoutes, processNextjsRoutes, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted } from './call-processor.js';
+import type { ExtractedRoute, ExtractedExpoNav, ExtractedORMQuery, ExtractedDecoratorRoute, ExtractedFetchCall, ExtractedToolDef } from './workers/parse-worker.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -253,6 +253,12 @@ export const runPipelineFromRepo = async (
     // 200-400MB less memory — critical for Linux-kernel-scale repos.
     const sequentialChunkPaths: string[][] = [];
     const sequentialChunkRoutes: ExtractedRoute[][] = [];
+    // Accumulate expoNavCalls, ormQueries, fetchCalls across chunks for processing after all chunks
+    const allExpoNavCalls: ExtractedExpoNav[] = [];
+    const allORMQueries: ExtractedORMQuery[] = [];
+    const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
+    const allFetchCalls: ExtractedFetchCall[] = [];
+    const allToolDefs: ExtractedToolDef[] = [];
 
     try {
       for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
@@ -347,12 +353,49 @@ export const runPipelineFromRepo = async (
               });
             },
           );
+          // Accumulate expoNavCalls and ormQueries for post-processing after all chunks
+          if (chunkWorkerData.expoNavCalls) {
+            allExpoNavCalls.push(...chunkWorkerData.expoNavCalls);
+          }
+          if (chunkWorkerData.ormQueries) {
+            allORMQueries.push(...chunkWorkerData.ormQueries);
+          }
+          // Accumulate decoratorRoutes (Express/Hono) for post-processing
+          if (chunkWorkerData.decoratorRoutes) {
+            allDecoratorRoutes.push(...chunkWorkerData.decoratorRoutes);
+          }
+          // Accumulate fetchCalls for post-processing
+          if (chunkWorkerData.fetchCalls) {
+            allFetchCalls.push(...chunkWorkerData.fetchCalls);
+          }
+          // Accumulate toolDefs for post-processing
+          if (chunkWorkerData.toolDefs) {
+            allToolDefs.push(...chunkWorkerData.toolDefs);
+          }
         } else {
           // Sequential path: processImports adds symbols, then heritage/calls are resolved
           // in the sequential fallback loop below (lines 351-365)
           await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
           sequentialChunkPaths.push(chunkPaths);
           sequentialChunkRoutes.push(chunkWorkerData.routes ?? []);
+          // Accumulate expoNavCalls and ormQueries for sequential path too
+          if (chunkWorkerData.expoNavCalls) {
+            allExpoNavCalls.push(...chunkWorkerData.expoNavCalls);
+          }
+          if (chunkWorkerData.ormQueries) {
+            allORMQueries.push(...chunkWorkerData.ormQueries);
+          }
+          if (chunkWorkerData.decoratorRoutes) {
+            allDecoratorRoutes.push(...chunkWorkerData.decoratorRoutes);
+          }
+          // Accumulate fetchCalls for sequential path too
+          if (chunkWorkerData.fetchCalls) {
+            allFetchCalls.push(...chunkWorkerData.fetchCalls);
+          }
+          // Accumulate toolDefs for sequential path too
+          if (chunkWorkerData.toolDefs) {
+            allToolDefs.push(...chunkWorkerData.toolDefs);
+          }
         }
 
         filesParsedSoFar += chunkFiles.length;
@@ -383,6 +426,59 @@ export const runPipelineFromRepo = async (
         await processRoutesFromExtracted(graph, chunkRoutes, ctx);
       }
       astCache.clear();
+    }
+
+    // Post-processing: Expo routes and ORM queries (accumulated across all chunks)
+    // Process Expo Router routes and navigation
+    const expoPaths = allPaths.filter(p => p.includes('app/'));
+    if (expoPaths.length > 0) {
+      const routeRegistry = processExpoRoutes(graph, expoPaths);
+      if (allExpoNavCalls.length > 0) {
+        processExpoRouterNavigations(graph, allExpoNavCalls, routeRegistry);
+      }
+    }
+
+    // Process ORM queries
+    if (allORMQueries.length > 0) {
+      processORMQueriesFromExtracted(graph, allORMQueries);
+    }
+
+    // Process Express/Hono routes (decoratorRoutes extracted from JS/TS files)
+    if (allDecoratorRoutes.length > 0) {
+      processDecoratorRoutes(graph, allDecoratorRoutes);
+    }
+
+    // Process MCP tool definitions (@mcp.tool() decorators)
+    if (allToolDefs.length > 0) {
+      await processToolDefsFromExtracted(graph, allToolDefs, ctx);
+    }
+
+    // Process PHP file-based routes (direct file routing in api/ directory)
+    const phpApiPaths = allPaths.filter(p => p.endsWith('.php') && (p.startsWith('api/') || p.includes('/api/')));
+    if (phpApiPaths.length > 0) {
+      const phpContents = await readFileContents(repoPath, phpApiPaths);
+      processPHPRoutes(graph, phpApiPaths, phpContents);
+    }
+
+    // Process Next.js App Router routes (app/api/**/route.ts files)
+    // Match files like: app/api/grants/route.ts, app/api/users/[id]/route.ts
+    const nextjsRoutePaths = allPaths.filter(p => /(?:^|\/)app\/api\/.*\/route\.(ts|js|tsx|jsx)$/.test(p));
+    let nextjsRouteRegistry: Map<string, string> | undefined;
+    if (nextjsRoutePaths.length > 0) {
+      const nextjsContents = await readFileContents(repoPath, nextjsRoutePaths);
+      nextjsRouteRegistry = processNextjsRoutes(graph, nextjsRoutePaths, nextjsContents);
+    }
+
+    // Process Next.js project-level middleware.ts and link to matching routes
+    const allFileContents = await readFileContents(repoPath, allPaths);
+    processNextjsMiddleware(graph, allPaths, allFileContents);
+
+    // Process fetch() calls to create FETCHES edges to Route nodes
+    if (allFetchCalls.length > 0 && nextjsRouteRegistry && nextjsRouteRegistry.size > 0) {
+      // Collect consumer file paths and read their contents for key extraction
+      const consumerPaths = [...new Set(allFetchCalls.map(c => c.filePath))];
+      const consumerContents = await readFileContents(repoPath, consumerPaths);
+      processNextjsFetchRoutes(graph, allFetchCalls, nextjsRouteRegistry, consumerContents);
     }
 
     // Log resolution cache stats
@@ -546,3 +642,93 @@ export const runPipelineFromRepo = async (
     throw error;
   }
 };
+
+/**
+ * Topological sort of files by import dependencies.
+ * Files with no imports (in-degree 0) go in level 0.
+ * Files that only depend on level 0 go in level 1, etc.
+ * Files involved in cycles (no entry point) are grouped in a final level
+ * and contribute to cycleCount.
+ *
+ * @param importMap  Map of file path → set of files it imports
+ * @returns levels array (each level is an array of file paths) and cycle count
+ */
+export function topologicalLevelSort(
+  importMap: Map<string, Set<string>>
+): { levels: string[][]; cycleCount: number } {
+  // in-degree = number of unprocessed dependencies this file has
+  // A file can be processed when all its dependencies (imports) are processed
+  const inDegree = new Map<string, number>();
+  // dependents = files that depend on this file (for notification)
+  const dependents = new Map<string, Set<string>>();
+
+  // Collect ALL files: both keys (files with imports) and values (imported files)
+  const allFiles = new Set<string>(importMap.keys());
+  for (const deps of importMap.values()) {
+    for (const dep of deps) {
+      allFiles.add(dep);
+    }
+  }
+
+  // Initialize: all files start with in-degree 0
+  for (const file of allFiles) {
+    inDegree.set(file, 0);
+    dependents.set(file, new Set());
+  }
+
+  // Compute in-degrees: for each file, count its dependencies (imports)
+  // Build reverse graph: for each imported file, track who imports it
+  for (const [file, deps] of importMap) {
+    // in-degree is the number of dependencies this file has
+    inDegree.set(file, deps.size);
+    for (const dep of deps) {
+      // dep is imported by file, so file depends on dep
+      // When dep is processed, file should be notified
+      dependents.get(dep)!.add(file);
+    }
+  }
+
+  const levels: string[][] = [];
+  let cycleCount = 0;
+
+  // Kahn's algorithm: process nodes with in-degree 0 (no remaining dependencies)
+  let queue: string[] = [];
+  for (const [file, degree] of inDegree) {
+    if (degree === 0) queue.push(file);
+  }
+
+  while (queue.length > 0) {
+    // All nodes in current queue are at the same level
+    levels.push([...queue]);
+    
+    // Process all nodes at current level and collect next level
+    const nextQueue: string[] = [];
+    for (const file of queue) {
+      // Notify all dependents that this dependency is processed
+      for (const dependent of dependents.get(file) ?? new Set()) {
+        const newDegree = (inDegree.get(dependent) ?? 1) - 1;
+        inDegree.set(dependent, newDegree);
+        if (newDegree === 0) {
+          nextQueue.push(dependent);
+        }
+      }
+    }
+    
+    queue = nextQueue;
+  }
+
+  // Remaining nodes are in cycles (no entry point found)
+  const cycleNodes: string[] = [];
+  for (const [file, degree] of inDegree) {
+    if (degree > 0) {
+      cycleNodes.push(file);
+    }
+  }
+
+  if (cycleNodes.length > 0) {
+    levels.push(cycleNodes);
+    cycleCount = cycleNodes.length;
+  }
+
+  return { levels, cycleCount };
+}
