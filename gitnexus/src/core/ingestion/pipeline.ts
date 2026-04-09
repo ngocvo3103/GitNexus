@@ -7,7 +7,7 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutes, processExpoRouterNavigations, processDecoratorRoutes, processPHPRoutes, processNextjsRoutes, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted } from './call-processor.js';
+import { processCalls, processCallsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutesWithRepoId, processExpoRouterNavigations, processDecoratorRoutesWithRepoId, processPHPRoutesWithRepoId, processNextjsRoutesWithRepoId, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted } from './call-processor.js';
 import type { ExtractedRoute, ExtractedExpoNav, ExtractedORMQuery, ExtractedDecoratorRoute, ExtractedFetchCall, ExtractedToolDef } from './workers/parse-worker.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
@@ -15,7 +15,7 @@ import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
 import { extractDependencies } from './dependency-extractor.js';
 import { writeManifest } from '../../storage/repo-manifest.js';
-import { createResolutionContext } from './resolution-context.js';
+import { createResolutionContext, type ResolutionContext } from './resolution-context.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
@@ -48,8 +48,8 @@ export const runPipelineFromRepo = async (
   options?: PipelineOptions,
 ): Promise<PipelineResult> => {
   const graph = createKnowledgeGraph();
-  const ctx = createResolutionContext(graph);
-  const symbolTable = ctx.symbols;
+  let ctx: ResolutionContext;
+  let symbolTable;
   let astCache = createASTCache(AST_CACHE_CAP);
 
   const cleanup = () => {
@@ -145,9 +145,12 @@ export const runPipelineFromRepo = async (
       if (isDev && manifest.dependencies.length > 0) {
         console.log(`📦 Extracted ${manifest.dependencies.length} dependencies from ${extractionResult.ecosystem}`);
       }
+      // Pass repoId to ResolutionContext so Route nodes get repoId property (WI-12)
+      ctx = createResolutionContext(graph, extractionResult.repoId);
+      symbolTable = ctx.symbols;
     } catch (err) {
       // Non-fatal: dependency extraction failure shouldn't stop indexing
-      if (isDev) console.warn('Dependency extraction failed:', (err as Error).message);
+      console.warn('Dependency extraction failed:', (err as Error).message);
     }
 
     // ── Phase 3+4: Chunked read + parse ────────────────────────────────
@@ -432,7 +435,7 @@ export const runPipelineFromRepo = async (
     // Process Expo Router routes and navigation
     const expoPaths = allPaths.filter(p => p.includes('app/'));
     if (expoPaths.length > 0) {
-      const routeRegistry = processExpoRoutes(graph, expoPaths);
+      const routeRegistry = processExpoRoutesWithRepoId(graph, expoPaths, ctx.repoId ?? '');
       if (allExpoNavCalls.length > 0) {
         processExpoRouterNavigations(graph, allExpoNavCalls, routeRegistry);
       }
@@ -445,7 +448,7 @@ export const runPipelineFromRepo = async (
 
     // Process Express/Hono routes (decoratorRoutes extracted from JS/TS files)
     if (allDecoratorRoutes.length > 0) {
-      processDecoratorRoutes(graph, allDecoratorRoutes);
+      processDecoratorRoutesWithRepoId(graph, allDecoratorRoutes, ctx.repoId ?? '');
     }
 
     // Process MCP tool definitions (@mcp.tool() decorators)
@@ -457,7 +460,7 @@ export const runPipelineFromRepo = async (
     const phpApiPaths = allPaths.filter(p => p.endsWith('.php') && (p.startsWith('api/') || p.includes('/api/')));
     if (phpApiPaths.length > 0) {
       const phpContents = await readFileContents(repoPath, phpApiPaths);
-      processPHPRoutes(graph, phpApiPaths, phpContents);
+      processPHPRoutesWithRepoId(graph, phpApiPaths, phpContents, ctx.repoId ?? '');
     }
 
     // Process Next.js App Router routes (app/api/**/route.ts files)
@@ -466,7 +469,7 @@ export const runPipelineFromRepo = async (
     let nextjsRouteRegistry: Map<string, string> | undefined;
     if (nextjsRoutePaths.length > 0) {
       const nextjsContents = await readFileContents(repoPath, nextjsRoutePaths);
-      nextjsRouteRegistry = processNextjsRoutes(graph, nextjsRoutePaths, nextjsContents);
+      nextjsRouteRegistry = processNextjsRoutesWithRepoId(graph, nextjsRoutePaths, nextjsContents, ctx.repoId ?? '');
     }
 
     // Process Next.js project-level middleware.ts and link to matching routes

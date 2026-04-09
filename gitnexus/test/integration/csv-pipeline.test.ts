@@ -114,7 +114,7 @@ describe('streamAllCSVsToDisk', () => {
     const lines = content.trim().split('\n');
 
     expect(lines[0]).toBe(
-      'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited',
+      'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited,repoId,responseKeys,errorKeys,middleware',
     );
     expect(content).toContain('"GET"');
     expect(content).toContain('"get"');

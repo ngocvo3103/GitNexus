@@ -48,6 +48,8 @@ export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
 export type ModuleAliasMap = Map<string, Map<string, string>>;
 
 export interface ResolutionContext {
+  /** Optional repository ID for the repository being ingested. */
+  readonly repoId?: string;
   /** Optional graph for D5 IMPLEMENTS edge lookups. */
   readonly graph?: KnowledgeGraph;
 
@@ -86,7 +88,7 @@ export interface ResolutionContext {
   findImplementations(interfaceIds: Set<string>): Set<string>;
 }
 
-export const createResolutionContext = (graph?: KnowledgeGraph): ResolutionContext => {
+export const createResolutionContext = (graph?: KnowledgeGraph, repoId?: string): ResolutionContext => {
   const symbols = createSymbolTable();
   const importMap: ImportMap = new Map();
   const packageMap: PackageMap = new Map();
@@ -215,6 +217,7 @@ export const createResolutionContext = (graph?: KnowledgeGraph): ResolutionConte
   };
 
   return {
+    repoId,
     resolve,
     symbols,
     importMap,

@@ -1547,6 +1547,7 @@ export const processRoutesFromExtracted = async (
           startLine: route.lineNumber,
           lineNumber: route.lineNumber,
           isInherited: route.isInherited ?? false,
+          repoId: ctx.repoId,
         },
       });
       created++;
@@ -1606,6 +1607,210 @@ export const processRoutesFromExtracted = async (
   }
 
   onProgress?.(extractedRoutes.length, extractedRoutes.length);
+};
+
+
+// WI-12: repoId parameter variant — used by pipeline.ts post-processing
+export const processExpoRoutesWithRepoId = (
+  graph: KnowledgeGraph,
+  filePaths: string[],
+  repoId: string,
+): Map<string, string> => {
+  const routeRegistry = new Map<string, string>();
+  const nextjsRoutePattern = /(?:^|\/)app\/api\/.*\/route\.(ts|js|tsx|jsx)$/;
+
+  for (const filePath of filePaths) {
+    if (nextjsRoutePattern.test(filePath)) continue;
+    const routeURL = expoFileToRouteURL(filePath);
+    if (!routeURL) continue;
+
+    const routeId = generateId('Route', routeURL);
+    const fileId = generateId('File', filePath);
+
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        filePath,
+        routeType: 'expo-router',
+        repoId,
+      },
+    });
+
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}->${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'expo-router-file',
+    });
+
+    routeRegistry.set(routeURL, filePath);
+  }
+
+  return routeRegistry;
+};
+
+export const processNextjsRoutesWithRepoId = (
+  graph: KnowledgeGraph,
+  filePaths: string[],
+  fileContents: Map<string, string>,
+  repoId: string,
+): Map<string, string> => {
+  const routeRegistry = new Map<string, string>();
+  let created = 0;
+
+  for (const filePath of filePaths) {
+    const routeURL = nextjsFileToRouteURL(filePath);
+    if (!routeURL) continue;
+    const content = fileContents.get(filePath);
+    if (!content) continue;
+
+    const { responseKeys, errorKeys } = extractResponseShapes(content);
+    const mwResult = extractMiddlewareChain(content);
+    const middleware = mwResult?.chain ?? [];
+
+    const routeId = generateId('Route', routeURL);
+    const fileId = generateId('File', filePath);
+
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        routePath: routeURL,
+        filePath,
+        routeType: 'nextjs-app-router',
+        repoId,
+        ...(responseKeys && responseKeys.length > 0 && { responseKeys }),
+        ...(errorKeys && errorKeys.length > 0 && { errorKeys }),
+        ...(middleware.length > 0 && { middleware }),
+      },
+    });
+
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}->${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'nextjs-app-router',
+    });
+
+    routeRegistry.set(routeURL, filePath);
+    created++;
+  }
+
+  return routeRegistry;
+};
+
+export const processDecoratorRoutesWithRepoId = (
+  graph: KnowledgeGraph,
+  decoratorRoutes: ExtractedDecoratorRoute[],
+  repoId: string,
+): void => {
+  const logVerbose = isVerboseIngestionEnabled();
+  let created = 0;
+
+  for (const route of decoratorRoutes) {
+    const routePath = route.path;
+    if (!routePath) continue;
+    const httpMethod = (route.decorator || 'get').toUpperCase();
+    if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'ALL'].includes(httpMethod)) continue;
+
+    const routeId = generateId('Route', `${route.filePath}:${route.decorator}:${routePath}`);
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routePath,
+        httpMethod,
+        routePath,
+        filePath: route.filePath,
+        startLine: route.lineNumber,
+        lineNumber: route.lineNumber,
+        repoId,
+      },
+    });
+    created++;
+
+    const fileId = generateId('File', route.filePath);
+
+    graph.addRelationship({
+      id: generateId('DEFINES', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'DEFINES',
+      confidence: 1.0,
+      reason: 'express-route',
+    });
+
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'express-route',
+    });
+  }
+};
+
+export const processPHPRoutesWithRepoId = (
+  graph: KnowledgeGraph,
+  phpFilePaths: string[],
+  phpFileContents: Map<string, string>,
+  repoId: string,
+): void => {
+  const logVerbose = isVerboseIngestionEnabled();
+  let created = 0;
+
+  for (const filePath of phpFilePaths) {
+    const routeURL = phpFileToRouteURL(filePath);
+    if (!routeURL) continue;
+    const content = phpFileContents.get(filePath);
+    if (!content) continue;
+
+    const { responseKeys, errorKeys } = extractPHPResponseShapes(content);
+
+    const routeId = generateId('Route', `${filePath}:${routeURL}`);
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        routePath: routeURL,
+        filePath,
+        httpMethod: 'GET',
+        repoId,
+        ...(responseKeys !== undefined && { responseKeys }),
+        ...(errorKeys !== undefined && { errorKeys }),
+      },
+    });
+    created++;
+
+    const fileId = generateId('File', filePath);
+
+    graph.addRelationship({
+      id: generateId('DEFINES', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'DEFINES',
+      confidence: 1.0,
+      reason: 'php-file-route',
+    });
+
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'php-file-route',
+    });
+  }
 };
 
 /**

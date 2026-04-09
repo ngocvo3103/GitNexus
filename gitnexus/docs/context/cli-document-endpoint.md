@@ -30,7 +30,8 @@ Analyzes the call chain from an HTTP endpoint handler through all service layers
 | `--depth <n>` | No | 10 | Maximum call chain depth to trace |
 | `--include-context` | No | false | Include source code snippets for AI enrichment |
 | `--compact` | No | false | Omit source content and empty arrays (use with `--include-context`) |
-| `--openapi` | No | false | Preserve raw BodySchema for OpenAPI generation (includes validation annotations) |
+| `--openapi` | No | false | Write both JSON and OpenAPI 3.1.0 YAML spec to `--outputPath` (requires `--outputPath`) |
+| `--outputPath <path>` | No | - | Output directory for JSON and OpenAPI YAML files (required with `--openapi`) |
 | `--schema-path <path>` | No | bundled | Path to custom JSON schema file for output validation |
 | `--strict` | No | warn | Fail on schema validation errors (default: warn only) |
 | `-r, --repo <name>` | No | - | Target repository (if multiple indexed) |
@@ -100,29 +101,77 @@ Preserves full `BodySchema` structure with:
 
 ### OpenAPI Mode (`--openapi`)
 
-Preserves raw `BodySchema` structure optimized for OpenAPI 3.0 schema generation:
-- Includes all validation annotations in field metadata
-- Preserves nested type structures for recursive schema generation
-- Suitable for piping to OpenAPI bundler/converter
+Generates OpenAPI 3.1.0 YAML specification alongside the default JSON output. Requires `--outputPath` to specify the output directory.
 
-```json
-{
-  "specs": {
-    "request": {
-      "body": {
-        "typeName": "SuggestionOrderDto",
-        "fields": [
-          {
-            "name": "productCode",
-            "type": "String",
-            "annotations": ["@NotEmpty(message = \"Product code is required\")"],
-            "nullable": false
-          }
-        ]
-      }
-    }
-  }
-}
+**Output Files:**
+- `{METHOD}_{sanitized-path}.json` - Default JSON documentation
+- `{METHOD}_{sanitized-path}.openapi.yaml` - OpenAPI 3.1.0 YAML specification
+
+```bash
+# Generate both JSON and OpenAPI YAML
+gitnexus document-endpoint --method PUT --path "bookings/suggest" --openapi --outputPath ./docs/api
+
+# Outputs:
+# ./docs/api/PUT_e_v1_bookings_productCode_suggest.json
+# ./docs/api/PUT_e_v1_bookings_productCode_suggest.openapi.yaml
+```
+
+**YAML Spec Features:**
+- Full OpenAPI 3.1.0 compliance
+- Parameter locations (`path`, `query`, `header`, `cookie`) from Spring annotations
+- Request body schemas with required fields
+- Response schemas differentiated by status code (2xx vs 4xx/5xx)
+- Nested type resolution for complex DTOs
+- Validation annotations mapped to OpenAPI constraints
+
+```yaml
+openapi: '3.1.0'
+info:
+  title: 'API - /e/v1/bookings/{productCode}/suggest'
+  version: '1.0.0'
+paths:
+  /e/v1/bookings/{productCode}/suggest:
+    put:
+      summary: Suggest booking
+      operationId: put_e_v1_bookings_productCode_suggest
+      parameters:
+        - name: productCode
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuggestionOrderDto'
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuggestionResultDto'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  schemas:
+    SuggestionOrderDto:
+      type: object
+      required:
+        - productCode
+        - quantity
+      properties:
+        productCode:
+          type: string
+          minLength: 1
+        quantity:
+          type: integer
 ```
 
 ### Strict Mode (`--strict`)
@@ -178,11 +227,21 @@ gitnexus document-endpoint --method POST --path "orders" --depth 5
 gitnexus document-endpoint --method GET --path "bonds" -r tcbs-bond-trading
 ```
 
-### OpenAPI Schema Generation
+### OpenAPI YAML Generation
 
 ```bash
-# Generate output suitable for OpenAPI 3.0 schema generation
-gitnexus document-endpoint --method PUT --path "bookings/suggest" --openapi > openapi-schema.json
+# Generate both JSON and OpenAPI 3.1.0 YAML files
+gitnexus document-endpoint --method PUT --path "bookings/suggest" --openapi --outputPath ./docs/api
+
+# Files written:
+# ./docs/api/PUT_e_v1_bookings_productCode_suggest.json
+# ./docs/api/PUT_e_v1_bookings_productCode_suggest.openapi.yaml
+```
+
+**Validate OpenAPI YAML:**
+```bash
+# Using Redocly CLI
+npx @redocly/cli lint ./docs/api/PUT_e_v1_bookings_productCode_suggest.openapi.yaml
 ```
 
 ### Strict Validation
@@ -612,13 +671,11 @@ The following options are NOT currently implemented but may be useful:
 | Option | Description | Status |
 |--------|-------------|--------|
 | `--all` | Document all endpoints in the repository | Not implemented |
-| `--format <format>` | Output format: `json` (default) or `yaml` | Not implemented |
-| `--output <file>` | Write output to file instead of stdout | Not implemented |
+| `--format <format>` | Output format: `json` (default) or `yaml` | Partial: use `--openapi --outputPath` for YAML |
 
 Workarounds:
 - **Document multiple endpoints**: Use a shell script to iterate over endpoints
-- **YAML output**: Pipe JSON through `yq` or `jq` for conversion
-- **Write to file**: Redirect stdout: `gitnexus document-endpoint ... > output.json`
+- **YAML output**: Use `--openapi --outputPath` to generate OpenAPI YAML
 
 ## See Also
 

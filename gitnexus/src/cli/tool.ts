@@ -16,8 +16,38 @@
  */
 
 import { writeSync } from 'node:fs';
+import { resolve } from 'path';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { ensureHeap } from './heap-utils.js';
+
+/**
+ * Validates that the user-provided output path is safe to use.
+ * Prevents path traversal attacks by ensuring the resolved path
+ * stays within allowed directories (cwd, home, /tmp, /var/tmp).
+ */
+function validateOutputPath(userPath: string): string {
+  const resolved = resolve(userPath);
+
+  // Check for path traversal sequences
+  if (userPath.includes('..')) {
+    console.error('Error: --outputPath cannot contain ".." sequences');
+    process.exit(1);
+  }
+
+  // Resolve to absolute and verify it's within safe boundaries
+  const cwd = process.cwd();
+  const home = process.env.HOME || process.env.USERPROFILE;
+  const safeRoots = [cwd, home, '/tmp', '/var/tmp'].filter(Boolean);
+
+  const isSafe = safeRoots.some(root => resolved.startsWith(resolve(root)));
+
+  if (!isSafe) {
+    console.error(`Error: --outputPath must be within current directory, home, or /tmp`);
+    process.exit(1);
+  }
+
+  return resolved;
+}
 
 let _backend: LocalBackend | null = null;
 
@@ -42,8 +72,18 @@ async function getBackend(): Promise<LocalBackend> {
  *
  * Falls back to stderr if the fd write fails (e.g., broken pipe).
  */
+
+/**
+ * JSON replacer that converts Map instances to plain objects.
+ * JavaScript's JSON.stringify serializes Map as {} — this replacer
+ * preserves nestedSchemas entries (and any other Map-valued fields)
+ * in CLI JSON output without modifying in-memory data structures.
+ */
+const mapReplacer = (_key: string, value: unknown): unknown =>
+  value instanceof Map ? Object.fromEntries(value) : value;
+
 function output(data: any): void {
-  const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+  const text = typeof data === 'string' ? data : JSON.stringify(data, mapReplacer, 2);
   try {
     writeSync(1, text + '\n');
   } catch (err: any) {
@@ -162,6 +202,7 @@ export async function documentEndpointCommand(options?: {
   includeContext?: boolean;
   compact?: boolean;
   openapi?: boolean;
+  outputPath?: string;
   repo?: string;
   schemaPath?: string;
   strict?: boolean;
@@ -175,7 +216,8 @@ export async function documentEndpointCommand(options?: {
     console.error('  --depth <n>           Max trace depth (default: 10)');
     console.error('  --include-context     Include source context for AI enrichment');
     console.error('  --compact             Omit source content and empty arrays (use with --include-context)');
-    console.error('  --openapi             Preserve raw BodySchema for OpenAPI generation');
+    console.error('  --openapi             Write both JSON and OpenAPI 3.1.0 YAML spec to --outputPath');
+    console.error('  --outputPath <path>   Output directory for JSON and OpenAPI YAML files (required with --openapi)');
     console.error('  --schema-path <path>  Path to custom JSON schema file (default: bundled schema)');
     console.error('  --strict              Fail on schema validation errors (default: warn)');
     console.error('  --repo <name>         Target repository');
@@ -213,5 +255,50 @@ export async function documentEndpointCommand(options?: {
     }
   }
 
-  output(result);
+  // Handle --openapi mode: write both JSON and OpenAPI YAML files
+  if (options.openapi) {
+    if (!options.outputPath) {
+      console.error('Error: --outputPath is required when using --openapi');
+      process.exit(1);
+    }
+
+    const { convertToOpenAPIDocument } = await import('../core/openapi/converter.js');
+    const yaml = await import('js-yaml');
+    const fs = await import('fs');
+    const pathMod = await import('path');
+
+    const safeOutputPath = validateOutputPath(options.outputPath);
+
+    // Ensure output directory exists
+    fs.mkdirSync(safeOutputPath, { recursive: true });
+
+    // Auto-generate base filename from method + path
+    // e.g., PUT /e/v1/bookings/{productCode}/suggest → PUT_e_v1_bookings_productCode_suggest
+    const sanitizedPath = result.path
+      .replace(/^\//, '')
+      .replace(/[{}]/g, '')
+      .replace(/[/\-:.]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/_$/, '');
+    const baseName = `${result.method.toUpperCase()}_${sanitizedPath}`;
+
+    // Write default JSON
+    const jsonPath = pathMod.join(safeOutputPath, `${baseName}.json`);
+    fs.writeFileSync(jsonPath, JSON.stringify(result, mapReplacer, 2), 'utf-8');
+
+    // Write OpenAPI YAML
+    const openApiDoc = convertToOpenAPIDocument([result], {
+      title: `API - ${result.path}`,
+      version: '1.0.0',
+      nestedSchemas: result.nestedSchemas,
+    });
+    const yamlPath = pathMod.join(safeOutputPath, `${baseName}.openapi.yaml`);
+    fs.writeFileSync(yamlPath, yaml.dump(openApiDoc, { lineWidth: -1, noRefs: true }), 'utf-8');
+
+    console.error(`Written: ${jsonPath}`);
+    console.error(`Written: ${yamlPath}`);
+  } else {
+    // Default: JSON to stdout (unchanged)
+    output(result);
+  }
 }

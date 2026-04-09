@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { processRoutesFromExtracted } from '../../src/core/ingestion/call-processor.js';
+import { processRoutesFromExtracted, processDecoratorRoutesWithRepoId, processNextjsRoutesWithRepoId, processExpoRoutesWithRepoId, processPHPRoutesWithRepoId } from '../../src/core/ingestion/call-processor.js';
 import { createResolutionContext, type ResolutionContext } from '../../src/core/ingestion/resolution-context.js';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
-import type { ExtractedRoute } from '../../src/core/ingestion/workers/parse-worker.js';
+import type { ExtractedRoute, ExtractedDecoratorRoute } from '../../src/core/ingestion/workers/parse-worker.js';
 
 describe('processRoutesFromExtracted - Route node creation (Spring routes)', () => {
   let graph: ReturnType<typeof createKnowledgeGraph>;
@@ -834,6 +834,300 @@ describe('processRoutesFromExtracted - Route node creation (Spring routes)', () 
       await processRoutesFromExtracted(graph, [], ctx);
       expect(graph.nodeCount).toBe(0);
       expect(graph.relationshipCount).toBe(0);
+    });
+  });
+
+  // ============================================================================
+  // WI-12: repoId on Route nodes
+  // ============================================================================
+  describe('WI-12: repoId on Route nodes', () => {
+    it('sets repoId on Route node when ctx.repoId is provided', async () => {
+      const ctxWithRepoId = createResolutionContext();
+      (ctxWithRepoId as any).repoId = 'tcbs-bond-trading';
+      ctxWithRepoId.symbols.add(
+        'src/controllers/UserController.java',
+        'UserController',
+        'Class:src/controllers/UserController.java:UserController',
+        'Class'
+      );
+      ctxWithRepoId.symbols.add(
+        'src/controllers/UserController.java',
+        'getUser',
+        'Method:src/controllers/UserController.java:getUser',
+        'Method',
+        { ownerId: 'Class:src/controllers/UserController.java:UserController' }
+      );
+
+      const routes: ExtractedRoute[] = [{
+        filePath: 'src/controllers/UserController.java',
+        httpMethod: 'GET',
+        routePath: '/users/{id}',
+        controllerName: 'UserController',
+        methodName: 'getUser',
+        middleware: [],
+        prefix: null,
+        lineNumber: 42,
+        isControllerClass: true,
+      }];
+
+      await processRoutesFromExtracted(graph, routes, ctxWithRepoId);
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(1);
+      expect(routeNodes[0].properties.repoId).toBe('tcbs-bond-trading');
+    });
+
+    it('leaves repoId absent on Route node when ctx has no repoId', async () => {
+      ctx.symbols.add(
+        'src/controllers/UserController.java',
+        'UserController',
+        'Class:src/controllers/UserController.java:UserController',
+        'Class'
+      );
+      ctx.symbols.add(
+        'src/controllers/UserController.java',
+        'getUser',
+        'Method:src/controllers/UserController.java:getUser',
+        'Method',
+        { ownerId: 'Class:src/controllers/UserController.java:UserController' }
+      );
+
+      const routes: ExtractedRoute[] = [{
+        filePath: 'src/controllers/UserController.java',
+        httpMethod: 'GET',
+        routePath: '/users/{id}',
+        controllerName: 'UserController',
+        methodName: 'getUser',
+        middleware: [],
+        prefix: null,
+        lineNumber: 42,
+        isControllerClass: true,
+      }];
+
+      await processRoutesFromExtracted(graph, routes, ctx);
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(1);
+      expect(routeNodes[0].properties.repoId).toBeUndefined();
+    });
+
+    it('sets same repoId on multiple Route nodes from same context', async () => {
+      const ctxWithRepoId = createResolutionContext();
+      (ctxWithRepoId as any).repoId = 'tcbs-bond-trading';
+      ctxWithRepoId.symbols.add(
+        'src/controllers/OrderController.java',
+        'OrderController',
+        'Class:src/controllers/OrderController.java:OrderController',
+        'Class'
+      );
+      ctxWithRepoId.symbols.add(
+        'src/controllers/OrderController.java',
+        'createOrder',
+        'Method:src/controllers/OrderController.java:createOrder',
+        'Method',
+        { ownerId: 'Class:src/controllers/OrderController.java:OrderController' }
+      );
+      ctxWithRepoId.symbols.add(
+        'src/controllers/OrderController.java',
+        'getOrder',
+        'Method:src/controllers/OrderController.java:getOrder',
+        'Method',
+        { ownerId: 'Class:src/controllers/OrderController.java:OrderController' }
+      );
+
+      const routes: ExtractedRoute[] = [
+        {
+          filePath: 'src/controllers/OrderController.java',
+          httpMethod: 'POST',
+          routePath: '/orders',
+          controllerName: 'OrderController',
+          methodName: 'createOrder',
+          middleware: [],
+          prefix: null,
+          lineNumber: 25,
+          isControllerClass: true,
+        },
+        {
+          filePath: 'src/controllers/OrderController.java',
+          httpMethod: 'GET',
+          routePath: '/orders/{id}',
+          controllerName: 'OrderController',
+          methodName: 'getOrder',
+          middleware: [],
+          prefix: null,
+          lineNumber: 30,
+          isControllerClass: true,
+        },
+      ];
+
+      await processRoutesFromExtracted(graph, routes, ctxWithRepoId);
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(2);
+      expect(routeNodes[0].properties.repoId).toBe('tcbs-bond-trading');
+      expect(routeNodes[1].properties.repoId).toBe('tcbs-bond-trading');
+    });
+  });
+});
+
+// WI-12: repoId on non-Spring Route nodes (Expo, Next.js, Decorator, PHP)
+// These test the WithRepoId variants used by pipeline.ts post-processing
+describe('WI-12: repoId on non-Spring Route nodes (Expo/Next.js/Decorator/PHP)', () => {
+  let graph: ReturnType<typeof createKnowledgeGraph>;
+
+  beforeEach(() => {
+    graph = createKnowledgeGraph();
+  });
+
+  describe('processDecoratorRoutesWithRepoId', () => {
+    it('sets repoId on Route node created from decorator route', async () => {
+      const { processDecoratorRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+      const decoratorRoutes = [{
+        filePath: 'src/routes/users.ts',
+        decorator: 'get',
+        method: 'getUser',
+        path: '/users/:id',
+        lineNumber: 10,
+      }];
+
+      processDecoratorRoutesWithRepoId(graph, decoratorRoutes, 'my-repo');
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(1);
+      expect(routeNodes[0].properties.repoId).toBe('my-repo');
+      expect(routeNodes[0].properties.routePath).toBe('/users/:id');
+      expect(routeNodes[0].properties.httpMethod).toBe('GET');
+    });
+
+    it('sets repoId on multiple Route nodes from decorator routes', async () => {
+      const { processDecoratorRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+      const decoratorRoutes = [
+        { filePath: 'src/routes/users.ts', decorator: 'get', method: 'getUser', path: '/users/:id', lineNumber: 10 },
+        { filePath: 'src/routes/users.ts', decorator: 'post', method: 'createUser', path: '/users', lineNumber: 15 },
+      ];
+
+      processDecoratorRoutesWithRepoId(graph, decoratorRoutes, 'tcbs-bond');
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(2);
+      expect(routeNodes[0].properties.repoId).toBe('tcbs-bond');
+      expect(routeNodes[1].properties.repoId).toBe('tcbs-bond');
+    });
+
+    it('skips routes with invalid HTTP method', async () => {
+      const { processDecoratorRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+      const decoratorRoutes = [
+        { filePath: 'src/routes/users.ts', decorator: 'custom', method: 'handler', path: '/custom', lineNumber: 10 },
+      ];
+
+      processDecoratorRoutesWithRepoId(graph, decoratorRoutes, 'my-repo');
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(0);
+    });
+  });
+
+  describe('processNextjsRoutesWithRepoId', () => {
+    it('sets repoId on Route node created from Next.js route file', async () => {
+      const { processNextjsRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+      const fileContents = new Map<string, string>([
+        ['app/api/users/route.ts', 'export async function GET() { return Response.json({}); }'],
+      ]);
+
+      const routeRegistry = processNextjsRoutesWithRepoId(
+        graph,
+        ['app/api/users/route.ts'],
+        fileContents,
+        'nextjs-repo',
+      );
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(1);
+      expect(routeNodes[0].properties.repoId).toBe('nextjs-repo');
+      expect(routeNodes[0].properties.routePath).toBe('/api/users');
+    });
+
+    it('sets repoId on multiple Next.js Route nodes', async () => {
+      const { processNextjsRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+      const fileContents = new Map<string, string>([
+        ['app/api/users/route.ts', 'export async function GET() { return Response.json({}); }'],
+        ['app/api/posts/route.ts', 'export async function POST() { return Response.json({}); }'],
+      ]);
+
+      processNextjsRoutesWithRepoId(
+        graph,
+        ['app/api/users/route.ts', 'app/api/posts/route.ts'],
+        fileContents,
+        'my-nextjs-app',
+      );
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(2);
+      expect(routeNodes[0].properties.repoId).toBe('my-nextjs-app');
+      expect(routeNodes[1].properties.repoId).toBe('my-nextjs-app');
+    });
+  });
+
+  describe('processExpoRoutesWithRepoId', () => {
+    it('sets repoId on Route node created from Expo Router file', async () => {
+      const { processExpoRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+
+      const routeRegistry = processExpoRoutesWithRepoId(
+        graph,
+        ['app/(tabs)/index.tsx'],
+        'expo-repo',
+      );
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(1);
+      expect(routeNodes[0].properties.repoId).toBe('expo-repo');
+      expect(routeNodes[0].properties.routeType).toBe('expo-router');
+    });
+
+    it('sets repoId on multiple Expo Route nodes', async () => {
+      const { processExpoRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+
+      processExpoRoutesWithRepoId(
+        graph,
+        ['app/(tabs)/index.tsx', 'app/settings.tsx'],
+        'my-expo-app',
+      );
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(2);
+      expect(routeNodes[0].properties.repoId).toBe('my-expo-app');
+      expect(routeNodes[1].properties.repoId).toBe('my-expo-app');
+    });
+  });
+
+  describe('processPHPRoutesWithRepoId', () => {
+    it('sets repoId on Route node created from PHP api file', async () => {
+      const { processPHPRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+      const phpFileContents = new Map<string, string>([
+        ['api/users.php', '<?php json_encode(["id" => 1]);'],
+      ]);
+
+      processPHPRoutesWithRepoId(graph, ['api/users.php'], phpFileContents, 'php-repo');
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(1);
+      expect(routeNodes[0].properties.repoId).toBe('php-repo');
+      expect(routeNodes[0].properties.routePath).toBe('/api/users');
+    });
+
+    it('sets repoId on multiple PHP Route nodes', async () => {
+      const { processPHPRoutesWithRepoId } = await import('../../src/core/ingestion/call-processor.js');
+      const phpFileContents = new Map<string, string>([
+        ['api/users.php', '<?php json_encode(["id" => 1]);'],
+        ['api/posts.php', '<?php json_encode(["id" => 1]);'],
+      ]);
+
+      processPHPRoutesWithRepoId(graph, ['api/users.php', 'api/posts.php'], phpFileContents, 'tcbs-php');
+
+      const routeNodes = graph.nodes.filter(n => n.label === 'Route');
+      expect(routeNodes).toHaveLength(2);
+      expect(routeNodes[0].properties.repoId).toBe('tcbs-php');
+      expect(routeNodes[1].properties.repoId).toBe('tcbs-php');
     });
   });
 });

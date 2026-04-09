@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   bodySchemaToOpenAPISchema,
+  codesToResponses,
   convertToOpenAPIPathItem,
   convertToOpenAPIDocument,
   generateSchemaName,
@@ -206,6 +207,169 @@ describe('generateSchemaName', () => {
   });
 });
 
+// WI-7: @NotNull minLength constraint only applies to string types
+describe('WI-7: @NotNull minLength on integer types', () => {
+  const cases = [
+    { type: 'String', annotation: '@NotNull', expectMinLength: true, label: '@NotNull on String → minLength 1' },
+    { type: 'Long', annotation: '@NotNull', expectMinLength: false, label: '@NotNull on Long → no minLength' },
+    { type: 'String', annotation: '@NotEmpty', expectMinLength: true, label: '@NotEmpty on String → minLength 1' },
+    { type: 'Integer', annotation: '@NotEmpty', expectMinLength: false, label: '@NotEmpty on Integer → no minLength' },
+    { type: 'String', annotation: '@NotBlank', expectMinLength: true, label: '@NotBlank on String → minLength 1' },
+    { type: 'Integer', annotation: '@NotBlank', expectMinLength: false, label: '@NotBlank on Integer → no minLength' },
+    { type: 'BigDecimal', annotation: '@NotNull', expectMinLength: false, label: '@NotNull on BigDecimal → no minLength' },
+    { type: 'Boolean', annotation: '@NotNull', expectMinLength: false, label: '@NotNull on Boolean → no minLength' },
+  ];
+
+  cases.forEach(({ type, annotation, expectMinLength, label }) => {
+    it(label, () => {
+      const schema: BodySchema = {
+        typeName: 'TestDto',
+        source: 'indexed',
+        fields: [
+          { name: 'field', type, annotations: [annotation] },
+        ],
+      };
+      const result = bodySchemaToOpenAPISchema(schema);
+      if (expectMinLength) {
+        expect(result.properties?.field.minLength).toBe(1);
+      } else {
+        expect(result.properties?.field.minLength).toBeUndefined();
+      }
+    });
+  });
+});
+
+// WI-8: required array includes integer fields with @NotNull (not tied to minLength)
+describe('WI-8: required array on top-level component schemas', () => {
+  it('integer @NotNull field is in required', () => {
+    const schema: BodySchema = {
+      typeName: 'OrderDto',
+      source: 'indexed',
+      fields: [
+        { name: 'id', type: 'Long', annotations: ['@NotNull'] },
+        { name: 'name', type: 'String', annotations: [] },
+      ],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    expect(result.required).toContain('id');
+    expect(result.required).not.toContain('name');
+  });
+
+  it('no required annotations → undefined/empty required', () => {
+    const schema: BodySchema = {
+      typeName: 'UserDto',
+      source: 'indexed',
+      fields: [
+        { name: 'id', type: 'Long', annotations: [] },
+        { name: 'name', type: 'String', annotations: [] },
+      ],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    expect(result.required).toBeUndefined();
+  });
+
+  it('mixed types in required', () => {
+    const schema: BodySchema = {
+      typeName: 'MixedDto',
+      source: 'indexed',
+      fields: [
+        { name: 'id', type: 'Long', annotations: ['@NotNull'] },
+        { name: 'count', type: 'Integer', annotations: ['@NotNull'] },
+        { name: 'optional', type: 'String', annotations: [] },
+      ],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    expect(result.required).toContain('id');
+    expect(result.required).toContain('count');
+    expect(result.required).not.toContain('optional');
+  });
+
+  it('all three annotation types populate required', () => {
+    const schema: BodySchema = {
+      typeName: 'AllAnnotationsDto',
+      source: 'indexed',
+      fields: [
+        { name: 'a', type: 'String', annotations: ['@NotNull'] },
+        { name: 'b', type: 'String', annotations: ['@NotEmpty'] },
+        { name: 'c', type: 'String', annotations: ['@NotBlank'] },
+        { name: 'd', type: 'String', annotations: [] },
+      ],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    expect(result.required).toContain('a');
+    expect(result.required).toContain('b');
+    expect(result.required).toContain('c');
+    expect(result.required).not.toContain('d');
+  });
+});
+
+// WI-9: Date format fix and field-name heuristics
+describe('WI-9: Date format and field-name heuristics', () => {
+  // EP: type-based format cases
+  it('Date → date-time', () => {
+    const schema: BodySchema = {
+      typeName: 'EventDto',
+      source: 'indexed',
+      fields: [{ name: 'createdAt', type: 'Date', annotations: [] }],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    expect(result.properties?.createdAt.format).toBe('date-time');
+  });
+
+  it('LocalDate → date', () => {
+    const schema: BodySchema = {
+      typeName: 'ScheduleDto',
+      source: 'indexed',
+      fields: [{ name: 'birthDate', type: 'LocalDate', annotations: [] }],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    expect(result.properties?.birthDate.format).toBe('date');
+  });
+
+  it('LocalDateTime → date-time', () => {
+    const schema: BodySchema = {
+      typeName: 'EventDto',
+      source: 'indexed',
+      fields: [{ name: 'eventTime', type: 'LocalDateTime', annotations: [] }],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    expect(result.properties?.eventTime.format).toBe('date-time');
+  });
+
+  // Field-name heuristics: *Time → date-time
+  it('field *Time → date-time when type format is undefined', () => {
+    const schema: BodySchema = {
+      typeName: 'UpdateDto',
+      source: 'indexed',
+      fields: [{ name: 'updateTime', type: 'Instant', annotations: [] }],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    // Instant already has date-time, verify field-name doesn't break it
+    expect(result.properties?.updateTime.format).toBe('date-time');
+  });
+
+  it('field without time suffix → no heuristic format', () => {
+    const schema: BodySchema = {
+      typeName: 'StatusDto',
+      source: 'indexed',
+      fields: [{ name: 'username', type: 'String', annotations: [] }],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    expect(result.properties?.username.format).toBeUndefined();
+  });
+
+  it('type format overrides field-name heuristic', () => {
+    const schema: BodySchema = {
+      typeName: 'UserDto',
+      source: 'indexed',
+      fields: [{ name: 'birthdayTime', type: 'LocalDate', annotations: [] }],
+    };
+    const result = bodySchemaToOpenAPISchema(schema);
+    // LocalDate → date, not overridden by *Time suffix
+    expect(result.properties?.birthdayTime.format).toBe('date');
+  });
+});
+
 describe('shouldExtractToComponents', () => {
   it('returns true for named indexed types with fields', () => {
     const schema: BodySchema = {
@@ -231,5 +395,404 @@ describe('shouldExtractToComponents', () => {
       isContainer: true,
     };
     expect(shouldExtractToComponents(schema)).toBe(false);
+  });
+});
+
+describe('codesToResponses', () => {
+  it('4xx uses $ref for ErrorResponse', () => {
+    const codes = [{ code: 400, description: 'Bad Request' }];
+    const components = {};
+    const result = codesToResponses(codes, null, components, true);
+    expect(result['400']).toBeDefined();
+    expect(result['400'].content).toBeDefined();
+    expect(result['400'].content['application/json'].schema).toEqual({ $ref: '#/components/schemas/ErrorResponse' });
+  });
+
+  it('5xx uses $ref for ErrorResponse', () => {
+    const codes = [{ code: 500, description: 'Internal Server Error' }];
+    const components = {};
+    const result = codesToResponses(codes, null, components, true);
+    expect(result['500']).toBeDefined();
+    expect(result['500'].content).toBeDefined();
+    expect(result['500'].content['application/json'].schema).toEqual({ $ref: '#/components/schemas/ErrorResponse' });
+  });
+
+  it('ErrorResponse appears in components exactly once', () => {
+    const codes = [
+      { code: 400, description: 'Bad Request' },
+      { code: 404, description: 'Not Found' },
+      { code: 500, description: 'Internal Server Error' },
+    ];
+    const components = {};
+    codesToResponses(codes, null, components, true);
+    expect(components.schemas).toBeDefined();
+    const schemaNames = Object.keys(components.schemas!);
+    const count = schemaNames.filter(n => n === 'ErrorResponse').length;
+    expect(count).toBe(1);
+  });
+
+  it('success response uses actual body schema (unaffected)', () => {
+    const codes = [{ code: 200, description: 'OK' }];
+    const components = {};
+    const result = codesToResponses(codes, null, components, true);
+    expect(result['200']).toBeDefined();
+    // Success with null body — 200 response has no schema in content
+    expect(result['200'].content).toBeUndefined();
+  });
+
+  it('aggregates descriptions when multiple codes share same HTTP status', () => {
+    const codes = [
+      { code: 400, description: 'Validation failed' },
+      { code: 400, description: 'Invalid input' },
+      { code: 400, description: 'Missing required field' },
+    ];
+    const components = {};
+    const result = codesToResponses(codes, null, components, true);
+    expect(Object.keys(result)).toHaveLength(1);
+    expect(result['400'].description).toBe('Validation failed | Invalid input | Missing required field');
+  });
+
+  it('preserves distinct status codes', () => {
+    const codes = [
+      { code: 200, description: 'OK' },
+      { code: 400, description: 'Bad Request' },
+      { code: 500, description: 'Internal Server Error' },
+    ];
+    const components = {};
+    const result = codesToResponses(codes, null, components, true);
+    expect(Object.keys(result)).toHaveLength(3);
+    expect(result['200']).toBeDefined();
+    expect(result['400']).toBeDefined();
+    expect(result['500']).toBeDefined();
+  });
+
+  it('returns default response for empty codes', () => {
+    const codes: Array<{ code: number; description?: string }> = [];
+    const components = {};
+    const result = codesToResponses(codes, null, components, true);
+    expect(Object.keys(result)).toHaveLength(1);
+    expect(result['default']).toBeDefined();
+    expect(result['default'].description).toBe('Default response');
+  });
+
+  it('attaches example for success BodySchema response', () => {
+    const bodySchema: BodySchema = {
+      typeName: 'User',
+      source: 'indexed',
+      fields: [
+        { name: 'id', type: 'Long', annotations: ['@NotNull'] },
+        { name: 'name', type: 'String', annotations: [] },
+      ],
+    };
+    const codes = [{ code: 200, description: 'Success' }];
+    const components = {};
+    const result = codesToResponses(codes, bodySchema, components, true);
+    expect(result['200']).toBeDefined();
+    expect(result['200'].content).toBeDefined();
+    expect(result['200'].content['application/json'].example).toBeDefined();
+    expect(result['200'].content['application/json'].example.id).toBe(0);
+    expect(result['200'].content['application/json'].example.name).toBeDefined();
+  });
+});
+
+describe('external dependencies extensions', () => {
+  it('includes downstream APIs in markdown description table', () => {
+    const result = {
+      method: 'GET',
+      path: '/users/{id}',
+      summary: 'Get user',
+      specs: {
+        request: { params: [], body: null, validation: [] },
+        response: { body: null, codes: [{ code: 200, description: 'OK' }] },
+      },
+      externalDependencies: {
+        downstreamApis: [
+          { serviceName: 'auth-service', endpoint: 'POST /validate', condition: 'always', purpose: 'Validate token' },
+        ],
+        messaging: { outbound: [], inbound: [] },
+        persistence: [],
+      },
+    };
+
+    const components = {};
+    const pathItem = convertToOpenAPIPathItem(result as any, components);
+
+    expect(pathItem.get).toBeDefined();
+    expect(pathItem.get?.['x-downstream-apis']).toBeUndefined();
+    expect(pathItem.get?.description).toBeDefined();
+    expect(pathItem.get?.description).toContain('## External Dependencies');
+    expect(pathItem.get?.description).toContain('**Downstream APIs:**');
+    expect(pathItem.get?.description).toContain('| Service | Method | Endpoint |');
+    expect(pathItem.get?.description).toContain('| auth-service | POST | /validate |');
+  });
+
+  it('includes messaging in markdown description table', () => {
+    const result = {
+      method: 'POST',
+      path: '/users',
+      summary: 'Create user',
+      specs: {
+        request: { params: [], body: null, validation: [] },
+        response: { body: null, codes: [{ code: 201, description: 'Created' }] },
+      },
+      externalDependencies: {
+        downstreamApis: [],
+        messaging: {
+          outbound: [{ topic: 'user-events', trigger: 'on success' }],
+          inbound: [{ topic: 'config-updates' }],
+        },
+        persistence: [],
+      },
+    };
+
+    const components = {};
+    const pathItem = convertToOpenAPIPathItem(result as any, components);
+
+    expect(pathItem.post?.['x-messaging']).toBeUndefined();
+    expect(pathItem.post?.description).toBeDefined();
+    expect(pathItem.post?.description).toContain('## External Dependencies');
+    expect(pathItem.post?.description).toContain('**Messaging:**');
+    expect(pathItem.post?.description).toContain('| Topic | Direction |');
+    expect(pathItem.post?.description).toContain('| user-events | outbound |');
+    expect(pathItem.post?.description).toContain('| config-updates | inbound |');
+  });
+
+  it('includes persistence in markdown description table', () => {
+    const result = {
+      method: 'GET',
+      path: '/users',
+      summary: 'List users',
+      specs: {
+        request: { params: [], body: null, validation: [] },
+        response: { body: null, codes: [{ code: 200, description: 'OK' }] },
+      },
+      externalDependencies: {
+        downstreamApis: [],
+        messaging: { outbound: [], inbound: [] },
+        persistence: [
+          { database: 'postgres', tables: 'users, sessions', storedProcedures: 'get_user_by_id' },
+        ],
+      },
+    };
+
+    const components = {};
+    const pathItem = convertToOpenAPIPathItem(result as any, components);
+
+    expect(pathItem.get?.['x-persistence']).toBeUndefined();
+    expect(pathItem.get?.description).toBeDefined();
+    expect(pathItem.get?.description).toContain('## External Dependencies');
+    expect(pathItem.get?.description).toContain('**Persistence:**');
+    expect(pathItem.get?.description).toContain('| Database | Tables |');
+    expect(pathItem.get?.description).toContain('| postgres | users, sessions |');
+  });
+
+  it('omits extensions when no dependencies', () => {
+    const result = {
+      method: 'GET',
+      path: '/health',
+      summary: 'Health check',
+      specs: {
+        request: { params: [], body: null, validation: [] },
+        response: { body: null, codes: [{ code: 200, description: 'OK' }] },
+      },
+      externalDependencies: {
+        downstreamApis: [],
+        messaging: { outbound: [], inbound: [] },
+        persistence: [],
+      },
+    };
+
+    const components = {};
+    const pathItem = convertToOpenAPIPathItem(result as any, components);
+
+    expect(pathItem.get?.['x-downstream-apis']).toBeUndefined();
+    expect(pathItem.get?.['x-messaging']).toBeUndefined();
+    expect(pathItem.get?.['x-persistence']).toBeUndefined();
+    expect(pathItem.get?.description).toBeUndefined();
+  });
+
+  it('includes all dependency types together in markdown description', () => {
+    const result = {
+      method: 'POST',
+      path: '/orders',
+      summary: 'Create order',
+      specs: {
+        request: { params: [], body: null, validation: [] },
+        response: { body: null, codes: [{ code: 201, description: 'Created' }] },
+      },
+      externalDependencies: {
+        downstreamApis: [
+          { serviceName: 'payment-service', endpoint: 'POST /charge', condition: 'if payment required', purpose: 'Process payment' },
+        ],
+        messaging: {
+          outbound: [{ topic: 'order-created', trigger: 'on success' }],
+          inbound: [],
+        },
+        persistence: [
+          { database: 'mysql', tables: 'orders, order_items' },
+        ],
+      },
+    };
+
+    const components = {};
+    const pathItem = convertToOpenAPIPathItem(result as any, components);
+
+    // Extensions should NOT be present
+    expect(pathItem.post?.['x-downstream-apis']).toBeUndefined();
+    expect(pathItem.post?.['x-messaging']).toBeUndefined();
+    expect(pathItem.post?.['x-persistence']).toBeUndefined();
+
+    // Markdown description should contain all dependency types
+    expect(pathItem.post?.description).toBeDefined();
+    expect(pathItem.post?.description).toContain('## External Dependencies');
+    expect(pathItem.post?.description).toContain('**Downstream APIs:**');
+    expect(pathItem.post?.description).toContain('| payment-service | POST | /charge |');
+    expect(pathItem.post?.description).toContain('**Messaging:**');
+    expect(pathItem.post?.description).toContain('| order-created | outbound |');
+    expect(pathItem.post?.description).toContain('**Persistence:**');
+    expect(pathItem.post?.description).toContain('| mysql | orders, order_items |');
+  });
+
+  it('includes Markdown description with dependency summary', () => {
+    const result = {
+      method: 'POST',
+      path: '/orders',
+      summary: 'Create order',
+      specs: {
+        request: { params: [], body: null, validation: [] },
+        response: { body: null, codes: [{ code: 201, description: 'Created' }] },
+      },
+      externalDependencies: {
+        downstreamApis: [
+          { serviceName: 'payment-service', endpoint: '/charge', condition: 'always', purpose: 'Process payment' },
+        ],
+        messaging: {
+          outbound: [{ topic: 'order-created', trigger: 'on success' }],
+          inbound: [],
+        },
+        persistence: [
+          { database: 'mysql', tables: 'orders, order_items' },
+        ],
+      },
+    };
+
+    const components = {};
+    const pathItem = convertToOpenAPIPathItem(result as any, components);
+
+    expect(pathItem.post?.description).toBeDefined();
+    expect(pathItem.post?.description).toContain('## External Dependencies');
+    expect(pathItem.post?.description).toContain('**Downstream APIs:**');
+    expect(pathItem.post?.description).toContain('payment-service');
+    expect(pathItem.post?.description).toContain('**Messaging:**');
+    expect(pathItem.post?.description).toContain('order-created');
+    expect(pathItem.post?.description).toContain('**Persistence:**');
+  });
+});
+
+describe('nestedSchemas in components (WI-11)', () => {
+  it('nested schema appears in components.schemas', () => {
+    const nestedSchema: BodySchema = {
+      typeName: 'OrderItem',
+      source: 'indexed',
+      fields: [
+        { name: 'productId', type: 'Long', annotations: ['@NotNull'] },
+        { name: 'quantity', type: 'Integer', annotations: [] },
+      ],
+    };
+    const results = [
+      {
+        method: 'GET',
+        path: '/orders',
+        summary: 'List orders',
+        specs: {
+          request: { params: [], body: null, validation: [] },
+          response: {
+            body: { typeName: 'Order', source: 'indexed', fields: [] } as BodySchema,
+            codes: [{ code: 200, description: 'OK' }],
+          },
+        },
+      },
+    ];
+    const nestedSchemas = new Map<string, BodySchema>([['OrderItem', nestedSchema]]);
+    const doc = convertToOpenAPIDocument(results as any, {
+      nestedSchemas,
+    });
+
+    expect(doc.components).toBeDefined();
+    expect(doc.components?.schemas?.['OrderItem']).toBeDefined();
+    expect(doc.components?.schemas?.['OrderItem'].type).toBe('object');
+    expect(doc.components?.schemas?.['OrderItem'].properties?.productId).toBeDefined();
+  });
+
+  it('multiple nested schemas all appear in components', () => {
+    const nested1: BodySchema = { typeName: 'Address', source: 'indexed', fields: [{ name: 'street', type: 'String', annotations: [] }] };
+    const nested2: BodySchema = { typeName: 'Phone', source: 'indexed', fields: [{ name: 'number', type: 'String', annotations: [] }] };
+    const results = [
+      {
+        method: 'GET',
+        path: '/users',
+        summary: 'Get users',
+        specs: {
+          request: { params: [], body: null, validation: [] },
+          response: { body: null, codes: [{ code: 200, description: 'OK' }] },
+        },
+      },
+    ];
+    const nestedSchemas = new Map<string, BodySchema>([['Address', nested1], ['Phone', nested2]]);
+    const doc = convertToOpenAPIDocument(results as any, { nestedSchemas });
+
+    expect(doc.components?.schemas?.['Address']).toBeDefined();
+    expect(doc.components?.schemas?.['Phone']).toBeDefined();
+  });
+
+  it('empty nestedSchemas produces no extra entries', () => {
+    const results = [
+      {
+        method: 'GET',
+        path: '/health',
+        summary: 'Health check',
+        specs: {
+          request: { params: [], body: null, validation: [] },
+          response: { body: null, codes: [{ code: 200, description: 'OK' }] },
+        },
+      },
+    ];
+    // Pass empty nestedSchemas explicitly - no nested schemas to add
+    const doc = convertToOpenAPIDocument(results as any, {
+      nestedSchemas: new Map(),
+    });
+
+    // No extra nested schema entries beyond what codesToResponses adds (ErrorResponse)
+    // Empty Map means no additions
+    expect(doc.components?.schemas?.['OrderItem']).toBeUndefined();
+    expect(doc.components?.schemas?.['Address']).toBeUndefined();
+  });
+
+  it('nested schema does not overwrite existing top-level schema', () => {
+    const nestedSchema: BodySchema = {
+      typeName: 'User',
+      source: 'indexed',
+      fields: [{ name: 'extra', type: 'String', annotations: [] }],
+    };
+    const results = [
+      {
+        method: 'GET',
+        path: '/users',
+        summary: 'Get user',
+        specs: {
+          request: { params: [], body: null, validation: [] },
+          response: {
+            body: { typeName: 'User', source: 'indexed', fields: [{ name: 'id', type: 'Long', annotations: [] }] } as BodySchema,
+            codes: [{ code: 200, description: 'OK' }],
+          },
+        },
+      },
+    ];
+    const nestedSchemas = new Map<string, BodySchema>([['User', nestedSchema]]);
+    const doc = convertToOpenAPIDocument(results as any, { nestedSchemas });
+
+    // Top-level User from response body should not be overwritten by nested User
+    expect(doc.components?.schemas?.['User'].properties?.id).toBeDefined();
+    expect(doc.components?.schemas?.['User'].properties?.extra).toBeUndefined();
   });
 });

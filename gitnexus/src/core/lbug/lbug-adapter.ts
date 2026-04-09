@@ -370,7 +370,7 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
     return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, fields, annotations) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Route') {
-    return `COPY ${t}(id, name, httpMethod, routePath, controllerName, methodName, filePath, startLine, lineNumber, isInherited) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, httpMethod, routePath, controllerName, methodName, filePath, startLine, lineNumber, isInherited, repoId, responseKeys, errorKeys, middleware) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   // TypeScript/JS code element tables have isExported; multi-language tables do not
   if (TABLES_WITH_EXPORTED.has(table)) {
@@ -414,7 +414,7 @@ export const insertNodeToLbug = async (
     } else if (label === 'Folder') {
       query = `CREATE (n:Folder {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}})`;
     } else if (label === 'Route') {
-      query = `CREATE (n:Route {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, httpMethod: ${escapeValue(properties.httpMethod ?? '')}, routePath: ${escapeValue(properties.routePath ?? '')}, controllerName: ${escapeValue(properties.controllerName ?? '')}, methodName: ${escapeValue(properties.methodName ?? '')}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine ?? 0}, lineNumber: ${properties.lineNumber ?? 0}, isInherited: ${!!properties.isInherited}})`;
+      query = `CREATE (n:Route {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, httpMethod: ${escapeValue(properties.httpMethod ?? '')}, routePath: ${escapeValue(properties.routePath ?? '')}, controllerName: ${escapeValue(properties.controllerName ?? '')}, methodName: ${escapeValue(properties.methodName ?? '')}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine ?? 0}, lineNumber: ${properties.lineNumber ?? 0}, isInherited: ${!!properties.isInherited}, repoId: ${escapeValue(properties.repoId ?? '')}, responseKeys: ${escapeValue(properties.responseKeys ?? [])}, errorKeys: ${escapeValue(properties.errorKeys ?? [])}, middleware: ${escapeValue(properties.middleware ?? [])}})`;
     } else if (TABLES_WITH_EXPORTED.has(label)) {
       const descPart = properties.description ? `, description: ${escapeValue(properties.description)}` : '';
       query = `CREATE (n:${t} {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, isExported: ${!!properties.isExported}, content: ${escapeValue(properties.content || '')}${descPart}})`;
@@ -487,7 +487,7 @@ export const batchInsertNodesToLbug = async (
         } else if (label === 'Folder') {
           query = `MERGE (n:Folder {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}`;
         } else if (label === 'Route') {
-          query = `MERGE (n:Route {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.httpMethod = ${escapeValue(properties.httpMethod)}, n.routePath = ${escapeValue(properties.routePath)}, n.controllerName = ${escapeValue(properties.controllerName)}, n.methodName = ${escapeValue(properties.methodName)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine ?? 0}, n.lineNumber = ${properties.lineNumber ?? 0}, n.isInherited = ${!!properties.isInherited}`;
+          query = `MERGE (n:Route {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.httpMethod = ${escapeValue(properties.httpMethod)}, n.routePath = ${escapeValue(properties.routePath)}, n.controllerName = ${escapeValue(properties.controllerName)}, n.methodName = ${escapeValue(properties.methodName)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine ?? 0}, n.lineNumber = ${properties.lineNumber ?? 0}, n.isInherited = ${!!properties.isInherited}, n.repoId = ${escapeValue(properties.repoId ?? '')}, n.responseKeys = ${escapeValue(properties.responseKeys ?? [])}, n.errorKeys = ${escapeValue(properties.errorKeys ?? [])}, n.middleware = ${escapeValue(properties.middleware ?? [])}`;
         } else if (TABLES_WITH_EXPORTED.has(label)) {
           const descPart = properties.description ? `, n.description = ${escapeValue(properties.description)}` : '';
           query = `MERGE (n:${t} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.isExported = ${!!properties.isExported}, n.content = ${escapeValue(properties.content || '')}${descPart}`;

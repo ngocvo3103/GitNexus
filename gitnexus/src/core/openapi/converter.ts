@@ -20,39 +20,13 @@ import {
   createSchemaRef,
   mapType,
   type BodySchema,
-  type ValidationRule,
 } from './schema-builder.js';
-
-/** Source types from document-endpoint.ts */
-export interface DocumentEndpointResult {
-  method: string;
-  path: string;
-  summary: string;
-  specs: {
-    request: {
-      params: ParamInfo[];
-      body: BodySchema | Record<string, unknown> | Record<string, unknown>[] | null;
-      validation: ValidationRule[];
-    };
-    response: {
-      body: BodySchema | Record<string, unknown> | Record<string, unknown>[] | null;
-      codes: ResponseCode[];
-    };
-  };
-}
-
-export interface ParamInfo {
-  name: string;
-  type: string;
-  required: boolean;
-  description: string;
-  _context?: string;
-}
-
-export interface ResponseCode {
-  code: number;
-  description: string;
-}
+import {
+  bodySchemaToJsonExample,
+  type DocumentEndpointResult,
+  type ParamInfo,
+  type ResponseCode,
+} from '../../mcp/local/document-endpoint.js';
 
 /** Map HTTP methods to OpenAPI operation keys */
 const METHOD_MAP: Record<string, keyof OpenAPIPathItem> = {
@@ -78,19 +52,8 @@ function normalizePath(path: string): string {
  * Convert ParamInfo to OpenAPI Parameter
  */
 function paramToOpenAPIParameter(param: ParamInfo): OpenAPIParameter {
-  // Determine parameter location
-  let location: 'query' | 'header' | 'path' | 'cookie' = 'query';
+  const location = param.location ?? 'query';
   
-  // Path parameters are in the path
-  if (param.name.startsWith('{') || param.name.includes('{')) {
-    location = 'path';
-  } else if (param.name.startsWith('@') || param.name.toLowerCase().includes('header')) {
-    location = 'header';
-  } else if (pathParamRegex.test(param.name)) {
-    location = 'path';
-  }
-  
-  // Clean up parameter name
   const cleanName = param.name.replace(/[{}@]/g, '').trim();
   
   return {
@@ -103,9 +66,6 @@ function paramToOpenAPIParameter(param: ParamInfo): OpenAPIParameter {
     },
   };
 }
-
-/** Regex to detect path parameters */
-const pathParamRegex = /^{|.*\{.*\}.*$/;
 
 /**
  * Convert body to OpenAPI RequestBody
@@ -122,13 +82,13 @@ function bodyToRequestBody(
   if (isBodySchema(body)) {
     if (extractSchemas && shouldExtractToComponents(body)) {
       const schemaName = generateSchemaName(body.typeName);
-      
+
       // Add to components
       if (!components.schemas) {
         components.schemas = {};
       }
       components.schemas[schemaName] = bodySchemaToOpenAPISchema(body);
-      
+
       schema = createSchemaRef(schemaName);
     } else {
       schema = bodySchemaToOpenAPISchema(body);
@@ -140,15 +100,26 @@ function bodyToRequestBody(
       example: body,
     };
   }
-  
-  return {
+
+  let requestBody: OpenAPIRequestBody = {
     description: 'Request body',
+    required: true,  // @RequestBody is required by default in Spring
     content: {
       'application/json': {
         schema,
       },
     },
   };
+
+  // Attach example for BodySchema
+  if (isBodySchema(body) && body.fields && body.fields.length > 0) {
+    const example = bodySchemaToJsonExample(body);
+    if (example) {
+      requestBody.content['application/json'].example = example;
+    }
+  }
+
+  return requestBody;
 }
 
 /**
@@ -166,29 +137,49 @@ function isBodySchema(body: unknown): body is BodySchema {
 /**
  * Convert response codes to OpenAPI responses
  */
-function codesToResponses(
+export function codesToResponses(
   codes: ResponseCode[],
   body: BodySchema | Record<string, unknown> | Record<string, unknown>[] | null,
   components: OpenAPIComponents,
   extractSchemas: boolean
 ): Record<string, OpenAPIResponse> {
   const responses: Record<string, OpenAPIResponse> = {};
-  
+
+  // Define standard error response schema (for components registration)
+  const errorSchema: OpenAPISchema = {
+    type: 'object',
+    properties: {
+      code: { type: 'integer' },
+      message: { type: 'string' }
+    }
+  };
+
+  // Add ErrorResponse to components once
+  if (!components.schemas) {
+    components.schemas = {};
+  }
+  components.schemas['ErrorResponse'] = errorSchema;
+
   for (const code of codes) {
     const statusCode = String(code.code);
-    
+    const isErrorStatus = statusCode.startsWith('4') || statusCode.startsWith('5');
+
     let schema: OpenAPISchema | undefined;
-    
-    if (body) {
+
+    if (isErrorStatus) {
+      // Use $ref to ErrorResponse for error responses
+      schema = createSchemaRef('ErrorResponse');
+    } else if (body) {
+      // Use actual body schema for success responses
       if (isBodySchema(body)) {
         if (extractSchemas && shouldExtractToComponents(body)) {
           const schemaName = generateSchemaName(body.typeName);
-          
+
           if (!components.schemas) {
             components.schemas = {};
           }
           components.schemas[schemaName] = bodySchemaToOpenAPISchema(body);
-          
+
           schema = createSchemaRef(schemaName);
         } else {
           schema = bodySchemaToOpenAPISchema(body);
@@ -200,17 +191,37 @@ function codesToResponses(
         };
       }
     }
-    
-    responses[statusCode] = {
+
+    // Build response with example for success responses
+    const response: OpenAPIResponse = {
       description: code.description || `Status ${statusCode}`,
-      ...(schema && {
-        content: {
-          'application/json': {
-            schema,
-          },
-        },
-      }),
     };
+
+    if (schema) {
+      response.content = {
+        'application/json': {
+          schema,
+        },
+      };
+      // Attach example for BodySchema success responses
+      if (!isErrorStatus && isBodySchema(body) && body.fields && body.fields.length > 0) {
+        const example = bodySchemaToJsonExample(body);
+        if (example) {
+          response.content['application/json'].example = example;
+        }
+      }
+    }
+
+        // Merge descriptions when multiple codes share the same HTTP status
+    if (responses[statusCode]) {
+      const existing = responses[statusCode];
+      const incoming = code.description || `Status ${statusCode}`;
+      existing.description = existing.description
+        ? `${existing.description} | ${incoming}`
+        : incoming;
+    } else {
+      responses[statusCode] = response;
+    }
   }
   
   // Ensure at least a default response exists
@@ -269,6 +280,14 @@ export function convertToOpenAPIPathItem(
     operation.requestBody = requestBody;
   }
   
+  // Build Markdown description for human-readable summary in Swagger UI
+  if (result.externalDependencies) {
+    const description = buildDependencyDescription(result.externalDependencies);
+    if (description) {
+      operation.description = description;
+    }
+  }
+  
   // Build path item with single operation
   const pathItem: OpenAPIPathItem = {
     [operationKey]: operation,
@@ -293,9 +312,71 @@ function generateOperationId(method: string, path: string): string {
   return `${method.toLowerCase()}_${pathPart}`;
 }
 
+/**
+ * Build Markdown-formatted description of external dependencies
+ */
+function buildDependencyDescription(
+  deps: DocumentEndpointResult['externalDependencies']
+): string | undefined {
+  const hasDownstream = deps.downstreamApis.length > 0;
+  const hasMessaging = deps.messaging.outbound.length > 0 || deps.messaging.inbound.length > 0;
+  const hasPersistence = deps.persistence.length > 0;
+  
+  if (!hasDownstream && !hasMessaging && !hasPersistence) {
+    return undefined;
+  }
+  
+  const lines: string[] = ['## External Dependencies', ''];
+  
+  if (hasDownstream) {
+    // Count unique services
+    const uniqueServices = new Set(deps.downstreamApis.map(api => api.serviceName));
+    lines.push(`**Downstream APIs:** ${deps.downstreamApis.length} calls to ${uniqueServices.size} services`);
+    lines.push('');
+    lines.push('| Service | Method | Endpoint |');
+    lines.push('|---------|--------|----------|');
+    for (const api of deps.downstreamApis) {
+      // Parse method and path from endpoint (e.g., "POST /v1/bond-limit/hold-unhold")
+      const match = api.endpoint.match(/^(GET|POST|PUT|DELETE|PATCH)\s+(.+)$/);
+      const method = match ? match[1] : '-';
+      const path = match ? match[2] : api.endpoint;
+      lines.push(`| ${api.serviceName} | ${method} | ${path} |`);
+    }
+    lines.push('');
+  }
+  
+  if (hasMessaging) {
+    lines.push(`**Messaging:** ${deps.messaging.outbound.length} outbound, ${deps.messaging.inbound.length} inbound`);
+    lines.push('');
+    lines.push('| Topic | Direction |');
+    lines.push('|-------|-----------|');
+    for (const m of deps.messaging.outbound) {
+      lines.push(`| ${m.topic} | outbound |`);
+    }
+    for (const m of deps.messaging.inbound) {
+      lines.push(`| ${m.topic} | inbound |`);
+    }
+    lines.push('');
+  }
+  
+  if (hasPersistence) {
+    for (const p of deps.persistence) {
+      const tables = p.tables ? p.tables.split(',').map(t => t.trim()) : [];
+      lines.push(`**Persistence:** ${tables.length} tables`);
+      lines.push('');
+      lines.push('| Database | Tables |');
+      lines.push('|----------|--------|');
+      lines.push(`| ${p.database} | ${tables.join(', ')} |`);
+    }
+  }
+  
+  return lines.join('\n');
+}
+
 /** Options for conversion */
 export interface ConvertOptions {
   extractSchemas?: boolean;
+  nestedSchemas?: Map<string, BodySchema>;
 }
 
 /**
@@ -348,7 +429,20 @@ export function convertToOpenAPIDocument(
   if (components.schemas && Object.keys(components.schemas).length > 0) {
     document.components = components;
   }
-  
+
+  // Add nested schemas to components (don't overwrite existing top-level schemas)
+  if (opts.nestedSchemas && components.schemas) {
+    for (const [name, schema] of opts.nestedSchemas) {
+      if (!components.schemas[name]) {
+        components.schemas[name] = bodySchemaToOpenAPISchema(schema);
+      }
+    }
+    // Re-attach if schemas were updated after document creation
+    if (Object.keys(components.schemas).length > 0) {
+      document.components = components;
+    }
+  }
+
   return document;
 }
 
@@ -357,4 +451,5 @@ export interface DocumentOptions {
   title?: string;
   version?: string;
   extractSchemas?: boolean;
+  nestedSchemas?: Map<string, BodySchema>;
 }

@@ -59,7 +59,7 @@ import {
 //   When streamAllCSVsToDisk processes the graph
 //   Then a route.csv file is written
 //   And its header row is:
-//     id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited
+//     id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited,repoId,responseKeys,errorKeys,middleware
 //
 // Scenario: Route node does not fall through to default/skip case
 //   Given a KnowledgeGraph containing a Route node with all required properties
@@ -206,7 +206,7 @@ describe('streamAllCSVsToDisk — Route node handling', () => {
       const csvContent = await fs.readFile(routeEntry!.csvPath, 'utf-8');
       const headerRow = csvContent.split('\n')[0];
       expect(headerRow).toBe(
-        'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited'
+        'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited,repoId,responseKeys,errorKeys,middleware'
       );
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });

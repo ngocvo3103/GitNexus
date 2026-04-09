@@ -15,6 +15,7 @@ import { executeTrace, type ChainNode, type BuilderDetail } from './trace-execut
 import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
 import { generateId } from '../../lib/utils.js';
 import { shouldSkipSchema, extractGenericInnerType, extractPackagePrefix } from '../../core/ingestion/type-extractors/shared.js';
+import type { BodySchemaField } from '../../core/openapi/schema-builder.js';
 
 // ============================================================================
 // Constants
@@ -138,6 +139,7 @@ export interface ParamInfo {
   type: string;
   required: boolean;
   description: string;
+  location?: 'path' | 'query' | 'header' | 'cookie';
   _context?: string;
 }
 
@@ -157,7 +159,7 @@ export interface ResponseCode {
 export interface BodySchema {
   typeName: string;
   source: 'indexed' | 'external' | 'primitive';
-  fields?: Array<{ name: string; type: string; annotations: string[] }>;
+  fields?: BodySchemaField[];
   /** Attribution for cross-repo resolution — repoId where the type was found */
   repoId?: string;
   /** Indicates the original type was a container (List, Set, array, etc.) */
@@ -171,6 +173,8 @@ export interface DownstreamApi {
   purpose: string;
   _context?: string;
   resolvedUrl?: string;
+  /** Attribution for how URL was resolved (e.g., 'value-annotation', 'static-final', 'builder-pattern') */
+  resolvedFrom?: string;
   resolutionDetails?: {
     serviceField?: string;
     serviceValue?: string;
@@ -183,6 +187,8 @@ export interface MessagingOutbound {
   payload: string | BodySchema | Record<string, unknown> | Record<string, unknown>[];
   trigger: string;
   _context?: string;
+  /** WI-5: RepoId where the payload type was resolved */
+  sourceRepo?: string;
 }
 
 export interface MessagingInbound {
@@ -190,6 +196,8 @@ export interface MessagingInbound {
   payload: string | BodySchema | Record<string, unknown> | Record<string, unknown>[];
   consumptionLogic: string;
   _context?: string;
+  /** WI-5: RepoId where the payload type was resolved */
+  sourceRepo?: string;
 }
 
 export interface PersistenceInfo {
@@ -261,6 +269,7 @@ export interface DocumentEndpointResult {
   keyDetails: KeyDetails;
   handlerClass?: string;
   handlerMethod?: string;
+  nestedSchemas?: Map<string, BodySchema>;
   _context?: {
     summaryContext?: string;
     resolvedProperties?: Record<string, string>;
@@ -781,6 +790,8 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
       endpoint: api.endpoint,
       condition: api.condition,
       purpose: api.purpose,
+      resolvedUrl: api.resolvedUrl,
+      resolvedFrom: api.resolvedFrom,
     }));
   }
   
@@ -801,30 +812,30 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
         const schema = msg.payload as BodySchema;
         // External types (not indexed) - return type name string
         if (schema.source === 'external' || !schema.fields) {
-          return { topic: msg.topic, payload: schema.typeName, trigger: msg.trigger };
+          return { topic: msg.topic, payload: schema.typeName, trigger: msg.trigger, sourceRepo: msg.sourceRepo };
         }
         // Indexed types with fields - return JSON example
-        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), trigger: msg.trigger };
+        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), trigger: msg.trigger, sourceRepo: msg.sourceRepo };
       }
-      return { topic: msg.topic, payload: msg.payload, trigger: msg.trigger };
+      return { topic: msg.topic, payload: msg.payload, trigger: msg.trigger, sourceRepo: msg.sourceRepo };
     });
-    
+
     result.externalDependencies.messaging.inbound = inbound.map(msg => {
       if (typeof msg.payload === 'object' && msg.payload !== null) {
         const schema = msg.payload as BodySchema;
         // External types (not indexed) - return type name string
         if (schema.source === 'external' || !schema.fields) {
-          return { topic: msg.topic, payload: schema.typeName, consumptionLogic: msg.consumptionLogic };
+          return { topic: msg.topic, payload: schema.typeName, consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
         }
         // Indexed types with fields - return JSON example
-        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), consumptionLogic: msg.consumptionLogic };
+        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
       }
-      return { topic: msg.topic, payload: msg.payload, consumptionLogic: msg.consumptionLogic };
+      return { topic: msg.topic, payload: msg.payload, consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
     });
   }
 
-  // Extract persistence (repository calls)
-  const persistence = extractPersistence(chain);
+  // Extract persistence (repository calls) with database heuristics
+  const persistence = await extractPersistence(chain, executeQuery, repoId);
   result.externalDependencies.persistence = persistence;
 
   // Extract exceptions for response codes
@@ -893,6 +904,9 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
   // - keyDetails.transactionManagement, businessRules, security
   // - cacheStrategy.population, invalidation, update
 
+  // WI-11: Attach nestedSchemas for OpenAPI converter to add to components.schemas
+  result.nestedSchemas = nestedSchemas;
+
   return result;
 }
 
@@ -922,6 +936,8 @@ async function extractDownstreamApis(
       let propertyKey: string | null = null;
       let resolvedFieldName: string | null = null;
       let resolvedValue: string | null = null;
+      // WI-4: Track which resolution pass succeeded for resolvedFrom attribution
+      let resolvedFrom: string | undefined;
 
       // ============================================
       // Pass 1: Current resolution (@Value + static final in same class)
@@ -932,19 +948,20 @@ async function extractDownstreamApis(
         if (resolved.propertyKey) {
           propertyKey = resolved.propertyKey;
           serviceValue = resolved.rawValue;
+          resolvedFrom = 'value-annotation';
         }
       }
 
       // ============================================
       // Pass 2: Variable assignment trace (heuristics + cross-class)
       // ============================================
-      
+
       // WI-4: Check for builder.toUriString() pattern first
       const builderResult = resolveBuilderUrl(detail.urlExpression, node.metadata.builderDetails, node.content);
       if (builderResult && className) {
         // Found builder pattern - resolve the base URL
         let baseField: string | null = null;
-        
+
         // Check if baseUrlExpression is a method call like "url.toString()"
         // If so, trace the StringBuilder construction to find the actual base field
         const toStringMatch = builderResult.baseUrlExpression.match(/^(\w+)\.toString\(\)$/);
@@ -952,12 +969,12 @@ async function extractDownstreamApis(
           const varName = toStringMatch[1];
           baseField = traceStringBuilderConstruction(varName, node.content);
         }
-        
+
         // If no StringBuilder trace, try direct extraction
         if (!baseField) {
           baseField = extractBaseField(builderResult.baseUrlExpression);
         }
-        
+
         if (baseField) {
           // Try to resolve the base field
           const resolved = await resolveValueAnnotation(executeQuery, repoId, className, baseField);
@@ -965,6 +982,7 @@ async function extractDownstreamApis(
             propertyKey = resolved.propertyKey;
             serviceValue = resolved.rawValue;
             resolvedFieldName = baseField;
+            resolvedFrom = 'builder-pattern';
           }
         }
         // If base field resolution failed, try the full expression
@@ -974,10 +992,11 @@ async function extractDownstreamApis(
             propertyKey = traced.propertyKey;
             serviceValue = traced.rawValue;
             resolvedFieldName = traced.fieldName;
+            resolvedFrom = 'builder-pattern';
           }
         }
       }
-      
+
       // Regular variable assignment trace if builder pattern didn't resolve
       if (!propertyKey && className && parsed.variableRefs.length > 0) {
         // Try each variable reference with heuristic patterns
@@ -987,6 +1006,7 @@ async function extractDownstreamApis(
             propertyKey = traced.propertyKey;
             serviceValue = traced.rawValue;
             resolvedFieldName = traced.fieldName;
+            resolvedFrom = 'variable-assignment';
             break;
           }
         }
@@ -1012,13 +1032,15 @@ async function extractDownstreamApis(
 
       // Resolve URI constants
       const pathConstants: { name: string; value: string; declaringClass?: string }[] = [];
-      
+
       // Pass 1: Same-class static final resolution (existing)
       for (const varRef of parsed.variableRefs) {
         if (className) {
           const value = await resolveStaticFieldValue(executeQuery, repoId, className, varRef);
           if (value) {
             pathConstants.push({ name: varRef, value });
+            // WI-4: Track static-final resolution
+            if (!resolvedFrom) resolvedFrom = 'static-final';
           }
         }
       }
@@ -1028,11 +1050,13 @@ async function extractDownstreamApis(
         if (!pathConstants.find(pc => pc.name === varRef) && className) {
           const resolved = await resolveStaticFieldValueCrossClass(executeQuery, repoId, className, varRef);
           if (resolved.value) {
-            pathConstants.push({ 
-              name: varRef, 
-              value: resolved.value, 
-              declaringClass: resolved.declaringClass ?? undefined 
+            pathConstants.push({
+              name: varRef,
+              value: resolved.value,
+              declaringClass: resolved.declaringClass ?? undefined
             });
+            // WI-4: Track static-final resolution (cross-repo)
+            if (!resolvedFrom) resolvedFrom = 'static-final';
           }
         }
       }
@@ -1091,6 +1115,7 @@ async function extractDownstreamApis(
         condition: TODO_AI_ENRICH,
         purpose: TODO_AI_ENRICH,
         resolvedUrl: resolvedUrl !== detail.urlExpression ? resolvedUrl : undefined,
+        resolvedFrom,
         resolutionDetails,
         ...(includeContext && {
           _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content?.slice(0, 200)}...`,
@@ -1919,11 +1944,13 @@ async function resolveTypeSchema(
               const fieldsJson = found.fields;
               if (fieldsJson) {
                 try {
+                  // WI-2: Filter out serialVersionUID from fields
                   const fields = JSON.parse(fieldsJson);
+                  const filteredFields = fields.filter((f: any) => f.name !== 'serialVersionUID');
                   return {
                     typeName: found.name || typeName,
                     source: 'indexed',
-                    fields: fields.map((f: any) => ({
+                    fields: filteredFields.map((f: any) => ({
                       name: f.name,
                       type: f.type,
                       annotations: f.annotations || []
@@ -1948,11 +1975,13 @@ async function resolveTypeSchema(
       return { typeName, source: 'indexed', fields: undefined };
     }
 
+    // WI-2: Filter out serialVersionUID from fields
     const fields = JSON.parse(fieldsJson);
+    const filteredFields = fields.filter((f: any) => f.name !== 'serialVersionUID');
     return {
       typeName: rows[0].name || typeName,
       source: 'indexed',
-      fields: fields.map((f: any) => ({
+      fields: filteredFields.map((f: any) => ({
         name: f.name,
         type: f.type,
         annotations: f.annotations || []
@@ -2232,11 +2261,21 @@ function extractRequestParams(
       }
     }
 
+    // Determine parameter location
+    const ANNOTATION_TO_LOCATION: Record<string, 'path' | 'query' | 'header' | 'cookie'> = {
+      '@PathVariable': 'path',
+      '@RequestParam': 'query',
+      '@RequestHeader': 'header',
+      '@CookieValue': 'cookie',
+    };
+    const location = ANNOTATION_TO_LOCATION[annType] ?? 'query';
+
     // Build the ParamInfo
     const paramInfo: ParamInfo = {
       name: param.name,
       type: param.type,
       required,
+      location,
       description: '',
     };
 
@@ -2516,6 +2555,11 @@ function extractFieldName(
     return arg;
   }
 
+  // Handle qualified type names with dots (e.g., com.example.OrderDTO) — preserve as-is
+  if (/^[a-zA-Z][\w.]*(?:\.[A-Z])\w*$/.test(arg)) {
+    return arg;
+  }
+
   // For anything else, return TODO_AI_ENRICH
   return TODO_AI_ENRICH;
 }
@@ -2668,9 +2712,12 @@ function extractValidationRules(
               fieldName = extractFieldName(lastArg, params, requestBody);
             }
 
-            // If fieldName is a type name, set paramType
+            // If fieldName is a type name (simple capitalized identifier), set paramType for later type matching.
+            // Qualified type names (with dots) are preserved as-is - they represent specific type arguments.
             if (fieldName && fieldName[0] === fieldName[0].toUpperCase() && !fieldName.includes('.')) {
               paramType = fieldName;
+            } else {
+              // Qualified type name (contains dots) or lowercase — no paramType needed
             }
           }
         }
@@ -2683,14 +2730,22 @@ function extractValidationRules(
           }
         }
 
-        // Map type to request body if it matches
-        if (paramType && requestBody?.typeName && paramType === requestBody.typeName) {
-          fieldName = 'body';  // Validates the whole request body
-        } else if (paramType) {
-          // Use the type name for other types (e.g., TcbsJWT → "TcbsJWT", OrderDTO → "OrderDTO")
-          // This handles both cases: variable found in params (use its type) and type name passed directly
-          fieldName = paramType;
+        // WI-3: Capitalized type names are never valid field names — fall back to 'body'.
+        // Qualified type names (with dots like com.example.OrderDTO) are preserved as specific type arguments.
+        // Simple capitalized identifiers (like TcbsJWT, OrderDTO) always fall back to 'body'.
+        if (fieldName !== TODO_AI_ENRICH && paramType && fieldName[0] === fieldName[0].toUpperCase() && !fieldName.includes('.')) {
+          // FieldName itself is a Java type name → falls back to 'body'
+          fieldName = 'body';
+        } else if (fieldName === TODO_AI_ENRICH && paramType) {
+          // No field name extracted — decide based on paramType
+          if (paramType === TODO_AI_ENRICH || (paramType[0] === paramType[0].toUpperCase() && !paramType.includes('.'))) {
+            fieldName = 'body';
+          } else {
+            // Qualified type name (with dots) — preserve as field name
+            fieldName = paramType;
+          }
         }
+        // else: keep fieldName as extracted (includes dotted qualified names, or regular field names)
         // else: keep fieldName as extracted or TODO_AI_ENRICH
 
         // Build rule object conditionally
@@ -2746,16 +2801,17 @@ export async function extractMessaging(
   const visited = new Set<string>();
   const nestedSchemas = new Map<string, BodySchema>();
 
-  // Helper to resolve payload type to BodySchema (always when executeQuery available)
-  const resolvePayload = async (typeName: string): Promise<string | BodySchema> => {
+  // Helper to resolve payload type to BodySchema and track resolution source repo
+  // Returns { payload, sourceRepo } where sourceRepo is the repoId from resolved BodySchema
+  const resolvePayload = async (typeName: string): Promise<{ payload: string | BodySchema; sourceRepo?: string }> => {
     if (typeName === TODO_AI_ENRICH) {
-      return TODO_AI_ENRICH;
+      return { payload: TODO_AI_ENRICH };
     }
     if (!executeQuery || !repoId) {
-      return typeName;
+      return { payload: typeName };
     }
     const resolved = await resolveTypeSchema(typeName, executeQuery, repoId, visited, crossRepo);
-    return resolved;
+    return { payload: resolved, sourceRepo: resolved.repoId };
   };
 
   for (const node of chain) {
@@ -2765,13 +2821,14 @@ export async function extractMessaging(
         seenOutbound.add(detail.topic);
         const payloadTypeName = detail.payload || TODO_AI_ENRICH;
         // Always resolve payload to BodySchema when executeQuery available
-        const payload = executeQuery && repoId && payloadTypeName !== TODO_AI_ENRICH
+        const resolvedPayload = executeQuery && repoId && payloadTypeName !== TODO_AI_ENRICH
           ? await resolvePayload(payloadTypeName)
-          : payloadTypeName;
+          : { payload: payloadTypeName };
 
         outbound.push({
           topic: detail.topic,
-          payload,
+          payload: resolvedPayload.payload,
+          sourceRepo: resolvedPayload.sourceRepo,
           trigger: node.name || 'TODO_AI_ENRICH',
           ...(includeContext && {
             _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\\n${node.content?.slice(0, 200)}...`,
@@ -2808,13 +2865,14 @@ export async function extractMessaging(
             seenInbound.add(key);
 
             // Always resolve payload to BodySchema when executeQuery available
-            const payload = executeQuery && repoId
+            const resolvedPayload = executeQuery && repoId
               ? await resolvePayload(payloadTypeName)
-              : payloadTypeName;
+              : { payload: payloadTypeName };
 
             inbound.push({
               topic,
-              payload,
+              payload: resolvedPayload.payload,
+              sourceRepo: resolvedPayload.sourceRepo,
               consumptionLogic,
               ...(includeContext && {
                 _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\\n${node.content?.slice(0, 200)}...`,
@@ -2899,13 +2957,14 @@ export async function extractMessaging(
         seenInbound.add(key);
 
         // Always resolve payload to BodySchema when executeQuery available
-        const payload = executeQuery && repoId
+        const resolvedPayload = executeQuery && repoId
           ? await resolvePayload(payloadTypeName)
-          : payloadTypeName;
+          : { payload: payloadTypeName };
 
         inbound.push({
           topic,
-          payload,
+          payload: resolvedPayload.payload,
+          sourceRepo: resolvedPayload.sourceRepo,
           consumptionLogic,
           ...(includeContext && {
             _context: `// Graph query result\\n// ${filePath}\\n@${listenerType} detected`,
@@ -3063,17 +3122,37 @@ function buildConsumptionLogic(filePath: string, methodName: string): string {
   return className && methodName ? `${className}.${methodName}()` : methodName || TODO_AI_ENRICH;
 }
 
-function extractPersistence(chain: ChainNode[]): PersistenceInfo[] {
+/**
+ * WI-6: Heuristic-based persistence database extraction.
+ * Tries to resolve database type from @Table(schema=...) or @Entity annotations.
+ * Falls back to TODO_AI_ENRICH if no annotations are found.
+ */
+export async function extractPersistence(
+  chain: ChainNode[],
+  executeQuery?: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
+  repoId?: string
+): Promise<PersistenceInfo[]> {
   const tables = new Set<string>();
   const repos = new Set<string>();
+
+  // WI-6: Strip Repository/Dao/Repo suffix and capitalize to derive entity name
+  const stripRepositorySuffix = (repoVar: string): string => {
+    const stripped = repoVar
+      .replace(/Repository$/, '')
+      .replace(/Dao$/, '')
+      .replace(/Repo$/, '');
+    // Capitalize first letter (e.g. userRepository → User)
+    return stripped.charAt(0).toUpperCase() + stripped.slice(1);
+  };
 
   for (const node of chain) {
     for (const call of node.metadata.repositoryCalls) {
       repos.add(call);
-      // Extract table/entity name from repository name
-      const match = call.match(/(\w+)Repository\.(\w+)/);
+      // Extract repository variable name and strip suffix to get entity name
+      const match = call.match(/(\w+)(?:Repository|Dao|Repo)\.(\w+)/);
       if (match) {
-        tables.add(match[1]);
+        const entityName = stripRepositorySuffix(match[1]);
+        tables.add(entityName);
       }
     }
   }
@@ -3082,8 +3161,59 @@ function extractPersistence(chain: ChainNode[]): PersistenceInfo[] {
     return [];
   }
 
+  // WI-6: Resolve database from @Table(schema=...) or @Entity annotations
+  let database: string = TODO_AI_ENRICH;
+
+  if (executeQuery && repoId) {
+    // Query for Entity/Table annotations on the identified table classes
+    // Pattern 1: @Table(schema = "schema_name") — wins over @Entity
+    // Pattern 2: @Entity — indicates JPA entity (usually same DB as other entities)
+    const entityQuery = `
+      MATCH (c:Class)
+      WHERE c.name CONTAINS $tableName
+         OR c.name ENDS WITH $tableName
+      RETURN c.name AS name, c.annotations AS annotations
+      LIMIT 5
+    `;
+
+    try {
+      for (const tableName of tables) {
+        const results = await executeQuery(repoId, entityQuery, { tableName });
+        for (const row of results) {
+          const annotationsRaw = row.annotations;
+          if (annotationsRaw) {
+            let annotations: Array<{ name: string; attrs?: Record<string, any> }>;
+            try {
+              annotations = typeof annotationsRaw === 'string' ? JSON.parse(annotationsRaw) : annotationsRaw;
+            } catch {
+              continue;
+            }
+
+            // WI-6: Check @Table first (wins over @Entity)
+            const tableAnn = annotations.find(a => a.name === '@Table');
+            if (tableAnn?.attrs?.schema) {
+              database = tableAnn.attrs.schema;
+              break;
+            }
+
+            // WI-6: Fall back to @Entity presence (JPA-managed entity)
+            const entityAnn = annotations.find(a => a.name === '@Entity');
+            if (entityAnn && database === TODO_AI_ENRICH) {
+              // @Entity found but no schema info — use JPA default
+              database = 'JPA';
+            }
+          }
+        }
+        if (database !== TODO_AI_ENRICH) break;
+      }
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Persistence database heuristic failed:', e);
+      // Fall through to TODO_AI_ENRICH
+    }
+  }
+
   return [{
-    database: TODO_AI_ENRICH,
+    database,
     tables: Array.from(tables).join(', ') || 'None detected',
     storedProcedures: 'None detected',
   }];
@@ -3247,13 +3377,30 @@ function unwrapNestedGenerics(typeName: string): { innermostType: string; depth:
 }
 
 function generateJsonExample(
-  fields: Array<{ name: string; type: string; annotations: string[] }>,
+  fields: BodySchemaField[],
   nestedSchemas?: Map<string, BodySchema>,
   visited: Set<string> = new Set()
 ): Record<string, unknown> {
   const example: Record<string, unknown> = {};
 
   for (const field of fields) {
+    // Check for embedded nested fields (from embedNestedSchemas) — only when fields array is non-empty
+    if (field.fields && Array.isArray(field.fields) && field.fields.length > 0) {
+      // Prevent circular reference in embedded fields — use type placeholder if already visited
+      if (visited.has(field.type)) {
+        example[field.name] = { _type: field.type };
+        continue;
+      }
+      // Recursively generate example from embedded nested fields
+      const nestedExample = generateJsonExample(field.fields, nestedSchemas, new Set(visited).add(field.type));
+      if (field.isContainer) {
+        example[field.name] = [nestedExample];
+      } else {
+        example[field.name] = nestedExample;
+      }
+      continue;
+    }
+
     // Check if this field has a nested schema directly
     if (nestedSchemas?.has(field.type)) {
       // Prevent circular reference - if type already visited, use placeholder
@@ -3268,10 +3415,9 @@ function generateJsonExample(
 
     // Check for generic container types (List<X>, Optional<X>, Set<X>, X[])
     // Also handle nested generics like Optional<List<String>>
-    const innerType = extractGenericInnerType(field.type);
-    if (innerType) {
-      // Recursively unwrap nested generics
-      const { innermostType, depth } = unwrapNestedGenerics(field.type);
+    // unwrapNestedGenerics returns depth=0 for non-generic types
+    const { innermostType, depth } = unwrapNestedGenerics(field.type);
+    if (depth > 0) {
       
       // Check if innermost type has a nested schema
       if (nestedSchemas?.has(innermostType)) {
@@ -3321,7 +3467,7 @@ function generateJsonExample(
 /**
  * Convert BodySchema to JSON example object or null.
  */
-function bodySchemaToJsonExample(
+export function bodySchemaToJsonExample(
   schema: BodySchema | null,
   nestedSchemas?: Map<string, BodySchema>
 ): Record<string, unknown> | Record<string, unknown>[] | null {

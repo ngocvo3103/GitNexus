@@ -4,11 +4,21 @@
 
 import type { OpenAPISchema } from './types.js';
 
+/** Field element with optional nested support (from embedNestedSchemas) */
+export interface BodySchemaField {
+  name: string;
+  type: string;
+  annotations: string[];
+  source?: 'indexed' | 'external' | 'primitive';
+  fields?: BodySchemaField[];
+  isContainer?: boolean;
+}
+
 /** Source types from document-endpoint.ts */
 export interface BodySchema {
   typeName: string;
   source: 'indexed' | 'external' | 'primitive';
-  fields?: Array<{ name: string; type: string; annotations: string[] }>;
+  fields?: BodySchemaField[];
   repoId?: string;
   isContainer?: boolean;
 }
@@ -74,9 +84,9 @@ const TYPE_MAP: Record<string, string> = {
 
 /** Map validation annotations to OpenAPI constraints */
 const ANNOTATION_CONSTRAINTS: Record<string, (schema: OpenAPISchema, value?: string) => void> = {
-  '@NotNull': (s) => { s.minLength = 1; },
-  '@NotEmpty': (s) => { s.minLength = 1; },
-  '@NotBlank': (s) => { s.minLength = 1; },
+  '@NotNull': (s) => { if (s.type === 'string') s.minLength = 1; },
+  '@NotEmpty': (s) => { if (s.type === 'string') s.minLength = 1; },
+  '@NotBlank': (s) => { if (s.type === 'string') s.minLength = 1; },
   '@Size': (s, value) => {
     const match = value?.match(/max\s*=\s*(\d+)/);
     if (match) s.maxLength = parseInt(match[1], 10);
@@ -121,13 +131,13 @@ export function mapType(type: string): string {
 }
 
 /**
- * Extract format from type string
+ * Extract format from type string and field name
  */
-function extractFormat(type: string): string | undefined {
+function extractFormat(type: string, fieldName?: string): string | undefined {
   const baseType = type.split('<')[0].trim();
-  
+
   const FORMAT_MAP: Record<string, string> = {
-    Date: 'date',
+    Date: 'date-time',
     LocalDate: 'date',
     LocalDateTime: 'date-time',
     ZonedDateTime: 'date-time',
@@ -140,8 +150,19 @@ function extractFormat(type: string): string | undefined {
     uri: 'uri',
     URI: 'uri',
   };
-  
-  return FORMAT_MAP[baseType];
+
+  const typeFormat = FORMAT_MAP[baseType];
+  if (typeFormat) return typeFormat;
+
+  // Field-name heuristic: fields ending in Time/At/Timestamp → date-time
+  if (fieldName) {
+    const lower = fieldName.toLowerCase();
+    if (lower.endsWith('time') || lower.endsWith('at') || lower.endsWith('timestamp')) {
+      return 'date-time';
+    }
+  }
+
+  return undefined;
 }
 
 /**
@@ -158,6 +179,14 @@ function applyAnnotations(schema: OpenAPISchema, annotations: string[]): void {
       constraint(schema, value);
     }
   }
+}
+
+/**
+ * Check if a type string represents a collection type
+ */
+function isCollectionType(type: string): boolean {
+  const collectionPatterns = ['List<', 'Set<', 'Collection<', 'ArrayList<', 'HashSet<'];
+  return collectionPatterns.some(p => type.includes(p));
 }
 
 /**
@@ -196,11 +225,37 @@ export function bodySchemaToOpenAPISchema(schema: BodySchema | null | undefined)
   const properties: Record<string, OpenAPISchema> = {};
   const required: string[] = [];
 
-  for (const field of schema.fields) {
+  // Filter out serialVersionUID and process fields
+  const filteredFields = schema.fields.filter(f => f.name !== 'serialVersionUID');
+
+  for (const field of filteredFields) {
+    // Check for embedded nested type (from embedNestedSchemas)
+    if ('fields' in field && Array.isArray(field.fields)) {
+      const nestedBodySchema: BodySchema = {
+        typeName: field.type,
+        source: field.source ?? 'indexed',
+        fields: field.fields,
+        isContainer: field.isContainer,
+      };
+      let fieldSchema = bodySchemaToOpenAPISchema(nestedBodySchema); // recursive call
+
+      // Apply annotations from parent field
+      if (field.annotations?.length > 0) {
+        applyAnnotations(fieldSchema, field.annotations);
+      }
+
+      // Handle container wrapper (List<X> → array)
+      if (field.isContainer || isCollectionType(field.type)) {
+        fieldSchema = { type: 'array', items: fieldSchema };
+      }
+      properties[field.name] = fieldSchema;
+      continue; // skip default primitive handling
+    }
+
     const fieldType = mapType(field.type);
     const fieldSchema: OpenAPISchema = { type: fieldType };
 
-    const format = extractFormat(field.type);
+    const format = extractFormat(field.type, field.name);
     if (format) {
       fieldSchema.format = format;
     }

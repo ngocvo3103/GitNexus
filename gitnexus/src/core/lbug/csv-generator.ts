@@ -238,7 +238,7 @@ export const streamAllCSVsToDisk = async (
   const codeElemWriter = new BufferedCSVWriter(path.join(csvDir, 'codeelement.csv'), codeElementHeader);
   const communityWriter = new BufferedCSVWriter(path.join(csvDir, 'community.csv'), 'id,label,heuristicLabel,keywords,description,enrichedBy,cohesion,symbolCount');
   const processWriter = new BufferedCSVWriter(path.join(csvDir, 'process.csv'), 'id,label,heuristicLabel,processType,stepCount,communities,entryPointId,terminalId');
-  const routeHeader = 'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited';
+  const routeHeader = 'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited,repoId,responseKeys,errorKeys,middleware';
   const routeWriter = new BufferedCSVWriter(path.join(csvDir, 'route.csv'), routeHeader);
 
   // Multi-language node types share the same CSV shape (no isExported column)
@@ -357,6 +357,10 @@ export const streamAllCSVsToDisk = async (
           escapeCSVNumber(node.properties.startLine, -1),
           escapeCSVNumber((node.properties as any).lineNumber, -1),
           (node.properties as any).isInherited ? 'true' : 'false',
+          escapeCSVField((node.properties as any).repoId || ''),
+          escapeCSVField((node.properties as any).responseKeys || ''),
+          escapeCSVField((node.properties as any).errorKeys || ''),
+          escapeCSVField((node.properties as any).middleware || ''),
         ].join(','));
         break;
       }
