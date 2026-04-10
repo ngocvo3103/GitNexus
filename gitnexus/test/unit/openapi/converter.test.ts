@@ -4,6 +4,8 @@ import {
   codesToResponses,
   convertToOpenAPIPathItem,
   convertToOpenAPIDocument,
+  convertToOpenAPIYamlString,
+  embedXExtensions,
   generateSchemaName,
   shouldExtractToComponents,
   type BodySchema,
@@ -794,5 +796,101 @@ describe('nestedSchemas in components (WI-11)', () => {
     // Top-level User from response body should not be overwritten by nested User
     expect(doc.components?.schemas?.['User'].properties?.id).toBeDefined();
     expect(doc.components?.schemas?.['User'].properties?.extra).toBeUndefined();
+  });
+});
+
+// WI-2: x-extension embedding
+describe('x-extension embedding', () => {
+  // Minimal FullDeps factory — only populate fields relevant to each test
+  const makeEmpty = () => ({
+    downstreamApis: [] as any[],
+    messaging: { outbound: [] as any[], inbound: [] as any[], nestedSchemas: new Map() },
+    persistence: [] as any[],
+    annotations: { transaction: [] as string[], retry: [] as any[], security: [] as string[] },
+    validation: [] as any[],
+  });
+
+  it('test_no_external_deps_produces_no_x_extensions', () => {
+    const operation: OpenAPIOperation = { summary: 'Test', responses: {} };
+    embedXExtensions(operation, makeEmpty());
+    expect(operation['x-downstream-apis']).toBeUndefined();
+    expect(operation['x-messaging-outbound']).toBeUndefined();
+    expect(operation['x-messaging-inbound']).toBeUndefined();
+    expect(operation['x-persistence']).toBeUndefined();
+    expect(operation['x-retry-logic']).toBeUndefined();
+    expect(operation['x-transaction']).toBeUndefined();
+    expect(operation['x-security']).toBeUndefined();
+    expect(operation['x-validation-rules']).toBeUndefined();
+  });
+
+  it('test_single_downstream_api_embedded_as_x_extension', () => {
+    const deps = makeEmpty();
+    deps.downstreamApis = [{ serviceName: 'auth', endpoint: 'POST /validate', condition: 'always', purpose: 'auth' }];
+    const operation: OpenAPIOperation = { summary: 'Test', responses: {} };
+    embedXExtensions(operation, deps);
+    expect(operation['x-downstream-apis']).toEqual(deps.downstreamApis);
+    expect(operation['x-messaging-outbound']).toBeUndefined();
+  });
+
+  it('test_multiple_downstream_apis_all_embedded', () => {
+    const deps = makeEmpty();
+    deps.downstreamApis = [
+      { serviceName: 'auth', endpoint: 'POST /validate', condition: 'always', purpose: 'auth' },
+      { serviceName: 'billing', endpoint: 'GET /charges', condition: 'always', purpose: 'billing' },
+    ];
+    const operation: OpenAPIOperation = { summary: 'Test', responses: {} };
+    embedXExtensions(operation, deps);
+    expect((operation['x-downstream-apis'] as any[])).toHaveLength(2);
+    expect((operation['x-downstream-apis'] as any[])[0].serviceName).toBe('auth');
+    expect((operation['x-downstream-apis'] as any[])[1].serviceName).toBe('billing');
+  });
+
+  it('test_messaging_outbound_embedded_as_x_extension', () => {
+    const deps = makeEmpty();
+    deps.messaging.outbound = [{ topic: 'user-created', trigger: 'on success' }];
+    const operation: OpenAPIOperation = { summary: 'Test', responses: {} };
+    embedXExtensions(operation, deps);
+    expect(operation['x-messaging-outbound']).toEqual(deps.messaging.outbound);
+    expect(operation['x-messaging-inbound']).toBeUndefined();
+  });
+
+  it('test_messaging_inbound_embedded_as_x_extension', () => {
+    const deps = makeEmpty();
+    deps.messaging.inbound = [{ topic: 'config-updates' }];
+    const operation: OpenAPIOperation = { summary: 'Test', responses: {} };
+    embedXExtensions(operation, deps);
+    expect(operation['x-messaging-inbound']).toEqual(deps.messaging.inbound);
+  });
+
+  it('test_mixed_dependencies_all_x_extension_types_present', () => {
+    const deps = makeEmpty();
+    deps.downstreamApis = [{ serviceName: 'auth', endpoint: 'POST /validate', condition: 'always', purpose: 'auth' }];
+    deps.messaging.outbound = [{ topic: 'user-created', trigger: 'on success' }];
+    deps.messaging.inbound = [{ topic: 'config-updates' }];
+    deps.persistence = [{ database: 'postgres', tables: 'users' }];
+    deps.annotations.retry = [{ maxAttempts: 3, delayMs: 500 }];
+    deps.annotations.transaction = ['REQUIRED'];
+    deps.annotations.security = ['@RolesAllowed("ADMIN")'];
+    deps.validation = [{ field: 'email', rule: '@Email' }];
+    const operation: OpenAPIOperation = { summary: 'Test', responses: {} };
+    embedXExtensions(operation, deps);
+    expect(operation['x-downstream-apis']).toEqual(deps.downstreamApis);
+    expect(operation['x-messaging-outbound']).toEqual(deps.messaging.outbound);
+    expect(operation['x-messaging-inbound']).toEqual(deps.messaging.inbound);
+    expect(operation['x-persistence']).toEqual(deps.persistence);
+    expect(operation['x-retry-logic']).toEqual(deps.annotations.retry);
+    expect(operation['x-transaction']).toEqual(deps.annotations.transaction);
+    expect(operation['x-security']).toEqual(deps.annotations.security);
+    expect(operation['x-validation-rules']).toEqual(deps.validation);
+  });
+
+  it('test_persistence_with_database_schema_embedded', () => {
+    const deps = makeEmpty();
+    deps.persistence = [{ database: 'postgres', tables: 'users, sessions', storedProcedures: 'get_user_by_id' }];
+    const operation: OpenAPIOperation = { summary: 'Test', responses: {} };
+    embedXExtensions(operation, deps);
+    expect(operation['x-persistence']).toEqual(deps.persistence);
+    expect((operation['x-persistence'] as any[])[0].database).toBe('postgres');
+    expect((operation['x-persistence'] as any[])[0].tables).toBe('users, sessions');
   });
 });

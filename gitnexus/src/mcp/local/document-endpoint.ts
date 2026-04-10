@@ -24,6 +24,57 @@ import type { BodySchemaField } from '../../core/openapi/schema-builder.js';
 /** Placeholder for AI enrichment - used throughout for fields requiring manual input */
 const TODO_AI_ENRICH = 'TODO_AI_ENRICH';
 
+/**
+ * Deep-clone an object, stripping all undefined values (including nested).
+ * Used by MCP output to ensure clean JSON without undefined literals.
+ */
+function stripUndefined<T>(obj: T): T {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) return obj.map(stripUndefined) as T;
+  if (typeof obj === 'object' && !(obj instanceof Map)) {
+    const result: any = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (value !== undefined) {
+        result[key] = stripUndefined(value);
+      }
+    }
+    return result;
+  }
+  return obj;
+}
+
+// Re-export for use in tool.ts output path
+export { stripUndefined };
+
+/**
+ * Bundles all external dependency extraction results.
+ * Used by convertToOpenAPIYamlString (in converter.ts) to embed x-extensions.
+ */
+export interface ExternalDeps {
+  downstreamApis: DownstreamApi[];
+  messaging: {
+    outbound: MessagingOutbound[];
+    inbound: MessagingInbound[];
+    nestedSchemas: Map<string, BodySchema>;
+  };
+  persistence: PersistenceInfo[];
+  annotations: {
+    transaction: string[];
+    retry: RetryLogic[];
+    security: string[];
+  };
+  validation: ValidationRule[];
+}
+
+/** Return type when mode === 'openapi' — YAML-wrapped result */
+export interface OpenApiModeResult {
+  yaml: string;
+  method: string;
+  path: string;
+  handlerClass?: string;
+  handlerMethod?: string;
+}
+
 /** Debug mode flag for conditional logging */
 const DEBUG = process.env.GITNEXUS_DEBUG === 'true';
 
@@ -123,11 +174,12 @@ export interface DocumentEndpointOptions {
   method: string;
   path: string;
   depth?: number;
+  /** Output mode: 'openapi' (compact YAML) or 'ai_context' (full JSON with BodySchema) */
+  mode?: 'openapi' | 'ai_context';
+  /** @deprecated Use mode === 'ai_context' instead */
   include_context?: boolean;
   compact?: boolean;
   repo?: string;
-  /** Preserve raw BodySchema for OpenAPI generation (includes validation annotations) */
-  openapi?: boolean;
   /** Optional injected query executor for testing */
   executeQuery?: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>;
   /** Optional cross-repo resolution capabilities */
@@ -168,12 +220,15 @@ export interface BodySchema {
 
 export interface DownstreamApi {
   serviceName: string;
+  name: string;
+  type: string;
+  service: string;
+  repoId?: string;
   endpoint: string;
   condition: string;
   purpose: string;
   _context?: string;
   resolvedUrl?: string;
-  /** Attribution for how URL was resolved (e.g., 'value-annotation', 'static-final', 'builder-pattern') */
   resolvedFrom?: string;
   resolutionDetails?: {
     serviceField?: string;
@@ -184,6 +239,10 @@ export interface DownstreamApi {
 
 export interface MessagingOutbound {
   topic: string;
+  pattern: string;
+  type: string;
+  direction: string;
+  service?: string;
   payload: string | BodySchema | Record<string, unknown> | Record<string, unknown>[];
   trigger: string;
   _context?: string;
@@ -193,6 +252,10 @@ export interface MessagingOutbound {
 
 export interface MessagingInbound {
   topic: string;
+  pattern: string;
+  type: string;
+  direction: string;
+  service?: string;
   payload: string | BodySchema | Record<string, unknown> | Record<string, unknown>[];
   consumptionLogic: string;
   _context?: string;
@@ -203,6 +266,8 @@ export interface MessagingInbound {
 export interface PersistenceInfo {
   database: string;
   tables: string;
+  entity: string;
+  operation: string;
   storedProcedures: string;
 }
 
@@ -259,8 +324,10 @@ export interface DocumentEndpointResult {
     messaging: {
       outbound: MessagingOutbound[];
       inbound: MessagingInbound[];
+      nestedSchemas?: Map<string, BodySchema>;
     };
     persistence: PersistenceInfo[];
+    validation: ValidationRule[];
   };
   logicFlow: string;
   codeDiagram: string;
@@ -297,7 +364,6 @@ interface BuildDocumentationParams {
   chain: ChainNode[];
   includeContext: boolean;
   compact: boolean;
-  openapi: boolean;
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>;
   repoId: string;
   crossRepo?: CrossRepoContext;
@@ -370,7 +436,7 @@ export function pathsMatchStructurally(inputPath: string, annotationPath: string
  * Searches for Java methods with @XxxMapping annotations matching the path.
  * Combines class-level @RequestMapping prefix with method-level path before validation.
  */
-async function findHandlerByPathPattern(
+export async function findHandlerByPathPattern(
   repo: RepoHandle,
   method: string,
   pathPattern: string
@@ -598,8 +664,16 @@ async function findHandlerByPathPattern(
 export async function documentEndpoint(
   repo: RepoHandle,
   options: DocumentEndpointOptions
-): Promise<{ result: DocumentEndpointResult; error?: string }> {
-  const { method, path, depth = 10, include_context = false, compact = false, openapi = false, crossRepo } = options;
+): Promise<{ result: DocumentEndpointResult; error?: string } | OpenApiModeResult> {
+  const { method, path, depth = 10, mode, include_context = false, compact = false, crossRepo } = options;
+  // Default mode is 'openapi' when neither mode nor include_context is set.
+  // mode takes precedence over include_context; include_context only
+  // applies when mode is not explicitly set (undefined).
+  const effectiveMode: 'openapi' | 'ai_context' =
+    mode === 'openapi' || mode === 'ai_context' ? mode
+    : include_context ? 'ai_context'
+    : 'openapi';
+  const effectiveIncludeContext = effectiveMode === 'ai_context';
 
   // Validate HTTP method
   const upperMethod = method.toUpperCase();
@@ -721,16 +795,65 @@ export async function documentEndpoint(
     path: route.path,
     route,
     chain: traceResult.chain,
-    includeContext: include_context,
+    includeContext: effectiveIncludeContext,
     compact,
-    openapi,
     executeQuery,
     repoId: repo.id,
     crossRepo,
   });
 
-  return { result };
+  // WI-4: Apply ai_context placeholders after buildDocumentation completes
+  // Use effectiveIncludeContext to decide return shape (covers both mode='ai_context' and legacy include_context=true)
+  if (effectiveIncludeContext) {
+    return { result: applyAiContextPlaceholders(result) };
+  }
+
+  // WI-3: mode === 'openapi' (default) — return YAML string instead of raw DocumentEndpointResult
+  // Build operationId (same logic as convertToOpenAPIPathItem/generateOperationId)
+  const normalizedPath = route.path
+    .replace(/[{}]/g, '')
+    .replace(/[/:-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+  const pathPart = normalizedPath.startsWith('_') ? normalizedPath.slice(1) : normalizedPath;
+  const operationId = `${method.toLowerCase()}_${pathPart}`;
+
+  // Collect external dependencies for x-extensions
+  const downstreamApis = result.externalDependencies.downstreamApis;
+  const messagingOutbound = result.externalDependencies.messaging.outbound;
+  const messagingInbound = result.externalDependencies.messaging.inbound;
+  const persistence = result.externalDependencies.persistence;
+  const { transaction, retry, security } = result.keyDetails
+    ? { transaction: result.keyDetails.transactionManagement, retry: result.retryLogic, security: result.keyDetails.security }
+    : { transaction: [], retry: [], security: [] };
+  const validation = result.specs.request.validation;
+
+  const deps: ExternalDeps = {
+    downstreamApis,
+    messaging: { outbound: messagingOutbound, inbound: messagingInbound, nestedSchemas: result.nestedSchemas ?? new Map() },
+    persistence,
+    annotations: { transaction, retry, security },
+    validation,
+  };
+
+  // Dynamic import to avoid breaking test mocks
+  const { convertToOpenAPIYamlString } = await import('../../core/openapi/converter.js');
+
+  const yaml = convertToOpenAPIYamlString(
+    [result],
+    {},
+    new Map([[operationId, deps]])
+  );
+
+  return {
+    yaml,
+    method,
+    path: route.path,
+    handlerClass: route.controller,
+    handlerMethod: route.handler,
+  };
 }
+
 
 // ============================================================================
 // Helper Functions
@@ -756,6 +879,7 @@ function createEmptyResult(method: string, path: string): DocumentEndpointResult
       downstreamApis: [],
       messaging: { outbound: [], inbound: [] },
       persistence: [],
+      validation: [],
     },
     logicFlow: TODO_AI_ENRICH,
     codeDiagram: '',
@@ -765,15 +889,56 @@ function createEmptyResult(method: string, path: string): DocumentEndpointResult
   };
 }
 
+
+/**
+ * Post-processing for ai_context mode: fills empty fields with TODO_AI_ENRICH placeholders
+ * and ensures _context is always defined. Does not overwrite existing content.
+ */
+function applyAiContextPlaceholders(result: DocumentEndpointResult): DocumentEndpointResult {
+  // summary → TODO_AI_ENRICH if empty or already a placeholder
+  if (!result.summary || result.summary === TODO_AI_ENRICH) {
+    result.summary = TODO_AI_ENRICH;
+  }
+
+  // logicFlow → TODO_AI_ENRICH if empty or already a placeholder
+  if (!result.logicFlow || result.logicFlow === TODO_AI_ENRICH) {
+    result.logicFlow = TODO_AI_ENRICH;
+  }
+
+  // keyDetails.businessRules → TODO_AI_ENRICH if empty array
+  if (!result.keyDetails.businessRules || result.keyDetails.businessRules.length === 0) {
+    result.keyDetails.businessRules = [TODO_AI_ENRICH];
+  }
+
+  // downstreamApis[].condition and .purpose → TODO_AI_ENRICH if empty
+  if (result.externalDependencies.downstreamApis) {
+    result.externalDependencies.downstreamApis = result.externalDependencies.downstreamApis.map(api => ({
+      ...api,
+      condition: api.condition || TODO_AI_ENRICH,
+      purpose: api.purpose || TODO_AI_ENRICH,
+    }));
+  }
+
+  // _context must be defined in ai_context mode
+  if (!result._context) {
+    result._context = {
+      summaryContext: TODO_AI_ENRICH,
+      resolvedProperties: {},
+    };
+  }
+
+  return result;
+}
 async function buildDocumentation(params: BuildDocumentationParams): Promise<DocumentEndpointResult> {
-  const { method, path, route, chain, includeContext, compact, openapi, executeQuery, repoId, crossRepo } = params;
+  const { method, path, route, chain, includeContext, compact, executeQuery, repoId, crossRepo } = params;
   const result = createEmptyResult(method, path);
 
-  // Run all three independent async operations in parallel for better performance
-  const [downstreamApis, bodyResult, messagingResult] = await Promise.all([
-    extractDownstreamApis(chain, executeQuery, repoId, includeContext),
+  // Run all four independent async operations in parallel for better performance
+  const [downstreamApis, bodyResult, messagingResult, persistence] = await Promise.all([
+    extractDownstreamApis(chain, executeQuery, repoId, includeContext, crossRepo),
     extractBodySchemas(chain, executeQuery, repoId, crossRepo),
     extractMessaging(chain, includeContext, executeQuery, repoId, crossRepo),
+    extractPersistence(chain, executeQuery, repoId),
   ]);
 
   // Destructure results from parallel execution
@@ -787,6 +952,10 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
     // Remove internal enrichment fields for schema-compliant output
     result.externalDependencies.downstreamApis = downstreamApis.map(api => ({
       serviceName: api.serviceName,
+      name: api.name,
+      type: api.type,
+      service: api.service,
+      repoId: api.repoId,
       endpoint: api.endpoint,
       condition: api.condition,
       purpose: api.purpose,
@@ -812,12 +981,12 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
         const schema = msg.payload as BodySchema;
         // External types (not indexed) - return type name string
         if (schema.source === 'external' || !schema.fields) {
-          return { topic: msg.topic, payload: schema.typeName, trigger: msg.trigger, sourceRepo: msg.sourceRepo };
+          return { topic: msg.topic, payload: schema.typeName, pattern: msg.pattern, type: msg.type, direction: msg.direction, service: msg.service, trigger: msg.trigger, sourceRepo: msg.sourceRepo };
         }
         // Indexed types with fields - return JSON example
-        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), trigger: msg.trigger, sourceRepo: msg.sourceRepo };
+        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), pattern: msg.pattern, type: msg.type, direction: msg.direction, service: msg.service, trigger: msg.trigger, sourceRepo: msg.sourceRepo };
       }
-      return { topic: msg.topic, payload: msg.payload, trigger: msg.trigger, sourceRepo: msg.sourceRepo };
+      return { topic: msg.topic, payload: msg.payload, pattern: msg.pattern, type: msg.type, direction: msg.direction, service: msg.service, trigger: msg.trigger, sourceRepo: msg.sourceRepo };
     });
 
     result.externalDependencies.messaging.inbound = inbound.map(msg => {
@@ -825,17 +994,15 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
         const schema = msg.payload as BodySchema;
         // External types (not indexed) - return type name string
         if (schema.source === 'external' || !schema.fields) {
-          return { topic: msg.topic, payload: schema.typeName, consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
+          return { topic: msg.topic, payload: schema.typeName, pattern: msg.pattern, type: msg.type, direction: msg.direction, service: msg.service, consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
         }
         // Indexed types with fields - return JSON example
-        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
+        return { topic: msg.topic, payload: bodySchemaToJsonExample(schema, nestedSchemas), pattern: msg.pattern, type: msg.type, direction: msg.direction, service: msg.service, consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
       }
-      return { topic: msg.topic, payload: msg.payload, consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
+      return { topic: msg.topic, payload: msg.payload, pattern: msg.pattern, type: msg.type, direction: msg.direction, service: msg.service, consumptionLogic: msg.consumptionLogic, sourceRepo: msg.sourceRepo };
     });
   }
 
-  // Extract persistence (repository calls) with database heuristics
-  const persistence = await extractPersistence(chain, executeQuery, repoId);
   result.externalDependencies.persistence = persistence;
 
   // Extract exceptions for response codes
@@ -852,10 +1019,9 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
   result.keyDetails.security = security;
 
   // Convert to JSON example for schema-compliant output
-  // When openapi=true, keep raw BodySchema for OpenAPI converter (includes validation annotations)
   // When includeContext is true, keep full BodySchema for AI enrichment
-  // When openapi=false and includeContext=false, output JSON example
-  if (openapi || includeContext) {
+  // When includeContext is false, output JSON example
+  if (includeContext) {
     result.specs.request.body = embedNestedSchemas(requestBody, nestedSchemas);
     result.specs.response.body = embedNestedSchemas(responseBody, nestedSchemas);
   } else {
@@ -870,6 +1036,9 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
     // Extract validation rules from handler parameters and body schema fields
     result.specs.request.validation = extractValidationRules(handler, requestBody, chain, includeContext);
   }
+
+  // WI-5: Copy validation to externalDependencies for consumer convenience
+  result.externalDependencies.validation = result.specs.request.validation;
 
   // Generate code diagram
   result.codeDiagram = generateCodeDiagram(chain);
@@ -914,7 +1083,8 @@ async function extractDownstreamApis(
   chain: ChainNode[],
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
   repoId: string,
-  includeContext: boolean
+  includeContext: boolean,
+  crossRepo?: CrossRepoContext
 ): Promise<DownstreamApi[]> {
   const apis: DownstreamApi[] = [];
   const seen = new Set<string>();
@@ -1089,6 +1259,39 @@ async function extractDownstreamApis(
         endpoint = `${detail.httpMethod} ${detail.urlExpression}`;
       }
 
+      // WI-4: Cross-repo URL resolution — find which dep repo provides this API
+      let resolvedRepoId: string = repoId; // default to current repo
+      if (crossRepo) {
+        try {
+          // Strategy 1: Match by serviceName (Spring property key often contains package prefix)
+          if (serviceName && serviceName !== 'unknown-service') {
+            const depRepoId = await crossRepo.findDepRepo(serviceName);
+            if (depRepoId) {
+              resolvedRepoId = depRepoId;
+            }
+          }
+
+          // Strategy 2: If serviceName didn't match, try URL path segment
+          if (resolvedRepoId === repoId && resolvedUrl) {
+            try {
+              const urlObj = new URL(resolvedUrl);
+              const pathSegments = urlObj.pathname.split('/').filter(Boolean);
+              if (pathSegments.length > 0) {
+                const serviceSegment = pathSegments[0];
+                const depRepoId = await crossRepo.findDepRepo(serviceSegment);
+                if (depRepoId) {
+                  resolvedRepoId = depRepoId;
+                }
+              }
+            } catch {
+              // URL parsing may fail for partial URLs — ignore
+            }
+          }
+        } catch (e) {
+          if (DEBUG) console.error('[GitNexus DEBUG] Cross-repo URL resolution failed:', e);
+        }
+      }
+
       // ============================================
       // Pass 3: Context enrichment for unresolved cases
       // ============================================
@@ -1111,6 +1314,10 @@ async function extractDownstreamApis(
 
       apis.push({
         serviceName,
+        name: serviceName,
+        type: 'REST',
+        service: serviceName,
+        repoId: resolvedRepoId,
         endpoint,
         condition: TODO_AI_ENRICH,
         purpose: TODO_AI_ENRICH,
@@ -2827,6 +3034,10 @@ export async function extractMessaging(
 
         outbound.push({
           topic: detail.topic,
+          pattern: 'publish/subscribe',
+          type: 'event',
+          direction: 'outbound',
+          service: resolvedPayload.sourceRepo,
           payload: resolvedPayload.payload,
           sourceRepo: resolvedPayload.sourceRepo,
           trigger: node.name || 'TODO_AI_ENRICH',
@@ -2871,6 +3082,10 @@ export async function extractMessaging(
 
             inbound.push({
               topic,
+              pattern: 'publish/subscribe',
+              type: 'event',
+              direction: 'inbound',
+              service: resolvedPayload.sourceRepo,
               payload: resolvedPayload.payload,
               sourceRepo: resolvedPayload.sourceRepo,
               consumptionLogic,
@@ -2963,6 +3178,10 @@ export async function extractMessaging(
 
         inbound.push({
           topic,
+          pattern: 'publish/subscribe',
+          type: 'event',
+          direction: 'inbound',
+          service: resolvedPayload.sourceRepo,
           payload: resolvedPayload.payload,
           sourceRepo: resolvedPayload.sourceRepo,
           consumptionLogic,
@@ -3133,6 +3352,7 @@ export async function extractPersistence(
   repoId?: string
 ): Promise<PersistenceInfo[]> {
   const tables = new Set<string>();
+  const operations = new Set<string>();
   const repos = new Set<string>();
 
   // WI-6: Strip Repository/Dao/Repo suffix and capitalize to derive entity name
@@ -3145,6 +3365,15 @@ export async function extractPersistence(
     return stripped.charAt(0).toUpperCase() + stripped.slice(1);
   };
 
+  // WI-3: Derive CRUD operation from repository method name
+  const deriveOperation = (methodName: string): string => {
+    const lower = methodName.toLowerCase();
+    if (/^(save|insert|add|create)/.test(lower)) return 'CREATE';
+    if (/^(delete|remove)/.test(lower)) return 'DELETE';
+    if (/^(update|modify|set)/.test(lower)) return 'UPDATE';
+    return 'READ'; // default for find*/get*/query*/read*
+  };
+
   for (const node of chain) {
     for (const call of node.metadata.repositoryCalls) {
       repos.add(call);
@@ -3153,6 +3382,7 @@ export async function extractPersistence(
       if (match) {
         const entityName = stripRepositorySuffix(match[1]);
         tables.add(entityName);
+        operations.add(deriveOperation(match[2]));
       }
     }
   }
@@ -3215,6 +3445,8 @@ export async function extractPersistence(
   return [{
     database,
     tables: Array.from(tables).join(', ') || 'None detected',
+    entity: Array.from(tables).join(', ') || 'None detected',
+    operation: Array.from(operations).join(', ') || 'READ',
     storedProcedures: 'None detected',
   }];
 }
@@ -3308,6 +3540,45 @@ function extractAnnotations(chain: ChainNode[]): {
   }
 
   return { transaction, retry, security };
+}
+
+/**
+ * Extracts all external dependencies from a call chain.
+ * Wrapper over the individual extractors, returning a flat ExternalDeps object
+ * suitable for embedding into OpenAPI x-extension fields.
+ *
+ * @param chain       Call chain returned by executeTrace
+ * @param _path       OpenAPI path (unused but kept for signature compatibility)
+ * @param _method     HTTP method (unused but kept for signature compatibility)
+ * @param executeQuery  Graph query function
+ * @param repoId      Repository ID
+ */
+export async function extractAllDependencies(
+  chain: import('../../mcp/local/trace-executor.js').ChainNode[],
+  _path: string,
+  _method: string,
+  executeQuery: (repoId: string, query: string, params: Record<string, unknown>) => Promise<unknown[]>,
+  repoId: string,
+): Promise<ExternalDeps> {
+  const [downstreamApis, messagingResult, persistence] = await Promise.all([
+    extractDownstreamApis(chain, executeQuery, repoId, false),
+    extractMessaging(chain, false, executeQuery, repoId),
+    extractPersistence(chain, executeQuery, repoId),
+  ]);
+
+  const annotations = extractAnnotations(chain);
+
+  return {
+    downstreamApis,
+    messaging: {
+      outbound: messagingResult.outbound,
+      inbound: messagingResult.inbound,
+      nestedSchemas: messagingResult.nestedSchemas,
+    },
+    persistence,
+    annotations,
+    validation: [],  // Enricher does not compute validation — use documentEndpoint for full results
+  };
 }
 
 /**

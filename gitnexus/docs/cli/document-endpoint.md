@@ -6,7 +6,7 @@ Generate API documentation for an endpoint.
 
 ```bash
 gitnexus document-endpoint --method <METHOD> --path <path-pattern> [options]
-gitnexus document-endpoint --all-endpoints --openapi --repo <name> [options]
+gitnexus document-endpoint --all-endpoints --repo <name> [options]
 ```
 
 ## Options
@@ -16,10 +16,9 @@ gitnexus document-endpoint --all-endpoints --openapi --repo <name> [options]
 | `--method <METHOD>` | HTTP method (GET, POST, PUT, DELETE, PATCH) |
 | `--path <pattern>` | Path pattern to match |
 | `--repo <name>` | Target repository |
-| `--openapi` | Output in OpenAPI 3.1.0 format |
-| `--format <yaml\|json>` | Output format (default: yaml when --openapi) |
+| `--mode <mode>` | Output mode: `openapi` (default) or `ai_context` |
 | `--all-endpoints` | Generate OpenAPI for all endpoints in repo |
-| `--output <path>` | Write to file instead of stdout |
+| `--outputPath <path>` | Output directory for JSON and OpenAPI YAML files |
 | `--title <title>` | API title for OpenAPI info |
 | `--api-version <ver>` | API version (default: 1.0.0) |
 
@@ -40,20 +39,20 @@ If you get "No endpoints found" but expect endpoints to exist:
 gitnexus analyze --force /path/to/repo --repo my-service
 
 # Then generate OpenAPI
-gitnexus document-endpoint --all-endpoints --openapi --repo my-service
+gitnexus document-endpoint --all-endpoints --outputPath ./docs --repo my-service
 ```
 
 ## Examples
 
 ```bash
-# Single endpoint documentation
+# Single endpoint documentation (default: OpenAPI YAML to stdout)
 gitnexus document-endpoint --method GET --path "/users" --repo my-service
 
-# Single endpoint as OpenAPI
-gitnexus document-endpoint --method GET --path "/users/{id}" --openapi --repo my-service
+# Single endpoint with context
+gitnexus document-endpoint --method GET --path "/users/{id}" --mode ai_context --repo my-service
 
-# All endpoints as OpenAPI
-gitnexus document-endpoint --all-endpoints --openapi --repo my-service --title "My API"
+# All endpoints with output to directory
+gitnexus document-endpoint --all-endpoints --outputPath ./docs --repo my-service --title "My API"
 ```
 
 ## Troubleshooting
@@ -67,4 +66,4 @@ If `--all-endpoints` returns no results:
 
 ### Output format issues
 
-For JSON output, use `--format json`. Default is YAML when `--openapi` is specified.
+Use `--mode ai_context` for JSON output with AI context fields. Default is OpenAPI YAML.

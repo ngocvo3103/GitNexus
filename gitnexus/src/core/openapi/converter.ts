@@ -24,9 +24,11 @@ import {
 import {
   bodySchemaToJsonExample,
   type DocumentEndpointResult,
+  type ExternalDeps,
   type ParamInfo,
   type ResponseCode,
 } from '../../mcp/local/document-endpoint.js';
+import yaml from 'js-yaml';
 
 /** Map HTTP methods to OpenAPI operation keys */
 const METHOD_MAP: Record<string, keyof OpenAPIPathItem> = {
@@ -444,6 +446,79 @@ export function convertToOpenAPIDocument(
   }
 
   return document;
+}
+
+
+/**
+ * Embed x-extension keys on an OpenAPI operation from extracted external dependencies.
+ * Only adds keys when the corresponding array has entries (no empty x-extensions).
+ */
+export function embedXExtensions(
+  operation: OpenAPIOperation,
+  deps: ExternalDeps
+): void {
+  if (deps.downstreamApis.length > 0) {
+    (operation as unknown as Record<string, unknown>)['x-downstream-apis'] = deps.downstreamApis;
+  }
+  if (deps.messaging.outbound.length > 0) {
+    (operation as unknown as Record<string, unknown>)['x-messaging-outbound'] = deps.messaging.outbound;
+  }
+  if (deps.messaging.inbound.length > 0) {
+    (operation as unknown as Record<string, unknown>)['x-messaging-inbound'] = deps.messaging.inbound;
+  }
+  if (deps.persistence.length > 0) {
+    (operation as unknown as Record<string, unknown>)['x-persistence'] = deps.persistence;
+  }
+  if (deps.annotations.retry.length > 0) {
+    (operation as unknown as Record<string, unknown>)['x-retry-logic'] = deps.annotations.retry;
+  }
+  if (deps.annotations.transaction.length > 0) {
+    (operation as unknown as Record<string, unknown>)['x-transaction'] = deps.annotations.transaction;
+  }
+  if (deps.annotations.security.length > 0) {
+    (operation as unknown as Record<string, unknown>)['x-security'] = deps.annotations.security;
+  }
+  if (deps.validation.length > 0) {
+    (operation as unknown as Record<string, unknown>)['x-validation-rules'] = deps.validation;
+  }
+}
+
+/**
+ * Convert document endpoint results to an OpenAPI YAML string.
+ * If deps is provided, x-extensions are embedded on each operation.
+ */
+export function convertToOpenAPIYamlString(
+  results: DocumentEndpointResult[],
+  options: DocumentOptions = {},
+  deps?: Map<string, ExternalDeps>
+): string {
+  const document = convertToOpenAPIDocument(results, options);
+
+  // Embed x-extensions on each operation if deps provided
+  if (deps) {
+    for (const pathItem of Object.values(document.paths)) {
+      for (const operation of Object.values(pathItem)) {
+        if (operation && typeof operation === 'object' && 'operationId' in operation) {
+          const operationId = (operation as OpenAPIOperation).operationId;
+          if (operationId && deps.has(operationId)) {
+            embedXExtensions(operation as OpenAPIOperation, deps.get(operationId)!);
+          }
+        }
+      }
+    }
+  }
+
+  // Convert nestedSchemas Map to plain object before YAML serialization
+  if (document.components?.schemas) {
+    const schemas = document.components.schemas;
+    const plainSchemas: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(schemas)) {
+      plainSchemas[key] = value;
+    }
+    document.components.schemas = plainSchemas as OpenAPIComponents['schemas'];
+  }
+
+  return yaml.dump(document, { lineWidth: -1, noRefs: true });
 }
 
 /** Options for document generation */

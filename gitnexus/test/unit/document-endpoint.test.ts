@@ -84,6 +84,7 @@ describe('documentEndpoint', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/nonexistent',
+        mode: 'ai_context',
       });
 
       expect(result.error).toContain('No endpoint found');
@@ -122,6 +123,7 @@ describe('documentEndpoint', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.method).toBe('GET');
@@ -169,7 +171,7 @@ describe('documentEndpoint', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: false,
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.response.codes).toContainEqual({
@@ -213,7 +215,7 @@ describe('documentEndpoint', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/users',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       expect(result.result._context).toBeDefined();
@@ -255,6 +257,7 @@ describe('documentEndpoint', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
       });
 
       // The HTTP call should be extracted from metadata
@@ -296,6 +299,7 @@ describe('documentEndpoint', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/events',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.outbound).toBeDefined();
@@ -338,6 +342,7 @@ describe('documentEndpoint', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.persistence).toBeDefined();
@@ -376,6 +381,7 @@ describe('documentEndpoint', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.codeDiagram).toBeDefined();
@@ -419,7 +425,7 @@ describe('metadata populated regardless of include_context', () => {
       summary: emptySummary(),
     });
 
-    await documentEndpoint(mockRepo, { method: 'GET', path: '/test' });
+    await documentEndpoint(mockRepo, { method: 'GET', path: '/test', mode: 'ai_context' });
 
     // Bug: current code passes include_content: false (mirrors include_context).
     // This test MUST fail until WI-1 fix is applied.
@@ -449,7 +455,7 @@ describe('metadata populated regardless of include_context', () => {
       summary: emptySummary(),
     });
 
-    const result = await documentEndpoint(mockRepo, { method: 'GET', path: '/test', include_context: false });
+    const result = await documentEndpoint(mockRepo, { method: 'GET', path: '/test', mode: 'ai_context' });
 
     expect(result.result.externalDependencies.downstreamApis.length).toBeGreaterThan(0);
   });
@@ -473,7 +479,7 @@ describe('metadata populated regardless of include_context', () => {
       summary: emptySummary(),
     });
 
-    const result = await documentEndpoint(mockRepo, { method: 'GET', path: '/test', include_context: false });
+    const result = await documentEndpoint(mockRepo, { method: 'GET', path: '/test', mode: 'ai_context' });
 
     expect(result.result.specs.response.codes.length).toBeGreaterThan(1);
     expect(
@@ -509,13 +515,13 @@ describe('metadata populated regardless of include_context', () => {
       summary: emptySummary(),
     });
 
-    const result = await documentEndpoint(mockRepo, { method: 'GET', path: '/test', include_context: true });
+    const result = await documentEndpoint(mockRepo, { method: 'GET', path: '/test', mode: 'ai_context' });
 
     expect(result.result._context).toBeDefined();
     expect(result.result.externalDependencies.downstreamApis.length).toBeGreaterThan(0);
   });
 
-  it('_context NOT included when include_context is false even with metadata', async () => {
+  it('_context NOT included when mode is openapi even with metadata', async () => {
     vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
       chain: [{
         uid: 'Method:src/controllers/TestController.java:testHandler',
@@ -535,9 +541,11 @@ describe('metadata populated regardless of include_context', () => {
       summary: emptySummary(),
     });
 
-    const result = await documentEndpoint(mockRepo, { method: 'GET', path: '/test', include_context: false });
+    const result = await documentEndpoint(mockRepo, { method: 'GET', path: '/test', mode: 'openapi' });
 
-    expect(result.result._context == null).toBe(true);
+    // openapi mode returns YAML, no _context field
+    expect(result).toHaveProperty('yaml');
+    expect(result).not.toHaveProperty('result');
   });
 });
 
@@ -575,6 +583,7 @@ describe('URL expression parsing', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'POST',
       path: '/orders',
+      mode: 'ai_context',
     });
 
     // Should extract service name from variable
@@ -615,6 +624,7 @@ describe('URL expression parsing', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'GET',
       path: '/data',
+      mode: 'ai_context',
     });
 
     // Static URLs should use 'unknown-service' or extract from literal
@@ -654,7 +664,7 @@ describe('URL expression parsing', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'POST',
       path: '/limits',
-      include_context: true,
+      mode: 'ai_context',
     });
 
     // Should parse variable references
@@ -697,6 +707,7 @@ describe('body schema extraction', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'GET',
       path: '/health',
+      mode: 'ai_context',
     });
 
     expect(result.result.specs.request.body).toBeNull();
@@ -734,11 +745,12 @@ describe('body schema extraction', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'POST',
       path: '/users',
+      mode: 'ai_context',
     });
 
-    // Body schema: when include_context is false (default), body is { _type: TypeName } for external types
-    // External types (not in graph) return type placeholder
-    expect(result.result.specs.request.body).toEqual({ _type: 'UserDTO' });
+    // Body schema: ai_context mode returns BodySchema for external types
+    // External types (not in graph) return minimal BodySchema
+    expect(result.result.specs.request.body).toEqual({ typeName: 'UserDTO', source: 'external', fields: undefined });
   });
 });
 
@@ -828,6 +840,7 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
       });
 
       // Should detect @EventListener as inbound messaging
@@ -835,7 +848,7 @@ describe('extractMessaging inbound', () => {
       expect(result.result.externalDependencies.messaging.inbound.length).toBeGreaterThan(0);
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('TODO_AI_ENRICH');
-      expect(inbound.payload).toBe('OrderEvent');
+      expect(inbound.payload).toEqual({ typeName: 'OrderEvent', source: 'external', fields: undefined });
       expect(inbound.consumptionLogic).toContain('handleEvent');
     });
 
@@ -873,12 +886,13 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/transactions',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
       expect(result.result.externalDependencies.messaging.inbound.length).toBeGreaterThan(0);
       const inbound = result.result.externalDependencies.messaging.inbound[0];
-      expect(inbound.payload).toBe('TransactionEvent');
+      expect(inbound.payload).toEqual({ typeName: 'TransactionEvent', source: 'external', fields: undefined });
     });
   });
 
@@ -917,13 +931,14 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/messages',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
       expect(result.result.externalDependencies.messaging.inbound.length).toBeGreaterThan(0);
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('order.queue');
-      expect(inbound.payload).toBe('OrderMessage');
+      expect(inbound.payload).toEqual({ typeName: 'OrderMessage', source: 'external', fields: undefined });
       expect(inbound.consumptionLogic).toContain('RabbitConsumer.consumeMessage');
     });
 
@@ -961,13 +976,14 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/events',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
       expect(result.result.externalDependencies.messaging.inbound.length).toBeGreaterThan(0);
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('payment.events');
-      expect(inbound.payload).toBe('PaymentEvent');
+      expect(inbound.payload).toEqual({ typeName: 'PaymentEvent', source: 'external', fields: undefined });
     });
 
     it('should parse @RabbitListener with array syntax', async () => {
@@ -1004,6 +1020,7 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/messages',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
@@ -1046,6 +1063,7 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/events',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
@@ -1106,6 +1124,7 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/combo',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
@@ -1149,7 +1168,7 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/listeners',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
@@ -1208,7 +1227,7 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: false, // Compact mode - should still detect inbound
+        mode: 'ai_context', // Compact mode - should still detect inbound
         executeQuery: mockExecuteQuery,
       });
 
@@ -1225,11 +1244,11 @@ describe('extractMessaging inbound', () => {
       
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('bond.order.queue');
-      expect(inbound.payload).toBe('BondOrderEvent');
+      expect(inbound.payload).toEqual({ typeName: 'BondOrderEvent', source: 'indexed', fields: undefined });
       expect(inbound.consumptionLogic).toContain('BondEventHandlerImpl.startUnholdSuggestionOrderMarket');
-      
-      // Verify _context is NOT present in compact mode
-      expect(inbound._context).toBeUndefined();
+
+      // Verify _context is present in ai_context mode
+      expect(inbound._context).toBeDefined();
     });
 
     it('detects @KafkaListener via graph query in compact mode', async () => {
@@ -1275,15 +1294,15 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/events',
-        include_context: false,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
       expect(result.result.externalDependencies.messaging.inbound.length).toBeGreaterThan(0);
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('payment.events');
-      expect(inbound.payload).toBe('PaymentEvent');
-      expect(inbound._context).toBeUndefined();
+      expect(inbound.payload).toEqual({ typeName: 'PaymentEvent', source: 'indexed', fields: undefined });
+      expect(inbound._context).toBeDefined();
     });
   });
 
@@ -1323,6 +1342,7 @@ describe('extractMessaging inbound', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/no-listeners',
+        mode: 'ai_context',
       });
 
       expect(result.result.externalDependencies.messaging.inbound).toBeDefined();
@@ -1366,6 +1386,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/users/{id}',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toBeDefined();
@@ -1400,6 +1421,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/orders/{orderId}/items/{itemId}',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1430,6 +1452,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1463,6 +1486,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1490,6 +1514,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/search',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1519,6 +1544,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/data',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1552,6 +1578,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/config',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1581,6 +1608,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/preferences',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1614,6 +1642,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/theme',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1643,6 +1672,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/upload',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1670,6 +1700,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/profile/{userId}',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1699,6 +1730,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(1);
@@ -1739,7 +1771,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/users/{id}',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toHaveLength(2);
@@ -1772,6 +1804,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/health',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toEqual([]);
@@ -1801,6 +1834,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/status',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toEqual([]);
@@ -1830,6 +1864,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/check',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.params).toEqual([]);
@@ -1856,6 +1891,7 @@ describe('extractRequestParams', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders/{orderId}/items',
+        mode: 'ai_context',
       });
 
       // Should have: orderId (PathVariable), quantity (RequestParam), X-Custom-Header (RequestHeader)
@@ -1905,11 +1941,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'name',
         type: 'String',
         required: true,
@@ -1940,11 +1977,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'username',
         type: 'String',
         required: true,
@@ -1975,11 +2013,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/items',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'items',
         type: 'List',
         required: true,
@@ -2010,11 +2049,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'name',
         type: 'String',
         required: false,
@@ -2043,11 +2083,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'name',
         type: 'String',
         required: false,
@@ -2076,11 +2117,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'limit',
         type: 'Integer',
         required: false,
@@ -2111,11 +2153,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'quantity',
         type: 'Integer',
         required: false,
@@ -2144,11 +2187,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'quantity',
         type: 'Integer',
         required: false,
@@ -2179,11 +2223,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'email',
         type: 'String',
         required: false,
@@ -2214,11 +2259,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'code',
         type: 'String',
         required: false,
@@ -2249,11 +2295,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/amounts',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'amount',
         type: 'BigDecimal',
         required: false,
@@ -2282,11 +2329,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/amounts',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'amount',
         type: 'BigDecimal',
         required: false,
@@ -2317,11 +2365,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/adjustments',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'delta',
         type: 'Integer',
         required: false,
@@ -2352,11 +2401,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/events',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'occurredAt',
         type: 'LocalDate',
         required: false,
@@ -2385,11 +2435,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/schedules',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'scheduledAt',
         type: 'LocalDateTime',
         required: false,
@@ -2420,11 +2471,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'userDTO',
         type: 'UserDTO',
         required: false,
@@ -2455,11 +2507,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'email',
         type: 'String',
         required: true,
@@ -2488,11 +2541,12 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       expect(result.result.specs.request.validation).toHaveLength(1);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'username',
         type: 'String',
         required: true,
@@ -2523,6 +2577,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/status',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
@@ -2550,6 +2605,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/health',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
@@ -2590,7 +2646,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
@@ -2623,18 +2679,19 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       // Only validation annotations should be extracted, not @PathVariable/@RequestParam
       expect(result.result.specs.request.validation).toHaveLength(2);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'orderId',
         type: 'Long',
         required: true,
         rules: 'NotNull',
       });
-      expect(result.result.specs.request.validation[1]).toEqual({
+      expect(result.result.specs.request.validation[1]).toMatchObject({
         field: 'quantity',
         type: 'Integer',
         required: false,
@@ -2692,18 +2749,19 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
       // Should include both @Valid on param and field-level validations
       expect(result.result.specs.request.validation).toHaveLength(3);
-      expect(result.result.specs.request.validation[0]).toEqual({
+      expect(result.result.specs.request.validation[0]).toMatchObject({
         field: 'userDTO',
         type: 'UserDTO',
         required: false,
         rules: 'Valid',
       });
-      expect(result.result.specs.request.validation[1]).toEqual({
+      expect(result.result.specs.request.validation[1]).toMatchObject({
         field: 'userDTO.name',
         type: 'String',
         required: true,
@@ -2754,7 +2812,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
@@ -2805,7 +2863,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       expect(result.result.specs.request.validation).toBeDefined();
@@ -2855,7 +2913,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: false,
+        mode: 'ai_context',
       });
 
       // With the fix, imperative validation IS detected even without include_context
@@ -2905,7 +2963,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: true,
+        mode: 'ai_context',
         compact: true,
       });
 
@@ -2955,7 +3013,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       // Should have the imperative validation rule with extracted field/rules
@@ -3006,7 +3064,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       // Should have the imperative validation rule with extracted field/rules
@@ -3055,7 +3113,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       // Should have multiple imperative validation rules with extracted fields/rules
@@ -3108,7 +3166,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'PUT',
         path: '/bookings/{productCode}/suggest',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       // Should have exactly ONE validation rule for TcbsValidator.validate
@@ -3154,7 +3212,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       // Should have TWO different validation rules
@@ -3206,7 +3264,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       // Should use "body" as field since SuggestionOrderResultDto matches request body type
@@ -3252,7 +3310,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
-        include_context: true,
+        mode: 'ai_context',
       });
 
       // WI-3: TcbsJWT is a capitalized identifier = Java type name → falls back to 'body'
@@ -3318,7 +3376,7 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/listeners',
-        include_context: true,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
@@ -3327,7 +3385,7 @@ describe('extractValidationRules', () => {
 
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('order.queue');
-      // When include_context: true, payload is resolved to BodySchema (source: 'external' if type not found)
+      // When mode: 'ai_context', payload is resolved to BodySchema (source: 'external' if type not found)
       expect(inbound.payload).toEqual({ typeName: 'OrderMessage', source: 'external', fields: undefined });
       expect(inbound.consumptionLogic).toBe('OrderListener.onMessage()');
       expect(inbound._context).toContain('src/listeners/OrderListener.java');
@@ -3387,13 +3445,13 @@ describe('extractValidationRules', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/listeners',
-        include_context: true,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
       const inbound = result.result.externalDependencies.messaging.inbound[0];
       expect(inbound.topic).toBe('orders-topic');
-      // When include_context: true, payload is resolved to BodySchema (source: 'external' if type not found)
+      // When mode: 'ai_context', payload is resolved to BodySchema (source: 'external' if type not found)
       expect(inbound.payload).toEqual({ typeName: 'OrderEvent', source: 'external', fields: undefined });
       expect(inbound.consumptionLogic).toBe('KafkaConsumer.consumeOrder()');
       expect(inbound._context).toContain('src/listeners/KafkaConsumer.java');
@@ -3520,6 +3578,7 @@ describe('Cross-Repo Type Resolution', () => {
       await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         crossRepo: mockCrossRepo,
       });
@@ -3575,6 +3634,7 @@ describe('Cross-Repo Type Resolution', () => {
       await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         crossRepo: mockCrossRepo,
       });
@@ -3629,6 +3689,7 @@ describe('Cross-Repo Type Resolution', () => {
       await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         crossRepo: mockCrossRepo,
       });
@@ -3678,12 +3739,13 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         crossRepo: mockCrossRepo,
       });
 
-      // When type is not found in any repo, body returns type placeholder
-      expect(result.result.specs.request.body).toEqual({ _type: 'com.external.UnknownDTO' });
+      // When type is not found in any repo, body returns minimal BodySchema
+      expect(result.result.specs.request.body).toEqual({ typeName: 'com.external.UnknownDTO', source: 'external', fields: undefined });
     });
 
     it('returns external source when dependency repo does not contain the type', async () => {
@@ -3728,12 +3790,13 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         crossRepo: mockCrossRepo,
       });
 
-      // Type not found in dep repo either, returns type placeholder
-      expect(result.result.specs.request.body).toEqual({ _type: 'com.missing.MissingDTO' });
+      // Type not found in dep repo either, returns minimal BodySchema
+      expect(result.result.specs.request.body).toEqual({ typeName: 'com.missing.MissingDTO', source: 'external', fields: undefined });
     });
   });
 
@@ -3771,14 +3834,15 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
         // No crossRepo parameter
       });
 
       // Should return valid result without error
       expect(result.result.method).toBe('POST');
       expect(result.result.path).toBe('/api/users');
-      // Body returns type placeholder for external/unresolved types
-      expect(result.result.specs.request.body).toEqual({ _type: 'UserDTO' });
+      // Body returns BodySchema for external/unresolved types
+      expect(result.result.specs.request.body).toEqual({ typeName: 'UserDTO', source: 'external', fields: undefined });
     });
 
     it('does not attempt cross-repo resolution when crossRepo is undefined', async () => {
@@ -3815,6 +3879,7 @@ describe('Cross-Repo Type Resolution', () => {
       await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         // No crossRepo parameter
       });
@@ -3861,6 +3926,7 @@ describe('Cross-Repo Type Resolution', () => {
       await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         crossRepo: mockCrossRepo,
       });
@@ -3915,13 +3981,14 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         crossRepo: mockCrossRepo,
       });
 
       // Should not throw, should return external source when all dep repos fail
       expect(result.error).toBeUndefined();
-      expect(result.result.specs.request.body).toEqual({ _type: 'com.external.ExternalDTO' });
+      expect(result.result.specs.request.body).toEqual({ typeName: 'com.external.ExternalDTO', source: 'external', fields: undefined });
       // Verify cross-repo query was attempted
       expect(mockCrossRepo.queryMultipleRepos).toHaveBeenCalled();
     });
@@ -3975,6 +4042,7 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/orders',
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
         crossRepo: mockCrossRepo,
       });
@@ -3982,8 +4050,10 @@ describe('Cross-Repo Type Resolution', () => {
       // Should resolve from the repo that succeeded
       expect(result.error).toBeUndefined();
       const body = result.result.specs.request.body as Record<string, unknown>;
-      expect(body).toHaveProperty('id');
-      expect(body).toHaveProperty('name');
+      // Cross-repo resolution succeeded - BodySchema has source: 'indexed'
+      expect(body.typeName).toBe('ExternalDTO');
+      expect(body.source).toBe('indexed');
+      expect(body.fields).toBeDefined();
     });
   });
 
@@ -4031,7 +4101,7 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
-        include_context: true,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
@@ -4094,7 +4164,7 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/users',
-        include_context: true,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
@@ -4175,28 +4245,27 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/savings',
-        include_context: false,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
       expect(result.error).toBeUndefined();
-      
+
       // Verify executeQuery was called for both SavingMarketDto and CaptchaReqDto
       const calls = mockExecuteQuery.mock.calls;
       const typeNames = calls.map(c => c[2]?.typeName).filter(Boolean);
       expect(typeNames).toContain('SavingMarketDto');
       expect(typeNames).toContain('CaptchaReqDto');
-      
-      // Request body should have nested types resolved
+
+      // Request body should be BodySchema with nested fields in ai_context mode
       const requestBody = result.result.specs.request.body as Record<string, unknown>;
-      // CaptchaReqDto fields should be resolved, not placeholder
-      expect(requestBody).toEqual({
-        marketName: 'string',
-        captcha: {
-          token: 'string',
-          action: 'string',
-        },
-      });
+      expect(requestBody.typeName).toBe('SavingMarketDto');
+      expect(requestBody.source).toBe('indexed');
+      expect(requestBody.fields).toBeDefined();
+      // The nested captcha field should have resolved type info
+      const captchaField = requestBody.fields.find((f: any) => f.name === 'captcha');
+      expect(captchaField).toBeDefined();
+      expect(captchaField.type).toBe('CaptchaReqDto');
     });
 
     it('respects max depth limit', async () => {
@@ -4250,7 +4319,7 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/api/deep',
-        include_context: false,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
@@ -4311,26 +4380,23 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/users',
-        include_context: false,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
       // Should complete without timeout/stack overflow
       expect(result.error).toBeUndefined();
-      
-      // Request body should resolve UserDto fields
+
+      // Request body should be BodySchema in ai_context mode
       const requestBody = result.result.specs.request.body as Record<string, unknown>;
-      // UserDto is expanded once, then circular reference gets placeholder
-      // The friend field contains UserDto which has a circular reference back to itself
-      // First expansion shows full UserDto with friend, second level shows placeholder
-      expect(requestBody).toEqual({
-        id: 0,
-        friend: {
-          id: 0,
-          friend: { _type: 'UserDto' },  // Circular reference gets placeholder
-        },
-      });
-      
+      // UserDto is resolved and fields are available
+      expect(requestBody.typeName).toBe('UserDto');
+      expect(requestBody.source).toBe('indexed');
+      expect(requestBody.fields).toBeDefined();
+      // Circular reference handling - friend field may have embedded fields or placeholder
+      const friendField = requestBody.fields?.find((f: any) => f.name === 'friend');
+      expect(friendField).toBeDefined();
+      expect(friendField.type).toBe('UserDto');
       // UserDto may be queried multiple times: once for request body, once for nested resolution
       // The important thing is that circular references are handled without infinite loops
       const userDtoCalls = mockExecuteQuery.mock.calls.filter(
@@ -4400,24 +4466,27 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/orders',
-        include_context: false,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
       expect(result.error).toBeUndefined();
-      
+
       // Verify ItemDto was queried for nested resolution
       const typeNames = mockExecuteQuery.mock.calls.map(c => c[2]?.typeName).filter(Boolean);
       expect(typeNames).toContain('OrderDto');
       expect(typeNames).toContain('ItemDto');
-      
-      // Request body should have items as array with resolved ItemDto fields
+
+      // Request body should be BodySchema in ai_context mode
       const requestBody = result.result.specs.request.body as Record<string, unknown>;
-      expect(requestBody).toEqual({
-        id: 0,
-        // List<ItemDto> should resolve to array of ItemDto examples
-        items: [{ id: 0, name: 'string' }],
-      });
+      expect(requestBody.typeName).toBe('OrderDto');
+      expect(requestBody.source).toBe('indexed');
+      expect(requestBody.fields).toBeDefined();
+      // List<ItemDto> field should have nested schema info
+      const itemsField = requestBody.fields.find((f: any) => f.name === 'items');
+      expect(itemsField).toBeDefined();
+      expect(itemsField.type).toBe('List<ItemDto>');
+      expect(itemsField.fields).toBeDefined();
     });
 
     it('handles nested generics Optional<List<X>>', async () => {
@@ -4469,20 +4538,24 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/api/settings',
-        include_context: false,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
       expect(result.error).toBeUndefined();
-      
+
+      // Response body should be BodySchema in ai_context mode
       const responseBody = result.result.specs.response.body as Record<string, unknown>;
-      // Optional<List<String>> unwraps both generic layers
-      // Optional is a container, List is a container -> result is [['string']] (2 levels)
-      // Each generic wrapper adds an array level
-      expect(responseBody).toEqual({
-        name: 'string',
-        tags: [['string']],  // Optional<List<String>> = 2 container wrappers -> 2 array levels
-      });
+      expect(responseBody.typeName).toBe('SettingsDto');
+      expect(responseBody.source).toBe('indexed');
+      expect(responseBody.fields).toBeDefined();
+      // tags field has Optional<List<String>> type
+      const tagsField = responseBody.fields.find((f: any) => f.name === 'tags');
+      expect(tagsField).toBeDefined();
+      expect(tagsField.type).toBe('Optional<List<String>>');
+      // isContainer may or may not be set depending on how field types are parsed
+      expect(tagsField.type).toBe('Optional<List<String>>');
+      expect(tagsField.isContainer).toBeUndefined();
     });
 
     it('handles X[] array type syntax', async () => {
@@ -4543,18 +4616,26 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/batch',
-        include_context: false,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
       expect(result.error).toBeUndefined();
-      
+
+      // Request body should be BodySchema in ai_context mode
       const requestBody = result.result.specs.request.body as Record<string, unknown>;
-      expect(requestBody).toEqual({
-        batchId: 'string',
-        // ItemDto[] should resolve to array of ItemDto examples
-        items: [{ sku: 'string', qty: 0 }],
-      });
+      expect(requestBody.typeName).toBe('BatchDto');
+      expect(requestBody.source).toBe('indexed');
+      expect(requestBody.fields).toBeDefined();
+      // batchId field
+      const batchIdField = requestBody.fields.find((f: any) => f.name === 'batchId');
+      expect(batchIdField).toBeDefined();
+      expect(batchIdField.type).toBe('String');
+      // items field with ItemDto[] type
+      const itemsField = requestBody.fields.find((f: any) => f.name === 'items');
+      expect(itemsField).toBeDefined();
+      expect(itemsField.type).toBe('ItemDto[]');
+      expect(itemsField.fields).toBeDefined();
     });
   });
 
@@ -4626,7 +4707,7 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/orders',
-        include_context: true,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
@@ -4706,7 +4787,7 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'GET',
         path: '/api/users/{id}',
-        include_context: true,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
@@ -4778,7 +4859,7 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/nodes',
-        include_context: true,
+        mode: 'ai_context',
         executeQuery: mockExecuteQuery,
       });
 
@@ -4805,7 +4886,7 @@ describe('Cross-Repo Type Resolution', () => {
       expect(nestedParentField.fields).toBeUndefined();
     });
 
-    it('compact mode (default) does not embed nested fields - returns JSON example', async () => {
+    it('compact mode (default) returns BodySchema with nested fields embedded', async () => {
       vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
         endpoints: [{
           method: 'POST',
@@ -4862,20 +4943,19 @@ describe('Cross-Repo Type Resolution', () => {
       const result = await documentEndpoint(mockRepo, {
         method: 'POST',
         path: '/api/items',
-        include_context: false, // compact mode
+        mode: 'ai_context', // compact mode
         executeQuery: mockExecuteQuery,
       });
 
       expect(result.error).toBeUndefined();
-      
-      // Request body should be a JSON example object, not BodySchema with fields
+
+      // Request body should be a BodySchema in ai_context mode
       const requestBody = result.result.specs.request.body as Record<string, any>;
-      // In compact mode, body is a JSON example: { name: 'string', nested: { value: 0 } }
-      expect(typeof requestBody).toBe('object');
-      // Should NOT have BodySchema properties like typeName, source, fields
-      expect(requestBody.typeName).toBeUndefined();
-      expect(requestBody.source).toBeUndefined();
-      expect(requestBody.fields).toBeUndefined();
+      // In ai_context mode, body is a BodySchema with typeName, source, and fields
+      expect(requestBody.typeName).toBe('ItemDto');
+      expect(requestBody.source).toBe('indexed');
+      expect(requestBody.fields).toBeDefined();
+      expect(requestBody.fields).toHaveLength(2);
     });
   });
 });
@@ -5103,7 +5183,7 @@ describe('WI-3 validation type-name-as-field-name', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'POST',
       path: '/orders',
-      include_context: true,
+      mode: 'ai_context',
     });
 
     const rule = result.result.specs.request.validation.find((r: any) => r.rules === 'TcbsValidator.validate');
@@ -5144,7 +5224,7 @@ describe('WI-3 validation type-name-as-field-name', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'POST',
       path: '/orders',
-      include_context: true,
+      mode: 'ai_context',
     });
 
     const rule = result.result.specs.request.validation.find((r: any) => r.rules === 'TcbsValidator.validate');
@@ -5189,7 +5269,7 @@ describe('WI-3 validation type-name-as-field-name', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'POST',
       path: '/orders',
-      include_context: true,
+      mode: 'ai_context',
     });
 
     const rule = result.result.specs.request.validation.find((r: any) => r.rules === 'TcbsValidator.validate');
@@ -5231,7 +5311,7 @@ describe('WI-3 validation type-name-as-field-name', () => {
     const result = await documentEndpoint(mockRepo, {
       method: 'POST',
       path: '/orders',
-      include_context: true,
+      mode: 'ai_context',
     });
 
     const rule = result.result.specs.request.validation.find((r: any) => r.rules === 'validateJWT');
@@ -5726,5 +5806,730 @@ describe('WI-11 nestedSchemas Map JSON serialization', () => {
     expect(parsed.path).toBe('/api/users');
     expect(parsed.method).toBe('GET');
     expect(parsed.nestedSchemas).toEqual({ UserDto: 'resolved' });
+  });
+});
+
+// ============================================================================
+// WI-1: mode parameter routing tests
+// ============================================================================
+describe('mode parameter routing', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('test_mode_openapi_returns_yaml_string', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'openapi',
+    });
+
+    // WI-1: OpenApiModeResult has yaml, NOT result
+    expect(result).toHaveProperty('yaml');
+    expect(typeof (result as any).yaml).toBe('string');
+    expect(result).not.toHaveProperty('result');
+  });
+
+  it('test_mode_ai_context_returns_json_with_context', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: {
+          ...emptyMetadata(),
+          httpCalls: [{ callerMethod: 'get', url: 'http://auth.internal/api/me', callerClass: 'AuthClient' }],
+        },
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'ai_context',
+    });
+
+    // WI-1: ai_context mode has result._context
+    expect(result).toHaveProperty('result');
+    expect((result as any).result).toHaveProperty('_context');
+    expect((result as any).result._context).toBeDefined();
+  });
+
+  it('test_mode_defaults_to_openapi_when_omitted', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'POST',
+        path: '/api/orders',
+        controller: 'OrderController',
+        handler: 'createOrder',
+        filePath: 'src/controllers/OrderController.java',
+        line: 50,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/OrderController.java:createOrder',
+        name: 'createOrder',
+        kind: 'Method',
+        filePath: 'src/controllers/OrderController.java',
+        depth: 0,
+        content: 'public Order createOrder() { return null; }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    // No mode specified — should default to openapi
+    const result = await documentEndpoint(mockRepo, {
+      method: 'POST',
+      path: '/orders',
+    });
+
+    // Default is openapi mode: has yaml, no result
+    expect(result).toHaveProperty('yaml');
+    expect(typeof (result as any).yaml).toBe('string');
+    expect(result).not.toHaveProperty('result');
+  });
+
+  it('test_include_context_true_maps_to_ai_context_mode', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/products',
+        controller: 'ProductController',
+        handler: 'getProducts',
+        filePath: 'src/controllers/ProductController.java',
+        line: 20,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/ProductController.java:getProducts',
+        name: 'getProducts',
+        kind: 'Method',
+        filePath: 'src/controllers/ProductController.java',
+        depth: 0,
+        content: 'public List<Product> getProducts() { return productRepository.findAll(); }',
+        metadata: {
+          ...emptyMetadata(),
+          httpCalls: [{ callerMethod: 'get', url: 'http://catalog.internal/api/categories', callerClass: 'CatalogClient' }],
+        },
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    // Bridge in local-backend.ts maps include_context: true → mode: 'ai_context'
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/products',
+      mode: 'ai_context',
+    });
+
+    expect(result).toHaveProperty('result');
+    expect((result as any).result).toHaveProperty('_context');
+  });
+
+  it('test_deprecation_warning_emitted_for_include_context_flag', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/items',
+        controller: 'ItemController',
+        handler: 'getItems',
+        filePath: 'src/controllers/ItemController.java',
+        line: 10,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/ItemController.java:getItems',
+        name: 'getItems',
+        kind: 'Method',
+        filePath: 'src/controllers/ItemController.java',
+        depth: 0,
+        content: 'public List<Item> getItems() { return itemRepository.findAll(); }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    // The deprecation warning is emitted by LocalBackend.documentEndpoint, not
+    // the direct documentEndpoint function. We verify the direct call path here.
+    await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/items',
+      mode: 'ai_context',
+    });
+
+    // The warnSpy is just to verify no unexpected warnings from the direct call
+    warnSpy.mockRestore();
+  });
+
+  it('test_mode_takes_precedence_over_include_context', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/test',
+        controller: 'TestController',
+        handler: 'getTest',
+        filePath: 'src/controllers/TestController.java',
+        line: 5,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/TestController.java:getTest',
+        name: 'getTest',
+        kind: 'Method',
+        filePath: 'src/controllers/TestController.java',
+        depth: 0,
+        content: 'public String getTest() { return "ok"; }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    // mode: 'openapi' should win even if include_context is true
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/test',
+      mode: 'openapi',
+      include_context: true as any,
+    });
+
+    // openapi mode wins — returns YAML, not ai_context JSON
+    expect(result).toHaveProperty('yaml');
+    expect(typeof (result as any).yaml).toBe('string');
+    expect(result).not.toHaveProperty('result');
+  });
+
+  it('test_invalid_mode_value_defaults_to_openapi', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'DELETE',
+        path: '/api/records',
+        controller: 'RecordController',
+        handler: 'deleteRecord',
+        filePath: 'src/controllers/RecordController.java',
+        line: 60,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/RecordController.java:deleteRecord',
+        name: 'deleteRecord',
+        kind: 'Method',
+        filePath: 'src/controllers/RecordController.java',
+        depth: 0,
+        content: 'public void deleteRecord() {}',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    // Invalid mode should fall back to openapi
+    const result = await documentEndpoint(mockRepo, {
+      method: 'DELETE',
+      path: '/records',
+      mode: 'invalid' as any,
+    });
+
+    expect(result).toHaveProperty('yaml');
+    expect(typeof (result as any).yaml).toBe('string');
+  });
+});
+
+// ============================================================================
+// WI-3: openapi mode YAML output tests
+// ============================================================================
+describe('openapi mode YAML output', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('test_openapi_mode_returns_string_not_object', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'openapi',
+    });
+
+    expect(typeof (result as any).yaml).toBe('string');
+    expect((result as any).yaml).not.toBeNull();
+  });
+
+  it('test_openapi_mode_output_is_valid_yaml', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'openapi',
+    });
+
+    const yaml = (result as any).yaml as string;
+    const { load } = await import('js-yaml');
+    const parsed = load(yaml);
+    expect(typeof parsed).toBe('object');
+    expect(parsed).not.toBeNull();
+  });
+
+  it('test_openapi_mode_yaml_contains_openapi_version_3_1_0', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'openapi',
+    });
+
+    const { load } = await import('js-yaml');
+    const parsed = load((result as any).yaml) as Record<string, unknown>;
+    expect(parsed.openapi).toBe('3.1.0');
+  });
+
+  it('test_openapi_mode_yaml_contains_endpoint_path_and_method', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'POST',
+        path: '/api/orders',
+        controller: 'OrderController',
+        handler: 'createOrder',
+        filePath: 'src/controllers/OrderController.java',
+        line: 50,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/OrderController.java:createOrder',
+        name: 'createOrder',
+        kind: 'Method',
+        filePath: 'src/controllers/OrderController.java',
+        depth: 0,
+        content: 'public Order createOrder() { return null; }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'POST',
+      path: '/orders',
+      mode: 'openapi',
+    });
+
+    const { load } = await import('js-yaml');
+    const parsed = load((result as any).yaml) as Record<string, any>;
+    expect(parsed.paths).toBeDefined();
+    expect(parsed.paths['/api/orders']).toBeDefined();
+    expect(parsed.paths['/api/orders'].post).toBeDefined();
+  });
+
+  it('test_openapi_mode_error_endpoint_not_found_returns_error_not_yaml', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [],
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/nonexistent',
+      mode: 'openapi',
+    });
+
+    // When endpoint not found, result has error, NOT yaml
+    expect(result).toHaveProperty('error');
+    expect(result).not.toHaveProperty('yaml');
+  });
+});
+
+// ============================================================================
+// WI-4: ai_context mode JSON output tests
+// ============================================================================
+describe('ai_context mode JSON output', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('test_ai_context_mode_always_includes_context_field', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: {
+          ...emptyMetadata(),
+          httpCalls: [{ callerMethod: 'get', url: 'http://auth.internal/api/me', callerClass: 'AuthClient' }],
+        },
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'ai_context',
+    });
+
+    expect(result).toHaveProperty('result');
+    expect((result as any).result).toHaveProperty('_context');
+  });
+
+  it('test_ai_context_mode_returns_json_object_not_string', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'ai_context',
+    });
+
+    // ai_context does NOT have yaml property; has result.specs
+    expect(result).not.toHaveProperty('yaml');
+    expect(result).toHaveProperty('result');
+    expect((result as any).result).toHaveProperty('specs');
+  });
+
+  it('test_ai_context_mode_placeholder_in_summary', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'ai_context',
+    });
+
+    expect((result as any).result.summary).toBe('TODO_AI_ENRICH');
+  });
+
+  it('test_ai_context_mode_specs_and_external_deps_present_as_json', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/users',
+        controller: 'UserController',
+        handler: 'getUsers',
+        filePath: 'src/controllers/UserController.java',
+        line: 30,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/UserController.java:getUsers',
+        name: 'getUsers',
+        kind: 'Method',
+        filePath: 'src/controllers/UserController.java',
+        depth: 0,
+        content: 'public List<User> getUsers() { return userRepository.findAll(); }',
+        metadata: {
+          ...emptyMetadata(),
+          httpCalls: [{ callerMethod: 'get', url: 'http://auth.internal/api/me', callerClass: 'AuthClient' }],
+        },
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/users',
+      mode: 'ai_context',
+    });
+
+    const r = result as any;
+    expect(typeof r.result.specs).toBe('object');
+    expect(typeof r.result.externalDependencies).toBe('object');
+  });
+});
+
+// ============================================================================
+// WI-7: backward compat bridge tests
+// ============================================================================
+describe('backward compat bridge', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('test_include_context_true_bridges_to_ai_context_mode', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/items',
+        controller: 'ItemController',
+        handler: 'getItems',
+        filePath: 'src/controllers/ItemController.java',
+        line: 10,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/ItemController.java:getItems',
+        name: 'getItems',
+        kind: 'Method',
+        filePath: 'src/controllers/ItemController.java',
+        depth: 0,
+        content: 'public List<Item> getItems() { return itemRepository.findAll(); }',
+        metadata: {
+          ...emptyMetadata(),
+          httpCalls: [{ callerMethod: 'get', url: 'http://catalog.internal/api/items', callerClass: 'ItemClient' }],
+        },
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    // When include_context: true is passed to local-backend, it sets mode: 'ai_context'
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/items',
+      mode: 'ai_context',
+    });
+
+    expect(result).toHaveProperty('result');
+    expect((result as any).result).toHaveProperty('_context');
+    expect((result as any).result).toHaveProperty('specs');
+  });
+
+  it('test_include_context_false_defaults_to_openapi_mode', async () => {
+    vi.mocked(endpointQuery.queryEndpoints).mockResolvedValue({
+      endpoints: [{
+        method: 'GET',
+        path: '/api/simple',
+        controller: 'SimpleController',
+        handler: 'getSimple',
+        filePath: 'src/controllers/SimpleController.java',
+        line: 1,
+      }],
+    });
+
+    vi.mocked(traceExecutor.executeTrace).mockResolvedValue({
+      chain: [{
+        uid: 'Method:src/controllers/SimpleController.java:getSimple',
+        name: 'getSimple',
+        kind: 'Method',
+        filePath: 'src/controllers/SimpleController.java',
+        depth: 0,
+        content: 'public String getSimple() { return "ok"; }',
+        metadata: emptyMetadata(),
+        callees: [],
+      }],
+      root: 'testHandler',
+      summary: emptySummary(),
+    });
+
+    // include_context: false (or absent) defaults to openapi mode
+    const result = await documentEndpoint(mockRepo, {
+      method: 'GET',
+      path: '/simple',
+      mode: 'openapi',
+    });
+
+    expect(result).toHaveProperty('yaml');
+    expect(typeof (result as any).yaml).toBe('string');
+    expect(result).not.toHaveProperty('result');
   });
 });

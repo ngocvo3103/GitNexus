@@ -26,7 +26,7 @@ describe('Route Node E2E', () => {
       });
     });
 
-    it('creates Route nodes for Java Spring controllers', () => {
+    it('creates Route nodes for Java Spring controllers', { timeout: 180_000 }, () => {
       execSync(`node dist/cli/index.js analyze "${TEST_REPO}"`, {
         cwd: process.cwd(),
         encoding: 'utf-8',

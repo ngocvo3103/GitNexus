@@ -20,7 +20,7 @@ import {
 } from '../../storage/repo-manager.js';
 import { readManifest, type RepoManifest } from '../../storage/repo-manifest.js';
 import { CrossRepoRegistry } from '../../core/ingestion/cross-repo-registry.js';
-import { documentEndpoint, type DocumentEndpointOptions } from './document-endpoint.js';
+import { documentEndpoint, type DocumentEndpointOptions, type DocumentEndpointResult, type OpenApiModeResult } from './document-endpoint.js';
 import type { CrossRepoContext } from './cross-repo-context.js';
 import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
 // AI context generation is CLI-only (gitnexus analyze)
@@ -2461,7 +2461,7 @@ export class LocalBackend {
   /**
    * Document Endpoint tool — Generate API documentation JSON.
    */
-  private async documentEndpoint(repo: RepoHandle, params: any): Promise<any> {
+  private async documentEndpoint(repo: RepoHandle, params: any): Promise<{ result: DocumentEndpointResult; error?: string } | OpenApiModeResult> {
     await this.ensureInitialized(repo.id);
     
     // Ensure cross-registry is initialized (lazy init on first access)
@@ -2482,13 +2482,21 @@ export class LocalBackend {
       }
     };
 
+    // Backward-compat bridge: map legacy include_context to mode
+    let mode: 'openapi' | 'ai_context' = 'openapi';
+    if (params.mode === 'ai_context' || params.mode === 'openapi') {
+      mode = params.mode;
+    } else if (params.include_context === true) {
+      mode = 'ai_context';
+      console.warn('[DEPRECATED] include_context is deprecated. Use mode: "ai_context" instead.');
+    }
+    // Note: params.openapi is now the default (mode: 'openapi'), no-op mapping
+
     const options: DocumentEndpointOptions = {
       method: params.method,
       path: params.path,
       depth: params.depth ?? 10,
-      include_context: params.include_context ?? false,
-      compact: params.compact ?? false,
-      openapi: params.openapi ?? false,
+      mode,
       repo: params.repo,
       crossRepo,
     };

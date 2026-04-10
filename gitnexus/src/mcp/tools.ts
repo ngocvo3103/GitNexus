@@ -242,9 +242,7 @@ Returns schema-valid JSON with:
 - Logic flow placeholder and code diagram
 - Retry logic, transaction management, security annotations
 
-Two modes:
-- Minimal (default): JSON with TODO_AI_ENRICH placeholders for non-mechanical fields
-- Context-enriched (--include-context): Same JSON + _context fields with source snippets
+Two modes:\n- openapi (default): Returns OpenAPI 3.1.0 YAML string with x-extensions for downstream dependencies\n- ai_context: Returns full JSON with _context fields, BodySchema payloads, and TODO_AI_ENRICH placeholders
 
 Use this to quickly document an endpoint's complete call chain and dependencies.`,
     inputSchema: {
@@ -253,7 +251,7 @@ Use this to quickly document an endpoint's complete call chain and dependencies.
         method: { type: 'string', description: 'HTTP method (GET, POST, PUT, DELETE, PATCH)' },
         path: { type: 'string', description: 'Path or path keyword to match (e.g., "users", "/api/users/{id}")' },
         depth: { type: 'number', description: 'Max call chain depth to trace (default: 10)', default: 10 },
-        include_context: { type: 'boolean', description: 'Include _context fields with source snippets (default: false)', default: false },
+        mode: { type: 'string', enum: ['openapi', 'ai_context'], description: 'Output mode: "openapi" for OpenAPI YAML (default), "ai_context" for AI-enriched JSON with source context', default: 'openapi' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: ['method', 'path'],

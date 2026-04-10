@@ -79,11 +79,39 @@ async function getBackend(): Promise<LocalBackend> {
  * preserves nestedSchemas entries (and any other Map-valued fields)
  * in CLI JSON output without modifying in-memory data structures.
  */
-const mapReplacer = (_key: string, value: unknown): unknown =>
-  value instanceof Map ? Object.fromEntries(value) : value;
+/**
+ * Deep-clone an object, stripping all undefined values (including nested).
+ * Ensures no `undefined` literals leak into JSON output.
+ */
+function stripUndefined<T>(obj: T): T {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) return obj.map(stripUndefined) as T;
+  if (typeof obj === 'object' && !(obj instanceof Map)) {
+    const result: any = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (value !== undefined) {
+        result[key] = stripUndefined(value);
+      }
+    }
+    return result;
+  }
+  return obj;
+}
+
+/**
+ * JSON replacer that converts Map instances to plain objects and strips undefined.
+ * JavaScript's JSON.stringify serializes Map as {} — this replacer
+ * preserves nestedSchemas entries (and any other Map-valued fields)
+ * in CLI JSON output without modifying in-memory data structures.
+ */
+const mapReplacer = (_key: string, value: unknown): unknown => {
+  if (value === undefined) return undefined;
+  if (value instanceof Map) return Object.fromEntries(value);
+  return value;
+};
 
 function output(data: any): void {
-  const text = typeof data === 'string' ? data : JSON.stringify(data, mapReplacer, 2);
+  const text = typeof data === 'string' ? data : JSON.stringify(stripUndefined(data), mapReplacer, 2);
   try {
     writeSync(1, text + '\n');
   } catch (err: any) {
@@ -199,9 +227,8 @@ export async function documentEndpointCommand(options?: {
   method?: string;
   path?: string;
   depth?: string;
-  includeContext?: boolean;
-  compact?: boolean;
-  openapi?: boolean;
+  mode?: 'openapi' | 'ai_context';
+  inputYaml?: string;
   outputPath?: string;
   repo?: string;
   schemaPath?: string;
@@ -209,18 +236,72 @@ export async function documentEndpointCommand(options?: {
 }): Promise<void> {
   if (ensureHeap()) return;
 
+  // ── YAML enrichment path ───────────────────────────────────────────────────
+  if (options?.inputYaml) {
+    const fs = await import('fs');
+    const pathMod = await import('path');
+
+    // Read input YAML
+    let yamlContent: string;
+    try {
+      yamlContent = fs.readFileSync(options.inputYaml, 'utf-8');
+    } catch (err) {
+      console.error(`Error: Cannot read file "${options.inputYaml}": ${(err as NodeJS.ErrnoException).message}`);
+      process.exit(1);
+    }
+
+    // Ensure repo is initialized
+    const backend = await getBackend();
+
+    // Resolve repo handle — resolveRepo both finds the repo AND ensures it's initialized
+    const repoHandle = await backend.resolveRepo(options.repo);
+
+    if (!repoHandle) {
+      console.error(`Error: Repository "${options.repo ?? 'default'}" not found. Run 'gitnexus index' first.`);
+      process.exit(1);
+    }
+
+    // Import enricher lazily
+    const { enrichExistingYaml } = await import('../core/openapi/enricher.js');
+
+    const enrichOptions = {
+      method: options.method,
+      path: options.path,
+      maxDepth: options.depth ? parseInt(options.depth, 10) : 10,
+    };
+
+    try {
+      const enriched = await enrichExistingYaml(yamlContent, repoHandle, enrichOptions);
+
+      // Validate input path for path traversal protection
+      const safeInputPath = validateOutputPath(options.inputYaml);
+
+      // Determine and validate output path
+      const outputPath = options.outputPath
+        ? validateOutputPath(pathMod.join(options.outputPath,
+            pathMod.basename(safeInputPath).replace(/\.ya?ml$/, '.enriched.openapi.yaml')))
+        : safeInputPath.replace(/\.ya?ml$/, '.enriched.openapi.yaml');
+
+      fs.writeFileSync(outputPath, enriched, 'utf-8');
+      console.error(`Enriched YAML written: ${outputPath}`);
+    } catch (err) {
+      console.error(`Error during YAML enrichment: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   if (!options?.method || !options?.path) {
     console.error('Usage: gitnexus document-endpoint --method <METHOD> --path <path-pattern>');
-    console.error('  --method <METHOD>     HTTP method (GET, POST, PUT, DELETE, PATCH)');
-    console.error('  --path <pattern>      Path pattern to match (e.g., "suggest", "/bookings/{id}")');
-    console.error('  --depth <n>           Max trace depth (default: 10)');
-    console.error('  --include-context     Include source context for AI enrichment');
-    console.error('  --compact             Omit source content and empty arrays (use with --include-context)');
-    console.error('  --openapi             Write both JSON and OpenAPI 3.1.0 YAML spec to --outputPath');
-    console.error('  --outputPath <path>   Output directory for JSON and OpenAPI YAML files (required with --openapi)');
-    console.error('  --schema-path <path>  Path to custom JSON schema file (default: bundled schema)');
-    console.error('  --strict              Fail on schema validation errors (default: warn)');
-    console.error('  --repo <name>         Target repository');
+    console.error('  --method <METHOD>       HTTP method (GET, POST, PUT, DELETE, PATCH)');
+    console.error('  --path <pattern>        Path pattern to match (e.g., "suggest", "/bookings/{id}")');
+    console.error('  --depth <n>             Max trace depth (default: 10)');
+    console.error('  --mode <mode>          Output mode: openapi (default) or ai_context');
+    console.error('  --input-yaml <path>    CLI-only: path to existing YAML to enrich');
+    console.error('  --outputPath <path>    Output directory for JSON and OpenAPI YAML files');
+    console.error('  --schema-path <path>   Path to custom JSON schema file (default: bundled schema)');
+    console.error('  --strict               Fail on schema validation errors (default: warn)');
+    console.error('  --repo <name>          Target repository');
     process.exit(1);
   }
 
@@ -229,9 +310,7 @@ export async function documentEndpointCommand(options?: {
     method: options.method,
     path: options.path,
     depth: options.depth ? parseInt(options.depth, 10) : undefined,
-    include_context: options.includeContext ?? false,
-    compact: options.compact ?? false,
-    openapi: options.openapi ?? false,
+    mode: options.mode ?? 'openapi',
     repo: options.repo,
   });
 
@@ -255,15 +334,9 @@ export async function documentEndpointCommand(options?: {
     }
   }
 
-  // Handle --openapi mode: write both JSON and OpenAPI YAML files
-  if (options.openapi) {
-    if (!options.outputPath) {
-      console.error('Error: --outputPath is required when using --openapi');
-      process.exit(1);
-    }
-
-    const { convertToOpenAPIDocument } = await import('../core/openapi/converter.js');
-    const yaml = await import('js-yaml');
+  // Handle --outputPath: write JSON file when specified
+  if (options.outputPath) {
+    const yamlMod = await import('js-yaml');
     const fs = await import('fs');
     const pathMod = await import('path');
 
@@ -273,32 +346,50 @@ export async function documentEndpointCommand(options?: {
     fs.mkdirSync(safeOutputPath, { recursive: true });
 
     // Auto-generate base filename from method + path
-    // e.g., PUT /e/v1/bookings/{productCode}/suggest → PUT_e_v1_bookings_productCode_suggest
     const sanitizedPath = result.path
       .replace(/^\//, '')
       .replace(/[{}]/g, '')
-      .replace(/[/\-:.]/g, '_')
+      .replace(/[\/:.\-]/g, '_')
       .replace(/_+/g, '_')
       .replace(/_$/, '');
     const baseName = `${result.method.toUpperCase()}_${sanitizedPath}`;
 
-    // Write default JSON
-    const jsonPath = pathMod.join(safeOutputPath, `${baseName}.json`);
-    fs.writeFileSync(jsonPath, JSON.stringify(result, mapReplacer, 2), 'utf-8');
+    if ('yaml' in result && typeof (result as any).yaml === 'string') {
+      // OpenAPI mode: yaml is pre-generated, write directly
+      const yamlPath = pathMod.join(safeOutputPath, `${baseName}.openapi.yaml`);
+      fs.writeFileSync(yamlPath, (result as any).yaml, 'utf-8');
+      console.error(`Written: ${yamlPath}`);
 
-    // Write OpenAPI YAML
-    const openApiDoc = convertToOpenAPIDocument([result], {
-      title: `API - ${result.path}`,
-      version: '1.0.0',
-      nestedSchemas: result.nestedSchemas,
-    });
-    const yamlPath = pathMod.join(safeOutputPath, `${baseName}.openapi.yaml`);
-    fs.writeFileSync(yamlPath, yaml.dump(openApiDoc, { lineWidth: -1, noRefs: true }), 'utf-8');
+      // Write metadata JSON
+      const metadata: Record<string, unknown> = { method: result.method, path: result.path };
+      if ((result as any).handlerClass) metadata.handlerClass = (result as any).handlerClass;
+      if ((result as any).handlerMethod) metadata.handlerMethod = (result as any).handlerMethod;
+      const jsonPath = pathMod.join(safeOutputPath, `${baseName}.json`);
+      fs.writeFileSync(jsonPath, JSON.stringify(metadata, null, 2), 'utf-8');
+      console.error(`Written: ${jsonPath}`);
+    } else {
+      // ai_context mode: convert DocumentEndpointResult to OpenAPI
+      const cleanResult = stripUndefined(result);
 
-    console.error(`Written: ${jsonPath}`);
-    console.error(`Written: ${yamlPath}`);
+      // Write default JSON
+      const jsonPath = pathMod.join(safeOutputPath, `${baseName}.json`);
+      fs.writeFileSync(jsonPath, JSON.stringify(cleanResult, mapReplacer, 2), 'utf-8');
+
+      // Write OpenAPI YAML
+      const { convertToOpenAPIDocument } = await import('../core/openapi/converter.js');
+      const openApiDoc = convertToOpenAPIDocument([result], {
+        title: `API - ${result.path}`,
+        version: '1.0.0',
+        nestedSchemas: result.nestedSchemas,
+      });
+      const yamlPath = pathMod.join(safeOutputPath, `${baseName}.openapi.yaml`);
+      fs.writeFileSync(yamlPath, yamlMod.dump(openApiDoc, { lineWidth: -1, noRefs: true }), 'utf-8');
+
+      console.error(`Written: ${jsonPath}`);
+      console.error(`Written: ${yamlPath}`);
+    }
   } else {
-    // Default: JSON to stdout (unchanged)
+    // Default: JSON to stdout
     output(result);
   }
 }

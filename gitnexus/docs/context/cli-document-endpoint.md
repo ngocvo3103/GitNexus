@@ -27,102 +27,23 @@ Analyzes the call chain from an HTTP endpoint handler through all service layers
 |--------|----------|---------|-------------|
 | `--method <METHOD>` | Yes | - | HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH` |
 | `--path <pattern>` | Yes | - | Path pattern (fuzzy match supported) |
+| `--mode <mode>` | No | `openapi` | Output mode: `openapi` or `ai_context` |
+| `--input-yaml <path>` | No | - | Enrich an existing OpenAPI spec file |
 | `--depth <n>` | No | 10 | Maximum call chain depth to trace |
-| `--include-context` | No | false | Include source code snippets for AI enrichment |
-| `--compact` | No | false | Omit source content and empty arrays (use with `--include-context`) |
-| `--openapi` | No | false | Write both JSON and OpenAPI 3.1.0 YAML spec to `--outputPath` (requires `--outputPath`) |
-| `--outputPath <path>` | No | - | Output directory for JSON and OpenAPI YAML files (required with `--openapi`) |
+| `--outputPath <path>` | No | - | Output directory; required when writing files |
 | `--schema-path <path>` | No | bundled | Path to custom JSON schema file for output validation |
 | `--strict` | No | warn | Fail on schema validation errors (default: warn only) |
 | `-r, --repo <name>` | No | - | Target repository (if multiple indexed) |
 
-## Path Matching
+### `--mode <openapi|ai_context>`
 
-The `--path` argument uses fuzzy matching:
+Controls the output format. Default is `openapi`.
 
-| Pattern | Matches |
-|---------|---------|
-| `bonds` | `/e/v1/bonds`, `/b/v1/bonds`, `/api/bonds` |
-| `customers/{id}` | `/customers/{tcbsId}`, `/v1/customers/{id}/assets` |
-| `/t/v1/orders/cds/sell` | Exact or near-exact match |
+#### Mode 1: `openapi` (default)
 
-When Route nodes exist in the graph, the tool uses them for precise matching. Otherwise, it falls back to searching for `@XxxMapping` annotations in controller classes.
+Returns OpenAPI 3.1.0 YAML with `x-` extension fields. Machine-readable, enhanced with dependency data.
 
-## Output Modes
-
-The tool supports multiple output modes depending on the flags used:
-
-### Default Mode (No Context)
-
-Converts request/response bodies to simplified JSON example format with top-level keys. Best for quick reference and human readability.
-
-```json
-{
-  "specs": {
-    "request": {
-      "body": {
-        "productCode": "String",
-        "quantity": "Integer",
-        "orderType": "String"
-      }
-    }
-  }
-}
-```
-
-### With Context (`--include-context`)
-
-Preserves full `BodySchema` structure with:
-- `typeName` - The DTO/POJO class name
-- `fields` - Nested array with full schema resolution
-- Validation annotations (`@NotEmpty`, `@NotNull`, `@JsonFormat`, etc.)
-- `_context` - Source code snippets for each extracted element
-
-```json
-{
-  "specs": {
-    "request": {
-      "body": {
-        "typeName": "SuggestionOrderDto",
-        "source": "external",
-        "fields": [
-          {
-            "name": "productCode",
-            "type": "String",
-            "annotations": ["@NotEmpty"],
-            "_context": "// SuggestionOrderDto.java:15\n@NotEmpty\nprivate String productCode;"
-          }
-        ]
-      }
-    }
-  }
-}
-```
-
-### OpenAPI Mode (`--openapi`)
-
-Generates OpenAPI 3.1.0 YAML specification alongside the default JSON output. Requires `--outputPath` to specify the output directory.
-
-**Output Files:**
-- `{METHOD}_{sanitized-path}.json` - Default JSON documentation
-- `{METHOD}_{sanitized-path}.openapi.yaml` - OpenAPI 3.1.0 YAML specification
-
-```bash
-# Generate both JSON and OpenAPI YAML
-gitnexus document-endpoint --method PUT --path "bookings/suggest" --openapi --outputPath ./docs/api
-
-# Outputs:
-# ./docs/api/PUT_e_v1_bookings_productCode_suggest.json
-# ./docs/api/PUT_e_v1_bookings_productCode_suggest.openapi.yaml
-```
-
-**YAML Spec Features:**
-- Full OpenAPI 3.1.0 compliance
-- Parameter locations (`path`, `query`, `header`, `cookie`) from Spring annotations
-- Request body schemas with required fields
-- Response schemas differentiated by status code (2xx vs 4xx/5xx)
-- Nested type resolution for complex DTOs
-- Validation annotations mapped to OpenAPI constraints
+**Output file:** `{METHOD}_{sanitized-path}.openapi.yaml`
 
 ```yaml
 openapi: '3.1.0'
@@ -174,102 +95,18 @@ components:
           type: integer
 ```
 
-### Strict Mode (`--strict`)
+**YAML Spec Features:**
+- Full OpenAPI 3.1.0 compliance
+- Parameter locations (`path`, `query`, `header`, `cookie`) from Spring annotations
+- Request body schemas with required fields
+- Response schemas differentiated by status code (2xx vs 4xx/5xx)
+- Nested type resolution for complex DTOs
+- Validation annotations mapped to OpenAPI constraints
+- `x-extension` fields embedding dependency metadata (downstream APIs, messaging, persistence)
 
-Validates output against JSON schema. By default, validation errors are logged as warnings. With `--strict`:
-- Fails with non-zero exit code on schema violations
-- Useful for CI/CD pipelines requiring valid output
+#### Mode 2: `ai_context`
 
-### Compact Mode (`--compact`)
-
-When combined with `--include-context`:
-- Omits source code content from `_context` fields
-- Removes empty arrays from output
-- Reduces output size by ~50%
-
-## Examples
-
-### Basic Usage
-
-```bash
-# From inside an indexed repository
-cd /path/to/your-repo
-gitnexus document-endpoint --method GET --path "bonds"
-gitnexus document-endpoint --method POST --path "/t/v1/orders/cds/sell"
-gitnexus document-endpoint --method PUT --path "bookings/{productCode}/suggest"
-```
-
-### With Context for AI Enrichment
-
-```bash
-# Include source code snippets (larger output)
-gitnexus document-endpoint --method GET --path "pricings" --include-context
-```
-
-### Compact Mode for Large Outputs
-
-```bash
-# Reduce output size (~50% smaller) - useful when hitting pipe buffer limits
-gitnexus document-endpoint --method PUT --path "bookings" --include-context --compact
-```
-
-### Control Trace Depth
-
-```bash
-# Limit depth for complex endpoints (default is 10)
-gitnexus document-endpoint --method POST --path "orders" --depth 5
-```
-
-### Multi-Repository
-
-```bash
-# Target a specific indexed repository
-gitnexus document-endpoint --method GET --path "bonds" -r tcbs-bond-trading
-```
-
-### OpenAPI YAML Generation
-
-```bash
-# Generate both JSON and OpenAPI 3.1.0 YAML files
-gitnexus document-endpoint --method PUT --path "bookings/suggest" --openapi --outputPath ./docs/api
-
-# Files written:
-# ./docs/api/PUT_e_v1_bookings_productCode_suggest.json
-# ./docs/api/PUT_e_v1_bookings_productCode_suggest.openapi.yaml
-```
-
-**Validate OpenAPI YAML:**
-```bash
-# Using Redocly CLI
-npx @redocly/cli lint ./docs/api/PUT_e_v1_bookings_productCode_suggest.openapi.yaml
-```
-
-### Strict Validation
-
-```bash
-# Fail on schema validation errors (useful for CI/CD)
-gitnexus document-endpoint --method GET --path "bonds" --strict
-```
-
-### Custom Schema Validation
-
-```bash
-# Validate against custom schema
-gitnexus document-endpoint --method POST --path "orders" \
-  --schema-path ./schemas/endpoint-output.schema.json \
-  --strict
-```
-
-### Redirect to File
-
-```bash
-# For large outputs, redirect to file to avoid pipe buffer truncation
-gitnexus document-endpoint --method PUT --path "bookings" --include-context > endpoint-doc.json
-```
-
-## Output Structure
-
-### Complete Output Schema
+Returns full JSON with `_context` fields, `BodySchema` payloads, and `TODO_AI_ENRICH` placeholders for AI agent enrichment.
 
 ```json
 {
@@ -300,27 +137,7 @@ gitnexus document-endpoint --method PUT --path "bookings" --include-context > en
               "_context": "// SuggestionOrderDto.java:25\n@NotEmpty\nprivate String orderType;"
             }
           ]
-        },
-        "validation": [
-          {
-            "field": "order",
-            "type": "Custom",
-            "required": true,
-            "rules": "@Valid order validation",
-            "method": "validateOrder"
-          }
-        ]
-      },
-      "response": {
-        "body": {
-          "typeName": "SuggestionOrderResultDto",
-          "source": "external",
-          "fields": []
-        },
-        "codes": [
-          { "code": 200, "description": "Success" },
-          { "code": 400, "description": "TcbsException: ErrorCode.UNKNOWN_ERROR" }
-        ]
+        }
       }
     },
     "externalDependencies": {
@@ -355,33 +172,7 @@ gitnexus document-endpoint --method PUT --path "bookings" --include-context > en
             "publishMethod": "rabbitTemplate.convertAndSend()"
           }
         ]
-      },
-      "persistence": [
-        {
-          "database": "PostgreSQL",
-          "tables": "trading, trading_attr, bond_product",
-          "storedProcedures": "None detected"
-        }
-      ]
-    },
-    "logicFlow": "1. Validate request\n2. Check product exists\n3. Create order\n4. Publish event",
-    "codeDiagram": "graph TB\n  subgraph Controller\n    A[unhold]\n  end\n  subgraph Service\n    B[process]\n    C[validate]\n    D[publishEvent]\n  end\n  A --> B\n  B --> C\n  B --> D",
-    "cacheStrategy": {
-      "flow": "Cache aside pattern with Redis",
-      "annotations": ["@Cacheable(value = \"suggestions\", key = \"#productCode\")"]
-    },
-    "retryLogic": [
-      {
-        "operation": "execPost",
-        "maxAttempts": "3",
-        "backoff": "1000ms exponential",
-        "recovery": "fallbackToCachedData"
       }
-    ],
-    "keyDetails": {
-      "transactionManagement": ["@Transactional(readOnly = true)"],
-      "businessRules": ["Order quantity must be positive"],
-      "security": ["JWT validation required"]
     },
     "_context": {
       "summaryContext": "Handler: Controller.handler() → Chain: handler → process"
@@ -390,30 +181,188 @@ gitnexus document-endpoint --method PUT --path "bookings" --include-context > en
 }
 ```
 
-### With `--compact`
+**`TODO_AI_ENRICH` placeholders** mark fields that require AI agent completion:
+- `summary` — human-readable endpoint summary
+- `condition` / `purpose` on downstream API entries — business context
+- Any other descriptive fields left empty by the analyzer
 
-When `--compact` is used with `--include-context`:
+> **Note:** `--include-context` is deprecated and maps to `--mode ai_context`. A deprecation warning is emitted when `--include-context` is used.
 
-1. Source code content is omitted from `_context` fields
-2. Empty arrays (`[]`) are removed from the output
-3. Output size is reduced by ~50%
+### `--input-yaml <path>`
 
-This is useful when:
-- Output needs to fit within terminal pipe buffers (64KB limit on macOS)
-- Processing by AI with token limits
-- Only structural metadata is needed
+Enrich an existing OpenAPI specification file with data extracted from the knowledge graph.
+
+```bash
+gitnexus document-endpoint --input-yaml ./openapi.yaml --method PUT --path "bookings/suggest"
+```
+
+**Behavior:**
+- `--method` and `--path` select specific endpoints to enrich
+- Without `--method` and `--path`, all endpoints are enriched
+- Output written to `{baseName}.enriched.openapi.yaml`
+- Original file is unchanged
+
+**Enrichment adds:**
+- Parameter types and required flags from source analysis
+- Request/response body schemas (resolving nested DTOs)
+- Validation constraints from field annotations
+- `x-` extension blocks for downstream APIs, messaging, and persistence
+
+### Deprecated: `--include-context`
+
+`--include-context` is deprecated. Use `--mode ai_context` instead.
+
+```bash
+# Deprecated
+gitnexus document-endpoint --method GET --path "bonds" --include-context
+
+# Equivalent
+gitnexus document-endpoint --method GET --path "bonds" --mode ai_context
+```
+
+A deprecation warning is emitted when `--include-context` is used.
+
+## Path Matching
+
+The `--path` argument uses fuzzy matching:
+
+| Pattern | Matches |
+|---------|---------|
+| `bonds` | `/e/v1/bonds`, `/b/v1/bonds`, `/api/bonds` |
+| `customers/{id}` | `/customers/{tcbsId}`, `/v1/customers/{id}/assets` |
+| `/t/v1/orders/cds/sell` | Exact or near-exact match |
+
+When Route nodes exist in the graph, the tool uses them for precise matching. Otherwise, it falls back to searching for `@XxxMapping` annotations in controller classes.
+
+## Enum Resolution
+
+When a Java field is typed as an enum class (e.g., `private OrderAction action`), the OpenAPI output resolves the enum constants and emits an `enum:` array.
+
+### How it works
+
+1. `resolveTypeSchema()` first queries `:Class` nodes for the type name.
+2. If no `:Class` found, it falls back to `MATCH (e:Enum) WHERE e.name = $typeName`.
+3. The raw `content` of the `:Enum` node is parsed by `parseEnumConstants()` to extract uppercase constant names (e.g., `BUY`, `SELL`, `HOLD`).
+4. The enum schema `{ source: 'indexed', enumValues: ['BUY','SELL','HOLD'] }` propagates through `resolveAllNestedTypes()` → `embedNestedSchemas()` → `bodySchemaToOpenAPISchema()`.
+5. The OpenAPI schema emits `{ type: string, enum: ['BUY','SELL','HOLD'] }`.
+
+### Output example
+
+```yaml
+properties:
+  action:
+    type: string
+    enum:
+      - BUY
+      - SELL
+      - HOLD
+  status:
+    type: string
+    enum:
+      - PENDING
+      - COMPLETED
+      - CANCELLED
+```
+
+### Limitations
+
+- Only works when the Java field type IS the enum class (e.g., `OrderAction action`). Fields declared as `String` that semantically hold enum values are not auto-detected.
+- Enum constants are parsed from raw source `content` via regex. Constants with non-standard casing or complex initializers may not be captured.
+- Cross-repo enums (defined in dependency repos) are resolved via the same cross-repo fallback path.
 
 ## Output Size Guidelines
 
 | Mode | Approximate Size | Use Case |
 |------|------------------|----------|
-| Default | 2-5 KB | Quick reference |
-| `--include-context` | 50-200 KB | Full AI enrichment |
-| `--include-context --compact` | 25-100 KB | AI enrichment with size constraints |
+| `openapi` (default) | 2-10 KB | Machine consumption, API registries |
+| `ai_context` | 50-200 KB | AI agent enrichment |
 
-**Note**: Terminal pipe buffers on macOS limit output to ~64KB. If output exceeds this:
-- Use `--compact` to reduce size
-- Redirect to file: `> output.json`
+**Note**: Terminal pipe buffers on macOS limit output to ~64KB. For `ai_context` output that may exceed this, redirect to a file.
+
+## Examples
+
+### Basic Usage
+
+```bash
+# From inside an indexed repository
+cd /path/to/your-repo
+gitnexus document-endpoint --method GET --path "bonds"
+gitnexus document-endpoint --method POST --path "/t/v1/orders/cds/sell"
+gitnexus document-endpoint --method PUT --path "bookings/{productCode}/suggest"
+```
+
+### OpenAPI Mode (default)
+
+```bash
+# Generate OpenAPI 3.1.0 YAML
+gitnexus document-endpoint --method PUT --path "bookings/suggest"
+
+# With explicit output directory
+gitnexus document-endpoint --method PUT --path "bookings/suggest" --outputPath ./docs/api
+
+# Validate generated YAML with Redocly CLI
+npx @redocly/cli lint ./docs/api/PUT_e_v1_bookings_productCode_suggest.openapi.yaml
+```
+
+### AI Context Mode
+
+```bash
+# Full JSON with _context fields and TODO_AI_ENRICH placeholders
+gitnexus document-endpoint --method GET --path "bonds" --mode ai_context
+
+# Redirect to file for large output
+gitnexus document-endpoint --method PUT --path "bookings" --mode ai_context > endpoint-doc.json
+```
+
+### Deprecation Warning
+
+```bash
+# --include-context still works but emits a warning
+gitnexus document-endpoint --method GET --path "pricings" --include-context
+# → Warning: --include-context is deprecated. Use --mode ai_context instead.
+```
+
+### Enrich an Existing OpenAPI File
+
+```bash
+# Enrich specific endpoint in existing spec
+gitnexus document-endpoint --input-yaml ./openapi.yaml --method PUT --path "bookings/suggest"
+
+# Output: openapi.enriched.openapi.yaml
+```
+
+```bash
+# Enrich all endpoints in spec (no method/path filter)
+gitnexus document-endpoint --input-yaml ./openapi.yaml
+
+# Output: openapi.enriched.openapi.yaml
+```
+
+### Control Trace Depth
+
+```bash
+# Limit depth for complex endpoints (default is 10)
+gitnexus document-endpoint --method POST --path "orders" --depth 5
+```
+
+### Multi-Repository
+
+```bash
+# Target a specific indexed repository
+gitnexus document-endpoint --method GET --path "bonds" -r tcbs-bond-trading
+```
+
+### Strict Validation
+
+```bash
+# Fail on schema validation errors (useful for CI/CD)
+gitnexus document-endpoint --method GET --path "bonds" --strict
+
+# Validate against custom schema
+gitnexus document-endpoint --method POST --path "orders" \
+  --schema-path ./schemas/endpoint-output.schema.json \
+  --strict
+```
 
 ## Service Resolution Features
 
@@ -450,7 +399,7 @@ Resolves static final constants and `@Value`-annotated constants:
 @Component
 public class ApiEndpoints {
     public static final String ORDERS_PATH = "/v1/orders";
-    
+
     @Value("${orders.service.url}")
     public static String ORDERS_SERVICE_URL;
 }
@@ -671,11 +620,11 @@ The following options are NOT currently implemented but may be useful:
 | Option | Description | Status |
 |--------|-------------|--------|
 | `--all` | Document all endpoints in the repository | Not implemented |
-| `--format <format>` | Output format: `json` (default) or `yaml` | Partial: use `--openapi --outputPath` for YAML |
+| `--format <format>` | Output format: `json` (default) or `yaml` | Use `--mode openapi --outputPath` for YAML |
 
 Workarounds:
 - **Document multiple endpoints**: Use a shell script to iterate over endpoints
-- **YAML output**: Use `--openapi --outputPath` to generate OpenAPI YAML
+- **YAML output**: Use `--mode openapi --outputPath` to generate OpenAPI YAML
 
 ## See Also
 
