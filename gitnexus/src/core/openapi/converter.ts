@@ -339,7 +339,7 @@ function buildDependencyDescription(
     lines.push('|---------|--------|----------|');
     for (const api of deps.downstreamApis) {
       // Parse method and path from endpoint (e.g., "POST /v1/bond-limit/hold-unhold")
-      const match = api.endpoint.match(/^(GET|POST|PUT|DELETE|PATCH)\s+(.+)$/);
+      const match = api.endpoint.match(/^([A-Z]+)\s+(.+)$/);
       const method = match ? match[1] : '-';
       const path = match ? match[2] : api.endpoint;
       lines.push(`| ${api.serviceName} | ${method} | ${path} |`);

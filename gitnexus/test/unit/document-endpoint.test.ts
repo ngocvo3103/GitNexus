@@ -29,7 +29,7 @@ vi.mock('../../src/mcp/core/lbug-adapter.js', () => ({
 }));
 
 // Import after mocks are set up
-import { documentEndpoint, extractLocalVariableAssignments, bodySchemaToJsonExample, extractMessaging, extractPersistence } from '../../src/mcp/local/document-endpoint.js';
+import { documentEndpoint, extractLocalVariableAssignments, bodySchemaToJsonExample, extractMessaging, extractPersistence, normalizeEndpoint } from '../../src/mcp/local/document-endpoint.js';
 import { executeParameterized } from '../../src/mcp/core/lbug-adapter.js';
 import * as endpointQuery from '../../src/mcp/local/endpoint-query.js';
 import * as traceExecutor from '../../src/mcp/local/trace-executor.js';
@@ -6531,5 +6531,126 @@ describe('backward compat bridge', () => {
     expect(result).toHaveProperty('yaml');
     expect(typeof (result as any).yaml).toBe('string');
     expect(result).not.toHaveProperty('result');
+  });
+});
+
+describe('normalizeEndpoint', () => {
+  it('strips domain from full HTTP URL', () => {
+    const result = normalizeEndpoint('GET http://apiintsit.tcbs.com.vn/fund-pricing');
+    expect(result.method).toBe('GET');
+    expect(result.serviceName).toBe('fund-pricing');
+    expect(result.endpoint).toBe('GET /fund-pricing');
+  });
+
+  it('strips domain from full URL with deep path', () => {
+    const result = normalizeEndpoint('GET http://apiintsit.tcbs.com.vn/hft-krema/v1/accounts/{customerTcbsId}/cashInvestments');
+    expect(result.method).toBe('GET');
+    expect(result.serviceName).toBe('hft-krema');
+    expect(result.endpoint).toBe('GET /hft-krema/v1/accounts/{customerTcbsId}/cashInvestments');
+  });
+
+  it('handles HTTPS URLs', () => {
+    const result = normalizeEndpoint('GET https://www.google.com/recaptcha/api/siteverify?secret={secret}&response={response}');
+    expect(result.method).toBe('GET');
+    expect(result.serviceName).toBe('recaptcha');
+    expect(result.endpoint).toBe('GET /recaptcha/api/siteverify?secret={secret}&response={response}');
+  });
+
+  it('handles URL with trailing slash', () => {
+    const result = normalizeEndpoint('POST http://apiintsit.tcbs.com.vn/matching-engine/');
+    expect(result.method).toBe('POST');
+    expect(result.serviceName).toBe('matching-engine');
+    expect(result.endpoint).toBe('POST /matching-engine/');
+  });
+
+  it('handles IP address URL with only slash — keeps full URL', () => {
+    const result = normalizeEndpoint('EXCHANGE http://10.7.2.85:8092/');
+    expect(result.method).toBe('EXCHANGE');
+    expect(result.endpoint).toBe('EXCHANGE http://10.7.2.85:8092/');
+    expect(result.serviceName).toBe('10.7.2.85');
+  });
+
+  it('handles URL with port and meaningful path', () => {
+    const result = normalizeEndpoint('GET http://localhost:9090/api/v1/orders');
+    expect(result.method).toBe('GET');
+    expect(result.serviceName).toBe('api');
+    expect(result.endpoint).toBe('GET /api/v1/orders');
+  });
+
+  it('handles relative paths — extracts first segment as service name', () => {
+    const result = normalizeEndpoint('POST /v1/bond-limit/hold-unhold');
+    expect(result.method).toBe('POST');
+    expect(result.serviceName).toBe('v1');
+    expect(result.endpoint).toBe('POST /v1/bond-limit/hold-unhold');
+  });
+
+  it('handles relative path with path params', () => {
+    const result = normalizeEndpoint('POST /v1/bond-limit/inquiry-hold-unhold/{transactionId}/{actionType}/{campainType}');
+    expect(result.method).toBe('POST');
+    expect(result.serviceName).toBe('v1');
+    expect(result.endpoint).toBe('POST /v1/bond-limit/inquiry-hold-unhold/{transactionId}/{actionType}/{campainType}');
+  });
+
+  it('does not modify raw code expressions', () => {
+    const result = normalizeEndpoint('POST bondServiceUrl + "/orders"');
+    expect(result.method).toBe('POST');
+    expect(result.serviceName).toBeNull();
+    expect(result.endpoint).toBe('POST bondServiceUrl + "/orders"');
+  });
+
+  it('does not modify another raw code expression', () => {
+    const result = normalizeEndpoint('POST bondSettlementService.concat(HOLD_UNHOLD_USED_LIMIT_URI)');
+    expect(result.method).toBe('POST');
+    expect(result.serviceName).toBeNull();
+    expect(result.endpoint).toBe('POST bondSettlementService.concat(HOLD_UNHOLD_USED_LIMIT_URI)');
+  });
+
+  it('handles URL with only domain and no path', () => {
+    const result = normalizeEndpoint('GET http://apiintsit.tcbs.com.vn');
+    expect(result.method).toBe('GET');
+    expect(result.serviceName).toBe('apiintsit.tcbs.com.vn');
+    expect(result.endpoint).toBe('GET http://apiintsit.tcbs.com.vn');
+  });
+
+  it('handles empty string', () => {
+    const result = normalizeEndpoint('');
+    expect(result.method).toBe('');
+    expect(result.serviceName).toBeNull();
+    expect(result.endpoint).toBe('');
+  });
+
+  it('handles string without space (no method)', () => {
+    const result = normalizeEndpoint('http://example.com/api');
+    expect(result.method).toBe('');
+    expect(result.serviceName).toBeNull();
+    expect(result.endpoint).toBe('http://example.com/api');
+  });
+
+  it('handles PUT method', () => {
+    const result = normalizeEndpoint('PUT http://apiintsit.tcbs.com.vn/matching-engine/');
+    expect(result.method).toBe('PUT');
+    expect(result.serviceName).toBe('matching-engine');
+    expect(result.endpoint).toBe('PUT /matching-engine/');
+  });
+
+  it('handles DELETE method', () => {
+    const result = normalizeEndpoint('DELETE http://api.example.com/v1/items/{id}');
+    expect(result.method).toBe('DELETE');
+    expect(result.serviceName).toBe('v1');
+    expect(result.endpoint).toBe('DELETE /v1/items/{id}');
+  });
+
+  it('handles PATCH method', () => {
+    const result = normalizeEndpoint('PATCH http://api.example.com/v1/items/{id}');
+    expect(result.method).toBe('PATCH');
+    expect(result.serviceName).toBe('v1');
+    expect(result.endpoint).toBe('PATCH /v1/items/{id}');
+  });
+
+  it('handles non-standard EXCHANGE method with path', () => {
+    const result = normalizeEndpoint('EXCHANGE http://10.7.2.85:8092/api');
+    expect(result.method).toBe('EXCHANGE');
+    expect(result.serviceName).toBe('api');
+    expect(result.endpoint).toBe('EXCHANGE /api');
   });
 });

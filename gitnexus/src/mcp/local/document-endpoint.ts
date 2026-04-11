@@ -950,18 +950,21 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
     result.externalDependencies.downstreamApis = downstreamApis;
   } else {
     // Remove internal enrichment fields for schema-compliant output
-    result.externalDependencies.downstreamApis = downstreamApis.map(api => ({
-      serviceName: api.serviceName,
-      name: api.name,
-      type: api.type,
-      service: api.service,
-      repoId: api.repoId,
-      endpoint: api.endpoint,
-      condition: api.condition,
-      purpose: api.purpose,
-      resolvedUrl: api.resolvedUrl,
-      resolvedFrom: api.resolvedFrom,
-    }));
+    result.externalDependencies.downstreamApis = downstreamApis.map(api => {
+      const normalized = normalizeEndpoint(api.endpoint);
+      return {
+        serviceName: api.serviceName,
+        name: normalized.serviceName || api.name,
+        type: api.type,
+        service: api.service,
+        repoId: api.repoId,
+        endpoint: normalized.endpoint,
+        condition: api.condition,
+        purpose: api.purpose,
+        resolvedUrl: api.resolvedUrl,
+        resolvedFrom: api.resolvedFrom,
+      };
+    });
   }
   
   // Merge messaging nestedSchemas into main nestedSchemas from body schemas
@@ -1312,13 +1315,17 @@ async function extractDownstreamApis(
         };
       }
 
+      // Normalize endpoint — strip domain, extract service name from URL
+      const normalized = normalizeEndpoint(endpoint);
+      const displayName = normalized.serviceName || serviceName;
+
       apis.push({
         serviceName,
-        name: serviceName,
+        name: displayName,
         type: 'REST',
         service: serviceName,
         repoId: resolvedRepoId,
-        endpoint,
+        endpoint: normalized.endpoint,
         condition: TODO_AI_ENRICH,
         purpose: TODO_AI_ENRICH,
         resolvedUrl: resolvedUrl !== detail.urlExpression ? resolvedUrl : undefined,
@@ -1352,13 +1359,87 @@ function extractServiceName(urlExpression: string): string {
 
 /**
  * Parse a URL expression to extract service references and constants.
- * 
+ *
  * Examples:
- * - "bondSettlementService.concat(HOLD_UNHOLD_USED_LIMIT_URI)" 
+ * - "bondSettlementService.concat(HOLD_UNHOLD_USED_LIMIT_URI)"
  *   -> { serviceName: "bondSettlementService", variableRefs: ["HOLD_UNHOLD_USED_LIMIT_URI"], staticParts: [] }
- * - "${serviceUrl}/api/v1" 
+ * - "${serviceUrl}/api/v1"
  *   -> { serviceName: null, variableRefs: ["serviceUrl"], staticParts: ["/api/v1"] }
- * - "http://api.example.com/v1" + path 
+ * - "http://api.example.com/v1" + path
+ *   -> { serviceName: null, variableRefs: [], staticParts: ["http://api.example.com/v1"] }
+ */
+
+/**
+ * Normalize a downstream API endpoint string by stripping the domain from full URLs
+ * and extracting the service name from the first path segment.
+ *
+ * @param endpoint - The endpoint string in "METHOD path_or_url" format
+ * @returns Object with method, serviceName (from URL path), and normalized endpoint
+ */
+export function normalizeEndpoint(endpoint: string): {
+  method: string;
+  serviceName: string | null;
+  endpoint: string;
+} {
+  // Split "METHOD path_or_url"
+  const spaceIdx = endpoint.indexOf(' ');
+  if (spaceIdx === -1) return { method: '', serviceName: null, endpoint };
+
+  const method = endpoint.slice(0, spaceIdx);
+  const rawPath = endpoint.slice(spaceIdx + 1);
+
+  // Not a URL or absolute path — raw code expression, skip normalization
+  if (!rawPath.startsWith('http://') && !rawPath.startsWith('https://') && !rawPath.startsWith('/')) {
+    return { method, serviceName: null, endpoint };
+  }
+
+  let cleanPath = rawPath;
+  let urlServiceName: string | null = null;
+
+  if (rawPath.startsWith('http://') || rawPath.startsWith('https://')) {
+    try {
+      const url = new URL(rawPath);
+      // Include query params in the path
+      const pathPart = url.pathname + url.search; // e.g., "/matching-engine/v1/orders" or "/api?key=val"
+      // Decode URL-encoded path parameters ({id} → not %7Bid%7D)
+      const decodedPath = decodeURIComponent(pathPart);
+
+      if (url.pathname === '/' || url.pathname === '') {
+        // Only domain, no meaningful path — keep full URL as endpoint
+        return { method, serviceName: url.hostname, endpoint: `${method} ${rawPath}` };
+      }
+
+      cleanPath = decodedPath;
+      // First path segment = service name
+      const segments = url.pathname.split('/').filter(Boolean);
+      if (segments.length > 0) {
+        urlServiceName = segments[0];
+      }
+    } catch {
+      // Malformed URL — don't normalize
+      return { method, serviceName: null, endpoint };
+    }
+  } else {
+    // Relative path — first segment is service name
+    const segments = rawPath.split('/').filter(Boolean);
+    if (segments.length > 0) {
+      urlServiceName = segments[0];
+    }
+  }
+
+  // Reconstruct endpoint as "METHOD /path"
+  return { method, serviceName: urlServiceName, endpoint: `${method} ${cleanPath}` };
+}
+
+/**
+ * Parse a URL expression to extract service references and constants.
+ *
+ * Examples:
+ * - "bondSettlementService.concat(HOLD_UNHOLD_USED_LIMIT_URI)"
+ *   -> { serviceName: "bondSettlementService", variableRefs: ["HOLD_UNHOLD_USED_LIMIT_URI"], staticParts: [] }
+ * - "${serviceUrl}/api/v1"
+ *   -> { serviceName: null, variableRefs: ["serviceUrl"], staticParts: ["/api/v1"] }
+ * - "http://api.example.com/v1" + path
  *   -> { serviceName: null, variableRefs: [], staticParts: ["http://api.example.com/v1"] }
  */
 function parseUrlExpression(urlExpression: string): {
