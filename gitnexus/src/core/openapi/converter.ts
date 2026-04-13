@@ -332,7 +332,7 @@ function buildDependencyDescription(
   
   if (hasDownstream) {
     // Count unique services
-    const uniqueServices = new Set(deps.downstreamApis.map(api => api.serviceName));
+    const uniqueServices = new Set(deps.downstreamApis.map(api => api.name));
     lines.push(`**Downstream APIs:** ${deps.downstreamApis.length} calls to ${uniqueServices.size} services`);
     lines.push('');
     lines.push('| Service | Method | Endpoint |');
@@ -342,7 +342,7 @@ function buildDependencyDescription(
       const match = api.endpoint.match(/^([A-Z]+)\s+(.+)$/);
       const method = match ? match[1] : '-';
       const path = match ? match[2] : api.endpoint;
-      lines.push(`| ${api.serviceName} | ${method} | ${path} |`);
+      lines.push(`| ${api.name} | ${method} | ${path} |`);
     }
     lines.push('');
   }

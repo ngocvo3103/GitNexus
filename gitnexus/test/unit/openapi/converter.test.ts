@@ -509,7 +509,7 @@ describe('external dependencies extensions', () => {
       },
       externalDependencies: {
         downstreamApis: [
-          { serviceName: 'auth-service', endpoint: 'POST /validate', condition: 'always', purpose: 'Validate token' },
+          { serviceName: 'auth-service', name: 'auth-service', endpoint: 'POST /validate', condition: 'always', purpose: 'Validate token' },
         ],
         messaging: { outbound: [], inbound: [] },
         persistence: [],
@@ -624,7 +624,7 @@ describe('external dependencies extensions', () => {
       },
       externalDependencies: {
         downstreamApis: [
-          { serviceName: 'payment-service', endpoint: 'POST /charge', condition: 'if payment required', purpose: 'Process payment' },
+          { serviceName: 'payment-service', name: 'payment-service', endpoint: 'POST /charge', condition: 'if payment required', purpose: 'Process payment' },
         ],
         messaging: {
           outbound: [{ topic: 'order-created', trigger: 'on success' }],
@@ -666,7 +666,7 @@ describe('external dependencies extensions', () => {
       },
       externalDependencies: {
         downstreamApis: [
-          { serviceName: 'payment-service', endpoint: '/charge', condition: 'always', purpose: 'Process payment' },
+          { serviceName: 'payment-service', name: 'payment-service', endpoint: '/charge', condition: 'always', purpose: 'Process payment' },
         ],
         messaging: {
           outbound: [{ topic: 'order-created', trigger: 'on success' }],
@@ -688,6 +688,41 @@ describe('external dependencies extensions', () => {
     expect(pathItem.post?.description).toContain('**Messaging:**');
     expect(pathItem.post?.description).toContain('order-created');
     expect(pathItem.post?.description).toContain('**Persistence:**');
+  });
+
+  it('uses api.name for Service column, not api.serviceName', () => {
+    const result = {
+      method: 'GET',
+      path: '/bond-product',
+      summary: 'Get bond product',
+      specs: {
+        request: { params: [], body: null, validation: [] },
+        response: { body: null, codes: [{ code: 200, description: 'OK' }] },
+      },
+      externalDependencies: {
+        downstreamApis: [
+          {
+            serviceName: 'tcbs.bond.product.url',
+            name: 'bond-product',
+            type: 'REST',
+            service: 'tcbs.bond.product.url',
+            endpoint: 'GET /bond-product',
+            condition: 'TODO_AI_ENRICH',
+            purpose: 'TODO_AI_ENRICH',
+          },
+        ],
+        messaging: { outbound: [], inbound: [] },
+        persistence: [],
+      },
+    };
+
+    const components = {};
+    const pathItem = convertToOpenAPIPathItem(result as any, components);
+
+    expect(pathItem.get?.description).toContain('| bond-product |');
+    expect(pathItem.get?.description).not.toContain('| tcbs.bond.product.url |');
+    // Verify unique service count uses name
+    expect(pathItem.get?.description).toContain('1 services');
   });
 });
 

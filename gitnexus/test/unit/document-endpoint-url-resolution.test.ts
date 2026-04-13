@@ -23,7 +23,7 @@ vi.mock('../../src/mcp/core/lbug-adapter.js', () => ({
 }));
 
 // Import after mocks are set up
-import { documentEndpoint } from '../../src/mcp/local/document-endpoint.js';
+import { documentEndpoint, deriveDisplayName } from '../../src/mcp/local/document-endpoint.js';
 import * as endpointQuery from '../../src/mcp/local/endpoint-query.js';
 import * as traceExecutor from '../../src/mcp/local/trace-executor.js';
 import { executeParameterized } from '../../src/mcp/core/lbug-adapter.js';
@@ -507,5 +507,39 @@ describe('URL resolution endpoint construction', () => {
     const api = result.result.externalDependencies.downstreamApis[0];
     expect(api._context).toBeDefined();
     expect(api.resolutionDetails?.resolvedValue).toBe('https://info.api.com');
+  });
+});
+
+describe('deriveDisplayName', () => {
+  it('extracts first path segment from HTTP URL', () => {
+    expect(deriveDisplayName('http://apiintsit.tcbs.com.vn/bond-settlement', 'v1', 'tcbs.bond.settlement.service.url')).toBe('bond-settlement');
+  });
+
+  it('extracts first path segment from HTTPS URL', () => {
+    expect(deriveDisplayName('https://www.google.com/recaptcha/api/siteverify', 'recaptcha', 'hold.suggestion.captcha.google.url')).toBe('recaptcha');
+  });
+
+  it('strips trailing slash before extracting path segment', () => {
+    expect(deriveDisplayName('http://apiintsit.tcbs.com.vn/matching-engine/', 'matching-engine', 'tcbs.matching.service.url')).toBe('matching-engine');
+  });
+
+  it('falls back to endpointServiceName when URL has no path (IP address)', () => {
+    expect(deriveDisplayName('http://10.7.2.85:8092/', '10.7.2.85', 'tcbs.profile.service')).toBe('10.7.2.85');
+  });
+
+  it('falls back to fallbackName when URL has root path and endpointServiceName is null', () => {
+    expect(deriveDisplayName('http://api.example.com/', null, 'fallback')).toBe('fallback');
+  });
+
+  it('falls back to endpointServiceName when resolvedValue is undefined', () => {
+    expect(deriveDisplayName(undefined, 'v1', 'tcbs.bond.product.url')).toBe('v1');
+  });
+
+  it('falls back to endpointServiceName when resolvedValue is not a URL', () => {
+    expect(deriveDisplayName('localhost:8080', 'v1', 'fallback')).toBe('v1');
+  });
+
+  it('extracts first path segment from multi-segment URL path', () => {
+    expect(deriveDisplayName('http://apiintsit.tcbs.com.vn/hft-krema/v1/accounts', 'hft-krema', 'services.hft-krema.cashInvestments.url')).toBe('hft-krema');
   });
 });

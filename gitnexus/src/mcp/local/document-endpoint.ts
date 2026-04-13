@@ -929,6 +929,35 @@ function applyAiContextPlaceholders(result: DocumentEndpointResult): DocumentEnd
 
   return result;
 }
+
+
+/**
+ * Derive a display-friendly service name from the resolved URL value.
+ * If the resolved value is an HTTP URL with a meaningful path, extract the first path segment.
+ * Otherwise, fall back to the endpoint-derived name or the original name.
+ *
+ * @param resolvedValue - The actual resolved URL (e.g., "http://apiint.tcbs.com.vn/bond-settlement")
+ * @param endpointServiceName - Service name extracted from endpoint path (e.g., "v1" from "/v1/bond-limit/hold-unhold")
+ * @param fallbackName - Original service name (typically the config key)
+ */
+export function deriveDisplayName(
+  resolvedValue: string | undefined,
+  endpointServiceName: string | null,
+  fallbackName: string
+): string {
+  if (resolvedValue && (resolvedValue.startsWith('http://') || resolvedValue.startsWith('https://'))) {
+    try {
+      const url = new URL(resolvedValue);
+      const segments = url.pathname.split('/').filter(Boolean);
+      if (segments.length > 0) {
+        return segments[0];
+      }
+    } catch {
+      // Malformed URL — fall through
+    }
+  }
+  return endpointServiceName || fallbackName;
+}
 async function buildDocumentation(params: BuildDocumentationParams): Promise<DocumentEndpointResult> {
   const { method, path, route, chain, includeContext, compact, executeQuery, repoId, crossRepo } = params;
   const result = createEmptyResult(method, path);
@@ -952,9 +981,10 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
     // Remove internal enrichment fields for schema-compliant output
     result.externalDependencies.downstreamApis = downstreamApis.map(api => {
       const normalized = normalizeEndpoint(api.endpoint);
+      const resolvedValue = (api as any).resolutionDetails?.resolvedValue;
       return {
         serviceName: api.serviceName,
-        name: normalized.serviceName || api.name,
+        name: deriveDisplayName(resolvedValue, normalized.serviceName, api.name),
         type: api.type,
         service: api.service,
         repoId: api.repoId,
@@ -1317,7 +1347,7 @@ async function extractDownstreamApis(
 
       // Normalize endpoint — strip domain, extract service name from URL
       const normalized = normalizeEndpoint(endpoint);
-      const displayName = normalized.serviceName || serviceName;
+      const displayName = deriveDisplayName(resolvedValue, normalized.serviceName, serviceName);
 
       apis.push({
         serviceName,
