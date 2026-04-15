@@ -101,7 +101,7 @@ async function verifyHandlerUid(
 ): Promise<boolean> {
   try {
     const result = await executeParameterized(repo.id,
-      `MATCH (m:Method) WHERE m.uid = $uid RETURN m.uid LIMIT 1`,
+      `MATCH (m:Method) WHERE m.id = $uid RETURN m.id LIMIT 1`,
       { uid: handlerUid }
     );
     return (result?.length ?? 0) > 0;

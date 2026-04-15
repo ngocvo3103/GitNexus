@@ -324,14 +324,14 @@ export class LocalBackend {
 
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
-  async callTool(method: string, params: any): Promise<any> {
+  async callTool<T = unknown>(method: string, params: any): Promise<T> {
     if (method === 'list_repos') {
-      return this.listRepos();
+      return this.listRepos() as T;
     }
 
     // Cross-repo routing: if repos[] is provided, use multi-repo handler
     if (params?.repos && Array.isArray(params.repos) && params.repos.length > 0) {
-      return this.callToolMultiRepo(method, params);
+      return this.callToolMultiRepo(method, params) as T;
     }
 
     // Single-repo routing (backward compatible)
@@ -340,36 +340,36 @@ export class LocalBackend {
 
     switch (method) {
       case 'query':
-        return this.query(repo, params);
+        return this.query(repo, params) as T;
       case 'cypher': {
         const raw = await this.cypher(repo, params);
-        return this.formatCypherAsMarkdown(raw);
+        return this.formatCypherAsMarkdown(raw) as T;
       }
       case 'context':
-        return this.context(repo, params);
+        return this.context(repo, params) as T;
       case 'impact':
-        return this.impact(repo, params);
+        return this.impact(repo, params) as T;
       case 'detect_changes':
-        return this.detectChanges(repo, params);
+        return this.detectChanges(repo, params) as T;
       case 'rename':
-        return this.rename(repo, params);
+        return this.rename(repo, params) as T;
       case 'endpoints':
-        return this.endpoints(repo, params);
+        return this.endpoints(repo, params) as T;
       case 'document-endpoint':
-        return this.documentEndpoint(repo, params);
+        return this.documentEndpoint(repo, params) as T;
       case 'api_impact':
-        return this.apiImpact(repo, params);
+        return this.apiImpact(repo, params) as T;
       case 'route_map':
-        return this.routeMap(repo, params);
+        return this.routeMap(repo, params) as T;
       case 'shape_check':
-        return this.shapeCheck(repo, params);
+        return this.shapeCheck(repo, params) as T;
       // Legacy aliases for backwards compatibility
       case 'search':
-        return this.query(repo, params);
+        return this.query(repo, params) as T;
       case 'explore':
-        return this.context(repo, { name: params?.name, ...params });
+        return this.context(repo, { name: params?.name, ...params }) as T;
       case 'overview':
-        return this.overview(repo, params);
+        return this.overview(repo, params) as T;
       default:
         throw new Error(`Unknown tool: ${method}`);
     }

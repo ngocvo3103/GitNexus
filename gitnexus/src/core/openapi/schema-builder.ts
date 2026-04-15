@@ -38,7 +38,7 @@ const TYPE_MAP: Record<string, string> = {
   String: 'string',
   char: 'string',
   Character: 'string',
-  
+
   // Numbers
   int: 'integer',
   Integer: 'integer',
@@ -198,7 +198,33 @@ export function bodySchemaToOpenAPISchema(schema: BodySchema | null | undefined)
   }
 
   if (schema.isContainer) {
-    // Extract inner type from generic like List<User>
+    // Map<K, V> types → object with additionalProperties
+    const baseType = schema.typeName.split('<')[0].trim();
+    if (baseType === 'Map' || baseType === 'HashMap' || baseType === 'LinkedHashMap' || baseType === 'TreeMap') {
+      // Map<K, V> → { type: 'object', additionalProperties: { type: <V> } }
+      const match = schema.typeName.match(/<(.+)>/);
+      const inner = match ? match[1].trim() : 'Object';
+      // For Map<K, V>, extract the value type (last type argument)
+      let valueType = inner;
+      let depth = 0;
+      let lastComma = -1;
+      for (let i = 0; i < inner.length; i++) {
+        if (inner[i] === '<') depth++;
+        else if (inner[i] === '>') depth--;
+        else if (inner[i] === ',' && depth === 0) lastComma = i;
+      }
+      if (lastComma !== -1) {
+        valueType = inner.slice(lastComma + 1).trim();
+      }
+      return {
+        type: 'object',
+        additionalProperties: {
+          type: mapType(valueType),
+        },
+      };
+    }
+
+    // List<T>, Set<T> etc → array
     const match = schema.typeName.match(/<(.+)>/);
     const innerType = match ? match[1].trim() : 'object';
 

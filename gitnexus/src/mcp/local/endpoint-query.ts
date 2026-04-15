@@ -15,6 +15,7 @@ export interface EndpointInfo {
   handler?: string;
   filePath?: string;
   line?: number;
+  handlerUid?: string;  // Method node id from Route→CALLS→Method edge
 }
 
 export async function queryEndpoints(
@@ -46,11 +47,14 @@ export async function queryEndpoints(
     cypher += '\n  WHERE ' + conditions.join(' AND ');
   }
 
+  // OPTIONAL MATCH to get the handler Method node via CodeRelation CALLS edge
   cypher += `
+    OPTIONAL MATCH (r)-[:CodeRelation {type: 'CALLS'}]->(m:Method)
     RETURN r.httpMethod AS method, r.routePath AS path,
            r.controllerName AS controller, r.methodName AS handler,
-           r.filePath AS filePath, r.lineNumber AS line
-    ORDER BY LENGTH(r.routePath) DESC, r.httpMethod
+           r.filePath AS filePath, r.lineNumber AS line,
+           m.id AS handlerUid
+    ORDER BY size(r.routePath) DESC, r.httpMethod
   `;
 
   const rows = await executeParameterized(repo.id, cypher, params);
@@ -62,7 +66,14 @@ export async function queryEndpoints(
     handler: row.handler ?? row[3] ?? undefined,
     filePath: row.filePath ?? row[4] ?? undefined,
     line: row.line ?? row[5] ?? undefined,
+    handlerUid: row.handlerUid ?? row[6] ?? undefined,
   }));
 
   return { endpoints };
+}
+
+export async function queryAllEndpoints(
+  repo: RepoHandle
+): Promise<{ endpoints: EndpointInfo[] }> {
+  return queryEndpoints(repo);
 }

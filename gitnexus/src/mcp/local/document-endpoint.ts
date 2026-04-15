@@ -134,7 +134,17 @@ const IMPERATIVE_VALIDATION_PATTERNS = [
 const CANDIDATE_QUERY_LIMIT = 100;
 const NESTED_TYPE_MAX_DEPTH = 10;
 const NESTED_TYPE_MAX_COUNT = 100;
-const PATH_MATCH_SCORE_BONUS = 100;
+export const PATH_MATCH_SCORE_BONUS = 200;
+export const EXACT_PATH_MATCH_BONUS = 2000;
+
+/** Handler-name hints per HTTP method — hoisted to avoid per-call allocation */
+const METHOD_HINTS: Record<string, string[]> = {
+  'PUT': ['unhold', 'update', 'put', 'edit', 'modify', 'replace'],
+  'POST': ['create', 'add', 'post', 'save', 'insert', 'new'],
+  'GET': ['get', 'find', 'list', 'search', 'query', 'fetch', 'read'],
+  'DELETE': ['delete', 'remove', 'destroy'],
+  'PATCH': ['patch', 'partial'],
+};
 
 // ============================================================================
 // Types
@@ -436,11 +446,114 @@ export function pathsMatchStructurally(inputPath: string, annotationPath: string
  * Searches for Java methods with @XxxMapping annotations matching the path.
  * Combines class-level @RequestMapping prefix with method-level path before validation.
  */
+export interface ScoreInput {
+  fullPath: string;
+  pathPattern: string;
+  handlerContent: string;
+  queryMethod: string;
+  annotationPath?: string;
+  classPath?: string;
+  annotation: string;
+  handlerName: string;
+  controllerType?: 'ext' | 'int'; // derived from filePath
+}
+
+export function scoreCandidate(input: ScoreInput): number {
+  let score = 0;
+  const { fullPath, pathPattern, handlerContent, queryMethod, annotationPath, classPath, annotation, handlerName, controllerType } = input;
+  const paths = pathPattern.split('/').filter(p => p.length > 0);
+
+  // HTTP method matching
+  const upperMethod = queryMethod.toUpperCase();
+  const hasSpecificAnnotation = annotation !== 'RequestMapping';
+  const hasMethodAttribute = /method\s*=\s*RequestMethod\./i.test(handlerContent);
+
+  if (hasSpecificAnnotation) score += 150;
+  else if (hasMethodAttribute) score += 140;
+  else if (annotation === 'RequestMapping') score -= 50;
+
+  // Method-match gate: exact-match bonus only when annotation implies correct HTTP method.
+  // - @GetMapping etc. are method-specific → gate passes.
+  // - @RequestMapping with explicit method=RequestMethod.{X} → extract X and compare.
+  // - Bare @RequestMapping (no method attr) → gate fails (ambiguous for all methods).
+  let methodMatches = true;
+  if (annotation === 'RequestMapping') {
+    if (hasMethodAttribute) {
+      const methodMatch = /method\s*=\s*RequestMethod\.(\w+)/i.exec(handlerContent);
+      if (methodMatch) {
+        methodMatches = methodMatch[1].toUpperCase() === upperMethod;
+      }
+    } else {
+      methodMatches = false; // bare RequestMapping → ambiguous
+    }
+  }
+
+  if (fullPath === pathPattern && methodMatches) {
+    score += EXACT_PATH_MATCH_BONUS; // 2000
+  } else if (fullPath.length > 1 && pathPattern.startsWith(fullPath)) {
+    score += 300; // Path prefix match
+  } else if (pathPattern.length > 1 && fullPath.startsWith(pathPattern)) {
+    score += 200; // Search is prefix of full path
+  }
+
+  // Segment count match bonus (reuses `paths` — already split from pathPattern)
+  const candidateSegments = fullPath.split('/').filter(s => s.length > 0);
+  if (paths.length === candidateSegments.length) {
+    score += 300;
+  }
+
+  // Last segment inclusion
+  const lastPathSegment = paths[paths.length - 1];
+  if (fullPath.includes(lastPathSegment)) score += PATH_MATCH_SCORE_BONUS;
+
+  // Suffix match (annotation path vs search suffix)
+  if (annotationPath) {
+    const searchSuffix = '/' + paths.slice(-2).join('/');
+    if (annotationPath.endsWith(searchSuffix) || annotationPath === '/' + paths[paths.length - 1]) {
+      score += 200;
+    }
+  }
+
+  // Handler name hints at HTTP operation (METHOD_HINTS is module-level)
+  const hints = METHOD_HINTS[upperMethod] || [];
+  const handlerLower = handlerName.toLowerCase();
+  for (const hint of hints) {
+    if (handlerLower.includes(hint)) {
+      score += 30;
+      break;
+    }
+  }
+
+  // External/internal controller type alignment
+  if (controllerType === 'ext') {
+    const searchPathLower = pathPattern.toLowerCase();
+    if (searchPathLower.includes('/e/') || searchPathLower.includes('/external/') || searchPathLower.startsWith('/e')) {
+      score += 80;
+    } else if (searchPathLower.includes('/i/') || searchPathLower.includes('/internal/') || searchPathLower.startsWith('/i')) {
+      score -= 50;
+    }
+  } else if (controllerType === 'int') {
+    const searchPathLower = pathPattern.toLowerCase();
+    if (searchPathLower.includes('/i/') || searchPathLower.includes('/internal/') || searchPathLower.startsWith('/i')) {
+      score += 80;
+    } else if (searchPathLower.includes('/e/') || searchPathLower.includes('/external/') || searchPathLower.startsWith('/e')) {
+      score -= 50;
+    }
+  }
+
+  return score;
+}
+
 export async function findHandlerByPathPattern(
   repo: RepoHandle,
   method: string,
-  pathPattern: string
+  pathPattern: string,
+  classPathCache?: Map<string, string | undefined>
 ): Promise<EndpointInfo | undefined> {
+  // Validate method against known HTTP methods to prevent regex injection
+  const upperMethod = method.toUpperCase();
+  if (!VALID_METHODS.has(upperMethod)) return undefined;
+
   // Query for Method nodes with request mapping annotations in content
   // Use larger limit to ensure we find relevant handlers before scoring
   const cypher = `
@@ -464,7 +577,6 @@ export async function findHandlerByPathPattern(
     'PATCH': ['PatchMapping', 'RequestMapping'],
   };
 
-  const upperMethod = method.toUpperCase();
   const annotations = methodToAnnotation[upperMethod] || ['Mapping'];
   const paths = pathPattern.split('/').filter(p => p.length > 0);
 
@@ -482,8 +594,8 @@ export async function findHandlerByPathPattern(
   }
   const candidates: Candidate[] = [];
 
-  // Cache for class-level paths to avoid repeated queries
-  const classPathCache = new Map<string, string | undefined>();
+  // Cache for class-level paths to avoid repeated queries (use provided or create new)
+  const cpCache = classPathCache ?? new Map<string, string | undefined>();
 
   for (const annotation of annotations) {
     // Try each path segment as a fragment
@@ -504,16 +616,16 @@ export async function findHandlerByPathPattern(
             const content = row.content ?? row[3] ?? '';
 
             // Extract the method-level path from the annotation
-            const pathMatch = content.match(new RegExp(`@(?:${upperMethod}Mapping|RequestMapping)\\s*\\(\\s*[^)]*value\\s*=\\s*["']([^"']+)["']`, 'i'))
-              || content.match(new RegExp(`@(?:${upperMethod}Mapping|RequestMapping)\\s*\\(\\s*["']([^"']+)["']`, 'i'));
+            const pathMatch = content.match(new RegExp(`@(?:${upperMethod}Mapping|RequestMapping)\\s*\\(\\s*[^)]*value\\s*=\\s*[\"']([^\"']+)[\"']`, 'i'))
+              || content.match(new RegExp(`@(?:${upperMethod}Mapping|RequestMapping)\\s*\\(\\s*[\"']([^\"']+)[\"']`, 'i'));
             const annotationPath = pathMatch?.[1];
 
             if (!annotationPath) continue; // Skip if no annotation path found
 
             // Get class-level prefix (cached)
             let classPath: string | undefined;
-            if (classPathCache.has(filePath)) {
-              classPath = classPathCache.get(filePath);
+            if (cpCache.has(filePath)) {
+              classPath = cpCache.get(filePath);
             } else {
               // Query for class-level RequestMapping prefix
               try {
@@ -538,7 +650,7 @@ export async function findHandlerByPathPattern(
                 if (DEBUG) console.error('[GitNexus DEBUG] Class path query failed:', e);
                 // Continue without class path
               }
-              classPathCache.set(filePath, classPath);
+              cpCache.set(filePath, classPath);
             }
 
             // Combine class prefix with method path
@@ -546,79 +658,29 @@ export async function findHandlerByPathPattern(
             const normalizedMethodPath = annotationPath.startsWith('/') ? annotationPath : '/' + annotationPath;
             const fullPath = normalizedClassPath + normalizedMethodPath;
 
-            // Score this candidate
-            let score = 0;
-
-            // Check for HTTP method specification in annotation
-            const hasSpecificAnnotation = new RegExp(`@${upperMethod}Mapping`, 'i').test(content);
-            const hasMethodAttribute = new RegExp(`@RequestMapping[^)]*method\\s*=\\s*RequestMethod\\.${upperMethod}`, 'i').test(content);
-
-            if (hasSpecificAnnotation) score += 150;
-            else if (hasMethodAttribute) score += 140;
-            else if (annotation === 'RequestMapping') score -= 50; // Generic RequestMapping without method
-
             // STRUCTURAL VALIDATION: Check if FULL path (class + method) matches input path
             let isValidCandidate = true;
             if (!pathsMatchStructurally(pathPattern, fullPath)) {
               isValidCandidate = false;  // Reject - structure mismatch
             }
 
-            // Scoring based on path match quality
-            // Check if full path matches the search path
-            if (fullPath === pathPattern) {
-              score += 500; // Exact match - highest priority
-            } else if (fullPath.length > 1 && pathPattern.startsWith(fullPath)) {
-              score += 300; // Full path is prefix of search
-            } else if (pathPattern.length > 1 && fullPath.startsWith(pathPattern)) {
-              score += 200; // Search is prefix of full path
-            }
+            // Determine controller type for scoring
+            const filePath_lower = filePath.toLowerCase();
+            const controllerType = filePath_lower.includes('ext') || filePath_lower.includes('external') || filePath_lower.includes('pio') ? 'ext' as const
+              : filePath_lower.includes('internal') ? 'int' as const
+              : undefined;
 
-            // Check if path ends with key segments
-            const lastPathSegment = paths[paths.length - 1];
-            if (fullPath.includes(lastPathSegment)) score += PATH_MATCH_SCORE_BONUS;
-
-            // Check for exact suffix match (ignoring class-level prefix)
-            const searchSuffix = '/' + paths.slice(-2).join('/');
-            if (annotationPath.endsWith(searchSuffix) || annotationPath === '/' + paths[paths.length - 1]) {
-              score += 200;
-            }
-
-            // Bonus if method name hints at HTTP operation
-            const methodHints: Record<string, string[]> = {
-              'PUT': ['unhold', 'update', 'put', 'edit', 'modify', 'replace'],
-              'POST': ['create', 'add', 'post', 'save', 'insert', 'new'],
-              'GET': ['get', 'find', 'list', 'search', 'query', 'fetch', 'read'],
-              'DELETE': ['delete', 'remove', 'destroy'],
-              'PATCH': ['patch', 'partial'],
-            };
-            const hints = methodHints[upperMethod] || [];
-            const handlerLower = handler.toLowerCase();
-            for (const hint of hints) {
-              if (handlerLower.includes(hint)) {
-                score += 30;
-                break;
-              }
-            }
-
-            // Check for external/internal controller distinction
-            const isExternal = filePath.toLowerCase().includes('ext') ||
-                               filePath.toLowerCase().includes('external') ||
-                               filePath.toLowerCase().includes('pio');
-            const isInternal = filePath.toLowerCase().includes('internal');
-
-            const searchPathLower = pathPattern.toLowerCase();
-            const suggestsExternal = searchPathLower.includes('/e/') ||
-                                     searchPathLower.includes('/external/') ||
-                                     searchPathLower.startsWith('/e');
-            const suggestsInternal = searchPathLower.includes('/i/') ||
-                                     searchPathLower.includes('/internal/') ||
-                                     searchPathLower.startsWith('/i');
-
-            // Boost score for matching controller type
-            if (isExternal && suggestsExternal) score += 80;
-            if (isInternal && suggestsInternal) score += 80;
-            if (isExternal && suggestsInternal) score -= 50; // Mismatch penalty
-            if (isInternal && suggestsExternal) score -= 50; // Mismatch penalty
+            const score = scoreCandidate({
+              fullPath,
+              pathPattern,
+              handlerContent: content,
+              queryMethod: method,
+              annotationPath,
+              classPath,
+              annotation,
+              handlerName: handler,
+              controllerType,
+            });
 
             // Deduplicate by handler + filePath
             if (!candidates.some(c => c.handler === handler && c.filePath === filePath)) {
@@ -635,7 +697,7 @@ export async function findHandlerByPathPattern(
   }
 
   // Filter to only valid candidates (those that passed structural validation)
-  const validCandidates = candidates.filter(c => c.isValid !== false);
+  const validCandidates = candidates.filter(c => c.isValid === true);
 
   if (validCandidates.length === 0) return undefined;
 
@@ -648,7 +710,7 @@ export async function findHandlerByPathPattern(
   const controller = fileName.replace(/\.[^.]+$/, ''); // Remove file extension
 
   return {
-    method: method.toUpperCase(),
+    method: upperMethod,
     path: best.fullPath,
     handler: best.handler,
     controller,
@@ -736,7 +798,7 @@ export async function documentEndpoint(
   let validHandlerUid: string | undefined = handlerUid;
   if (handlerUid) {
     try {
-      const verifyQuery = `MATCH (m:Method) WHERE m.uid = $uid RETURN m.uid LIMIT 1`;
+      const verifyQuery = `MATCH (m:Method) WHERE m.id = $uid RETURN m.id LIMIT 1`;
       const verifyResult = await executeParameterized(repo.id, verifyQuery, { uid: handlerUid });
       if (!verifyResult || verifyResult.length === 0) {
         validHandlerUid = undefined; // Method node not found, will fall back
@@ -748,7 +810,50 @@ export async function documentEndpoint(
     }
   }
 
-  // Fall back to pattern matching if handler UID verification failed
+  // Step 2b: If UID verification failed, try CALLS edge target from Route node
+  // The Route→CALLS→Method edge is created during ingestion and directly links
+  // to the resolved handler Method node, even for inherited/delegated methods.
+  if (!validHandlerUid && route.handlerUid) {
+    try {
+      const edgeVerify = await executeParameterized(repo.id,
+        `MATCH (m:Method) WHERE m.id = $uid RETURN m.id LIMIT 1`,
+        { uid: route.handlerUid }
+      );
+      if (edgeVerify && edgeVerify.length > 0) {
+        validHandlerUid = route.handlerUid;
+        if (DEBUG) console.error(`[GitNexus DEBUG] Resolved handler via CALLS edge: ${validHandlerUid}`);
+      }
+    } catch (err: any) {
+      if (DEBUG) console.error('[GitNexus DEBUG] CALLS edge verification failed:', err);
+    }
+  }
+
+  // Step 2c: Cross-repo resolution — try dependency repos if handler not found locally
+  if (!validHandlerUid && crossRepo && handlerUid) {
+    try {
+      const depRepoIds = await crossRepo.listDepRepos();
+      for (const depRepoId of depRepoIds) {
+        const depResults = await crossRepo.queryMultipleRepos(
+          [depRepoId],
+          `MATCH (m:Method) WHERE m.id = $uid RETURN m.id AS id, m.filePath AS filePath, m.name AS name LIMIT 1`,
+          { uid: handlerUid }
+        );
+        // queryMultipleRepos returns Array<{ repoId: string; results: unknown[] }>
+        const found = depResults?.some(r =>
+          Array.isArray(r.results) && r.results.length > 0
+        );
+        if (found) {
+          validHandlerUid = handlerUid;
+          if (DEBUG) console.error(`[GitNexus DEBUG] Resolved handler in dep repo ${depRepoId}: ${validHandlerUid}`);
+          break;
+        }
+      }
+    } catch (err: any) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Cross-repo resolution failed:', err);
+    }
+  }
+
+  // Fall back to pattern matching if all resolution strategies failed
   if (!validHandlerUid) {
     const fallbackResult = await findHandlerByPathPattern(repo, method, path);
     if (fallbackResult) {
@@ -1054,11 +1159,16 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
   // Convert to JSON example for schema-compliant output
   // When includeContext is true, keep full BodySchema for AI enrichment
   // When includeContext is false, output JSON example
+  // Note: For request bodies with primitive/container types (e.g., @RequestBody Map<String,Object>),
+  // keep the BodySchema object so the OpenAPI converter can generate a proper schema.
+  // bodySchemaToJsonExample returns null for primitives, which would drop the requestBody entirely.
   if (includeContext) {
     result.specs.request.body = embedNestedSchemas(requestBody, nestedSchemas);
     result.specs.response.body = embedNestedSchemas(responseBody, nestedSchemas);
   } else {
-    result.specs.request.body = bodySchemaToJsonExample(requestBody, nestedSchemas);
+    const requestExample = bodySchemaToJsonExample(requestBody, nestedSchemas);
+    // Keep BodySchema for primitive-sourced request bodies so the converter generates proper schemas
+    result.specs.request.body = requestExample ?? requestBody;
     result.specs.response.body = bodySchemaToJsonExample(responseBody, nestedSchemas);
   }
 
@@ -1122,6 +1232,9 @@ async function extractDownstreamApis(
   const apis: DownstreamApi[] = [];
   const seen = new Set<string>();
 
+  // Cache for enclosing class lookups to avoid N+1 queries
+  const enclosingClassCache = new Map<string, string | undefined>();
+
   for (const node of chain) {
     for (const detail of node.metadata.httpCallDetails) {
       const key = `${detail.httpMethod}:${detail.urlExpression}`;
@@ -1131,8 +1244,15 @@ async function extractDownstreamApis(
       // Parse URL expression to extract components
       const parsed = parseUrlExpression(detail.urlExpression);
 
-      // Find enclosing class for field resolution
-      const className = await findEnclosingClass(executeQuery, repoId, node.filePath);
+      // Find enclosing class for field resolution (cached)
+      const cacheKey = node.filePath;
+      let className: string | undefined;
+      if (enclosingClassCache.has(cacheKey)) {
+        className = enclosingClassCache.get(cacheKey);
+      } else {
+        className = await findEnclosingClass(executeQuery, repoId, node.filePath);
+        enclosingClassCache.set(cacheKey, className);
+      }
 
       // Resolve service variable if present
       let serviceValue: string | null = null;
@@ -2185,7 +2305,9 @@ async function resolveTypeSchema(
   const innerType = extractGenericInnerType(typeName);
   if (innerType) {
     const innerSchema = await resolveTypeSchema(innerType, executeQuery, repoId, visited, crossRepo);
-    return { ...innerSchema, isContainer: true };
+    // Preserve the original generic type name (e.g., 'Map<String, Object>')
+    // so the OpenAPI converter can distinguish Map from List
+    return { ...innerSchema, typeName, isContainer: true };
   }
 
   // Query for class fields
