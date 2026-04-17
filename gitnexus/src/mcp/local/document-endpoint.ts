@@ -802,6 +802,44 @@ export async function documentEndpoint(
       const verifyResult = await executeParameterized(repo.id, verifyQuery, { uid: handlerUid });
       if (!verifyResult || verifyResult.length === 0) {
         validHandlerUid = undefined; // Method node not found, will fall back
+      } else if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+        // Step 2a-ov: For mutating HTTP methods, check if the resolved handler has @RequestBody.
+        // If not, try overload variants (:1, :2, etc.) that may have @RequestBody instead.
+        // This handles the case where the ingestion indexed the @RequestParam overload
+        // instead of the @RequestBody overload for the same method name.
+        const paramQuery = `MATCH (m:Method {id: $uid}) RETURN m.parameterAnnotations AS paramAnns LIMIT 1`;
+        const paramResult = await executeParameterized(repo.id, paramQuery, { uid: handlerUid });
+        const paramAnns = paramResult?.[0]?.paramAnns ?? paramResult?.[0]?.[0];
+        let hasRequestBody = false;
+        if (typeof paramAnns === 'string') {
+          try {
+            const parsed = JSON.parse(paramAnns);
+            hasRequestBody = parsed.some((p: any) => p.annotations?.includes('@RequestBody'));
+          } catch { /* ignore parse errors */ }
+        }
+        if (!hasRequestBody) {
+          // Try overload variants :1, :2, ... :10
+          for (let overloadIdx = 1; overloadIdx <= 10; overloadIdx++) {
+            const overloadUid = `${handlerUid}:${overloadIdx}`;
+            const overloadResult = await executeParameterized(repo.id,
+              `MATCH (m:Method {id: $uid}) RETURN m.parameterAnnotations AS paramAnns LIMIT 1`,
+              { uid: overloadUid }
+            );
+            if (overloadResult && overloadResult.length > 0) {
+              const overloadParamAnns = overloadResult[0].paramAnns ?? overloadResult[0][0];
+              if (typeof overloadParamAnns === 'string') {
+                try {
+                  const parsed = JSON.parse(overloadParamAnns);
+                  if (parsed.some((p: any) => p.annotations?.includes('@RequestBody'))) {
+                    validHandlerUid = overloadUid;
+                    if (DEBUG) console.error(`[GitNexus DEBUG] Switched to overload variant ${overloadUid} (has @RequestBody)`);
+                    break;
+                  }
+                } catch { /* ignore parse errors */ }
+              }
+            }
+          }
+        }
       }
     } catch (err: any) {
       if (DEBUG) console.error('[GitNexus DEBUG] Method verification query failed:', err);
@@ -1169,7 +1207,10 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
     const requestExample = bodySchemaToJsonExample(requestBody, nestedSchemas);
     // Keep BodySchema for primitive-sourced request bodies so the converter generates proper schemas
     result.specs.request.body = requestExample ?? requestBody;
-    result.specs.response.body = bodySchemaToJsonExample(responseBody, nestedSchemas);
+    // Keep BodySchema for response so the converter can generate properties from fields.
+    // Previously bodySchemaToJsonExample was used here, but it produces a plain JSON object
+    // that the converter can only represent as `type: object` with an example — no properties.
+    result.specs.response.body = embedNestedSchemas(responseBody, nestedSchemas) ?? responseBody;
   }
 
   // Extract request parameters (PathVariable, RequestParam, RequestHeader, CookieValue)
@@ -2304,30 +2345,108 @@ async function resolveTypeSchema(
   // Extract generic inner type if applicable
   const innerType = extractGenericInnerType(typeName);
   if (innerType) {
-    const innerSchema = await resolveTypeSchema(innerType, executeQuery, repoId, visited, crossRepo);
-    // Preserve the original generic type name (e.g., 'Map<String, Object>')
-    // so the OpenAPI converter can distinguish Map from List
-    return { ...innerSchema, typeName, isContainer: true };
+    const baseType = typeName.split('<')[0].trim();
+
+    // Known collection/container types: resolve inner type only, mark as container
+    const COLLECTION_TYPES = new Set([
+      'List', 'ArrayList', 'LinkedList', 'Vector', 'Stack',
+      'Set', 'HashSet', 'TreeSet', 'LinkedHashSet',
+      'Collection', 'Iterable',
+      'Map', 'HashMap', 'TreeMap', 'LinkedHashMap', 'SortedMap',
+      'Optional', 'Mono', 'Flux',
+      'Stream',
+    ]);
+
+    if (COLLECTION_TYPES.has(baseType)) {
+      const innerSchema = await resolveTypeSchema(innerType, executeQuery, repoId, visited, crossRepo);
+      // Preserve the original generic type name (e.g., 'Map<String, Object>')
+      // so the OpenAPI converter can distinguish Map from List
+      return { ...innerSchema, typeName, isContainer: true };
+    }
+
+    // Generic DTOs (e.g., PageDataDto<TransactionViewDto>): resolve the outer type
+    // as a class and substitute generic type parameters in fields
+    // Fall through to the class query below, which will resolve fields
+    // and handle the generic type parameter substitution
   }
 
-  // Query for class fields
-  const query = `
-    MATCH (c:Class)
-    WHERE c.name = $typeName OR c.name ENDS WITH $typePattern
-    RETURN c.name AS name, c.fields AS fields
-    LIMIT 1
-  `;
+  // For generic types (e.g., PageDataDto<?>), extract the base type name for class lookup
+  // and record generic parameters for field type substitution
+  const baseTypeName = typeName.includes('<') ? typeName.split('<')[0].trim() : typeName;
+  let genericParams: Map<string, string> | undefined;
+  if (typeName.includes('<') && innerType) {
+    // Parse type arguments from the generic type
+    const angleStart = typeName.indexOf('<');
+    const angleEnd = typeName.lastIndexOf('>');
+    if (angleStart !== -1 && angleEnd !== -1) {
+      const argsStr = typeName.slice(angleStart + 1, angleEnd);
+      // Split on commas at depth 0 to get all type arguments
+      const typeArgs: string[] = [];
+      let depth = 0;
+      let segStart = 0;
+      for (let i = 0; i < argsStr.length; i++) {
+        if (argsStr[i] === '<') depth++;
+        else if (argsStr[i] === '>') depth--;
+        else if (argsStr[i] === ',' && depth === 0) {
+          typeArgs.push(argsStr.slice(segStart, i).trim());
+          segStart = i + 1;
+        }
+      }
+      typeArgs.push(argsStr.slice(segStart).trim());
+      // We'll map generic params to actual types after class resolution
+      // (T -> TransactionViewDto, ? -> Object, etc.)
+      genericParams = new Map();
+      for (const arg of typeArgs) {
+        // Normalize wildcards to Object
+        const normalizedArg = (arg === '?' || arg === '*') ? 'Object' : arg;
+        genericParams.set('T', normalizedArg); // Simple: map 'T' to the actual type
+        // Also map E, K, V for common Java conventions
+        if (typeArgs.length >= 2) {
+          genericParams.set('K', typeArgs[0] === '?' || typeArgs[0] === '*' ? 'Object' : typeArgs[0]);
+          genericParams.set('V', normalizedArg);
+        }
+      }
+    }
+  }
+
+  // Query for class fields — use base type name (without generics) for lookup
+  const lookupName = baseTypeName;
+
+  // Handle inner class syntax: OuterClass.InnerClass → search by inner class name, scoped to parent
+  const isInnerClass = lookupName.includes('.') && !lookupName.startsWith('java');
+  const innerClassName = isInnerClass ? lookupName.split('.').pop()! : lookupName;
+  const parentClassName = isInnerClass ? lookupName.slice(0, lookupName.lastIndexOf('.')) : undefined;
+
+  const query = isInnerClass
+    ? `MATCH (c:Class) WHERE c.name = $innerName AND c.id CONTAINS $parentFile RETURN c.name AS name, c.fields AS fields LIMIT 1`
+    : `MATCH (c:Class) WHERE c.name = $typeName OR c.name ENDS WITH $typePattern RETURN c.name AS name, c.fields AS fields LIMIT 1`;
+
+  /**
+   * Substitute generic type parameters in field types.
+   * E.g., List<T> → List<TransactionViewDto> when T→TransactionViewDto
+   */
+  function substituteGenerics(fieldType: string, params: Map<string, string>): string {
+    if (!params || params.size === 0) return fieldType;
+    let result = fieldType;
+    for (const [param, replacement] of params) {
+      // Replace standalone generic param (e.g., T in "List<T>" or just "T")
+      // Match T when it's a word boundary (not part of another identifier)
+      result = result.replace(new RegExp(`\\b${param}\\b`, 'g'), replacement);
+    }
+    return result;
+  }
 
   try {
-    const rows = await executeQuery(repoId, query, {
-      typeName,
-      typePattern: '.' + typeName
-    });
+    const queryParams = isInnerClass
+      ? { innerName: innerClassName, parentFile: parentClassName + '.java' }
+      : { typeName: lookupName, typePattern: '.' + lookupName };
+    const rows = await executeQuery(repoId, query, queryParams);
 
     if (!rows || rows.length === 0) {
       // Try cross-repo resolution if type not found locally
       if (crossRepo) {
-        const packagePrefix = extractPackagePrefix(typeName);
+        // For inner classes, use parent class name for package prefix lookup
+        const packagePrefix = extractPackagePrefix(isInnerClass ? parentClassName! : lookupName);
 
         if (DEBUG) {
           console.error(`[GitNexus DEBUG] resolveTypeSchema: typeName=${typeName}, packagePrefix=${packagePrefix || 'none'}`);
@@ -2368,7 +2487,9 @@ async function resolveTypeSchema(
           const depResults = await crossRepo.queryMultipleRepos(
             depRepoIds,
             query,
-            { typeName, typePattern: '.' + typeName }
+            isInnerClass
+              ? { innerName: innerClassName, parentFile: parentClassName! + '.java' }
+              : { typeName: lookupName, typePattern: '.' + lookupName }
           );
 
           if (DEBUG) {
@@ -2388,11 +2509,11 @@ async function resolveTypeSchema(
                   const fields = JSON.parse(fieldsJson);
                   const filteredFields = fields.filter((f: any) => f.name !== 'serialVersionUID');
                   return {
-                    typeName: found.name || typeName,
+                    typeName: typeName, // Keep original generic type name (e.g., PageDataDto<?>)
                     source: 'indexed',
                     fields: filteredFields.map((f: any) => ({
                       name: f.name,
-                      type: f.type,
+                      type: genericParams ? substituteGenerics(f.type, genericParams) : f.type,
                       annotations: f.annotations || []
                     })),
                     repoId: result.repoId
@@ -2419,11 +2540,11 @@ async function resolveTypeSchema(
     const fields = JSON.parse(fieldsJson);
     const filteredFields = fields.filter((f: any) => f.name !== 'serialVersionUID');
     return {
-      typeName: rows[0].name || typeName,
+      typeName: typeName, // Keep original generic type name (e.g., PageDataDto<?>)
       source: 'indexed',
       fields: filteredFields.map((f: any) => ({
         name: f.name,
-        type: f.type,
+        type: genericParams ? substituteGenerics(f.type, genericParams) : f.type,
         annotations: f.annotations || []
       }))
     };
@@ -2710,9 +2831,16 @@ function extractRequestParams(
     };
     const location = ANNOTATION_TO_LOCATION[annType] ?? 'query';
 
+    // For binding annotations with an explicit argument (e.g., @PathVariable("bondProductCode")),
+    // Spring uses the argument to bind to the path/query variable — not the Java parameter name.
+    // Use the annotation argument when present, falling back to the Java parameter name.
+    // This matches Spring's resolution: @PathVariable("x") takes "x"; @PathVariable alone defaults to param name.
+    const annArgMatch = annotation.match(/@(PathVariable|RequestParam|RequestHeader|CookieValue|RequestBody)\("([^"]+)"\)/);
+    const paramName = annArgMatch ? annArgMatch[2] : param.name;
+
     // Build the ParamInfo
     const paramInfo: ParamInfo = {
-      name: param.name,
+      name: paramName,
       type: param.type,
       required,
       location,

@@ -1525,7 +1525,25 @@ export const processRoutesFromExtracted = async (
 
     const methodResolved = ctx.resolve(route.methodName, controllerDef.filePath);
     // Accept method resolution from same-file or via imports (for inherited methods)
-    const methodId = methodResolved?.candidates[0]?.nodeId;
+    // When multiple overloads exist, prefer the one with @RequestBody (for Spring routes
+    // that accept JSON bodies) or with fewest parameters (to avoid @RequestParam overloads).
+    let methodId = methodResolved?.candidates[0]?.nodeId;
+    if (methodResolved?.candidates?.length > 1) {
+      const bodyCandidate = methodResolved.candidates.find(c => {
+        const node = graph.getNode(c.nodeId);
+        const paramAnns = (node?.properties as Record<string, unknown>)?.parameterAnnotations;
+        if (typeof paramAnns === 'string') {
+          try {
+            const parsed = JSON.parse(paramAnns);
+            return parsed.some((p: any) => p.annotations?.includes('@RequestBody'));
+          } catch { return false; }
+        }
+        return false;
+      });
+      if (bodyCandidate) {
+        methodId = bodyCandidate.nodeId;
+      }
+    }
 
     // Spring routes (isControllerClass: true) create Route nodes
     if (route.isControllerClass) {

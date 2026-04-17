@@ -3,6 +3,7 @@
  */
 
 import type { OpenAPISchema } from './types.js';
+import { PRIMITIVE_TYPES, SKIP_SCHEMA_TYPES, extractGenericInnerType } from '../ingestion/type-extractors/shared.js';
 
 /** Field element with optional nested support (from embedNestedSchemas) */
 export interface BodySchemaField {
@@ -38,6 +39,10 @@ const TYPE_MAP: Record<string, string> = {
   String: 'string',
   char: 'string',
   Character: 'string',
+
+  // Java wildcards
+  '?': 'object',
+  '*': 'object',
 
   // Numbers
   int: 'integer',
@@ -126,7 +131,11 @@ export function mapType(type: string): string {
     return TYPE_MAP[lowerType];
   }
   
-  // Unknown types default to string
+  // Unknown types: uppercase first char suggests a DTO/class → 'object', otherwise 'string'
+  const baseForCheck = type.split('<')[0].trim();
+  if (baseForCheck[0] === baseForCheck[0].toUpperCase() && baseForCheck[0] !== baseForCheck[0].toLowerCase()) {
+    return 'object';
+  }
   return 'string';
 }
 
@@ -216,6 +225,25 @@ export function bodySchemaToOpenAPISchema(schema: BodySchema | null | undefined)
       if (lastComma !== -1) {
         valueType = inner.slice(lastComma + 1).trim();
       }
+      // Normalize Java wildcards to Object
+      if (valueType === '?' || valueType === '*') valueType = 'Object';
+      // If the value type is a generic container (e.g., List<String>), recursively resolve it
+      const valueBaseType = valueType.split('<')[0].trim();
+      if (valueBaseType === 'List' || valueBaseType === 'Set' || valueBaseType === 'ArrayList' ||
+          valueBaseType === 'LinkedList' || valueBaseType === 'HashSet' || valueBaseType === 'TreeSet' ||
+          valueBaseType === 'Collection' || valueBaseType === 'Iterable') {
+        // Recursively resolve the container value type
+        const valueSchema = bodySchemaToOpenAPISchema({
+          typeName: valueType,
+          source: schema.source,
+          fields: schema.fields,
+          isContainer: true,
+        });
+        return {
+          type: 'object',
+          additionalProperties: valueSchema,
+        };
+      }
       return {
         type: 'object',
         additionalProperties: {
@@ -225,8 +253,17 @@ export function bodySchemaToOpenAPISchema(schema: BodySchema | null | undefined)
     }
 
     // List<T>, Set<T> etc → array
-    const match = schema.typeName.match(/<(.+)>/);
-    const innerType = match ? match[1].trim() : 'object';
+    const innerType = extractGenericInnerType(schema.typeName) || 'object';
+
+    // If the inner type was resolved with fields, use them instead of mapType
+    if (schema.fields && schema.fields.length > 0) {
+      const itemsSchema = bodySchemaToOpenAPISchema({
+        typeName: innerType,
+        source: schema.source,
+        fields: schema.fields,
+      });
+      return { type: 'array', items: itemsSchema };
+    }
 
     return {
       type: 'array',
@@ -364,11 +401,16 @@ export function generateSchemaName(typeName: string): string {
  * Check if a schema should be extracted to components
  */
 export function shouldExtractToComponents(schema: BodySchema): boolean {
-  // Extract named types with fields
-  return (
-    schema.source === 'indexed' &&
-    schema.fields !== undefined &&
-    schema.fields.length > 0 &&
-    !schema.isContainer
-  );
+  // Must have fields and be from an indexed source
+  if (schema.source !== 'indexed' || !schema.fields || schema.fields.length === 0) {
+    return false;
+  }
+  // Non-container types: extract directly
+  if (!schema.isContainer) return true;
+  // Container types: extract if inner type is a named DTO (not primitive/container)
+  const innerType = extractGenericInnerType(schema.typeName);
+  if (innerType && !PRIMITIVE_TYPES.has(innerType) && !SKIP_SCHEMA_TYPES.has(innerType)) {
+    return true;
+  }
+  return false;
 }

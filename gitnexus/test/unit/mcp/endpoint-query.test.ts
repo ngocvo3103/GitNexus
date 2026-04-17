@@ -166,6 +166,122 @@ describe('queryEndpoints', () => {
     });
   });
 
+  describe('Exact match priority', () => {
+    it('returns exact match when method and path are both provided', async () => {
+      // Exact match query returns one result
+      mockExecuteParameterized.mockResolvedValueOnce([
+        {
+          method: 'PUT',
+          path: '/i/v2/orders/ibond/{id}/sign',
+          controller: 'OrderIBondIntControllerV2',
+          handler: 'signContract',
+          filePath: 'src/main/java/com/tcbs/bond/trading/controller/internal/v2/OrderIBondIntControllerV2.java',
+          line: 164,
+          handlerUid: 'Method:src/main/java/com/tcbs/bond/trading/controller/internal/v2/OrderIBondIntControllerV2.java:signContract',
+        },
+      ]);
+
+      const result = await queryEndpoints(
+        { id: 'test-repo', path: '/test' },
+        { method: 'PUT', path: '/i/v2/orders/ibond/{id}/sign' }
+      );
+
+      expect(result.endpoints).toHaveLength(1);
+      expect(result.endpoints[0].path).toBe('/i/v2/orders/ibond/{id}/sign');
+      expect(result.endpoints[0].handler).toBe('signContract');
+
+      // Verify exact match query was called first (one call, no CONTAINS fallback)
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(1);
+      const cypher = mockExecuteParameterized.mock.calls[0][1] as string;
+      expect(cypher).toContain('r.routePath = $path');
+      expect(cypher).not.toContain('CONTAINS');
+    });
+
+    it('falls back to CONTAINS when exact match returns no results', async () => {
+      // Exact match returns empty
+      mockExecuteParameterized.mockResolvedValueOnce([]);
+      // CONTAINS fallback returns results
+      mockExecuteParameterized.mockResolvedValueOnce([
+        {
+          method: 'GET',
+          path: '/api/users/search',
+          controller: 'UserController',
+          handler: 'searchUsers',
+          filePath: 'src/controllers/UserController.java',
+          line: 80,
+          handlerUid: 'Method:src/controllers/UserController.java:searchUsers',
+        },
+      ]);
+
+      const result = await queryEndpoints(
+        { id: 'test-repo', path: '/test' },
+        { method: 'GET', path: 'users' }
+      );
+
+      expect(result.endpoints).toHaveLength(1);
+      expect(result.endpoints[0].path).toBe('/api/users/search');
+
+      // Two calls: exact match (empty), then CONTAINS (results)
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(2);
+      const exactCypher = mockExecuteParameterized.mock.calls[0][1] as string;
+      const containsCypher = mockExecuteParameterized.mock.calls[1][1] as string;
+      expect(exactCypher).toContain('r.routePath = $path');
+      expect(containsCypher).toContain('CONTAINS');
+    });
+
+    it('does not use exact match when only method is provided (no path)', async () => {
+      mockExecuteParameterized.mockResolvedValueOnce([
+        {
+          method: 'GET',
+          path: '/api/users',
+          controller: 'UserController',
+          handler: 'getUsers',
+          filePath: 'src/controllers/UserController.java',
+          line: 42,
+          handlerUid: 'Method:src/controllers/UserController.java:getUsers',
+        },
+      ]);
+
+      const result = await queryEndpoints(
+        { id: 'test-repo', path: '/test' },
+        { method: 'GET' }
+      );
+
+      expect(result.endpoints).toHaveLength(1);
+      // Only one call — CONTAINS query (no exact match since path not provided)
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(1);
+      const cypher = mockExecuteParameterized.mock.calls[0][1] as string;
+      expect(cypher).not.toContain('r.routePath = $path');
+      expect(cypher).toContain('r.httpMethod = $method');
+    });
+
+    it('does not use exact match when only path is provided (no method)', async () => {
+      mockExecuteParameterized.mockResolvedValueOnce([
+        {
+          method: 'GET',
+          path: '/api/users/{id}',
+          controller: 'UserController',
+          handler: 'getUser',
+          filePath: 'src/controllers/UserController.java',
+          line: 55,
+          handlerUid: 'Method:src/controllers/UserController.java:getUser',
+        },
+      ]);
+
+      const result = await queryEndpoints(
+        { id: 'test-repo', path: '/test' },
+        { path: 'users' }
+      );
+
+      expect(result.endpoints).toHaveLength(1);
+      // Only one call — CONTAINS query (no exact match since method not provided)
+      expect(mockExecuteParameterized).toHaveBeenCalledTimes(1);
+      const cypher = mockExecuteParameterized.mock.calls[0][1] as string;
+      expect(cypher).not.toContain('r.routePath = $path');
+      expect(cypher).toContain('CONTAINS');
+    });
+  });
+
   describe('Error handling', () => {
     it('propagates error when Route query fails', async () => {
       mockExecuteParameterized.mockRejectedValueOnce(new Error('Database connection failed'));

@@ -272,13 +272,13 @@ export function convertToOpenAPIPathItem(
     operation.parameters = result.specs.request.params.map(paramToOpenAPIParameter);
   }
   
-  // Add request body
+  // Add request body (not allowed on GET, HEAD, OPTIONS per OpenAPI spec)
   const requestBody = bodyToRequestBody(
     result.specs.request.body,
     components,
     opts.extractSchemas
   );
-  if (requestBody) {
+  if (requestBody && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
     operation.requestBody = requestBody;
   }
   

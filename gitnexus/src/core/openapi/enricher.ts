@@ -165,10 +165,54 @@ export async function enrichExistingYaml(
       if (!route) return; // Not found — skip gracefully
 
       // (b) Build handler UID
-      const handlerUid = route.handler && route.filePath
+      let handlerUid = route.handler && route.filePath
         ? generateId('Method', `${route.filePath}:${route.handler}`)
         : undefined;
       if (!handlerUid) return;
+
+      // (b-ov) For mutating HTTP methods, try overload variants if the primary handler
+      // lacks @RequestBody. This handles Java method overloading where the @RequestParam
+      // overload was indexed instead of the @RequestBody overload.
+      if (handlerUid && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+        const isValid = await verifyHandlerUid(repo, handlerUid);
+        if (isValid) {
+          // Check if the handler has @RequestBody
+          const paramResult = await executeQuery(repo.id,
+            `MATCH (m:Method {id: $uid}) RETURN m.parameterAnnotations AS paramAnns LIMIT 1`,
+            { uid: handlerUid }
+          );
+          const paramAnns = (paramResult?.[0] as Record<string, unknown>)?.paramAnns ?? paramResult?.[0]?.[0];
+          let hasRequestBody = false;
+          if (typeof paramAnns === 'string') {
+            try {
+              const parsed = JSON.parse(paramAnns);
+              hasRequestBody = parsed.some((p: any) => p.annotations?.includes('@RequestBody'));
+            } catch { /* ignore */ }
+          }
+          if (!hasRequestBody) {
+            // Try overload variants :1, :2, ... :10
+            for (let overloadIdx = 1; overloadIdx <= 10; overloadIdx++) {
+              const overloadUid = `${handlerUid}:${overloadIdx}`;
+              const overloadValid = await verifyHandlerUid(repo, overloadUid);
+              if (!overloadValid) break; // No more overloads
+              const overloadParamResult = await executeQuery(repo.id,
+                `MATCH (m:Method {id: $uid}) RETURN m.parameterAnnotations AS paramAnns LIMIT 1`,
+                { uid: overloadUid }
+              );
+              const overloadParamAnns = (overloadParamResult?.[0] as Record<string, unknown>)?.paramAnns ?? overloadParamResult?.[0]?.[0];
+              if (typeof overloadParamAnns === 'string') {
+                try {
+                  const parsed = JSON.parse(overloadParamAnns);
+                  if (parsed.some((p: any) => p.annotations?.includes('@RequestBody'))) {
+                    handlerUid = overloadUid;
+                    break;
+                  }
+                } catch { /* ignore */ }
+              }
+            }
+          }
+        }
+      }
 
       // (c) Verify handler UID exists in graph
       const isValid = await verifyHandlerUid(repo, handlerUid);

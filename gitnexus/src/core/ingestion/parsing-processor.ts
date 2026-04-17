@@ -461,6 +461,12 @@ const processParsingSequential = async (
     // Build per-file type environment for FieldExtractor context (lightweight — skipped if no fieldExtractor)
     const typeEnv = provider.fieldExtractor ? buildTypeEnv(tree, language, { enclosingFunctionFinder: provider.enclosingFunctionFinder }) : null;
 
+    // Track method name occurrences per file to generate unique IDs for overloaded methods.
+    // Java/Kotlin/C# support method overloading — multiple methods with the same name but different
+    // signatures. Without disambiguation, overloaded methods collide on the same node ID and only
+    // the first overload survives in the graph.
+    const methodNameCounts = new Map<string, number>();
+
     matches.forEach(match => {
       const captureMap: Record<string, any> = {};
 
@@ -478,7 +484,21 @@ const processParsingSequential = async (
 
       const definitionNodeForRange = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNodeForRange ? definitionNodeForRange.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+
+      // Generate unique node ID for Method/Constructor nodes, handling method overloading.
+      // For overloaded methods (same name, different parameters), append a 0-based index suffix
+      // to distinguish them. Overload 0 keeps the original format for backward compatibility.
+      let nodeId: string;
+      if (nodeLabel === 'Method' || nodeLabel === 'Constructor') {
+        const nameKey = `${file.path}:${nodeName}`;
+        const overloadIndex = methodNameCounts.get(nameKey) ?? 0;
+        methodNameCounts.set(nameKey, overloadIndex + 1);
+        nodeId = overloadIndex > 0
+          ? `${generateId(nodeLabel, `${file.path}:${nodeName}`)}:${overloadIndex}`
+          : generateId(nodeLabel, `${file.path}:${nodeName}`);
+      } else {
+        nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+      }
 
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
       const frameworkHint = definitionNode

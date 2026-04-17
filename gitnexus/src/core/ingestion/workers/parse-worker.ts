@@ -969,13 +969,44 @@ function extractAnnotationsFromModifiers(node: Parser.SyntaxNode): string[] {
   return annotations;
 }
 
-/** Extract the name of an annotation (e.g., @Column, @NotNull) */
+/** Extract the name of an annotation (e.g., @Column, @NotNull).
+ *  For binding annotations with a string argument (e.g., @PathVariable("id")),
+ *  includes the argument: @PathVariable("id"). */
 function extractAnnotationName(node: Parser.SyntaxNode): string | null {
   // marker_annotation: @ColumnName
   // annotation: @ColumnName(args)
   const nameNode = node.childForFieldName?.('name') ??
     node.children.find((c: Parser.SyntaxNode) => c.type === 'identifier' || c.type === 'scoped_identifier');
-  return nameNode ? '@' + nameNode.text : null;
+  if (!nameNode) return null;
+
+  const annotationName = '@' + nameNode.text;
+
+  // For parameter-binding annotations, extract the first string argument if present.
+  // Spring uses this to bind to path/query/header variables: @PathVariable("bondProductCode")
+  const BINDING_ANNOTATIONS = ['@PathVariable', '@RequestParam', '@RequestHeader', '@CookieValue', '@RequestBody'];
+  if (BINDING_ANNOTATIONS.includes(annotationName)) {
+    // Look for argument_list or arguments child containing a string_literal
+    const argList = node.childForFieldName?.('arguments') ??
+      node.children.find((c: Parser.SyntaxNode) => c.type === 'argument_list' || c.type === 'arguments');
+    if (argList) {
+      for (const arg of argList.children) {
+        // string_literal: "bondProductCode"
+        if (arg.type === 'string_literal') {
+          // Strip surrounding quotes
+          const argValue = arg.text.slice(1, -1);
+          return `${annotationName}("${argValue}")`;
+        }
+        // Some parsers nest string_literal inside an argument
+        const innerStr = arg.children?.find((c: Parser.SyntaxNode) => c.type === 'string_literal');
+        if (innerStr) {
+          const argValue = innerStr.text.slice(1, -1);
+          return `${annotationName}("${argValue}")`;
+        }
+      }
+    }
+  }
+
+  return annotationName;
 }
 
 /** Extract modifiers (static, final, private, public, etc.) from a field declaration */
@@ -2391,6 +2422,12 @@ const processFileGroup = (
       console.debug(`[parse-worker] JAVA_ALL: ${file.path}: ${matches.length} matches, ${callCaptures} calls, ${methodInvCount} method_inv`);
     }
 
+    // Track method name occurrences per file to generate unique IDs for overloaded methods.
+    // Java/Kotlin/C# support method overloading — multiple methods with the same name but different
+    // signatures. Without disambiguation, overloaded methods collide on the same node ID and only
+    // the first overload survives in the graph.
+    const methodNameCounts = new Map<string, number>();
+
     for (const match of matches) {
       const captureMap: Record<string, any> = {};
       for (const c of match.captures) {
@@ -2733,7 +2770,23 @@ const processFileGroup = (
 
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNode ? definitionNode.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+
+      // Generate unique node ID for Method/Constructor nodes, handling method overloading.
+      // For overloaded methods (same name, different parameters), append a 0-based index suffix
+      // to distinguish them: Method:filePath:methodName for the first overload,
+      // Method:filePath:methodName:1 for the second, etc.
+      // Overload 0 keeps the original format for backward compatibility.
+      let nodeId: string;
+      if (nodeLabel === 'Method' || nodeLabel === 'Constructor') {
+        const nameKey = `${file.path}:${nodeName}`;
+        const overloadIndex = methodNameCounts.get(nameKey) ?? 0;
+        methodNameCounts.set(nameKey, overloadIndex + 1);
+        nodeId = overloadIndex > 0
+          ? `${generateId(nodeLabel, `${file.path}:${nodeName}`)}:${overloadIndex}`
+          : generateId(nodeLabel, `${file.path}:${nodeName}`);
+      } else {
+        nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+      }
 
       let description: string | undefined;
       if (language === SupportedLanguages.PHP) {

@@ -630,7 +630,9 @@ export const PRIMITIVE_TYPES = new Set([
   'String', 'Integer', 'int', 'Long', 'long', 'Double', 'double', 'Float', 'float',
   'Boolean', 'boolean', 'Byte', 'byte', 'Short', 'short', 'Character', 'char',
   'void', 'Void', 'Object', 'Number', 'BigDecimal', 'BigInteger',
-  'Date', 'LocalDate', 'LocalDateTime', 'Instant', 'ZonedDateTime', 'UUID',
+  'Date', 'LocalDate', 'LocalDateTime', 'LocalTime', 'Instant', 'ZonedDateTime',
+  'Timestamp', 'Year', 'YearMonth', 'MonthDay', 'Period', 'Duration',
+  'ZoneId', 'ZoneOffset', 'UUID',
   // TypeScript/JavaScript primitives
   'string', 'number', 'boolean', 'null', 'undefined',
   // Rust primitives
@@ -661,7 +663,9 @@ export const SKIP_SCHEMA_TYPES = new Set([
  * Combines PRIMITIVE_TYPES and SKIP_SCHEMA_TYPES.
  */
 export function shouldSkipSchema(typeName: string): boolean {
-  return PRIMITIVE_TYPES.has(typeName) || 
+  // Java wildcard type (?) — treat as Object/unknown
+  if (typeName === '?' || typeName === '*') return true;
+  return PRIMITIVE_TYPES.has(typeName) ||
          PRIMITIVE_TYPES.has(typeName.toLowerCase()) ||
          SKIP_SCHEMA_TYPES.has(typeName);
 }
@@ -716,7 +720,11 @@ export function extractGenericInnerType(typeName: string): string | null {
   }
 
   const inner = typeName.slice(firstAngle + 1, lastAngle).trim();
-  
+
+  // Java wildcard: treat as Object (unknown generic parameter)
+  if (inner === '?' || inner === '*') {
+    return 'Object';
+  }
   // Handle multiple type args (e.g., Map<K, V>) - return last type arg
   if (inner.includes(',')) {
     // Split on comma, but be careful with nested generics
