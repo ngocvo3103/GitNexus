@@ -41,6 +41,8 @@ export interface HttpCallDetail {
   urlExpression: string;
   /** Resolved URL if statically determinable (optional) */
   resolvedUrl?: string;
+  /** True when this HTTP call was detected from a FeignClient annotation (not a restTemplate/webClient call) */
+  isFeignClient?: boolean;
 }
 
 export interface MessagingDetail {
@@ -195,6 +197,8 @@ const HTTP_METHOD_MAP: Record<string, string> = {
 /** Enhanced HTTP call patterns with URL capture - matches first argument (may contain nested parens) */
 const HTTP_CALL_PATTERN = /(?:restTemplate|webClient)\.(\w+)\s*\(\s*((?:[^,\n()]|\([^)]*\))+)/g;
 const EXEC_CALL_PATTERN = /\bexec(Get|Post|Put|Delete)\s*\(\s*((?:[^,\n()]|\([^)]*\))+)/g;
+/** FeignClient HTTP annotation pattern — @GetMapping("path"), @PostMapping("/v1/..."), etc. */
+const FEIGN_HTTP_ANNOTATION_PATTERN = /@(Get|Post|Put|Delete|Patch|Request)Mapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/g;
 
 /** Annotation patterns */
 const ANNOTATION_PATTERNS = [
@@ -380,6 +384,18 @@ export function extractMetadata(content: string | undefined): ChainNode['metadat
     const urlExpression = execMatch[2].trim();
     if (!metadata.httpCallDetails.some(d => d.httpMethod === httpMethod && d.urlExpression === urlExpression)) {
       metadata.httpCallDetails.push({ httpMethod, urlExpression });
+    }
+  }
+
+  // Extract FeignClient HTTP annotations (@GetMapping, @PostMapping, etc.)
+  // These appear on FeignClient interface methods and indicate downstream HTTP calls
+  FEIGN_HTTP_ANNOTATION_PATTERN.lastIndex = 0;
+  let feignMatch;
+  while ((feignMatch = FEIGN_HTTP_ANNOTATION_PATTERN.exec(content)) !== null) {
+    const httpMethod = feignMatch[1] === 'Request' ? 'GET' : feignMatch[1].toUpperCase();
+    const urlExpression = feignMatch[2];
+    if (!metadata.httpCallDetails.some(d => d.httpMethod === httpMethod && d.urlExpression === urlExpression)) {
+      metadata.httpCallDetails.push({ httpMethod, urlExpression, isFeignClient: true });
     }
   }
 
@@ -1103,7 +1119,7 @@ export async function executeTrace(
         // If callee is a method whose parent is an Interface, resolve to concrete implementations
         if (parentType === 'Interface') {
           const impls = await resolveInterfaceCall(executeQuery, repoId, calleeId);
-          
+
           if (impls.length > 0) {
             // Add the interface node itself to discoveredNodes with isInterface marker
             // This allows the chain to show both interface and implementations
@@ -1121,7 +1137,7 @@ export async function executeTrace(
               currentCallees.push(calleeId);
               calleeMap.set(current.uid, currentCallees);
             }
-            
+
             // Add each implementation with resolvedFrom marker
             for (const impl of impls) {
               if (!visited.has(impl.implMethodId)) {
@@ -1138,15 +1154,17 @@ export async function executeTrace(
                   resolvedFrom: interfaceRef,
                 });
                 queue.push({ uid: impl.implMethodId, depth: currentDepth + 2 });
-                
+
                 // Track that the interface calls this implementation
                 const implCallees = calleeMap.get(calleeId) || [];
                 implCallees.push(impl.implMethodId);
                 calleeMap.set(calleeId, implCallees);
               }
             }
+            continue; // Interface resolution handled — skip normal node addition
           }
-          continue; // Interface resolution handled above
+          // No implementations found (e.g., FeignClient — Spring proxy at runtime)
+          // Fall through to add the interface node to the chain normally
         }
 
         // Add to discovered nodes (extended info fetched later via batch query if needed)

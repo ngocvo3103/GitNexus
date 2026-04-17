@@ -128,6 +128,21 @@ const IMPERATIVE_VALIDATION_PATTERNS = [
 
   // Custom validation methods: .validateJWT(), validateJWT(), .validateRequest()
   /(?:\.\s*)?validate[A-Z]\w*\s*\(/g,
+
+  // Guava Preconditions
+  /Preconditions\.(checkArgument|checkNotNull|checkState)\s*\(/g,
+
+  // Spring Assert
+  /Assert\.(notNull|hasText|hasLength|isTrue|isInstanceOf|isAssignable)\s*\(/g,
+
+  // Java Objects.requireNonNull
+  /Objects\.requireNonNull\s*\(/g,
+
+  // Apache Commons Validate
+  /Validate\.(isTrue|isNotNull|notEmpty|notBlank|inclusiveBetween|exclusiveBetween)\s*\(/g,
+
+  // IllegalArgumentException (common validation throw)
+  /throw\s+new\s+IllegalArgumentException\s*\(/g,
 ];
 
 /** Query limits and defaults */
@@ -1276,11 +1291,115 @@ async function extractDownstreamApis(
   // Cache for enclosing class lookups to avoid N+1 queries
   const enclosingClassCache = new Map<string, string | undefined>();
 
+  // Cache FeignClient interface metadata for downstream API detection
+  const feignClientCache = new Map<string, { serviceName: string; serviceUrl: string }>();
+  if (executeQuery && repoId) {
+    try {
+      const feignQuery = `
+        MATCH (c)
+        WHERE c.content CONTAINS '@FeignClient'
+           OR c.annotations CONTAINS 'FeignClient'
+        RETURN c.name AS className, c.content AS classContent, c.annotations AS classAnnotations, c.filePath AS filePath
+      `;
+      const feignRows = await executeQuery(repoId, feignQuery, {});
+      for (const row of feignRows) {
+        const className = row.className ?? row[0] ?? '';
+        const filePath = row.filePath ?? row[3] ?? '';
+        const classContent = row.classContent ?? row[1] ?? '';
+        const classAnnotationsRaw = row.classAnnotations ?? row[2] ?? '';
+        let serviceName = '';
+        let serviceUrl = '';
+        // Try parsing structured annotations first
+        try {
+          const classAnns = typeof classAnnotationsRaw === 'string' ? JSON.parse(classAnnotationsRaw) : classAnnotationsRaw;
+          const feignAnn = Array.isArray(classAnns) ? classAnns.find((a: any) => a.name === '@FeignClient') : null;
+          if (feignAnn?.attrs) {
+            serviceName = feignAnn.attrs.name || '';
+            serviceUrl = feignAnn.attrs.url || '';
+          }
+        } catch {}
+        // Fallback: extract from content using regex
+        if (!serviceName && !serviceUrl && classContent) {
+          const nameMatch = classContent.match(/@FeignClient\s*\(\s*(?:name\s*=\s*)?["']([^"']+)["']/);
+          const urlMatch = classContent.match(/@FeignClient\s*\([^)]*url\s*=\s*["']([^"']+)["']/);
+          if (nameMatch) serviceName = nameMatch[1];
+          if (urlMatch) serviceUrl = urlMatch[1];
+        }
+        if (serviceName || serviceUrl) {
+          if (filePath) feignClientCache.set(filePath, { serviceName, serviceUrl });
+          if (className) feignClientCache.set(className, { serviceName, serviceUrl });
+        }
+      }
+    } catch (e) {
+      // Ignore graph query errors
+    }
+  }
+
   for (const node of chain) {
     for (const detail of node.metadata.httpCallDetails) {
-      const key = `${detail.httpMethod}:${detail.urlExpression}`;
+      const key = detail.isFeignClient
+        ? `feign:${detail.httpMethod}:${detail.urlExpression}`
+        : `${detail.httpMethod}:${detail.urlExpression}`;
       if (seen.has(key)) continue;
       seen.add(key);
+
+      // ─── FeignClient shortcut: use @FeignClient annotation for service name + URL ───
+      if (detail.isFeignClient) {
+        let feignInfo = node.filePath ? feignClientCache.get(node.filePath) : undefined;
+        if (!feignInfo && node.filePath) {
+          const cacheKey = node.filePath;
+          let className: string | undefined;
+          if (enclosingClassCache.has(cacheKey)) {
+            className = enclosingClassCache.get(cacheKey);
+          } else {
+            className = await findEnclosingClass(executeQuery, repoId, node.filePath);
+            enclosingClassCache.set(cacheKey, className);
+          }
+          if (className) feignInfo = feignClientCache.get(className);
+        }
+
+        if (feignInfo) {
+          // Resolve service URL if it contains ${...} property references
+          let resolvedUrl = feignInfo.serviceUrl;
+          if (resolvedUrl && resolvedUrl.includes('${')) {
+            const varMatch = resolvedUrl.match(/\$\{([^}]+)\}/);
+            if (varMatch) {
+              const propKey = varMatch[1];
+              const cacheKey = node.filePath;
+              let className: string | undefined;
+              if (enclosingClassCache.has(cacheKey)) {
+                className = enclosingClassCache.get(cacheKey);
+              } else {
+                className = await findEnclosingClass(executeQuery, repoId, node.filePath);
+                enclosingClassCache.set(cacheKey, className);
+              }
+              if (className) {
+                const resolved = await resolveValueAnnotation(executeQuery, repoId, className, propKey);
+                if (resolved.rawValue) resolvedUrl = resolved.rawValue;
+              }
+            }
+          }
+
+          const serviceName = feignInfo.serviceName || 'unknown-service';
+          apis.push({
+            serviceName,
+            name: serviceName,
+            type: 'REST',
+            service: serviceName,
+            repoId,
+            endpoint: `${detail.httpMethod} ${detail.urlExpression}`,
+            condition: TODO_AI_ENRICH,
+            purpose: TODO_AI_ENRICH,
+            resolvedUrl: resolvedUrl?.startsWith('http') ? resolvedUrl : undefined,
+            resolvedFrom: 'feign-client',
+            ...(includeContext && {
+              _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\n${node.content?.slice(0, 200)}...`,
+            }),
+          });
+          continue;
+        }
+        // Fall through to standard resolution if FeignClient info not found
+      }
 
       // Parse URL expression to extract components
       const parsed = parseUrlExpression(detail.urlExpression);
@@ -3144,16 +3263,13 @@ function extractValidationRules(
   const rules: ValidationRule[] = [];
 
   // Parse parameterAnnotations JSON
-  if (!handler.parameterAnnotations) {
-    return rules;
-  }
-
-  let rawParams: RawParamAnnotation[];
-  try {
-    rawParams = JSON.parse(handler.parameterAnnotations);
-  } catch (e) {
-    if (DEBUG) console.error('[GitNexus DEBUG] Validation parameter annotations parse failed:', e);
-    return rules;
+  let rawParams: RawParamAnnotation[] = [];
+  if (handler.parameterAnnotations) {
+    try {
+      rawParams = JSON.parse(handler.parameterAnnotations);
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Validation parameter annotations parse failed:', e);
+    }
   }
 
   // Transform from stored format to expected format
@@ -3174,6 +3290,29 @@ function extractValidationRules(
       handler.startLine
     );
     rules.push(...paramRules);
+  }
+
+  // Part 1b: @RequestParam(required=true) as validation rule
+  for (const param of params) {
+    if (!param.annotations || param.annotations.length === 0) continue;
+
+    const requestParamAnn = param.annotations.find((a: string) => a.startsWith('@RequestParam'));
+    if (!requestParamAnn) continue;
+
+    // Default for @RequestParam is required=true unless explicitly set to false
+    const requiredMatch = requestParamAnn.match(/required\s*=\s*(true|false)/i);
+    const isRequired = !requiredMatch || requiredMatch[1].toLowerCase() === 'true';
+
+    if (isRequired) {
+      if (!rules.some(r => r.field === param.name && r.rules === 'Required')) {
+        rules.push({
+          field: param.name,
+          type: param.type || 'query',
+          required: true,
+          rules: 'Required',
+        });
+      }
+    }
   }
 
   // Include field-level validation rules from BodySchema or chain nodes
@@ -3385,8 +3524,10 @@ export async function extractMessaging(
   for (const node of chain) {
     // Extract outbound messaging
     for (const detail of node.metadata.messagingDetails) {
-      if (detail.topic && !seenOutbound.has(detail.topic)) {
-        seenOutbound.add(detail.topic);
+      const trigger = node.name || 'TODO_AI_ENRICH';
+      const dedupKey = `${detail.topic}:${trigger}`;
+      if (detail.topic && !seenOutbound.has(dedupKey)) {
+        seenOutbound.add(dedupKey);
         const payloadTypeName = detail.payload || TODO_AI_ENRICH;
         // Always resolve payload to BodySchema when executeQuery available
         const resolvedPayload = executeQuery && repoId && payloadTypeName !== TODO_AI_ENRICH
@@ -3401,7 +3542,7 @@ export async function extractMessaging(
           service: resolvedPayload.sourceRepo,
           payload: resolvedPayload.payload,
           sourceRepo: resolvedPayload.sourceRepo,
-          trigger: node.name || 'TODO_AI_ENRICH',
+          trigger: trigger,
           ...(includeContext && {
             _context: `// ${node.filePath}:${node.startLine}-${node.endLine}\\n${node.content?.slice(0, 200)}...`,
           }),
