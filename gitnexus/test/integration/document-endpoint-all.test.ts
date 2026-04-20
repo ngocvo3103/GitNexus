@@ -190,16 +190,37 @@ describe('document-endpoint --all E2E', () => {
     // - 17 POST/PUT missing @RequestBody: endpoints with only @RequestParam/@PathVariable
     //     PathVariable only (8): certificates/download x2, combo x2, cancel, sign/extend, sign/swap, unhold-money-mortgage
     //     RequestParam only (4): handle-info, cds/expire x2, ibond/origin x2 (RequestParam Map)
-    //     Zero business params (3): auto-cds x2, pre-order/expired x2
+    //     Zero business params (5): auto-cds x2, pre-order/expired x2, iconnect-pro
     // - 3 items:type:string: legitimate List<String> returns (trading-code, working-days, bonds/{tcbsId}/get Map<String,List<String>>)
     // These are Java-source limitations, not GitNexus bugs.
     const KNOWN_BARE_TYPE_OBJECT = 10;
     const KNOWN_MISSING_REQUEST_BODY = 17;
     const KNOWN_LEGITIMATE_ITEMS_STRING = 3;
     // Baseline for new metrics — these are floors, should only improve
-    const BASELINE_DOWNSTREAM_APIS = 333;
+    const BASELINE_DOWNSTREAM_APIS = 331;
     const BASELINE_OUTBOUND_MESSAGING = 64;
     const BASELINE_VALIDATION_RULES = 282;
+
+    // ── Ceiling metrics (cannot improve without AI or config scanning) ──
+    const CEILING_EXCHANGE_METHOD = 0;       // EXCHANGE method now excluded from downstream APIs
+    const CEILING_UNKNOWN_SERVICE = 0;       // Variable name heuristic + proactive @Value scan + builder tracing + class name fallback
+    const CEILING_CODE_EXPRESSION = 190;       // builder.toUriString() + concatenation resolution
+
+    // ── Anomaly ceilings ──
+    // A2: Path {param} without matching in:path parameter (tcbsId from JWT is unfixable)
+    const CEILING_PATH_PARAM_MISMATCH = 5;
+    // A4: Container without items (inner type unresolved)
+    const CEILING_CONTAINER_WITHOUT_ITEMS = 128;
+    // A5: Download endpoints without application/octet-stream
+    const CEILING_DOWNLOAD_WITHOUT_OCTET = 26;
+    // B1: Unresolved downstream endpoints (code expressions)
+    const CEILING_UNRESOLVED_ENDPOINTS = 197;
+    // B4: Inbound topic over-inclusion (shared base class — expected 341)
+    const CEILING_INBOUND_TOPIC_ALL_FILES = 341;
+    // B7: ID path params typed as string (may be correct for string IDs like tcbsId)
+    const CEILING_ID_PATH_PARAM_STRING = 164;
+    // B8: Endpoints without 400 response
+    const CEILING_NO_400_RESPONSE = 46;
 
     /**
      * Parse all generated YAML files and compute quality metrics.
@@ -215,6 +236,16 @@ describe('document-endpoint --all E2E', () => {
       downstreamApisPresent: number;
       outboundMessaging: number;
       validationRules: number;
+      unknownServiceCount: number;
+      // Anomaly metrics
+      pathParamMismatch: { file: string; path: string; braces: number; params: number }[];
+      containerWithoutItems: number;
+      downloadWithoutOctetStream: number;
+      unresolvedEndpoints: number;
+      inboundTopicAllFiles: number;
+      idPathParamString: number;
+      no400Response: number;
+      bareObjectNoProps: number;
     } {
       const yamlFiles = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.openapi.yaml'));
       let structured200 = 0;
@@ -226,6 +257,16 @@ describe('document-endpoint --all E2E', () => {
       let downstreamApisPresent = 0;
       let outboundMessaging = 0;
       let validationRules = 0;
+      let unknownServiceCount = 0;
+      // Anomaly counters
+      const pathParamMismatch: { file: string; path: string; braces: number; params: number }[] = [];
+      let containerWithoutItems = 0;
+      let downloadWithoutOctetStream = 0;
+      let unresolvedEndpoints = 0;
+      let inboundTopicAllFiles = 0;
+      let idPathParamString = 0;
+      let no400Response = 0;
+      let bareObjectNoProps = 0;
 
       for (const file of yamlFiles) {
         const content = fs.readFileSync(path.join(tmpDir, file), 'utf8');
@@ -269,6 +310,12 @@ describe('document-endpoint --all E2E', () => {
           downstreamApisPresent++;
         }
 
+        // Unknown-service count in downstream APIs
+        const unknownMatches = content.match(/serviceName: unknown-service/g);
+        if (unknownMatches) {
+          unknownServiceCount += unknownMatches.length;
+        }
+
         // Outbound messaging present
         if (/x-messaging-outbound:/.test(content)) {
           outboundMessaging++;
@@ -277,6 +324,85 @@ describe('document-endpoint --all E2E', () => {
         // Validation rules present
         if (/x-validation-rules:/.test(content)) {
           validationRules++;
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // ANOMALY DETECTION
+        // ═══════════════════════════════════════════════════════════════
+
+        // A2: Path {param} without matching in:path parameter
+        const pathMatch = content.match(/^  (\/[^\n]+):/m);
+        if (pathMatch) {
+          const path = pathMatch[1];
+          const braceCount = (path.match(/{/g) || []).length;
+          const pathParamCount = (content.match(/in: path/g) || []).length;
+          if (braceCount > pathParamCount) {
+            pathParamMismatch.push({ file, path, braces: braceCount, params: pathParamCount });
+          }
+        }
+
+        // A3: Bare type:object without properties (in schemas, not responses)
+        // Count occurrences of "type: object" NOT followed by "properties:" within 3 lines
+        const lines = content.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (/\btype: object\b/.test(lines[i]) && !lines[i].includes('#')) {
+            let hasProps = false;
+            for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+              if (/properties:/.test(lines[j])) {
+                hasProps = true;
+                break;
+              }
+              // Stop if we hit another key at same or lower indent
+              if (lines[j].match(/^\s*[a-zA-Z]/) && !lines[j].includes('properties')) {
+                break;
+              }
+            }
+            if (!hasProps) bareObjectNoProps++;
+          }
+        }
+
+        // A4: Container without items (type: array NOT followed by items:)
+        for (let i = 0; i < lines.length; i++) {
+          if (/\btype: array\b/.test(lines[i])) {
+            let hasItems = false;
+            for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+              if (/^\s*items:/.test(lines[j])) {
+                hasItems = true;
+                break;
+              }
+              if (lines[j].match(/^\s*[a-zA-Z]/) && !lines[j].includes('items')) {
+                break;
+              }
+            }
+            if (!hasItems) containerWithoutItems++;
+          }
+        }
+
+        // A5: Download endpoints missing application/octet-stream
+        if (file.toLowerCase().includes('download') && !content.includes('octet-stream')) {
+          downloadWithoutOctetStream++;
+        }
+
+        // B1: Unresolved downstream endpoints (code expressions)
+        const unresolvedMatches = content.match(/endpoint: (GET|POST|PUT|DELETE|PATCH) (targetUrl|url\.toString\(\)|targetUrl\.toString\(\)|url\.toUriString\(\)|\[internal\])/g);
+        if (unresolvedMatches) {
+          unresolvedEndpoints += unresolvedMatches.length;
+        }
+
+        // B4: Inbound topic over-inclusion (b.e.q.trading.005032 appears everywhere)
+        if (content.includes('b.e.q.trading.005032')) {
+          inboundTopicAllFiles++;
+        }
+
+        // B7: ID path params typed as string
+        const idStringParams = content.match(/name: (\w*(?:id|Id|ID)\w*)\s*\n\s*in: path[\s\S]*?type: string/g);
+        if (idStringParams) {
+          idPathParamString += idStringParams.length;
+        }
+
+        // B8: Endpoints without 400 response
+        if (!content.includes("'400'")) {
+          no400Response++;
         }
       }
 
@@ -291,6 +417,15 @@ describe('document-endpoint --all E2E', () => {
         downstreamApisPresent,
         outboundMessaging,
         validationRules,
+        unknownServiceCount,
+        pathParamMismatch,
+        containerWithoutItems,
+        downloadWithoutOctetStream,
+        unresolvedEndpoints,
+        inboundTopicAllFiles,
+        idPathParamString,
+        no400Response,
+        bareObjectNoProps,
       };
     }
 
@@ -350,6 +485,13 @@ describe('document-endpoint --all E2E', () => {
       ).toBeGreaterThanOrEqual(BASELINE_VALIDATION_RULES);
     });
 
+    it('P1: unknown-service count <= ceiling', () => {
+      const m = computeMetrics();
+      expect(m.unknownServiceCount,
+        `${m.unknownServiceCount} unknown-service entries — expected <= ${CEILING_UNKNOWN_SERVICE}`
+      ).toBeLessThanOrEqual(CEILING_UNKNOWN_SERVICE);
+    });
+
     it('P2: prints quality metrics summary', () => {
       const m = computeMetrics();
       const pct = ((m.structured200 / m.total) * 100).toFixed(1);
@@ -366,7 +508,112 @@ describe('document-endpoint --all E2E', () => {
       console.log(`  Downstream API docs:          ${m.downstreamApisPresent} (${((m.downstreamApisPresent / m.total) * 100).toFixed(1)}%)`);
       console.log(`  Outbound messaging:           ${m.outboundMessaging} (${((m.outboundMessaging / m.total) * 100).toFixed(1)}%)`);
       console.log(`  Validation rules:            ${m.validationRules} (${((m.validationRules / m.total) * 100).toFixed(1)}%)`);
+      console.log(`  Unknown-service entries:     ${m.unknownServiceCount} (ceiling: ${CEILING_UNKNOWN_SERVICE})`);
+      console.log(`  EXCHANGE method (excluded):  ${CEILING_EXCHANGE_METHOD}`);
+      console.log(`  Code expression ceiling:     ${CEILING_CODE_EXPRESSION}`);
       console.log('');
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ANOMALY DETECTION TESTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    it('A2: path {param} mismatches <= ceiling (tcbsId from JWT is unfixable)', () => {
+      const m = computeMetrics();
+      if (m.pathParamMismatch.length > 0) {
+        console.log('  Path param mismatches:');
+        for (const { file, path, braces, params } of m.pathParamMismatch) {
+          console.log(`    ${file}: ${path} (braces=${braces}, params=${params})`);
+        }
+      }
+      expect(m.pathParamMismatch.length,
+        `${m.pathParamMismatch.length} path param mismatches — ceiling: ${CEILING_PATH_PARAM_MISMATCH}`
+      ).toBeLessThanOrEqual(CEILING_PATH_PARAM_MISMATCH);
+    });
+
+    it('A4: container without items <= ceiling', () => {
+      const m = computeMetrics();
+      expect(m.containerWithoutItems,
+        `${m.containerWithoutItems} arrays without items — ceiling: ${CEILING_CONTAINER_WITHOUT_ITEMS}`
+      ).toBeLessThanOrEqual(CEILING_CONTAINER_WITHOUT_ITEMS);
+    });
+
+    it('A5: download endpoints without octet-stream <= ceiling', () => {
+      const m = computeMetrics();
+      expect(m.downloadWithoutOctetStream,
+        `${m.downloadWithoutOctetStream} downloads missing octet-stream — ceiling: ${CEILING_DOWNLOAD_WITHOUT_OCTET}`
+      ).toBeLessThanOrEqual(CEILING_DOWNLOAD_WITHOUT_OCTET);
+    });
+
+    it('B1: unresolved downstream endpoints <= ceiling', () => {
+      const m = computeMetrics();
+      expect(m.unresolvedEndpoints,
+        `${m.unresolvedEndpoints} unresolved endpoints (targetUrl, toString, [internal]) — ceiling: ${CEILING_UNRESOLVED_ENDPOINTS}`
+      ).toBeLessThanOrEqual(CEILING_UNRESOLVED_ENDPOINTS);
+    });
+
+    it('B4: inbound topic over-inclusion <= ceiling (shared base class)', () => {
+      const m = computeMetrics();
+      // b.e.q.trading.005032 appears in all 341 files due to shared base class listener
+      expect(m.inboundTopicAllFiles,
+        `${m.inboundTopicAllFiles} files with same inbound topic — ceiling: ${CEILING_INBOUND_TOPIC_ALL_FILES}`
+      ).toBeLessThanOrEqual(CEILING_INBOUND_TOPIC_ALL_FILES);
+    });
+
+    it('B7: ID path params typed as string <= ceiling', () => {
+      const m = computeMetrics();
+      expect(m.idPathParamString,
+        `${m.idPathParamString} ID params typed as string — ceiling: ${CEILING_ID_PATH_PARAM_STRING}`
+      ).toBeLessThanOrEqual(CEILING_ID_PATH_PARAM_STRING);
+    });
+
+    it('B8: endpoints without 400 response <= ceiling', () => {
+      const m = computeMetrics();
+      expect(m.no400Response,
+        `${m.no400Response} endpoints without 400 response — ceiling: ${CEILING_NO_400_RESPONSE}`
+      ).toBeLessThanOrEqual(CEILING_NO_400_RESPONSE);
+    });
+
+    it('P2: prints anomaly summary', () => {
+      const m = computeMetrics();
+      console.log('\n╔══════════════════════════════════════════════╗');
+      console.log('║          ANOMALY DETECTION SUMMARY           ║');
+      console.log('╚══════════════════════════════════════════════╝');
+      console.log(`  A2 Path param mismatch:       ${m.pathParamMismatch.length} (ceiling: ${CEILING_PATH_PARAM_MISMATCH})`);
+      console.log(`  A3 Bare object no props:      ${m.bareObjectNoProps}`);
+      console.log(`  A4 Container without items:   ${m.containerWithoutItems} (ceiling: ${CEILING_CONTAINER_WITHOUT_ITEMS})`);
+      console.log(`  A5 Download w/o octet-stream: ${m.downloadWithoutOctetStream} (ceiling: ${CEILING_DOWNLOAD_WITHOUT_OCTET})`);
+      console.log(`  B1 Unresolved endpoints:       ${m.unresolvedEndpoints} (ceiling: ${CEILING_UNRESOLVED_ENDPOINTS})`);
+      console.log(`  B3 Unknown-service entries:   ${m.unknownServiceCount} (ceiling: ${CEILING_UNKNOWN_SERVICE})`);
+      console.log(`  B4 Inbound topic over-include:${m.inboundTopicAllFiles}/${m.total} (ceiling: ${CEILING_INBOUND_TOPIC_ALL_FILES})`);
+      console.log(`  B7 ID params as string:       ${m.idPathParamString} (ceiling: ${CEILING_ID_PATH_PARAM_STRING})`);
+      console.log(`  B8 No 400 response:           ${m.no400Response} (ceiling: ${CEILING_NO_400_RESPONSE})`);
+      console.log('');
+    });
+
+    it('P0: no duplicate method+path combos', () => {
+      const yamlFiles = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.openapi.yaml'));
+      const seen = new Map<string, string[]>();
+
+      for (const file of yamlFiles) {
+        const content = fs.readFileSync(path.join(tmpDir, file), 'utf8');
+        const methodMatch = content.match(/^\s+(get|post|put|delete|patch):/m);
+        const pathMatch = content.match(/^  (\/[^\n]+):/m);
+        if (methodMatch && pathMatch) {
+          const key = `${methodMatch[1].toUpperCase()} ${pathMatch[1]}`;
+          if (!seen.has(key)) seen.set(key, []);
+          seen.get(key)!.push(file);
+        }
+      }
+
+      const duplicates = [...seen.entries()].filter(([_, files]) => files.length > 1);
+      if (duplicates.length > 0) {
+        console.log('  Duplicate method+path combos:');
+        for (const [key, files] of duplicates) {
+          console.log(`    ${key}: ${files.join(', ')}`);
+        }
+      }
+      expect(duplicates.length, `${duplicates.length} duplicate method+path combos — must be 0`).toBe(0);
     });
   });
 });

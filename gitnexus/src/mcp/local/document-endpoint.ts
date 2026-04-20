@@ -81,6 +81,9 @@ const DEBUG = process.env.GITNEXUS_DEBUG === 'true';
 /** Valid HTTP methods for endpoint documentation */
 const VALID_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
 
+/** Regex to detect path variable patterns like {id}, {orderId} */
+const PATH_VAR_RE = /^\{.+\}$/;
+
 /** Spring annotations that map request parameters */
 const REQUEST_PARAM_ANNOTATIONS = new Set([
   '@PathVariable', '@RequestParam', '@RequestHeader', '@CookieValue'
@@ -241,6 +244,8 @@ export interface BodySchema {
   repoId?: string;
   /** Indicates the original type was a container (List, Set, array, etc.) */
   isContainer?: boolean;
+  /** Marks a recursive reference — this type references itself, emit $ref instead of expanding */
+  _recursiveRef?: string;
 }
 
 export interface DownstreamApi {
@@ -847,6 +852,19 @@ export async function documentEndpoint(
                   const parsed = JSON.parse(overloadParamAnns);
                   if (parsed.some((p: any) => p.annotations?.includes('@RequestBody'))) {
                     validHandlerUid = overloadUid;
+                    // Also update the route path to match the overload's actual URL template.
+                    // Without this, the original route.path (from the non-@RequestBody overload)
+                    // would be used, causing path-variable mismatches in the output.
+                    try {
+                      const overloadRouteResult = await executeParameterized(repo.id,
+                        `MATCH (r:Route)-[:CodeRelation{CALLS}]->(m:Method {id: $uid}) RETURN r.routePath AS path LIMIT 1`,
+                        { uid: overloadUid }
+                      );
+                      if (overloadRouteResult?.[0]?.path) {
+                        route = { ...route, path: overloadRouteResult[0].path };
+                        if (DEBUG) console.error(`[GitNexus DEBUG] Updated route.path to ${route.path} for overload ${overloadUid}`);
+                      }
+                    } catch { /* keep original route on error */ }
                     if (DEBUG) console.error(`[GitNexus DEBUG] Switched to overload variant ${overloadUid} (has @RequestBody)`);
                     break;
                   }
@@ -1287,6 +1305,7 @@ async function extractDownstreamApis(
 ): Promise<DownstreamApi[]> {
   const apis: DownstreamApi[] = [];
   const seen = new Set<string>();
+  const seenOutput = new Set<string>(); // dedup by final serviceName+type+endpoint
 
   // Cache for enclosing class lookups to avoid N+1 queries
   const enclosingClassCache = new Map<string, string | undefined>();
@@ -1320,7 +1339,7 @@ async function extractDownstreamApis(
         } catch {}
         // Fallback: extract from content using regex
         if (!serviceName && !serviceUrl && classContent) {
-          const nameMatch = classContent.match(/@FeignClient\s*\(\s*(?:name\s*=\s*)?["']([^"']+)["']/);
+          const nameMatch = classContent.match(/@FeignClient\s*\([^)]*(?:name|value)\s*=\s*["']([^"']+)["']/);
           const urlMatch = classContent.match(/@FeignClient\s*\([^)]*url\s*=\s*["']([^"']+)["']/);
           if (nameMatch) serviceName = nameMatch[1];
           if (urlMatch) serviceUrl = urlMatch[1];
@@ -1332,6 +1351,180 @@ async function extractDownstreamApis(
       }
     } catch (e) {
       // Ignore graph query errors
+    }
+  }
+
+  // Build reverse lookup: propertyKey → serviceName from FeignClient URL references
+  // E.g., @FeignClient(name="product-service", url="${tcbs.bond.product.url}")
+  //   → propertyKeyToServiceName("tcbs.bond.product.url") = "product-service"
+  const propertyKeyToServiceName = new Map<string, string>();
+  for (const [, info] of feignClientCache) {
+    if (info.serviceUrl) {
+      const propMatches = info.serviceUrl.matchAll(/\$\{([^}:}]+)(?::[^}]*)?\}/g);
+      for (const pm of propMatches) {
+        propertyKeyToServiceName.set(pm[1], info.serviceName);
+      }
+    }
+  }
+
+  // Build URL path → serviceName mapping from servicePropertyCache URLs
+  // E.g., http://apiintsit.tcbs.com.vn/matching-engine/v1/ → /matching-engine/ → matching
+  const urlPathToServiceName = new Map<string, string>();
+  if (executeQuery && repoId) {
+    try {
+      const propQuery = `
+        MATCH (p:Property)
+        WHERE (p.description IS NULL OR p.description = '')
+          AND (p.name CONTAINS 'url' OR p.name CONTAINS 'host' OR p.name CONTAINS 'endpoint')
+        RETURN p.name AS propKey, p.content AS content
+      `;
+      const propRows = await executeQuery(repoId, propQuery, {});
+      for (const row of propRows) {
+        const propKey = (row.propKey ?? row[0] ?? '') as string;
+        const content = (row.content ?? row[1] ?? '') as string;
+        const urlValue = parsePropertyValueFromContent(propKey, content);
+        if (urlValue && urlValue.startsWith('http')) {
+          try {
+            const url = new URL(urlValue);
+            if (url.pathname && url.pathname.length > 1) {
+              // Extract first path segment as service path prefix
+              const segments = url.pathname.split('/').filter(Boolean);
+              if (segments.length > 0) {
+                const pathPrefix = '/' + segments[0] + '/';
+                const snFromKey = parseServiceNameFromPropertyKey(propKey);
+                const snFromPath = segments[0];
+                const serviceName = snFromKey || snFromPath;
+                if (serviceName && serviceName !== 'unknown-service') {
+                  urlPathToServiceName.set(pathPrefix, serviceName);
+                  // Also map just the first segment
+                  urlPathToServiceName.set('/' + segments[0], serviceName);
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] URL path scan failed:', e);
+    }
+  }
+
+  // Proactive property scan: build propertyKey → serviceName mapping from Property nodes
+  // This resolves cases where @Value resolution finds a property key but no serviceName
+  const servicePropertyCache = new Map<string, string>(); // propertyKey → serviceName
+  if (executeQuery && repoId) {
+    try {
+      const propQuery = `
+        MATCH (p:Property)
+        WHERE (p.description IS NULL OR p.description = '')
+          AND (p.name CONTAINS 'url' OR p.name CONTAINS 'host' OR p.name CONTAINS 'endpoint')
+        RETURN p.name AS propKey, p.content AS content
+      `;
+      const propRows = await executeQuery(repoId, propQuery, {});
+      for (const row of propRows) {
+        const propKey = (row.propKey ?? row[0] ?? '') as string;
+        const content = (row.content ?? row[1] ?? '') as string;
+        const urlValue = parsePropertyValueFromContent(propKey, content);
+        if (urlValue && urlValue.startsWith('http')) {
+          try {
+            const url = new URL(urlValue);
+            if (url.hostname && url.hostname !== 'localhost' && !/^\d+\.\d+\.\d+\.\d+$/.test(url.hostname)) {
+              const sn = parseServiceNameFromPropertyKey(propKey) || url.pathname.split('/').filter(Boolean)[0] || url.hostname.replace(/\./g, '-');
+              if (sn) servicePropertyCache.set(propKey, sn);
+            }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Property scan failed:', e);
+    }
+  }
+
+  // Cross-repo FeignClient enrichment: query dep repos for their FeignClient interfaces
+  // to map RestTemplate property keys to actual FeignClient service names
+  if (crossRepo) {
+    try {
+      const depRepoIds = await crossRepo.listDepRepos();
+      if (depRepoIds.length > 0) {
+        const feignQuery = `
+          MATCH (c)
+          WHERE c.content CONTAINS '@FeignClient'
+             OR c.annotations CONTAINS 'FeignClient'
+          RETURN c.name AS className, c.content AS classContent, c.annotations AS classAnnotations, c.filePath AS filePath
+        `;
+        const crossRepoResults = await crossRepo.queryMultipleRepos(depRepoIds, feignQuery, {});
+        for (const { results: rows } of crossRepoResults) {
+          for (const row of rows as any[]) {
+            const classContent = row.classContent ?? row[1] ?? '';
+            const classAnnotationsRaw = row.classAnnotations ?? row[2] ?? '';
+            let sn = '';
+            let su = '';
+            try {
+              const classAnns = typeof classAnnotationsRaw === 'string' ? JSON.parse(classAnnotationsRaw) : classAnnotationsRaw;
+              const feignAnn = Array.isArray(classAnns) ? classAnns.find((a: any) => a.name === '@FeignClient') : null;
+              if (feignAnn?.attrs) {
+                sn = feignAnn.attrs.name || '';
+                su = feignAnn.attrs.url || '';
+              }
+            } catch {}
+            if (!sn && !su && classContent) {
+              const nameMatch = classContent.match(/@FeignClient\s*\([^)]*(?:name|value)\s*=\s*["']([^"']+)["']/);
+              const urlMatch = classContent.match(/@FeignClient\s*\([^)]*url\s*=\s*["']([^"']+)["']/);
+              if (nameMatch) sn = nameMatch[1];
+              if (urlMatch) su = urlMatch[1];
+            }
+            if (su) {
+              const propMatches = su.matchAll(/\$\{([^}:}]+)(?::[^}]*)?\}/g);
+              for (const pm of propMatches) {
+                propertyKeyToServiceName.set(pm[1], sn);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Cross-repo FeignClient enrichment failed:', e);
+    }
+  }
+
+  // Proactive @Value field scan: pre-build fieldName → propertyKey map for all URL-related fields
+  const fieldNameToPropertyKey = new Map<string, { propertyKey: string; rawValue: string; declaringClass: string }>();
+  if (executeQuery && repoId) {
+    try {
+      const valueFieldQuery = `
+        MATCH (c:Class)
+        WHERE c.fields CONTAINS '@Value'
+        RETURN c.name AS className, c.fields AS fields
+      `;
+      const valueRows = await executeQuery(repoId, valueFieldQuery, {});
+      for (const row of valueRows) {
+        const fieldsJson = row.fields || row[1];
+        const className = row.className || row[0] || '';
+        if (!fieldsJson) continue;
+        try {
+          const fields = JSON.parse(fieldsJson);
+          for (const field of fields) {
+            if (field.annotationAttrs) {
+              const valueAnn = field.annotationAttrs.find((a: any) => a.name === '@Value');
+              if (valueAnn?.attrs) {
+                const rawValue = valueAnn.attrs['0'] || valueAnn.attrs['value'] || '';
+                if (rawValue && (rawValue.includes('url') || rawValue.includes('host') || rawValue.includes('endpoint') || rawValue.includes('service'))) {
+                  const match = rawValue.match(/\$\{([^}:}]+)(?::[^}]*)?\}/);
+                  if (match) {
+                    fieldNameToPropertyKey.set(field.name, {
+                      propertyKey: match[1],
+                      rawValue,
+                      declaringClass: className,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+    } catch (e) {
+      if (DEBUG) console.error('[GitNexus DEBUG] Field-to-PropertyKey scan failed:', e);
     }
   }
 
@@ -1380,7 +1573,16 @@ async function extractDownstreamApis(
             }
           }
 
-          const serviceName = feignInfo.serviceName || 'unknown-service';
+          let serviceName = feignInfo.serviceName;
+          if (!serviceName && feignInfo.serviceUrl) {
+            try {
+              const url = new URL(feignInfo.serviceUrl);
+              serviceName = url.hostname.replace(/\./g, '-');
+            } catch {
+              serviceName = 'unknown-service';
+            }
+          }
+          serviceName = serviceName || 'unknown-service';
           apis.push({
             serviceName,
             name: serviceName,
@@ -1432,6 +1634,15 @@ async function extractDownstreamApis(
           propertyKey = resolved.propertyKey;
           serviceValue = resolved.rawValue;
           resolvedFrom = 'value-annotation';
+        } else {
+          // Pass 1b: Cross-class @Value fallback — search ALL classes for field with @Value
+          const fieldName = parsed.serviceName + 'Service';
+          const crossResolved = await resolveValueAnnotationCrossClass(executeQuery, repoId, fieldName);
+          if (crossResolved.propertyKey) {
+            propertyKey = crossResolved.propertyKey;
+            serviceValue = crossResolved.rawValue;
+            resolvedFrom = 'cross-class-value-annotation';
+          }
         }
       }
 
@@ -1495,6 +1706,85 @@ async function extractDownstreamApis(
         }
       }
 
+      // Pass 2a: Bare variable tracing — when urlExpression is a simple variable like "url" or "targetUrl"
+      // Try to trace local variable assignments to find the base URL field
+      if (!propertyKey && className && /^[a-zA-Z]\w*$/.test(detail.urlExpression) && node.content) {
+        const assignments = extractLocalVariableAssignments(node.content);
+        const expr = assignments.get(detail.urlExpression);
+        if (expr) {
+          const baseField = extractBaseField(expr);
+          if (baseField && baseField !== detail.urlExpression) {
+            // Try @Value resolution for the base field
+            const resolved = await resolveValueAnnotation(executeQuery, repoId, className, baseField);
+            if (resolved.propertyKey) {
+              propertyKey = resolved.propertyKey;
+              serviceValue = resolved.rawValue;
+              resolvedFieldName = baseField;
+              resolvedFrom = 'bare-variable-trace';
+            } else {
+              // Try cross-class
+              const crossResolved = await resolveValueAnnotationCrossClass(executeQuery, repoId, baseField);
+              if (crossResolved.propertyKey) {
+                propertyKey = crossResolved.propertyKey;
+                serviceValue = crossResolved.rawValue;
+                resolvedFieldName = baseField;
+                resolvedFrom = 'bare-variable-trace+cross-class';
+              }
+            }
+          }
+        }
+      }
+
+      // Pass 2a2: StringBuilder toString() — when urlExpression is "targetUrl.toString()"
+      // Try to trace the StringBuilder construction for the variable
+      if (!propertyKey && className && node.content) {
+        const toStringMatch = detail.urlExpression.match(/^(\w+)\.toString\(\)$/);
+        if (toStringMatch) {
+          const varName = toStringMatch[1];
+          // Try StringBuilder construction trace
+          const sbBase = traceStringBuilderConstruction(varName, node.content);
+          if (sbBase) {
+            const resolved = await resolveValueAnnotation(executeQuery, repoId, className, sbBase);
+            if (resolved.propertyKey) {
+              propertyKey = resolved.propertyKey;
+              serviceValue = resolved.rawValue;
+              resolvedFieldName = sbBase;
+              resolvedFrom = 'stringbuilder-tostring-trace';
+            }
+          }
+        }
+      }
+
+      // Pass 2b: Fuzzy field name → property key matching using servicePropertyCache
+      if (!propertyKey && parsed.serviceName) {
+        const fieldName = parsed.serviceName + 'Service';
+        const fuzzyKey = findMatchingPropertyKey(fieldName, servicePropertyCache);
+        if (fuzzyKey) {
+          propertyKey = fuzzyKey;
+          resolvedFrom = 'property-fuzzy-match';
+          const propValue = await resolvePropertyValue(executeQuery, repoId, propertyKey);
+          if (propValue.value) resolvedValue = propValue.value;
+        }
+      }
+
+      // Pass 2c: Proactive field-to-propertyKey cache lookup
+      if (!propertyKey && fieldNameToPropertyKey.size > 0) {
+        // Try variable refs and parsed.serviceName-based patterns
+        const candidates = [
+          ...parsed.variableRefs,
+          ...(parsed.serviceName ? [parsed.serviceName + 'Service', parsed.serviceName + 'ServiceUrl', parsed.serviceName] : []),
+        ].filter(Boolean);
+        for (const candidate of candidates) {
+          const cached = fieldNameToPropertyKey.get(candidate);
+          if (cached) {
+            propertyKey = cached.propertyKey;
+            serviceValue = cached.rawValue;
+            resolvedFrom = 'field-property-cache';
+            break;
+          }
+        }
+      }
+
       // ============================================
       // Pass 1b: Resolve actual property value from config files
       // ============================================
@@ -1553,8 +1843,44 @@ async function extractDownstreamApis(
         }
       }
 
-      // Determine service name
-      const serviceName = propertyKey || parsed.serviceName || 'unknown-service';
+      // Determine service name — enhanced with FeignClient reverse lookup + property key parsing
+      let serviceName = propertyKey || parsed.serviceName || 'unknown-service';
+
+      if (propertyKey && propertyKeyToServiceName.has(propertyKey)) {
+        serviceName = propertyKeyToServiceName.get(propertyKey)!;
+        resolvedFrom = resolvedFrom ? `${resolvedFrom}+feign-lookup` : 'feign-lookup';
+      } else if (propertyKey && servicePropertyCache.has(propertyKey)) {
+        serviceName = servicePropertyCache.get(propertyKey)!;
+        resolvedFrom = resolvedFrom ? `${resolvedFrom}+property-scan` : 'property-scan';
+      } else if (propertyKey && propertyKey.includes('.')) {
+        const parsedKey = parseServiceNameFromPropertyKey(propertyKey);
+        if (parsedKey) {
+          serviceName = parsedKey;
+          resolvedFrom = resolvedFrom ? `${resolvedFrom}+key-parse` : 'key-parse';
+        }
+      }
+
+      // Try hostname extraction from resolved URL value
+      if ((serviceName === 'unknown-service' || serviceName.includes('.')) && resolvedValue) {
+        try {
+          const url = new URL(resolvedValue);
+          if (url.hostname && url.hostname !== 'localhost' && !/^\d+\.\d+\.\d+\.\d+$/.test(url.hostname)) {
+            serviceName = url.hostname.replace(/\./g, '-');
+            resolvedFrom = resolvedFrom ? `${resolvedFrom}+url-hostname` : 'url-hostname';
+          }
+        } catch {}
+      }
+
+      // Final fallback: try to extract from resolvedUrl
+      if (serviceName === 'unknown-service' && resolvedUrl) {
+        try {
+          const url = new URL(resolvedUrl);
+          if (url.hostname && url.hostname !== 'localhost' && !/^\d+\.\d+\.\d+\.\d+$/.test(url.hostname)) {
+            serviceName = url.hostname.replace(/\./g, '-');
+            resolvedFrom = resolvedFrom ? `${resolvedFrom}+url-hostname-fallback` : 'url-hostname-fallback';
+          }
+        } catch {}
+      }
 
       // Build endpoint string - simplified: HTTP_METHOD + /path
       let endpoint: string;
@@ -1625,9 +1951,96 @@ async function extractDownstreamApis(
         };
       }
 
+      // Skip EXCHANGE method entries — RestTemplate.exchange() doesn't reveal
+      // the actual HTTP method at static analysis time, so these are invalid
+      if (detail.httpMethod === 'EXCHANGE') {
+        continue;
+      }
+
       // Normalize endpoint — strip domain, extract service name from URL
+      // Final fallback: derive service name from endpoint path when all resolution failed
+      if (serviceName === 'unknown-service' && endpoint.includes('/')) {
+        // Try all path segments (skip {param} segments) against urlPathToServiceName
+        const segments = endpoint.match(/^([A-Z]+)\s+(.*)/);
+        if (segments) {
+          const pathStr = segments[2] || '';
+          const pathSegs = pathStr.replace(/^https?:\/\/[^/]*/, '').split('/').filter(Boolean);
+          for (const seg of pathSegs) {
+            if (seg.startsWith('{') || seg.length <= 1) continue;
+            const segWithSlash = '/' + seg;
+            const segWithTrailing = segWithSlash + '/';
+            if (urlPathToServiceName.has(segWithTrailing)) {
+              serviceName = urlPathToServiceName.get(segWithTrailing)!;
+              resolvedFrom = resolvedFrom ? `${resolvedFrom}+url-path-map` : 'url-path-map';
+              break;
+            } else if (urlPathToServiceName.has(segWithSlash)) {
+              serviceName = urlPathToServiceName.get(segWithSlash)!;
+              resolvedFrom = resolvedFrom ? `${resolvedFrom}+url-path-map` : 'url-path-map';
+              break;
+            }
+          }
+          // If urlPathToServiceName didn't match, fall back to first non-param segment
+          if (serviceName === 'unknown-service') {
+            const pathMatch = pathStr.match(/^(?:https?:\/\/[^/]+)?\/([^/{\s]+)/);
+            if (pathMatch && pathMatch[1].length > 1) {
+              serviceName = pathMatch[1];
+              resolvedFrom = resolvedFrom ? `${resolvedFrom}+endpoint-path` : 'endpoint-path';
+            }
+          }
+        }
+      }
+
+      // NEW: Variable name heuristic fallback — derive service name from variable/field names
+      if (serviceName === 'unknown-service') {
+        for (const varRef of parsed.variableRefs) {
+          const derived = serviceNameFromVariableName(varRef);
+          if (derived) {
+            serviceName = derived;
+            resolvedFrom = resolvedFrom ? `${resolvedFrom}+variable-name-heuristic` : 'variable-name-heuristic';
+            break;
+          }
+        }
+        // Try builder base expression
+        if (serviceName === 'unknown-service' && builderResult) {
+          const derived = serviceNameFromVariableName(builderResult.baseUrlExpression);
+          if (derived) {
+            serviceName = derived;
+            resolvedFrom = resolvedFrom ? `${resolvedFrom}+variable-name-heuristic` : 'variable-name-heuristic';
+          }
+        }
+        // Try parsed.serviceName (from xxxService pattern)
+        if (serviceName === 'unknown-service' && parsed.serviceName) {
+          const derived = serviceNameFromVariableName(parsed.serviceName + 'Service');
+          if (derived) {
+            serviceName = derived;
+            resolvedFrom = resolvedFrom ? `${resolvedFrom}+variable-name-heuristic` : 'variable-name-heuristic';
+          }
+        }
+        // Try urlExpression itself for simple variable patterns
+        if (serviceName === 'unknown-service') {
+          const derived = serviceNameFromVariableName(detail.urlExpression);
+          if (derived) {
+            serviceName = derived;
+            resolvedFrom = resolvedFrom ? `${resolvedFrom}+variable-name-heuristic` : 'variable-name-heuristic';
+          }
+        }
+        // Last-resort: derive from enclosing class name
+        if (serviceName === 'unknown-service' && className) {
+          const derived = serviceNameFromClassName(className);
+          if (derived) {
+            serviceName = derived;
+            resolvedFrom = resolvedFrom ? `${resolvedFrom}+class-name-heuristic` : 'class-name-heuristic';
+          }
+        }
+      }
+
       const normalized = normalizeEndpoint(endpoint);
       const displayName = deriveDisplayName(resolvedValue, normalized.serviceName, serviceName);
+
+      // Dedup by final service+type+endpoint (different URL expressions may resolve to same endpoint)
+      const outputDedupKey = `${serviceName}|REST|${normalized.endpoint}`;
+      if (seenOutput.has(outputDedupKey)) continue;
+      seenOutput.add(outputDedupKey);
 
       apis.push({
         serviceName,
@@ -1649,6 +2062,132 @@ async function extractDownstreamApis(
   }
 
   return apis;
+}
+
+/**
+ * Parse a Spring property key to extract a meaningful service name segment.
+ * E.g., "tcbs.bond.product.url" → "product"
+ *       "mortgage.service.url" → "mortgage"
+ *       "tcbs.profile.service" → "profile"
+ */
+function parseServiceNameFromPropertyKey(key: string): string | null {
+  let stripped = key.replace(/\.(service\.url|base-?url|url|host|endpoint|base-?path|service)$/, '');
+  if (stripped === key) return null; // no recognized suffix
+  const parts = stripped.split('.');
+  const generic = new Set(['service', 'api', 'app', 'spring', 'url', 'config', 'client', 'core', 'tcbs', 'v1', 'v2', 'v3', 'v4', 'v5']);
+  const meaningful: string[] = [];
+  for (const part of parts) {
+    if (!generic.has(part) && part.length > 1) {
+      meaningful.push(part);
+    }
+  }
+  if (meaningful.length === 0) {
+    return parts[parts.length - 1] || null;
+  }
+  // Return compound name for multi-segment keys (e.g., "bond.product" → "bond-product")
+  if (meaningful.length > 1) {
+    return meaningful.join('-');
+  }
+  return meaningful[0];
+}
+
+/**
+ * Find a property key that fuzzy-matches a Java field name.
+ * Converts camelCase field names to dot-separated property key patterns.
+ * E.g., "bondProductService" → looks for keys matching "bond.product.url", "tcbs.bond.product.url", etc.
+ */
+function findMatchingPropertyKey(fieldName: string, propertyCache: Map<string, string>): string | null {
+  // Strip common suffixes: Service, Url, URL, ServiceUrl, ServiceURL
+  const base = fieldName.replace(/Service(?:Url|URL)?$|Url$|URL$/, '');
+  if (!base || base.length < 3) return null;
+
+  // Convert camelCase to dot-separated: bondProduct → bond.product
+  const dotSeparated = base.replace(/([a-z])([A-Z])/g, '$1.$2').toLowerCase();
+  const segments = dotSeparated.split('.');
+
+  // Try exact and partial matches against propertyCache keys
+  for (const propKey of propertyCache.keys()) {
+    const propSegments = propKey.split('.');
+    // Check if the field segments appear in order in the property key
+    let propIdx = 0;
+    let allMatched = true;
+    for (const seg of segments) {
+      const found = propSegments.slice(propIdx).findIndex(p => p === seg);
+      if (found === -1) { allMatched = false; break; }
+      propIdx += found + 1;
+    }
+    if (allMatched) return propKey;
+  }
+
+  return null;
+}
+
+/**
+ * Derive a service name from a variable/field name by stripping URL/Service suffixes
+ * and converting case format to kebab-case.
+ * E.g., "portfolioServiceUrl" → "portfolio", "MATCHING_URL" → "matching",
+ *       "hftKremaServiceUrl" → "hft-krema", "notiUrl" → "noti"
+ * Returns null for names that are too generic (e.g., "url", "baseUrl", "target").
+ */
+function serviceNameFromVariableName(varName: string): string | null {
+  // Reject names that are too generic to derive a meaningful service name
+  const genericNames = new Set([
+    'url', 'uri', 'baseUrl', 'baseUri', 'base', 'endpoint', 'address',
+    'host', 'server', 'service', 'client', 'connection', 'config',
+    'target', 'builder', 'result', 'response', 'request', 'path',
+    'id', 'name', 'value', 'key', 'type', 'code', 'data', 'str',
+    'obj', 'object', 'map', 'list', 'set', 'val', 'ref', 'tmp',
+    // Method call patterns that shouldn't become service names
+    'tostring', 'touristring', 'to-uri-string', 'to-string',
+    // Common path parameter names that shouldn't become service names
+    'tcbsid', 'orderid', 'productcode', 'bondcode', 'assetid',
+    'tradingid', 'mechanismtype', 'sectype', 'system',
+  ]);
+  // Reject expressions containing dots, parentheses, or other non-identifier chars
+  if (/[.(){}<>+\-\s]/.test(varName)) return null;
+
+  const lower = varName.toLowerCase();
+  if (genericNames.has(lower)) return null;
+
+  // Strip suffixes in specificity order (longest/most-specific first)
+  const suffixes = [
+    'ServiceUrl', 'ServiceURL', 'ServiceURI',
+    '_SERVICE_URL', '_SERVICE_URI',
+    '_URL', '_URI',
+    'Service', 'Url', 'URL', 'Uri', 'URI',
+  ];
+  let base = varName;
+  for (const suffix of suffixes) {
+    if (base.endsWith(suffix)) {
+      base = base.slice(0, -suffix.length);
+      break;
+    }
+  }
+  if (!base || base.length < 2) return null;
+
+  // Also reject the base if it's a generic term after suffix stripping
+  if (genericNames.has(base.toLowerCase())) return null;
+
+  // SCREAMING_SNAKE_CASE → kebab-case
+  if (/^[A-Z][A-Z0-9_]*$/.test(base)) {
+    return base.toLowerCase().replace(/_/g, '-');
+  }
+  // camelCase/PascalCase → kebab-case
+  return base.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
+}
+
+/**
+ * Derive a service name from a class name as a last-resort heuristic.
+ * Strips common suffixes (ServiceImpl, Controller, etc.) and converts to kebab-case.
+ * Returns null if the result is too short or too generic.
+ */
+function serviceNameFromClassName(className: string): string | null {
+  const base = className.replace(
+    /(ServiceImpl|Service|Controller|Component|Config(?:uration)?|Handler|Provider|Client|Repository|Impl)$/,
+    ''
+  );
+  if (!base || base.length < 3) return null;
+  return base.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
 }
 
 function extractServiceName(urlExpression: string): string {
@@ -1698,8 +2237,26 @@ export function normalizeEndpoint(endpoint: string): {
   const method = endpoint.slice(0, spaceIdx);
   const rawPath = endpoint.slice(spaceIdx + 1);
 
-  // Not a URL or absolute path — raw code expression, skip normalization
+  // Not a URL or absolute path — could be a code expression or a relative path
   if (!rawPath.startsWith('http://') && !rawPath.startsWith('https://') && !rawPath.startsWith('/')) {
+    // Code expressions contain operators, method calls, or variable patterns that are NOT paths
+    const isCodeExpression = /^[a-zA-Z_$]/.test(rawPath) && (
+      rawPath.includes(' + ') ||
+      rawPath.includes('(') ||
+      rawPath.includes(')')
+    );
+    // If it looks like a relative API path (not a code expression, contains /), normalize it
+    if (!isCodeExpression && rawPath.includes('/')) {
+      let normalized = rawPath.startsWith('/') ? rawPath : '/' + rawPath;
+      // Strip trailing slash (except root path)
+      if (normalized.length > 1 && normalized.endsWith('/')) {
+        normalized = normalized.slice(0, -1);
+      }
+      const segments = normalized.split('/').filter(Boolean);
+      const serviceName = segments[0] ?? null;
+      return { method, serviceName, endpoint: `${method} ${normalized}` };
+    }
+    // Otherwise it's a code expression like "url" or "builder.toUriString()" — skip normalization
     return { method, serviceName: null, endpoint };
   }
 
@@ -1714,26 +2271,30 @@ export function normalizeEndpoint(endpoint: string): {
       // Decode URL-encoded path parameters ({id} → not %7Bid%7D)
       const decodedPath = decodeURIComponent(pathPart);
 
+      // Mask internal IP addresses to [internal]
+      const isInternalIp = /^\d+\.\d+\.\d+\.\d+$/.test(url.hostname);
+
       if (url.pathname === '/' || url.pathname === '') {
-        // Only domain, no meaningful path — keep full URL as endpoint
-        return { method, serviceName: url.hostname, endpoint: `${method} ${rawPath}` };
+        // Only domain, no meaningful path — use masked endpoint for internal IPs
+        const displayEndpoint = isInternalIp ? `${method} [internal]` : `${method} ${rawPath}`;
+        return { method, serviceName: isInternalIp ? '[internal]' : url.hostname, endpoint: displayEndpoint };
       }
 
       cleanPath = decodedPath;
-      // First path segment = service name
+      // First path segment = service name (skip path variable patterns)
       const segments = url.pathname.split('/').filter(Boolean);
-      if (segments.length > 0) {
-        urlServiceName = segments[0];
-      }
+      urlServiceName = isInternalIp ? '[internal]' : (segments.find(seg => !PATH_VAR_RE.test(seg)) ?? null);
     } catch {
       // Malformed URL — don't normalize
       return { method, serviceName: null, endpoint };
     }
   } else {
-    // Relative path — first segment is service name
+    // Relative path — first non-parameter segment is service name
     const segments = rawPath.split('/').filter(Boolean);
-    if (segments.length > 0) {
-      urlServiceName = segments[0];
+    urlServiceName = segments.find(seg => !PATH_VAR_RE.test(seg)) ?? null;
+    // Ensure relative paths start with /
+    if (!cleanPath.startsWith('/')) {
+      cleanPath = '/' + cleanPath;
     }
   }
 
@@ -2010,6 +2571,64 @@ async function resolveValueAnnotation(
 }
 
 /**
+ * Cross-class @Value resolution: search ALL classes for a field with the given name
+ * that has an @Value annotation. This catches cases where the handler class doesn't
+ * have the @Value field directly (delegates to a service class).
+ */
+const crossClassValueCache = new Map<string, { propertyKey: string | null; rawValue: string | null; declaringClass: string | null }>();
+
+async function resolveValueAnnotationCrossClass(
+  executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
+  repoId: string,
+  fieldName: string
+): Promise<{ propertyKey: string | null; rawValue: string | null; declaringClass: string | null }> {
+  if (crossClassValueCache.has(fieldName)) {
+    return crossClassValueCache.get(fieldName)!;
+  }
+
+  // Use CONTAINS filter to find classes with the field name, then parse client-side
+  const query = `
+    MATCH (c:Class)
+    WHERE c.fields IS NOT NULL AND c.fields CONTAINS $fieldName
+    RETURN c.fields AS fields, c.name AS className
+    LIMIT 50
+  `;
+
+  try {
+    const rows = await executeQuery(repoId, query, { fieldName: `"name":"${fieldName}"` });
+    for (const row of rows) {
+      const fieldsJson = row.fields || row[0];
+      if (!fieldsJson) continue;
+      try {
+        const fields = JSON.parse(fieldsJson);
+        const field = fields.find((f: any) => f.name === fieldName);
+        if (field?.annotationAttrs) {
+          const valueAnn = field.annotationAttrs.find((a: any) => a.name === '@Value');
+          if (valueAnn?.attrs) {
+            const rawValue = valueAnn.attrs['0'] || valueAnn.attrs['value'];
+            if (rawValue) {
+              const match = rawValue.match(/\$\{([^}]+)\}/);
+              const result = {
+                propertyKey: match ? match[1] : rawValue,
+                rawValue,
+                declaringClass: row.className || row[1] || null,
+              };
+              crossClassValueCache.set(fieldName, result);
+              return result;
+            }
+          }
+        }
+      } catch {}
+    }
+    crossClassValueCache.set(fieldName, { propertyKey: null, rawValue: null, declaringClass: null });
+  } catch (e) {
+    if (DEBUG) console.error('[GitNexus DEBUG] Cross-class @Value resolution failed:', e);
+  }
+
+  return { propertyKey: null, rawValue: null, declaringClass: null };
+}
+
+/**
  * Resolves the actual value of a property from Property nodes (application.properties/yml).
  * Queries the graph for Property nodes with matching key and returns the actual value.
  * 
@@ -2030,6 +2649,32 @@ async function resolveValueAnnotation(
  * @param propertyKey - Property key to look up (e.g., "tcbs.bond.product.url")
  * @returns The actual property value from config files, or null if not found
  */
+/**
+ * Parse a property value from Property node content, which may be a single value
+ * or a multi-line config block containing the propertyKey=value line.
+ */
+function parsePropertyValueFromContent(propertyKey: string, content: string): string | null {
+  if (!content) return null;
+  // Single-line value (no newlines, doesn't contain '=' meaning it's the raw value)
+  if (!content.includes('\n') && (content.startsWith('http') || content.startsWith('/') || !content.includes('='))) {
+    return content.trim();
+  }
+  // Multi-line: find the line starting with propertyKey=
+  const lines = content.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#') || trimmed.startsWith('!') || trimmed === '') continue;
+    if (trimmed.startsWith(propertyKey + '=') || trimmed.startsWith(propertyKey + ':')) {
+      const sepIdx = trimmed.indexOf('=') !== -1 ? trimmed.indexOf('=') : trimmed.indexOf(':');
+      if (sepIdx > 0) {
+        const value = trimmed.substring(sepIdx + 1).trim();
+        if (value) return value;
+      }
+    }
+  }
+  return null;
+}
+
 async function resolvePropertyValue(
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
   repoId: string,
@@ -2149,7 +2794,21 @@ async function traceVariableAssignment(
           }
         }
         
-        // Step 1b: Try @Value annotation resolution for regular fields
+        // Step 1b: Try to resolve string concatenation like "baseUrl + path"
+        if (!baseField) {
+          const concatMatch = expression.match(/^["']([^"']+)["']\s*\+\s*(\w+)$/);
+          if (concatMatch) {
+            const literalPart = concatMatch[1];
+            const varPart = concatMatch[2];
+            const resolved = await resolveValueAnnotation(executeQuery, repoId, className, varPart);
+            if (resolved.propertyKey) {
+              return { propertyKey: literalPart + resolved.rawValue, rawValue: literalPart + resolved.rawValue, fieldName: varPart };
+            }
+            return { propertyKey: literalPart, rawValue: literalPart, fieldName: varPart };
+          }
+        }
+
+        // Step 1c: Try @Value annotation resolution for regular fields
         const resolved = await resolveValueAnnotation(executeQuery, repoId, className, baseField);
         if (resolved.propertyKey) {
           return { propertyKey: resolved.propertyKey, rawValue: resolved.rawValue, fieldName: baseField };
@@ -2242,6 +2901,42 @@ function resolveBuilderUrl(
           };
         }
       }
+    }
+  }
+
+  // Pattern 3: Direct UriComponentsBuilder call in URL expression
+  // e.g., UriComponentsBuilder.fromHttpUrl(baseUrl).path(segment)
+  const directUriBuilderMatch = urlExpression.match(
+    /UriComponentsBuilder\.(fromHttpUrl|fromUriString)\(([^)]+)\)/
+  );
+  if (directUriBuilderMatch) {
+    return {
+      baseUrlExpression: directUriBuilderMatch[2].trim(),
+      builderVar: 'UriComponentsBuilder',
+    };
+  }
+
+  // Pattern 4: UriComponentsBuilder with concatenation
+  // e.g., UriComponentsBuilder.fromUriString(cashBridgeUrl + PATH_BOND_HOLD)
+  const fromUriConcatMatch = urlExpression.match(
+    /UriComponentsBuilder\.(fromHttpUrl|fromUriString)\((\w+)\s*\+/
+  );
+  if (fromUriConcatMatch) {
+    return {
+      baseUrlExpression: fromUriConcatMatch[2].trim(),
+      builderVar: 'UriComponentsBuilder',
+    };
+  }
+
+  // Pattern 5: Direct builder reference without .toUriString()
+  // e.g., just "builder" when the builderDetails have the base URL
+  if (/^[a-zA-Z]\w*$/.test(urlExpression)) {
+    const builder = builderDetails.find(b => b.builderVar === urlExpression);
+    if (builder) {
+      return {
+        baseUrlExpression: builder.baseUrlExpression,
+        builderVar: builder.builderVar,
+      };
     }
   }
 
@@ -2512,18 +3207,25 @@ async function resolveTypeSchema(
         }
       }
       typeArgs.push(argsStr.slice(segStart).trim());
-      // We'll map generic params to actual types after class resolution
-      // (T -> TransactionViewDto, ? -> Object, etc.)
+      // Map generic parameter names to actual type arguments.
+      // Convention: 1-arg → T→arg; 2-args → K→arg0, V→arg1; 3+ → T0→arg0, T1→arg1, …
       genericParams = new Map();
-      for (const arg of typeArgs) {
-        // Normalize wildcards to Object
-        const normalizedArg = (arg === '?' || arg === '*') ? 'Object' : arg;
-        genericParams.set('T', normalizedArg); // Simple: map 'T' to the actual type
-        // Also map E, K, V for common Java conventions
-        if (typeArgs.length >= 2) {
-          genericParams.set('K', typeArgs[0] === '?' || typeArgs[0] === '*' ? 'Object' : typeArgs[0]);
-          genericParams.set('V', normalizedArg);
+      const normalizeArg = (arg: string) => (arg === '?' || arg === '*') ? 'Object' : arg;
+      if (typeArgs.length === 1) {
+        genericParams.set('T', normalizeArg(typeArgs[0]));
+      } else if (typeArgs.length === 2) {
+        // Map<K, V> convention
+        genericParams.set('K', normalizeArg(typeArgs[0]));
+        genericParams.set('V', normalizeArg(typeArgs[1]));
+        // Also map T for classes that use T for the value type (e.g., ResponseEntity<T>)
+        genericParams.set('T', normalizeArg(typeArgs[1]));
+      } else {
+        // Positional: T0, T1, T2, …
+        for (let i = 0; i < typeArgs.length; i++) {
+          genericParams.set(`T${i}`, normalizeArg(typeArgs[i]));
         }
+        // Also map T to first arg as fallback
+        genericParams.set('T', normalizeArg(typeArgs[0]));
       }
     }
   }
@@ -2775,9 +3477,9 @@ function embedNestedSchemas(
     return schema;
   }
 
-  // Prevent circular references
+  // Prevent circular references — emit a $ref marker for recursive types
   if (visited.has(schema.typeName)) {
-    return schema;
+    return { ...schema, fields: schema.fields, _recursiveRef: schema.typeName };
   }
 
   const newVisited = new Set(visited);
@@ -3941,6 +4643,25 @@ export async function extractPersistence(
     } catch (e) {
       if (DEBUG) console.error('[GitNexus DEBUG] Persistence database heuristic failed:', e);
       // Fall through to TODO_AI_ENRICH
+    }
+
+    // Broader fallback: search for @Entity annotation on any class ending with the entity suffix
+    if (database === TODO_AI_ENRICH) {
+      try {
+        for (const tableName of tables) {
+          const entityResult = await executeQuery(
+            repoId,
+            `MATCH (c:Class) WHERE c.annotations IS NOT NULL AND c.annotations CONTAINS '@Entity' AND c.name ENDS WITH $entitySuffix RETURN c.name AS name, c.annotations AS annotations LIMIT 1`,
+            { entitySuffix: tableName }
+          );
+          if (entityResult.length > 0) {
+            database = 'JPA';
+            break;
+          }
+        }
+      } catch (e) {
+        if (DEBUG) console.error('[GitNexus DEBUG] Broader @Entity search failed:', e);
+      }
     }
   }
 

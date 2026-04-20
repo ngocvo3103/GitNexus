@@ -5465,6 +5465,10 @@ describe('WI-6 persistence database heuristics', () => {
     }];
 
     const mockExecuteQuery = vi.fn().mockImplementation(async (_repoId: string, query: string, params: Record<string, any>) => {
+      // Broader @Entity fallback finds no @Entity in this scenario
+      if (query.includes("'@Entity'")) {
+        return [];
+      }
       if (query.includes('MATCH (c:Class)')) {
         return [{
           name: 'User',
@@ -5637,6 +5641,10 @@ describe('WI-6 persistence database heuristics', () => {
     }];
 
     const mockExecuteQuery = vi.fn().mockImplementation(async (_repoId: string, query: string, params: Record<string, any>) => {
+      // Broader @Entity fallback finds no @Entity in this scenario
+      if (query.includes("'@Entity'")) {
+        return [];
+      }
       if (query.includes('MATCH (c:Class)')) {
         return [{ name: 'User', annotations: JSON.stringify([{ name: '@Component' }]) }];
       }
@@ -5697,6 +5705,10 @@ describe('WI-6 persistence database heuristics', () => {
     }];
 
     const mockExecuteQuery2 = vi.fn().mockImplementation(async (_repoId: string, query: string, _params: Record<string, any>) => {
+      // Broader @Entity fallback finds no @Entity in this scenario
+      if (query.includes("'@Entity'")) {
+        return [];
+      }
       if (query.includes('MATCH (c:Class)')) {
         return [{
           name: 'User',
@@ -6563,11 +6575,11 @@ describe('normalizeEndpoint', () => {
     expect(result.endpoint).toBe('POST /matching-engine/');
   });
 
-  it('handles IP address URL with only slash — keeps full URL', () => {
+  it('handles IP address URL with only slash — masks internal IP', () => {
     const result = normalizeEndpoint('EXCHANGE http://10.7.2.85:8092/');
     expect(result.method).toBe('EXCHANGE');
-    expect(result.endpoint).toBe('EXCHANGE http://10.7.2.85:8092/');
-    expect(result.serviceName).toBe('10.7.2.85');
+    expect(result.endpoint).toBe('EXCHANGE [internal]');
+    expect(result.serviceName).toBe('[internal]');
   });
 
   it('handles URL with port and meaningful path', () => {
@@ -6647,10 +6659,10 @@ describe('normalizeEndpoint', () => {
     expect(result.endpoint).toBe('PATCH /v1/items/{id}');
   });
 
-  it('handles non-standard EXCHANGE method with path', () => {
+  it('handles non-standard EXCHANGE method with path — masks internal IP', () => {
     const result = normalizeEndpoint('EXCHANGE http://10.7.2.85:8092/api');
     expect(result.method).toBe('EXCHANGE');
-    expect(result.serviceName).toBe('api');
+    expect(result.serviceName).toBe('[internal]');
     expect(result.endpoint).toBe('EXCHANGE /api');
   });
 });

@@ -22,6 +22,7 @@ export interface BodySchema {
   fields?: BodySchemaField[];
   repoId?: string;
   isContainer?: boolean;
+  _recursiveRef?: string;
 }
 
 export interface ValidationRule {
@@ -204,6 +205,11 @@ function isCollectionType(type: string): boolean {
 export function bodySchemaToOpenAPISchema(schema: BodySchema | null | undefined): OpenAPISchema {
   if (!schema) {
     return {};
+  }
+
+  // Recursive type — emit $ref instead of expanding to prevent infinite recursion
+  if (schema._recursiveRef) {
+    return { $ref: `#/${schema._recursiveRef}` };
   }
 
   if (schema.isContainer) {
