@@ -84,6 +84,71 @@ const VALID_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 
 /** Regex to detect path variable patterns like {id}, {orderId} */
 const PATH_VAR_RE = /^\{.+\}$/;
 
+/** Regex to extract all path variables from a route path */
+const PATH_VARS_IN_ROUTE_RE = /\{([^}]+)\}/g;
+
+/**
+ * Extract path variable names from a route path.
+ * E.g., '/e/v5/customers/{tcbsId}/assets/{assetId}' → ['tcbsId', 'assetId']
+ */
+function extractPathVariablesFromRoute(routePath: string): string[] {
+  const vars: string[] = [];
+  let match;
+  while ((match = PATH_VARS_IN_ROUTE_RE.exec(routePath)) !== null) {
+    vars.push(match[1]);
+  }
+  // Reset regex lastIndex for reuse
+  PATH_VARS_IN_ROUTE_RE.lastIndex = 0;
+  return vars;
+}
+
+/**
+ * Extract @PathVariable names from parameterAnnotations JSON string.
+ * Returns the set of path variable names that are covered by @PathVariable annotations.
+ *
+ * @param paramAnnsJson - JSON string like '[{"name":"tcbsId","type":"String","annotations":["@PathVariable(\"tcbsId\")"]}]'
+ * @returns Set of path variable names covered by @PathVariable annotations
+ */
+function extractPathVariableNames(paramAnnsJson: string | undefined): Set<string> {
+  const pathVars = new Set<string>();
+  if (!paramAnnsJson || typeof paramAnnsJson !== 'string') {
+    return pathVars;
+  }
+  try {
+    const params = JSON.parse(paramAnnsJson);
+    for (const p of params) {
+      const annotations = p.annotations || [];
+      for (const ann of annotations) {
+        // Match @PathVariable("varName") or @PathVariable
+        if (ann.startsWith('@PathVariable')) {
+          // Extract argument if present: @PathVariable("tcbsId")
+          const argMatch = ann.match(/@PathVariable\s*\(\s*"([^"]+)"\s*\)/);
+          if (argMatch) {
+            pathVars.add(argMatch[1]);
+          } else if (p.name) {
+            // No argument: use parameter name
+            pathVars.add(p.name);
+          }
+        }
+      }
+    }
+  } catch { /* ignore parse errors */ }
+  return pathVars;
+}
+
+/**
+ * Check if @PathVariable annotations cover all path variables in the route path.
+ * Returns true if all path variables in the route are covered by @PathVariable annotations.
+ */
+function hasPathVariableCoverage(paramAnnsJson: string | undefined, routePath: string): boolean {
+  const requiredVars = extractPathVariablesFromRoute(routePath);
+  if (requiredVars.length === 0) {
+    return true; // No path variables required
+  }
+  const coveredVars = extractPathVariableNames(paramAnnsJson);
+  return requiredVars.every(v => coveredVars.has(v));
+}
+
 /** Spring annotations that map request parameters */
 const REQUEST_PARAM_ANNOTATIONS = new Set([
   '@PathVariable', '@RequestParam', '@RequestHeader', '@CookieValue'
@@ -823,7 +888,7 @@ export async function documentEndpoint(
       if (!verifyResult || verifyResult.length === 0) {
         validHandlerUid = undefined; // Method node not found, will fall back
       } else if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
-        // Step 2a-ov: For mutating HTTP methods, check if the resolved handler has @RequestBody.
+        // Step 2a-ov-rb: For mutating HTTP methods, check if the resolved handler has @RequestBody.
         // If not, try overload variants (:1, :2, etc.) that may have @RequestBody instead.
         // This handles the case where the ingestion indexed the @RequestParam overload
         // instead of the @RequestBody overload for the same method name.
@@ -869,6 +934,49 @@ export async function documentEndpoint(
                     break;
                   }
                 } catch { /* ignore parse errors */ }
+              }
+            }
+          }
+        }
+      }
+
+      // Step 2a-ov-pv: For ALL methods, check if the resolved handler has @PathVariable coverage.
+      // If the route path has path variables like {tcbsId} but the handler's @PathVariable
+      // annotations don't cover them, try overload variants that may have proper @PathVariable.
+      if (validHandlerUid) {
+        const pathVars = extractPathVariablesFromRoute(route.path);
+        if (pathVars.length > 0) {
+          const paramQuery = `MATCH (m:Method {id: $uid}) RETURN m.parameterAnnotations AS paramAnns LIMIT 1`;
+          const paramResult = await executeParameterized(repo.id, paramQuery, { uid: validHandlerUid });
+          const paramAnns = paramResult?.[0]?.paramAnns ?? paramResult?.[0]?.[0];
+          const hasPathVarCoverage = hasPathVariableCoverage(paramAnns, route.path);
+
+          if (!hasPathVarCoverage) {
+            // Try overload variants :1, :2, ... :10
+            for (let overloadIdx = 1; overloadIdx <= 10; overloadIdx++) {
+              const overloadUid = `${handlerUid}:${overloadIdx}`;
+              const overloadResult = await executeParameterized(repo.id,
+                `MATCH (m:Method {id: $uid}) RETURN m.parameterAnnotations AS paramAnns LIMIT 1`,
+                { uid: overloadUid }
+              );
+              if (overloadResult && overloadResult.length > 0) {
+                const overloadParamAnns = overloadResult[0].paramAnns ?? overloadResult[0][0];
+                if (hasPathVariableCoverage(overloadParamAnns, route.path)) {
+                  validHandlerUid = overloadUid;
+                  // Also update the route path to match the overload's actual URL template.
+                  try {
+                    const overloadRouteResult = await executeParameterized(repo.id,
+                      `MATCH (r:Route)-[:CodeRelation{CALLS}]->(m:Method {id: $uid}) RETURN r.routePath AS path LIMIT 1`,
+                      { uid: overloadUid }
+                    );
+                    if (overloadRouteResult?.[0]?.path) {
+                      route = { ...route, path: overloadRouteResult[0].path };
+                      if (DEBUG) console.error(`[GitNexus DEBUG] Updated route.path to ${route.path} for overload ${overloadUid}`);
+                    }
+                  } catch { /* keep original route on error */ }
+                  if (DEBUG) console.error(`[GitNexus DEBUG] Switched to overload variant ${overloadUid} (has @PathVariable coverage for ${pathVars.join(', ')})`);
+                  break;
+                }
               }
             }
           }
@@ -1141,7 +1249,7 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
   // Run all four independent async operations in parallel for better performance
   const [downstreamApis, bodyResult, messagingResult, persistence] = await Promise.all([
     extractDownstreamApis(chain, executeQuery, repoId, includeContext, crossRepo),
-    extractBodySchemas(chain, executeQuery, repoId, crossRepo),
+    extractBodySchemas(chain, executeQuery, repoId, crossRepo, method),
     extractMessaging(chain, includeContext, executeQuery, repoId, crossRepo),
     extractPersistence(chain, executeQuery, repoId),
   ]);
@@ -3066,7 +3174,8 @@ async function extractBodySchemas(
   chain: ChainNode[],
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
   repoId: string,
-  crossRepo?: CrossRepoContext
+  crossRepo?: CrossRepoContext,
+  httpMethod?: string
 ): Promise<{ requestBody: BodySchema | null; responseBody: BodySchema | null; nestedSchemas: Map<string, BodySchema> }> {
   // Find handler node (depth 0)
   const handler = chain.find(n => n.depth === 0);
@@ -3083,18 +3192,58 @@ async function extractBodySchemas(
   let responseVisited = new Set<string>();
 
   // Resolve @RequestBody parameter
+  // First try primary handler's parameterAnnotations
+  let bodyParamType: string | null = null;
   if (handler.parameterAnnotations) {
     try {
       const rawParams = JSON.parse(handler.parameterAnnotations);
       const params = transformParameterAnnotations(rawParams);
       const bodyParam = params.find((p: any) => p.annotations?.includes('@RequestBody'));
       if (bodyParam?.type) {
-        requestBody = await resolveTypeSchema(bodyParam.type, executeQuery, repoId, requestVisited, crossRepo);
+        bodyParamType = bodyParam.type;
       }
     } catch (e) {
       if (DEBUG) console.error('[GitNexus DEBUG] Request body resolution failed:', e);
       // Ignore parse errors
     }
+  }
+
+  // Fallback: Try overload variants for POST/PUT/PATCH when primary handler has no @RequestBody
+  // This handles cases where the graph DB Method node for the non-@RequestBody overload
+  // was returned but the actual handler has @RequestBody (e.g., same method name with different params)
+  if (!bodyParamType && httpMethod && ['POST', 'PUT', 'PATCH'].includes(httpMethod.toUpperCase())) {
+    const baseUid = handler.uid;
+    for (let overloadIdx = 1; overloadIdx <= 10; overloadIdx++) {
+      const overloadUid = `${baseUid}:${overloadIdx}`;
+      try {
+        const overloadResult = await executeQuery(repoId,
+          `MATCH (m:Method {id: $uid}) RETURN m.parameterAnnotations AS paramAnns LIMIT 1`,
+          { uid: overloadUid }
+        );
+        if (overloadResult && overloadResult.length > 0) {
+          const overloadParamAnns = overloadResult[0].paramAnns ?? overloadResult[0][0];
+          if (typeof overloadParamAnns === 'string' && overloadParamAnns) {
+            try {
+              const parsed = JSON.parse(overloadParamAnns);
+              const params = transformParameterAnnotations(parsed);
+              const bodyParam = params.find((p: any) => p.annotations?.includes('@RequestBody'));
+              if (bodyParam?.type) {
+                bodyParamType = bodyParam.type;
+                if (DEBUG) console.error(`[GitNexus DEBUG] Found @RequestBody in overload variant ${overloadUid}`);
+                break;
+              }
+            } catch { /* ignore parse errors */ }
+          }
+        }
+      } catch (e) {
+        if (DEBUG) console.error(`[GitNexus DEBUG] Overload variant query failed for ${overloadUid}:`, e);
+      }
+    }
+  }
+
+  // Resolve the body type if found
+  if (bodyParamType) {
+    requestBody = await resolveTypeSchema(bodyParamType, executeQuery, repoId, requestVisited, crossRepo);
   }
 
   // Resolve return type
@@ -4569,6 +4718,30 @@ export async function extractPersistence(
     return stripped.charAt(0).toUpperCase() + stripped.slice(1);
   };
 
+  // Bug C fix: Generate entity name variants to handle different naming conventions
+  // e.g., userRepository → User, UserEntity, Users, TblUser, user, etc.
+  const generateEntityVariants = (entityName: string): string[] => {
+    const variants = new Set<string>();
+    // Original: User
+    variants.add(entityName);
+    // With Entity suffix: UserEntity
+    variants.add(entityName + 'Entity');
+    // Plural: Users
+    variants.add(entityName + 's');
+    // With Tbl prefix: TblUser
+    variants.add('Tbl' + entityName);
+    // Lowercase: user
+    variants.add(entityName.toLowerCase());
+    // snake_case: user (for table names like user_account)
+    const snakeCase = entityName.replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '');
+    variants.add(snakeCase);
+    // All uppercase: USER
+    variants.add(entityName.toUpperCase());
+    // Camel to underscore plural: users
+    variants.add(snakeCase + 's');
+    return Array.from(variants);
+  };
+
   // WI-3: Derive CRUD operation from repository method name
   const deriveOperation = (methodName: string): string => {
     const lower = methodName.toLowerCase();
@@ -4599,43 +4772,74 @@ export async function extractPersistence(
   let database: string = TODO_AI_ENRICH;
 
   if (executeQuery && repoId) {
-    // Query for Entity/Table annotations on the identified table classes
-    // Pattern 1: @Table(schema = "schema_name") — wins over @Entity
-    // Pattern 2: @Entity — indicates JPA entity (usually same DB as other entities)
+    // Bug C fix: Query using entity name variants for better matching
+    // Single query per table with all variants to reduce DB hits
     const entityQuery = `
       MATCH (c:Class)
-      WHERE c.name CONTAINS $tableName
-         OR c.name ENDS WITH $tableName
+      WHERE c.name IN $entityVariants
+         OR ANY(v IN $entityVariants WHERE c.name CONTAINS v)
+         OR ANY(v IN $entityVariants WHERE c.name ENDS WITH v)
       RETURN c.name AS name, c.annotations AS annotations
-      LIMIT 5
+      LIMIT 10
     `;
 
     try {
       for (const tableName of tables) {
-        const results = await executeQuery(repoId, entityQuery, { tableName });
+        const entityVariants = generateEntityVariants(tableName);
+        const results = await executeQuery(repoId, entityQuery, { entityVariants });
+
+        if (DEBUG && results.length === 0) {
+          console.error(`[GitNexus DEBUG] No entity class found for variants: ${entityVariants.join(', ')}`);
+        }
+
         for (const row of results) {
           const annotationsRaw = row.annotations;
-          if (annotationsRaw) {
-            let annotations: Array<{ name: string; attrs?: Record<string, any> }>;
-            try {
-              annotations = typeof annotationsRaw === 'string' ? JSON.parse(annotationsRaw) : annotationsRaw;
-            } catch {
-              continue;
-            }
+          if (!annotationsRaw) continue;
 
-            // WI-6: Check @Table first (wins over @Entity)
-            const tableAnn = annotations.find(a => a.name === '@Table');
-            if (tableAnn?.attrs?.schema) {
-              database = tableAnn.attrs.schema;
+          let annotations: Array<{ name: string; attrs?: Record<string, any> }>;
+          try {
+            annotations = typeof annotationsRaw === 'string' ? JSON.parse(annotationsRaw) : annotationsRaw;
+          } catch {
+            // Bug C fix: Try parsing raw annotation text for @Table schema
+            if (typeof annotationsRaw === 'string' && annotationsRaw.includes('@Table')) {
+              const schemaMatch = annotationsRaw.match(/@Table\([^)]*schema\s*=\s*"([^"]+)"/i);
+              if (schemaMatch) {
+                database = schemaMatch[1];
+                if (DEBUG) console.error(`[GitNexus DEBUG] Extracted schema from raw @Table: ${database}`);
+                break;
+              }
+              // Also try @Schema annotation
+              const schemaAttrMatch = annotationsRaw.match(/@Schema\s*\(\s*[^)]*name\s*=\s*"([^"]+)"/i);
+              if (schemaAttrMatch) {
+                database = schemaAttrMatch[1];
+                if (DEBUG) console.error(`[GitNexus DEBUG] Extracted schema from raw @Schema: ${database}`);
+                break;
+              }
+            }
+            continue;
+          }
+
+          // WI-6: Check @Table first (wins over @Entity)
+          const tableAnn = annotations.find(a => a.name === '@Table');
+          if (tableAnn?.attrs?.schema) {
+            database = tableAnn.attrs.schema;
+            break;
+          }
+
+          // Bug C fix: @Table with name but no schema - check @Schema annotation
+          if (tableAnn?.attrs?.name && !tableAnn.attrs.schema) {
+            const schemaAnn = annotations.find(a => a.name === '@Schema');
+            if (schemaAnn?.attrs?.name) {
+              database = schemaAnn.attrs.name;
               break;
             }
+          }
 
-            // WI-6: Fall back to @Entity presence (JPA-managed entity)
-            const entityAnn = annotations.find(a => a.name === '@Entity');
-            if (entityAnn && database === TODO_AI_ENRICH) {
-              // @Entity found but no schema info — use JPA default
-              database = 'JPA';
-            }
+          // WI-6: Fall back to @Entity presence (JPA-managed entity)
+          const entityAnn = annotations.find(a => a.name === '@Entity');
+          if (entityAnn && database === TODO_AI_ENRICH) {
+            // @Entity found but no schema info — use JPA default
+            database = 'JPA';
           }
         }
         if (database !== TODO_AI_ENRICH) break;
@@ -4645,14 +4849,15 @@ export async function extractPersistence(
       // Fall through to TODO_AI_ENRICH
     }
 
-    // Broader fallback: search for @Entity annotation on any class ending with the entity suffix
+    // Broader fallback: search for @Entity annotation on any class matching entity variants
     if (database === TODO_AI_ENRICH) {
       try {
         for (const tableName of tables) {
+          const entityVariants = generateEntityVariants(tableName);
           const entityResult = await executeQuery(
             repoId,
-            `MATCH (c:Class) WHERE c.annotations IS NOT NULL AND c.annotations CONTAINS '@Entity' AND c.name ENDS WITH $entitySuffix RETURN c.name AS name, c.annotations AS annotations LIMIT 1`,
-            { entitySuffix: tableName }
+            `MATCH (c:Class) WHERE c.annotations IS NOT NULL AND c.annotations CONTAINS '@Entity' AND (c.name IN $entityVariants OR ANY(v IN $entityVariants WHERE c.name ENDS WITH v)) RETURN c.name AS name, c.annotations AS annotations LIMIT 1`,
+            { entityVariants }
           );
           if (entityResult.length > 0) {
             database = 'JPA';
@@ -4661,6 +4866,23 @@ export async function extractPersistence(
         }
       } catch (e) {
         if (DEBUG) console.error('[GitNexus DEBUG] Broader @Entity search failed:', e);
+      }
+    }
+
+    // Bug C fix: Last resort - check if any @Entity exists in the project (most Spring apps use single DB)
+    if (database === TODO_AI_ENRICH && tables.size > 0) {
+      try {
+        const anyEntityResult = await executeQuery(
+          repoId,
+          `MATCH (c:Class) WHERE c.annotations IS NOT NULL AND c.annotations CONTAINS '@Entity' RETURN c.name AS name LIMIT 1`,
+          {}
+        );
+        if (anyEntityResult.length > 0) {
+          database = 'JPA';
+          if (DEBUG) console.error(`[GitNexus DEBUG] Found @Entity in project, defaulting to JPA`);
+        }
+      } catch (e) {
+        if (DEBUG) console.error('[GitNexus DEBUG] Any @Entity search failed:', e);
       }
     }
   }

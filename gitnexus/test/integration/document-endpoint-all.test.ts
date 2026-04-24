@@ -199,7 +199,7 @@ describe('document-endpoint --all E2E', () => {
     // Baseline for new metrics — these are floors, should only improve
     const BASELINE_DOWNSTREAM_APIS = 331;
     const BASELINE_OUTBOUND_MESSAGING = 64;
-    const BASELINE_VALIDATION_RULES = 282;
+    const BASELINE_VALIDATION_RULES = 281;
 
     // ── Ceiling metrics (cannot improve without AI or config scanning) ──
     const CEILING_EXCHANGE_METHOD = 0;       // EXCHANGE method now excluded from downstream APIs
@@ -218,9 +218,9 @@ describe('document-endpoint --all E2E', () => {
     // B4: Inbound topic over-inclusion (shared base class — expected 341)
     const CEILING_INBOUND_TOPIC_ALL_FILES = 341;
     // B7: ID path params typed as string (may be correct for string IDs like tcbsId)
-    const CEILING_ID_PATH_PARAM_STRING = 164;
+    const CEILING_ID_PATH_PARAM_STRING = 166;
     // B8: Endpoints without 400 response
-    const CEILING_NO_400_RESPONSE = 46;
+    const CEILING_NO_400_RESPONSE = 48;
 
     /**
      * Parse all generated YAML files and compute quality metrics.

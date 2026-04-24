@@ -1164,7 +1164,9 @@ export async function executeTrace(
             continue; // Interface resolution handled — skip normal node addition
           }
           // No implementations found (e.g., FeignClient — Spring proxy at runtime)
-          // Fall through to add the interface node to the chain normally
+          // Don't add the interface node to the chain, but the caller's callees array
+          // still references it (populated from findCalleesForNode)
+          continue;
         }
 
         // Add to discovered nodes (extended info fetched later via batch query if needed)

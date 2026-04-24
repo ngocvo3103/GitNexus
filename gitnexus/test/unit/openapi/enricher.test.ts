@@ -151,7 +151,7 @@ describe('enrichExistingYaml', () => {
     });
 
     mockExecuteParameterized.mockImplementation(async (_repoId, query) => {
-      if (query.includes('m.uid = $uid')) {
+      if (query.includes('m.id = $uid')) {
         return [{ uid: 'Method:src/com/tcbs/wallet/booking/controller/BookingIConnectExtControllerV2.java:getBondDetails' }];
       }
       return [];
@@ -198,7 +198,7 @@ describe('enrichExistingYaml', () => {
       }],
     });
     mockExecuteParameterized.mockImplementation(async (_repoId, query) => {
-      if (query.includes('m.uid = $uid')) return [{ uid: 'Method:src/BookingController.java:listBonds' }];
+      if (query.includes('m.id = $uid')) return [{ uid: 'Method:src/BookingController.java:listBonds' }];
       return [];
     });
     mockExtractAllDependencies.mockReturnValue({
@@ -268,7 +268,7 @@ describe('enrichExistingYaml', () => {
       }],
     });
     mockExecuteParameterized.mockImplementation(async (_repoId, query) => {
-      if (query.includes('m.uid = $uid')) return [{ uid: 'Method:src/BookingController.java:listBonds' }];
+      if (query.includes('m.id = $uid')) return [{ uid: 'Method:src/BookingController.java:listBonds' }];
       return [];
     });
 
@@ -364,7 +364,7 @@ describe('enrichExistingYaml', () => {
       }],
     });
     mockExecuteParameterized.mockImplementation(async (_repoId, query) => {
-      if (query.includes('m.uid = $uid')) return [{ uid: 'Method:src/BookingController.java:listBonds' }];
+      if (query.includes('m.id = $uid')) return [{ uid: 'Method:src/BookingController.java:listBonds' }];
       return [];
     });
     mockExtractAllDependencies.mockReturnValue({
@@ -404,7 +404,7 @@ describe('enrichExistingYaml', () => {
       }],
     });
     mockExecuteParameterized.mockImplementation(async (_repoId, query) => {
-      if (query.includes('m.uid = $uid')) return [{ uid: 'Method:src/BookingIConnectExtControllerV2.java:updateBond' }];
+      if (query.includes('m.id = $uid')) return [{ uid: 'Method:src/BookingIConnectExtControllerV2.java:updateBond' }];
       return [];
     });
     mockExtractAllDependencies.mockReturnValue({
@@ -448,7 +448,7 @@ describe('enrichExistingYaml', () => {
       }],
     }));
     mockExecuteParameterized.mockImplementation(async (_repoId, query) => {
-      if (query.includes('m.uid = $uid')) return [{ uid: 'Method:src/BookingController.java:listBonds' }];
+      if (query.includes('m.id = $uid')) return [{ uid: 'Method:src/BookingController.java:listBonds' }];
       return [];
     });
     mockExtractAllDependencies.mockReturnValue({

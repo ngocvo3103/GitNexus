@@ -1526,9 +1526,10 @@ export const processRoutesFromExtracted = async (
     const methodResolved = ctx.resolve(route.methodName, controllerDef.filePath);
     // Accept method resolution from same-file or via imports (for inherited methods)
     // When multiple overloads exist, prefer the one with @RequestBody (for Spring routes
-    // that accept JSON bodies) or with fewest parameters (to avoid @RequestParam overloads).
+    // that accept JSON bodies) or with @PathVariable coverage (for routes with path variables).
     let methodId = methodResolved?.candidates[0]?.nodeId;
     if (methodResolved?.candidates?.length > 1) {
+      // First, try to find a candidate with @RequestBody
       const bodyCandidate = methodResolved.candidates.find(c => {
         const node = graph.getNode(c.nodeId);
         const paramAnns = (node?.properties as Record<string, unknown>)?.parameterAnnotations;
@@ -1542,6 +1543,46 @@ export const processRoutesFromExtracted = async (
       });
       if (bodyCandidate) {
         methodId = bodyCandidate.nodeId;
+      } else {
+        // No @RequestBody candidate - check for @PathVariable coverage
+        // Extract path variables from the route path
+        const pathVarMatch = route.routePath?.match(/\{([^}]+)\}/g);
+        const pathVars = pathVarMatch ? pathVarMatch.map((m: string) => m.slice(1, -1)) : [];
+
+        if (pathVars.length > 0) {
+          // Find candidate with @PathVariable coverage for all path variables
+          const pathVarCandidate = methodResolved.candidates.find(c => {
+            const node = graph.getNode(c.nodeId);
+            const paramAnns = (node?.properties as Record<string, unknown>)?.parameterAnnotations;
+            if (typeof paramAnns === 'string') {
+              try {
+                const parsed = JSON.parse(paramAnns);
+                // Extract @PathVariable names from parameterAnnotations
+                const coveredVars = new Set<string>();
+                for (const p of parsed) {
+                  const annotations = p.annotations || [];
+                  for (const ann of annotations) {
+                    if (ann.startsWith('@PathVariable')) {
+                      // Extract argument: @PathVariable("tcbsId")
+                      const argMatch = ann.match(/@PathVariable\s*\(\s*"([^"]+)"\s*\)/);
+                      if (argMatch) {
+                        coveredVars.add(argMatch[1]);
+                      } else if (p.name) {
+                        coveredVars.add(p.name);
+                      }
+                    }
+                  }
+                }
+                // Check if all path variables are covered
+                return pathVars.every((v: string) => coveredVars.has(v));
+              } catch { return false; }
+            }
+            return false;
+          });
+          if (pathVarCandidate) {
+            methodId = pathVarCandidate.nodeId;
+          }
+        }
       }
     }
 

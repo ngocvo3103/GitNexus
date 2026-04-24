@@ -67,8 +67,8 @@ describe('bodySchemaToOpenAPISchema', () => {
 
     expect(result.type).toBe('array');
     expect(result.items).toBeDefined();
-    // Unknown types (User) default to 'string' in the TYPE_MAP
-    expect(result.items?.type).toBe('string');
+    // Unknown types (User) are non-primitive → resolve to 'object'
+    expect(result.items?.type).toBe('object');
   });
 });
 

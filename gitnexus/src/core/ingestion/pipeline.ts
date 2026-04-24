@@ -133,25 +133,32 @@ export const runPipelineFromRepo = async (
       message: 'Extracting dependencies...',
     });
 
+    let extractionRepoId: string | undefined;
     try {
       const extractionResult = await extractDependencies(repoPath);
+      extractionRepoId = extractionResult.repoId;
       // Convert ExtractionResult to RepoManifest format
       const manifest: import('../../storage/repo-manifest.js').RepoManifest = {
         repoId: extractionResult.repoId,
         indexedAt: extractionResult.indexedAt,
         dependencies: extractionResult.dependencies.map(d => d.name),
       };
-      await writeManifest(repoPath, manifest);
       if (isDev && manifest.dependencies.length > 0) {
         console.log(`📦 Extracted ${manifest.dependencies.length} dependencies from ${extractionResult.ecosystem}`);
       }
-      // Pass repoId to ResolutionContext so Route nodes get repoId property (WI-12)
-      ctx = createResolutionContext(graph, extractionResult.repoId);
-      symbolTable = ctx.symbols;
+      try {
+        await writeManifest(repoPath, manifest);
+      } catch (manifestErr) {
+        console.warn('Failed to write repo manifest:', (manifestErr as Error).message);
+      }
     } catch (err) {
       // Non-fatal: dependency extraction failure shouldn't stop indexing
       console.warn('Dependency extraction failed:', (err as Error).message);
     }
+
+    // Always initialize ctx/symbolTable — never leave them undefined
+    ctx = createResolutionContext(graph, extractionRepoId);
+    symbolTable = ctx.symbols;
 
     // ── Phase 3+4: Chunked read + parse ────────────────────────────────
     // Group parseable files into byte-budget chunks so only ~20MB of source
