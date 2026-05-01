@@ -92,6 +92,8 @@ export default defineConfig({
             'test/integration/shape-check-regression.test.ts',
             'test/integration/impacted-endpoints-e2e.test.ts',
             'test/integration/impacted-endpoints-cross-repo.test.ts',
+            'test/integration/document-endpoint-all.test.ts',
+            'test/integration/resolvers/cobol.test.ts',
             'test/unit/exec-git-diff.test.ts',
           ],
         },
