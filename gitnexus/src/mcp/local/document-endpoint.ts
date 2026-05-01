@@ -1236,7 +1236,7 @@ async function buildDocumentation(params: BuildDocumentationParams): Promise<Doc
 
   // Run all four independent async operations in parallel for better performance
   const [downstreamApis, bodyResult, messagingResult, persistence] = await Promise.all([
-    extractDownstreamApis(chain, executeQuery, repoId, includeContext, crossRepo),
+    extractDownstreamApis(chain, executeQuery, repoId, includeContext, crossRepo, route.controller),
     extractBodySchemas(chain, executeQuery, repoId, crossRepo, method),
     extractMessaging(chain, includeContext, executeQuery, repoId, crossRepo),
     extractPersistence(chain, executeQuery, repoId),
@@ -1397,7 +1397,8 @@ async function extractDownstreamApis(
   executeQuery: (repoId: string, query: string, params: Record<string, any>) => Promise<any[]>,
   repoId: string,
   includeContext: boolean,
-  crossRepo?: CrossRepoContext
+  crossRepo?: CrossRepoContext,
+  currentController?: string
 ): Promise<DownstreamApi[]> {
   const apis: DownstreamApi[] = [];
   const seen = new Set<string>();
@@ -2124,6 +2125,10 @@ async function extractDownstreamApis(
         if (serviceName === 'unknown-service' && className) {
           const derived = serviceNameFromClassName(className);
           if (derived) {
+            // Skip if this is the current endpoint's own controller (self-reference)
+            if (currentController && serviceNameFromClassName(currentController) === derived) {
+              continue;
+            }
             serviceName = derived;
             resolvedFrom = resolvedFrom ? `${resolvedFrom}+class-name-heuristic` : 'class-name-heuristic';
           }
@@ -4993,8 +4998,7 @@ export async function extractAllDependencies(
   executeQuery: (repoId: string, query: string, params: Record<string, unknown>) => Promise<unknown[]>,
   repoId: string,
 ): Promise<ExternalDeps> {
-  const [downstreamApis, messagingResult, persistence] = await Promise.all([
-    extractDownstreamApis(chain, executeQuery, repoId, false),
+  const [messagingResult, persistence] = await Promise.all([
     extractMessaging(chain, false, executeQuery, repoId),
     extractPersistence(chain, executeQuery, repoId),
   ]);
@@ -5002,7 +5006,7 @@ export async function extractAllDependencies(
   const annotations = extractAnnotations(chain);
 
   return {
-    downstreamApis,
+    downstreamApis: [],
     messaging: {
       outbound: messagingResult.outbound,
       inbound: messagingResult.inbound,
