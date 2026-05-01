@@ -481,16 +481,49 @@ export class LocalBackend {
               // Add _repoId to each candidate
               aggregated.candidates.push(...result.candidates.map((c: any) => ({ ...c, _repoId: repoId })));
             } else if (result.status === 'found' && result.symbol) {
-              // Found in one repo, return with _repoId
-              aggregated.symbol = { ...result.symbol, _repoId: repoId };
-              aggregated.repoId = repoId;
+              // First-repo wins: skip if already found in an earlier repo
+              if (!aggregated.symbol) {
+                aggregated.symbol = { ...result.symbol, _repoId: repoId };
+                aggregated.repoId = repoId;
+                // Preserve relationship data with _repoId attribution
+                if (result.incoming) {
+                  aggregated.incoming = Object.fromEntries(
+                    Object.entries(result.incoming).map(([cat, entries]) => [
+                      cat,
+                      (entries as any[]).map((e: any) => ({ ...e, _repoId: repoId })),
+                    ]),
+                  );
+                }
+                if (result.outgoing) {
+                  aggregated.outgoing = Object.fromEntries(
+                    Object.entries(result.outgoing).map(([cat, entries]) => [
+                      cat,
+                      (entries as any[]).map((e: any) => ({ ...e, _repoId: repoId })),
+                    ]),
+                  );
+                }
+                if (result.processes) {
+                  aggregated.processes = result.processes.map((p: any) => ({ ...p, _repoId: repoId }));
+                }
+              }
             }
           }
         }
 
-        // If we found an exact match, return it
+        // If we found an exact match, return it with relationships
         if (aggregated.symbol) {
-          return { status: 'found', symbol: aggregated.symbol, _repoId: aggregated.repoId };
+          const found: any = {
+            status: 'found',
+            symbol: aggregated.symbol,
+            incoming: aggregated.incoming || {},
+            outgoing: aggregated.outgoing || {},
+            processes: aggregated.processes || [],
+            _repoId: aggregated.repoId,
+          };
+          if (aggregated.errors.length > 0) {
+            found.errors = aggregated.errors;
+          }
+          return found;
         }
 
         // Otherwise return aggregated candidates
