@@ -220,7 +220,7 @@ Results from multi-repo queries include '_repoId' attribution.`,
     inputSchema: {
       type: 'object',
       properties: {
-        target: { type: 'string', description: 'Name of function, class, or file to analyze' },
+        target: { type: 'string', description: 'Name of function, class, or file to analyze. Also accepts uid format from context tool (e.g., "Class:UserController", "Method:getUsers")' },
         direction: { type: 'string', description: 'upstream (what depends on this) or downstream (what this depends on)' },
         maxDepth: { type: 'number', description: 'Max relationship depth (default: 3)', default: 3 },
         relationTypes: { type: 'array', items: { type: 'string' }, description: 'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, OVERRIDES (default: usage-based)' },
