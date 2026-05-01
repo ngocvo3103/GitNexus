@@ -43,6 +43,8 @@ export interface HttpCallDetail {
   resolvedUrl?: string;
   /** True when this HTTP call was detected from a FeignClient annotation (not a restTemplate/webClient call) */
   isFeignClient?: boolean;
+  /** 1-based line number where this call was found in the source content (used for line-range filtering) */
+  lineNumber?: number;
 }
 
 export interface MessagingDetail {
@@ -334,8 +336,11 @@ function camelCaseToKebab(str: string): string {
 
 /**
  * Extract metadata from source content.
+ * @param content Source code content to scan
+ * @param startLine Optional 1-based start line — when provided, only httpCallDetails within [startLine, endLine] are kept
+ * @param endLine Optional 1-based end line
  */
-export function extractMetadata(content: string | undefined): ChainNode['metadata'] {
+export function extractMetadata(content: string | undefined, startLine?: number, endLine?: number): ChainNode['metadata'] {
   const metadata: ChainNode['metadata'] = {
     httpCalls: [],
     httpCallDetails: [],
@@ -370,9 +375,10 @@ export function extractMetadata(content: string | undefined): ChainNode['metadat
     const methodName = httpMatch[1];
     const httpMethod = HTTP_METHOD_MAP[methodName] || methodName.toUpperCase();
     const urlExpression = httpMatch[2].trim();
+    const lineNumber = content.substring(0, httpMatch.index).split('\n').length;
     // Avoid duplicates
     if (!metadata.httpCallDetails.some(d => d.httpMethod === httpMethod && d.urlExpression === urlExpression)) {
-      metadata.httpCallDetails.push({ httpMethod, urlExpression });
+      metadata.httpCallDetails.push({ httpMethod, urlExpression, lineNumber });
     }
   }
 
@@ -382,8 +388,9 @@ export function extractMetadata(content: string | undefined): ChainNode['metadat
   while ((execMatch = EXEC_CALL_PATTERN.exec(content)) !== null) {
     const httpMethod = execMatch[1].toUpperCase();
     const urlExpression = execMatch[2].trim();
+    const lineNumber = content.substring(0, execMatch.index).split('\n').length;
     if (!metadata.httpCallDetails.some(d => d.httpMethod === httpMethod && d.urlExpression === urlExpression)) {
-      metadata.httpCallDetails.push({ httpMethod, urlExpression });
+      metadata.httpCallDetails.push({ httpMethod, urlExpression, lineNumber });
     }
   }
 
@@ -394,8 +401,9 @@ export function extractMetadata(content: string | undefined): ChainNode['metadat
   while ((feignMatch = FEIGN_HTTP_ANNOTATION_PATTERN.exec(content)) !== null) {
     const httpMethod = feignMatch[1] === 'Request' ? 'GET' : feignMatch[1].toUpperCase();
     const urlExpression = feignMatch[2];
+    const lineNumber = content.substring(0, feignMatch.index).split('\n').length;
     if (!metadata.httpCallDetails.some(d => d.httpMethod === httpMethod && d.urlExpression === urlExpression)) {
-      metadata.httpCallDetails.push({ httpMethod, urlExpression, isFeignClient: true });
+      metadata.httpCallDetails.push({ httpMethod, urlExpression, isFeignClient: true, lineNumber });
     }
   }
 
@@ -571,6 +579,15 @@ export function extractMetadata(content: string | undefined): ChainNode['metadat
         constructMethod: 'toUriString',
       });
     }
+  }
+
+  // Line-range filtering: when the caller provides a startLine/endLine range,
+  // keep only httpCallDetails whose lineNumber falls within that range.
+  // This prevents sibling methods in the same class file from polluting the handler's downstream list.
+  if (startLine !== undefined && endLine !== undefined) {
+    metadata.httpCallDetails = metadata.httpCallDetails.filter(
+      d => d.lineNumber === undefined || (d.lineNumber >= startLine && d.lineNumber <= endLine)
+    );
   }
 
   return metadata;
@@ -1246,7 +1263,7 @@ export async function executeTrace(
       resolvedFrom: nodeInfo.resolvedFrom,
       isInterface: nodeInfo.isInterface,
       callees: nodeCallees,
-      metadata: extractMetadata(content),
+      metadata: extractMetadata(content, nodeInfo.startLine, nodeInfo.endLine),
     };
 
     if (content) {
