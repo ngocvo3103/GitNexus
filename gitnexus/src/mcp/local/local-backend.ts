@@ -3063,6 +3063,10 @@ export class LocalBackend {
     await this.ensureInitialized(repo.id);
     
     const { target, direction } = params;
+    const isQualified = target.includes(':') || target.includes('/');
+    // For uid-format targets (e.g. "Class:UserController"), extract the name
+    // part for name-based fallback lookups.
+    const targetName = isQualified ? (target.split(/[:/]/).pop() ?? target) : target;
     const maxDepth = params.maxDepth || 3;
     const rawRelTypes = params.relationTypes && params.relationTypes.length > 0
       ? params.relationTypes.filter(t => VALID_RELATION_TYPES.has(t))
@@ -3082,44 +3086,59 @@ export class LocalBackend {
     let sym: any = null;
     let symType = '';
 
-    try {
-      const rows = await executeParameterized(repo.id, `
-        MATCH (n:\`Class\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Interface\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Function\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Method\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Constructor\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority LIMIT 1
-      `, { targetName: target }).catch(() => []);
-
-      if (rows.length > 0) {
-        // Pick the row with the lowest priority value (Class wins over Constructor)
-        const best = rows.reduce((a: any, b: any) =>
-          (a.priority ?? a[3] ?? 99) <= (b.priority ?? b[3] ?? 99) ? a : b,
-        );
-        sym = best;
-        const priorityToLabel = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
-        symType = priorityToLabel[best.priority ?? best[3]] ?? '';
-      }
-    } catch { /* fall through to unlabeled match */ }
-
-    // Fall back to unlabeled match for any other node type
-    if (!sym) {
-      const rows = await executeParameterized(repo.id, `
-        MATCH (n)
-        WHERE n.name = $targetName
+    // If target looks like a uid (Type:Name or path/Name), try exact id match first
+    if (isQualified) {
+      const uidRows = await executeParameterized(repo.id, `
+        MATCH (n) WHERE n.id = $targetName
         RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
         LIMIT 1
-      `, { targetName: target });
-      if (rows.length > 0) { sym = rows[0]; symType = sym.type || sym[2] || ''; }
+      `, { targetName: target }).catch((e) => { logQueryError('impact:uid-resolution', e); return []; });
+      if (uidRows.length > 0) {
+        sym = uidRows[0];
+        symType = sym.type || '';
+      }
+    }
+
+    if (!sym) {
+      try {
+        const rows = await executeParameterized(repo.id, `
+          MATCH (n:\`Class\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority LIMIT 1
+          UNION ALL
+          MATCH (n:\`Interface\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority LIMIT 1
+          UNION ALL
+          MATCH (n:\`Function\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority LIMIT 1
+          UNION ALL
+          MATCH (n:\`Method\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority LIMIT 1
+          UNION ALL
+          MATCH (n:\`Constructor\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority LIMIT 1
+        `, { targetName }).catch(() => []);
+
+        if (rows.length > 0) {
+          // Pick the row with the lowest priority value (Class wins over Constructor)
+          const best = rows.reduce((a: any, b: any) =>
+            (a.priority ?? a[3] ?? 99) <= (b.priority ?? b[3] ?? 99) ? a : b,
+          );
+          sym = best;
+          const priorityToLabel = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
+          symType = priorityToLabel[best.priority ?? best[3]] ?? '';
+        }
+      } catch { /* fall through to unlabeled match */ }
+
+      // Fall back to unlabeled match for any other node type
+      if (!sym) {
+        const rows = await executeParameterized(repo.id, `
+          MATCH (n)
+          WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+          LIMIT 1
+        `, { targetName });
+        if (rows.length > 0) { sym = rows[0]; symType = sym.type || sym[2] || ''; }
+      }
     }
 
     if (!sym) return { error: `Target '${target}' not found` };
