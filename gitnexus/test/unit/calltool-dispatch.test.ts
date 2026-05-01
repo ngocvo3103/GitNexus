@@ -837,35 +837,251 @@ describe('callTool multi-repo routing', () => {
 
   describe('context tool with repos[]', () => {
     it('routes to multi-repo handler when repos array is provided', async () => {
-      (executeParameterized as any)
-        .mockResolvedValueOnce([
-          { id: 'func:auth', name: 'auth', type: 'Function', filePath: '/a.ts', startLine: 1, endLine: 10 },
-        ])
-        .mockResolvedValueOnce([]);
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          return { status: 'found', symbol: { uid: 'func:auth', name: 'auth', kind: 'Function', filePath: '/a.ts', startLine: 1, endLine: 10 }, incoming: {}, outgoing: {}, processes: [] };
+        }
+        return { error: 'Symbol not found' };
+      });
 
       const result = await backend.callTool('context', {
         name: 'auth',
         repos: ['test-project', 'other-project'],
       });
 
-      // Should aggregate candidates from multiple repos
-      expect((result as any)).toHaveProperty('status');
+      expect(result.status).toBe('found');
+      expect(result.symbol).toBeDefined();
+      expect(result.symbol._repoId).toBe('test-project');
+      expect(result.incoming).toBeDefined();
+      expect(result.outgoing).toBeDefined();
+      expect(result.processes).toBeDefined();
     });
 
     it('returns symbol with _repoId when found in one repo', async () => {
-      (executeParameterized as any)
-        .mockResolvedValueOnce([
-          { id: 'func:auth', name: 'auth', type: 'Function', filePath: '/a.ts', startLine: 1, endLine: 10 },
-        ])
-        .mockResolvedValueOnce([]);
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          return { status: 'found', symbol: { uid: 'func:auth', name: 'auth', kind: 'Function', filePath: '/a.ts', startLine: 1, endLine: 10 }, incoming: {}, outgoing: {}, processes: [] };
+        }
+        return { error: 'Symbol not found' };
+      });
 
       const result = await backend.callTool('context', {
         name: 'auth',
         repos: ['test-project', 'other-project'],
       });
 
-      // If found exactly one match, should return it with _repoId
-      expect((result as any)).toHaveProperty('status');
+      expect(result.status).toBe('found');
+      expect(result.symbol._repoId).toBe('test-project');
+      expect(result._repoId).toBe('test-project');
+    });
+
+    it('returns incoming relationships with _repoId (TC-1)', async () => {
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          return {
+            status: 'found',
+            symbol: { uid: 'func:auth', name: 'auth', kind: 'Function', filePath: '/auth.ts', startLine: 1, endLine: 10 },
+            incoming: {
+              calls: [{ uid: 'func:login', name: 'login', filePath: '/login.ts', kind: 'Function' }],
+              imports: [{ uid: 'func:setup', name: 'setup', filePath: '/setup.ts', kind: 'Function' }],
+            },
+            outgoing: {},
+            processes: [],
+          };
+        }
+        return { error: 'Symbol not found' };
+      });
+
+      const result = await backend.callTool('context', {
+        name: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      expect(result.status).toBe('found');
+      expect(result.incoming.calls).toBeInstanceOf(Array);
+      expect(result.incoming.calls).toHaveLength(1);
+      expect(result.incoming.calls[0]).toMatchObject({
+        uid: 'func:login', name: 'login', _repoId: 'test-project',
+      });
+      expect(result.incoming.imports).toHaveLength(1);
+      expect(result.incoming.imports[0]).toMatchObject({
+        uid: 'func:setup', name: 'setup', _repoId: 'test-project',
+      });
+    });
+
+    it('returns outgoing relationships with _repoId (TC-2)', async () => {
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          return {
+            status: 'found',
+            symbol: { uid: 'func:auth', name: 'auth', kind: 'Function', filePath: '/auth.ts', startLine: 1, endLine: 10 },
+            incoming: {},
+            outgoing: {
+              calls: [{ uid: 'func:validate', name: 'validate', filePath: '/validate.ts', kind: 'Function' }],
+              extends: [{ uid: 'class:BaseAuth', name: 'BaseAuth', filePath: '/base.ts', kind: 'Class' }],
+            },
+            processes: [],
+          };
+        }
+        return { error: 'Symbol not found' };
+      });
+
+      const result = await backend.callTool('context', {
+        name: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      expect(result.status).toBe('found');
+      expect(result.outgoing.calls[0]).toMatchObject({
+        uid: 'func:validate', _repoId: 'test-project',
+      });
+      expect(result.outgoing.extends[0]).toMatchObject({
+        uid: 'class:BaseAuth', _repoId: 'test-project',
+      });
+    });
+
+    it('returns processes with _repoId (TC-3)', async () => {
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          return {
+            status: 'found',
+            symbol: { uid: 'func:login', name: 'login', kind: 'Function', filePath: '/login.ts', startLine: 1, endLine: 10 },
+            incoming: {},
+            outgoing: {},
+            processes: [{ id: 'proc:UserLogin', name: 'UserLogin', step_index: 2, step_count: 5 }],
+          };
+        }
+        return { error: 'Symbol not found' };
+      });
+
+      const result = await backend.callTool('context', {
+        name: 'login',
+        repos: ['test-project', 'other-project'],
+      });
+
+      expect(result.status).toBe('found');
+      expect(result.processes).toHaveLength(1);
+      expect(result.processes[0]).toMatchObject({
+        id: 'proc:UserLogin', name: 'UserLogin', _repoId: 'test-project',
+      });
+    });
+
+    it('preserves empty relationship shape when no refs exist (TC-4)', async () => {
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          return {
+            status: 'found',
+            symbol: { uid: 'func:auth', name: 'auth', kind: 'Function', filePath: '/auth.ts', startLine: 1, endLine: 10 },
+            incoming: {},
+            outgoing: {},
+            processes: [],
+          };
+        }
+        return { error: 'Symbol not found' };
+      });
+
+      const result = await backend.callTool('context', {
+        name: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      expect(result.status).toBe('found');
+      expect(result.incoming).toEqual({});
+      expect(result.outgoing).toEqual({});
+      expect(result.processes).toEqual([]);
+    });
+
+    it('adds _repoId to each nested entry in incoming categories (TC-5)', async () => {
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          return {
+            status: 'found',
+            symbol: { uid: 'func:auth', name: 'auth', kind: 'Function', filePath: '/auth.ts', startLine: 1, endLine: 10 },
+            incoming: {
+              calls: [
+                { uid: 'func:caller1', name: 'caller1', filePath: '/c1.ts', kind: 'Function' },
+                { uid: 'func:caller2', name: 'caller2', filePath: '/c2.ts', kind: 'Function' },
+              ],
+            },
+            outgoing: {},
+            processes: [],
+          };
+        }
+        return { error: 'Symbol not found' };
+      });
+
+      const result = await backend.callTool('context', {
+        name: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      expect(result.status).toBe('found');
+      expect(result.incoming.calls).toHaveLength(2);
+      expect(result.incoming.calls[0]._repoId).toBe('test-project');
+      expect(result.incoming.calls[1]._repoId).toBe('test-project');
+    });
+
+    it('returns relationships from other repo when one repo errors (TC-6)', async () => {
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          throw new Error('connection failed');
+        }
+        return {
+          status: 'found',
+          symbol: { uid: 'func:auth', name: 'auth', kind: 'Function', filePath: '/auth.ts', startLine: 1, endLine: 10 },
+          incoming: { calls: [{ uid: 'func:caller', name: 'caller', filePath: '/c.ts', kind: 'Function' }] },
+          outgoing: {},
+          processes: [],
+        };
+      });
+
+      const result = await backend.callTool('context', {
+        name: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      expect(result.status).toBe('found');
+      expect(result.symbol._repoId).toBe('other-project');
+      expect(result.incoming.calls[0]._repoId).toBe('other-project');
+      expect(result.errors).toBeDefined();
+      expect(result.errors.length).toBeGreaterThanOrEqual(1);
+      expect(result.errors[0].repoId).toBe('test-project');
+    });
+
+    it('returns ambiguous candidates with _repoId (TC-7)', async () => {
+      vi.spyOn(backend as any, 'context').mockImplementation(async (handle: any) => {
+        if (handle.id === 'test-project') {
+          return {
+            status: 'ambiguous',
+            candidates: [
+              { uid: 'func:auth:1', name: 'auth', kind: 'Function', filePath: '/a.ts', startLine: 1, endLine: 5 },
+              { uid: 'func:auth:2', name: 'auth', kind: 'Function', filePath: '/b.ts', startLine: 1, endLine: 5 },
+            ],
+          };
+        }
+        return { error: 'Symbol not found' };
+      });
+
+      const result = await backend.callTool('context', {
+        name: 'auth',
+        repos: ['test-project', 'other-project'],
+      });
+
+      expect(result.status).toBe('ambiguous');
+      expect(result.candidates).toHaveLength(2);
+      expect(result.candidates[0]._repoId).toBe('test-project');
+      expect(result.candidates[1]._repoId).toBe('test-project');
+    });
+
+    it('returns not_found when symbol not in any repo (TC-8)', async () => {
+      vi.spyOn(backend as any, 'context').mockResolvedValue({ error: 'Symbol not found' });
+
+      const result = await backend.callTool('context', {
+        name: 'nonexistent',
+        repos: ['test-project', 'other-project'],
+      });
+
+      expect(result.status).toBe('not_found');
     });
   });
 
