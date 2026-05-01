@@ -82,12 +82,25 @@ gitnexus/docs/e2e.md
 gitnexus/docs/progress.md
 gitnexus/docs/scripts/
 
-# Binary files
+# Binary / scratch files
 abc.json
 abc.md
 gitnexus/bond-exception-handler
 gitnexus/tcbs-bond-amqp
 gitnexus/tcbs-bond-amqp-message
+gitnexus/matching-engine-client
+gitnexus/tcbs-bond-trading
+gitnexus/tcbs-bond-trading-core
+
+# Claude local config
+gitnexus/.claude/
+
+# Local scripts
+gitnexus/scripts/
+
+# Local scratch files
+gitnexus/CLAUDE.md
+gitnexus/test-doc-endpoint.ts
 
 gitnexus/test/fixtures/mini-repo/*.md
 gitnexus/test/fixtures/mini-repo/.claude
