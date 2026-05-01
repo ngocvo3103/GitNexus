@@ -16,13 +16,18 @@ import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady } 
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
+  loadMeta,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
+import { SCHEMA_VERSION } from '../../core/lbug/schema.js';
 import { readManifest, type RepoManifest } from '../../storage/repo-manifest.js';
 import { CrossRepoRegistry } from '../../core/ingestion/cross-repo-registry.js';
 import { documentEndpoint, type DocumentEndpointOptions, type DocumentEndpointResult, type OpenApiModeResult } from './document-endpoint.js';
 import type { CrossRepoContext } from './cross-repo-context.js';
+import { CrossRepoResolver, type ChangedSymbol, type RepoHandle as ResolverRepoHandle } from './cross-repo-resolver.js';
 import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
+import { parseMethodLevelMapping, parseClassLevelPrefix, combinePaths } from './route-annotation-parser.js';
+import { parseDiffOutputWithLines, type FileDiffWithLines, type LineRange } from './parse-diff-lines.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -334,6 +339,19 @@ export class LocalBackend {
       return this.callToolMultiRepo(method, params) as T;
     }
 
+    // Auto-expand impacted_endpoints to include consumer repos (WI-4)
+    // When called without explicit repos, discover dependents via CrossRepoRegistry
+    // and route to multi-repo handler. Falls back to single-repo if no consumers found.
+    if (method === 'impacted_endpoints') {
+      const repo = await this.resolveRepo(params?.repo);
+      const expanded = await this.expandToConsumers(repo.id);
+      if (expanded) {
+        return this.callToolMultiRepo(method, { ...params, repos: expanded }) as T;
+      }
+      // No consumers found or registry not available — single-repo fallback
+      return this._impactedEndpointsImpl(repo, params) as T;
+    }
+
     // Single-repo routing (backward compatible)
     // Resolve repo from optional param (re-reads registry on miss)
     const repo = await this.resolveRepo(params?.repo);
@@ -535,6 +553,90 @@ export class LocalBackend {
         // Calculate aggregate risk
         aggregated.risk = this.calculateAggregateRisk(results.map((r) => r.result));
 
+        return aggregated;
+      }
+
+      case 'impacted_endpoints': {
+        // Lazy-initialize cross-repo registry for multi-repo queries
+        if (!this.crossRepoRegistry) {
+          if (!this.crossRepoInitPromise) {
+            this.crossRepoInitPromise = this.initCrossRepoRegistry();
+          }
+          await this.crossRepoInitPromise;
+        }
+
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              // Create cross-repo context for this repo
+              let crossRepo: CrossRepoContext | undefined;
+              if (this.crossRepoRegistry && repoIds.length > 1) {
+                crossRepo = {
+                  findDepRepo: (prefix: string) => this.findDepRepo(prefix),
+                  queryMultipleRepos: (ids: string[], query: string, p: Record<string, unknown>) =>
+                    this.queryMultipleRepos(ids, query, p),
+                  listDepRepos: async () => {
+                    const repos = this.crossRepoRegistry!.listRepos();
+                    return repos.map(r => r.repoId).filter(id => id !== repoId);
+                  },
+                };
+              }
+              const result = await this._impactedEndpointsImpl(handle, params, crossRepo);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        const aggregated: any = {
+          summary: { changed_files: {} as Record<string, number>, impacted_endpoints: {} as Record<string, number> },
+          impacted_endpoints: { WILL_BREAK: [] as any[], LIKELY_AFFECTED: [] as any[], MAY_NEED_TESTING: [] as any[] },
+          changed_symbols: [] as any[],
+          affected_processes: [] as any[],
+          affected_modules: [] as any[],
+          errors: [] as { repoId: string; error: string }[],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result) {
+            aggregated.summary.changed_files[repoId] = result.summary?.changed_files ?? 0;
+            aggregated.summary.impacted_endpoints[repoId] = result.summary?.impacted_endpoints ?? 0;
+            if (result.changed_symbols) {
+              aggregated.changed_symbols.push(...result.changed_symbols.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.impacted_endpoints) {
+              for (const tier of ['WILL_BREAK', 'LIKELY_AFFECTED', 'MAY_NEED_TESTING'] as const) {
+                if (result.impacted_endpoints[tier]) {
+                  aggregated.impacted_endpoints[tier].push(...result.impacted_endpoints[tier].map((e: any) => ({ ...e, _repoId: repoId })));
+                }
+              }
+            }
+            if (result.affected_processes) {
+              aggregated.affected_processes.push(...result.affected_processes.map((p: any) => ({ ...p, _repoId: repoId })));
+            }
+            if (result.affected_modules) {
+              aggregated.affected_modules.push(...result.affected_modules.map((m: any) => ({ ...m, _repoId: repoId })));
+            }
+          }
+        }
+
+        // Filter null results before risk calculation; impacted_endpoints uses summary.risk_level
+        const nonNullResults = results.map(r => r.result).filter((r): r is NonNullable<typeof r> => r != null);
+        const riskLevels = nonNullResults.map(r => r.summary?.risk_level ?? r.risk).filter(Boolean);
+        aggregated.summary.risk_level = this.calculateAggregateRisk(
+          riskLevels.map(r => ({ risk: r }))
+        );
+        // Aggregate _meta: mark partial if any individual result is partial
+        const anyPartial = nonNullResults.some(r => r._meta?.partial === true);
+        aggregated._meta = {
+          version: '1.0',
+          generated_at: new Date().toISOString(),
+          ...(anyPartial && { partial: true }),
+        };
         return aggregated;
       }
 
@@ -1406,16 +1508,13 @@ export class LocalBackend {
    * Detect changes — git-diff based impact analysis.
    * Maps changed lines to indexed symbols, then finds affected processes.
    */
-  private async detectChanges(repo: RepoHandle, params: {
-    scope?: string;
-    base_ref?: string;
-  }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-    
-    const scope = params.scope || 'unstaged';
+  private async execGitDiff(
+    scope: string,
+    baseRef: string | undefined,
+    cwd: string
+  ): Promise<string[] | { error: string }> {
     const { execFileSync } = await import('child_process');
 
-    // Build git diff args based on scope (using execFileSync to avoid shell injection)
     let diffArgs: string[];
     switch (scope) {
       case 'staged':
@@ -1425,8 +1524,8 @@ export class LocalBackend {
         diffArgs = ['diff', 'HEAD', '--name-only'];
         break;
       case 'compare':
-        if (!params.base_ref) return { error: 'base_ref is required for "compare" scope' };
-        diffArgs = ['diff', params.base_ref, '--name-only'];
+        if (!baseRef) return { error: 'base_ref is required for "compare" scope' };
+        diffArgs = ['diff', baseRef, '--name-only'];
         break;
       case 'unstaged':
       default:
@@ -1434,13 +1533,61 @@ export class LocalBackend {
         break;
     }
 
-    let changedFiles: string[];
     try {
-      const output = execFileSync('git', diffArgs, { cwd: repo.repoPath, encoding: 'utf-8' });
-      changedFiles = output.trim().split('\n').filter(f => f.length > 0);
+      const output = execFileSync('git', diffArgs, { cwd, encoding: 'utf-8' });
+      return output.trim().split('\n').filter(f => f.length > 0);
     } catch (err: any) {
       return { error: `Git diff failed: ${err.message}` };
     }
+  }
+
+  private async execGitDiffWithLines(
+    scope: string,
+    baseRef: string | undefined,
+    cwd: string
+  ): Promise<FileDiffWithLines[] | { error: string }> {
+    const { execFileSync } = await import('child_process');
+
+    let diffArgs: string[];
+    switch (scope) {
+      case 'staged':
+        diffArgs = ['diff', '--staged', '--unified=0'];
+        break;
+      case 'all':
+        diffArgs = ['diff', 'HEAD', '--unified=0'];
+        break;
+      case 'compare':
+        if (!baseRef) return { error: 'base_ref is required for "compare" scope' };
+        diffArgs = ['diff', baseRef, '--unified=0'];
+        break;
+      case 'unstaged':
+      default:
+        diffArgs = ['diff', '--unified=0'];
+        break;
+    }
+
+    try {
+      const output = execFileSync('git', diffArgs, { cwd, encoding: 'utf-8' });
+      return parseDiffOutputWithLines(output);
+    } catch (err: any) {
+      return { error: `Git diff failed: ${err.message}` };
+    }
+  }
+
+  private async detectChanges(repo: RepoHandle, params: {
+    scope?: string;
+    base_ref?: string;
+  }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+    
+    const scope = params.scope || 'unstaged';
+    const diffResult = await this.execGitDiff(scope, params.base_ref, repo.repoPath);
+    
+    if ('error' in diffResult) {
+      return { error: diffResult.error };
+    }
+    
+    const changedFiles = diffResult;
     
     if (changedFiles.length === 0) {
       return {
@@ -1511,6 +1658,891 @@ export class LocalBackend {
       },
       changed_symbols: changedSymbols,
       affected_processes: Array.from(affectedProcesses.values()),
+    };
+  }
+
+  /**
+   * impacted_endpoints tool — find API routes affected by code changes.
+   *
+   * 1. execGitDiff → changed files
+   * 2. Map files → indexed symbols
+   * 3. BFS upstream traversal (CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD)
+   * 4. Route discovery: reverse-CALLS, DEFINES/HANDLES_ROUTE, FETCHES
+   * 5. Dedup + tier classification (WILL_BREAK / LIKELY_AFFECTED / MAY_NEED_TESTING)
+   * 6. Enrichment: processes, modules, risk
+   */
+  private async _impactedEndpointsImpl(
+    repo: RepoHandle,
+    params: {
+      scope?: string;
+      base_ref?: string;
+      max_depth?: number;
+      min_confidence?: number;
+    },
+    crossRepo?: CrossRepoContext
+  ): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    const maxDepth = params.max_depth || 3;
+    const minConfidence = params.min_confidence ?? 0.7;
+
+    // ── 1. Git diff → changed files with line ranges ─────────────────
+    const lineDiffResult = await this.execGitDiffWithLines(
+      params.scope || 'unstaged',
+      params.base_ref,
+      repo.repoPath
+    );
+
+    let changedFiles: string[];
+    let fileLineRanges: Map<string, LineRange[]>;
+
+    if ('error' in lineDiffResult) {
+      // Fallback: try original file-level diff
+      const fallbackResult = await this.execGitDiff(
+        params.scope || 'unstaged',
+        params.base_ref,
+        repo.repoPath
+      );
+      if ('error' in fallbackResult) {
+        return { error: fallbackResult.error };
+      }
+      changedFiles = fallbackResult;
+      fileLineRanges = new Map(); // empty = whole-file resolution
+    } else if (lineDiffResult.length === 0) {
+      return {
+        summary: { changed_files: 0, changed_symbols: 0, impacted_endpoints: 0, risk_level: 'none' },
+        impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
+        changed_symbols: [], affected_processes: [], affected_modules: [],
+        _meta: { version: '1.0', generated_at: new Date().toISOString() },
+      };
+    } else {
+      changedFiles = lineDiffResult.map(f => f.filePath.replace(/\\/g, '/'));
+      fileLineRanges = new Map(
+        lineDiffResult.map(f => [f.filePath.replace(/\\/g, '/'), f.changedLineRanges])
+      );
+    }
+
+    if (changedFiles.length === 0) {
+      return {
+        summary: { changed_files: 0, changed_symbols: 0, impacted_endpoints: 0, risk_level: 'none' },
+        impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
+        changed_symbols: [], affected_processes: [], affected_modules: [],
+        _meta: { version: '1.0', generated_at: new Date().toISOString() },
+      };
+    }
+
+    // ── 2. Map files → symbols with line-range filtering ──────────────
+    const changedSymbols: any[] = [];
+    for (const file of changedFiles) {
+      const normalizedFile = file.replace(/\\/g, '/');
+      const ranges = fileLineRanges.get(normalizedFile) ?? [];
+      const isWholeFile = ranges.length === 0;
+
+      try {
+        const symbols = await executeParameterized(repo.id, `
+          MATCH (n) WHERE n.filePath CONTAINS $filePath
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath,
+                 n.startLine AS startLine, n.endLine AS endLine
+          LIMIT 50
+        `, { filePath: normalizedFile });
+
+        for (const sym of symbols) {
+          const symStart = sym.startLine ?? null;
+          const symEnd = sym.endLine ?? null;
+
+          // File nodes (no line range) always included — they carry DEFINES edges to Route nodes
+          // Also include symbols with no line info (fallback to whole-file behavior for that symbol)
+          if (isWholeFile || symStart === null || symEnd === null) {
+            changedSymbols.push({
+              id: sym.id || sym[0],
+              name: sym.name || sym[1],
+              type: sym.type || sym[2],
+              filePath: sym.filePath || sym[3],
+              change_type: 'Modified',
+            });
+            continue;
+          }
+
+          // Check if ANY changed line range overlaps with this symbol's range
+          const overlaps = ranges.some(
+            r => symStart <= r.endLine && symEnd >= r.startLine
+          );
+          if (overlaps) {
+            changedSymbols.push({
+              id: sym.id || sym[0],
+              name: sym.name || sym[1],
+              type: sym.type || sym[2],
+              filePath: sym.filePath || sym[3],
+              change_type: 'Modified',
+            });
+          }
+        }
+      } catch (e) { logQueryError('impacted-endpoints:file-symbols', e); }
+    }
+
+    if (changedSymbols.length === 0) {
+      return {
+        summary: {
+          changed_files: changedFiles.length,
+          changed_symbols: 0,
+          impacted_endpoints: 0,
+          risk_level: 'none',
+        },
+        impacted_endpoints: {
+          WILL_BREAK: [],
+          LIKELY_AFFECTED: [],
+          MAY_NEED_TESTING: [],
+        },
+        changed_symbols: [],
+        affected_processes: [],
+        affected_modules: [],
+        _meta: { version: '1.0', generated_at: new Date().toISOString() },
+      };
+    }
+
+    // ── 2b. Index health check (non-blocking diagnostics) ──────────
+    interface IndexDiagnostics {
+      index_health: 'stale' | 'healthy';
+      missing_tables?: string[];
+      schema_version?: { current: number; indexed: number | null };
+      low_node_count?: boolean;
+      recommendation: string;
+    }
+
+    let _diagnostics: IndexDiagnostics | undefined;
+
+    try {
+      const diagnostics: IndexDiagnostics = { index_health: 'healthy', recommendation: '' };
+      let isStale = false;
+
+      // Check 1: Route table exists
+      try {
+        await executeParameterized(repo.id, 'MATCH (r:Route) RETURN count(r) AS cnt LIMIT 1', {});
+      } catch (routeErr: any) {
+        const msg = routeErr?.message || String(routeErr);
+        if (msg.includes('does not exist')) {
+          diagnostics.missing_tables = ['Route'];
+          diagnostics.index_health = 'stale';
+          isStale = true;
+        }
+      }
+
+      // Check 2: Schema version match
+      try {
+        const meta = await loadMeta(repo.storagePath);
+        const indexedVersion = meta?.schemaVersion ?? null;
+        if (indexedVersion !== SCHEMA_VERSION) {
+          diagnostics.schema_version = { current: SCHEMA_VERSION, indexed: indexedVersion };
+          diagnostics.index_health = 'stale';
+          isStale = true;
+        }
+      } catch { /* meta.json read failure is non-blocking */ }
+
+      // Check 3: Low node count
+      const nodeCount = repo.stats?.nodes ?? 0;
+      const fileCount = repo.stats?.files ?? 0;
+      if (nodeCount > 0 && nodeCount < 100 && fileCount > 50) {
+        diagnostics.low_node_count = true;
+        diagnostics.index_health = 'stale';
+        isStale = true;
+      }
+
+      if (isStale) {
+        const parts: string[] = [];
+        if (diagnostics.missing_tables?.length) {
+          parts.push(`Missing tables: ${diagnostics.missing_tables.join(', ')}`);
+        }
+        if (diagnostics.schema_version) {
+          parts.push(`Schema version mismatch: indexed=${diagnostics.schema_version.indexed}, current=${diagnostics.schema_version.current}`);
+        }
+        if (diagnostics.low_node_count) {
+          parts.push(`Low node count (${nodeCount}) for ${fileCount} files — index may be incomplete`);
+        }
+        diagnostics.recommendation = `Index may be stale. ${parts.join('; ')}. Consider re-running \`gitnexus analyze\`.`;
+      }
+
+      if (diagnostics.index_health === 'stale') {
+        _diagnostics = diagnostics;
+      }
+    } catch { /* Health check failures are non-blocking */ }
+
+    // ── 3. BFS upstream traversal ───────────────────────────────────
+    const changedIds = changedSymbols.map(s => s.id);
+    const visited = new Set<string>(changedIds);
+    let frontier = [...changedIds];
+    const expandedMeta = new Map<string, { depth: number; confidence: number; relationType: string }>();
+    // changed symbols are depth 0
+    for (const id of changedIds) {
+      expandedMeta.set(id, { depth: 0, confidence: 1.0, relationType: 'DIRECT_CHANGE' });
+    }
+
+    // Track which dep-repo symbols triggered cross-repo discoveries.
+    // Maps expanded symbol ID → array of "repoId:symbolName" triggers.
+    const triggeredByMap = new Map<string, string[]>();
+
+    const relTypes = ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES'];
+    const relTypeFilter = relTypes.map(t => `'${t}'`).join(', ');
+    const MAX_EXPANDED_NODES = 10000;
+    let traversalComplete = true;
+
+    for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
+      if (visited.size >= MAX_EXPANDED_NODES) {
+        traversalComplete = false;
+        break;
+      }
+
+      const nextFrontier: string[] = [];
+      // Safety filter: exclude IDs with characters that could break Cypher syntax
+      const safeFrontier = frontier.filter(id => !/[}{]/.test(id));
+      const idList = safeFrontier.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+
+      const confidenceFilter = minConfidence > 0
+        ? ` AND r.confidence >= ${minConfidence}`
+        : '';
+
+      const query = `MATCH (caller)-[r:CodeRelation]->(n) ` +
+        `WHERE n.id IN [${idList}] ` +
+        `AND r.type IN [${relTypeFilter}]${confidenceFilter} ` +
+        `RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, ` +
+        `labels(caller)[0] AS type, caller.filePath AS filePath, ` +
+        `r.type AS relType, r.confidence AS confidence`;
+
+      try {
+        const related = await executeQuery(repo.id, query);
+
+        for (const rel of related) {
+          const relId = rel.id || rel[1];
+          const filePath = rel.filePath || rel[4] || '';
+          const relConfidence = rel.confidence || rel[6] || 0;
+          const relType = rel.relType || rel[5] || '';
+
+          // Skip test files
+          if (isTestFilePath(filePath)) continue;
+
+          // Apply confidence floor when stored confidence is missing/0
+          const effectiveConfidence = relConfidence > 0
+            ? relConfidence
+            : (IMPACT_RELATION_CONFIDENCE[relType] ?? 0.7);
+
+          if (effectiveConfidence < minConfidence) continue;
+
+          if (!visited.has(relId)) {
+            visited.add(relId);
+            nextFrontier.push(relId);
+            expandedMeta.set(relId, {
+              depth,
+              confidence: effectiveConfidence,
+              relationType: relType,
+            });
+          }
+        }
+      } catch (e) {
+        logQueryError('impacted-endpoints:depth-traversal', e);
+        traversalComplete = false;
+        break;
+      }
+
+      if (visited.size >= MAX_EXPANDED_NODES) {
+        traversalComplete = false;
+        break;
+      }
+
+      // ── 3b. Interface resolution ───────────────────────────────────
+      // After BFS expansion, check if any frontier nodes implement interfaces.
+      // Add those interfaces to nextFrontier so BFS can find callers of the
+      // interface methods in subsequent depths. This bridges the gap where
+      // controllers call CashService.method() but the graph only has an edge
+      // from the controller to the interface, not to the implementation.
+      const safeFrontierForImplements = frontier.filter(id => !/[}{]/.test(id) && (expandedMeta.get(id)?.depth ?? 0) <= 2);
+      if (safeFrontierForImplements.length > 0) {
+        const implIdList = safeFrontierForImplements.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+        const implementsQuery = `MATCH (impl)-[r:CodeRelation {type: 'IMPLEMENTS'}]->(iface) ` +
+          `WHERE impl.id IN [${implIdList}] ` +
+          `RETURN iface.id AS id, iface.name AS name, labels(iface)[0] AS type, iface.filePath AS filePath, ` +
+          `r.type AS relType, r.confidence AS confidence, impl.id AS implId`;
+        try {
+          const interfaceResults = await executeQuery(repo.id, implementsQuery);
+          for (const iface of interfaceResults) {
+            const ifaceId = iface.id || iface[0];
+            const ifaceFilePath = iface.filePath || iface[3] || '';
+            if (isTestFilePath(ifaceFilePath)) continue;
+            if (!visited.has(ifaceId)) {
+              visited.add(ifaceId);
+              nextFrontier.push(ifaceId);
+              expandedMeta.set(ifaceId, {
+                depth: expandedMeta.get(iface.implId || iface[6])?.depth ?? maxDepth,
+                confidence: iface.confidence || iface[5] || 0.85,
+                relationType: 'IMPLEMENTS',
+              });
+            }
+          }
+        } catch (e) {
+          logQueryError('impacted-endpoints:implements-resolution', e);
+          // Non-fatal — continue without interface resolution
+        }
+      }
+
+      frontier = nextFrontier;
+    }
+
+    // ── 3c. Cross-repo BFS bridging via CrossRepoResolver ──────────────
+    // If CrossRepoContext is provided, use CrossRepoResolver to find consumer-repo
+    // symbols that depend on changed dep-repo symbols. The resolver uses a 3-stage
+    // strategy (file-path IMPORTS, class-name, package-path) instead of the old
+    // direct ID-matching approach which failed because IMPORTS edges are File→File.
+    if (crossRepo && changedSymbols.length > 0) {
+      try {
+        const depRepoIds = await crossRepo.listDepRepos();
+        if (depRepoIds.length > 0) {
+          const resolver = new CrossRepoResolver();
+
+          // Build ChangedSymbol array for resolver
+          const changedSymbolsForResolver: ChangedSymbol[] = changedSymbols.map(s => ({
+            id: s.id,
+            name: s.name,
+            filePath: s.filePath,
+          }));
+
+          // Map from dep symbol ID → name for _triggered_by format "repoId:symbolName"
+          const changedSymIdToName = new Map<string, string>(
+            changedSymbols.map(s => [s.id, s.name] as [string, string]),
+          );
+
+          // For each dep repo, resolve which consumer-repo symbols depend on changed dep symbols
+          const consumerRepo: ResolverRepoHandle = {
+            repoId: repo.id,
+            query: async (query: string, params: Record<string, unknown>) =>
+              executeParameterized(repo.id, query, params),
+          };
+
+          for (const depRepoId of depRepoIds) {
+            const depRepo: ResolverRepoHandle = {
+              repoId: depRepoId,
+              query: async (query: string, params: Record<string, unknown>) => {
+                const results = await crossRepo.queryMultipleRepos(
+                  [depRepoId], query, params
+                );
+                // Extract results for this repo
+                const match = results.find(r => r.repoId === depRepoId);
+                return match?.results ?? [];
+              },
+            };
+
+            const resolvedConsumers = await resolver.resolveDepConsumers(
+              consumerRepo, depRepo, changedSymbolsForResolver
+            );
+
+            // Add resolved consumers to BFS frontier
+            for (const consumer of resolvedConsumers) {
+              // Build trigger key: "repoId:symbolName" for cross-repo attribution
+              const depSymbolName = changedSymIdToName.get(consumer.matchedDepSymbol) ?? consumer.matchedDepSymbol;
+              const triggerKey = `${depRepoId}:${depSymbolName}`;
+
+              // Find all Method/Class symbols in the importing file
+              try {
+                const fileSymbols = await executeParameterized(repo.id,
+                  `MATCH (s) WHERE s.filePath = $filePath
+                   RETURN s.id AS id, s.name AS name, s.filePath AS filePath, labels(s)[0] AS type`,
+                  { filePath: consumer.filePath }
+                );
+
+                for (const sym of fileSymbols) {
+                  const symId = sym.id || sym[0];
+                  const symType = sym.type || sym[3] || '';
+                  const symFilePath = sym.filePath || sym[2] || '';
+                  // Only include Method and Class symbols (skip File, Route, etc.)
+                  if (symType !== 'Method' && symType !== 'Class') continue;
+                  if (isTestFilePath(symFilePath)) continue;
+                  if (!visited.has(symId)) {
+                    visited.add(symId);
+                    expandedMeta.set(symId, {
+                      depth: 1,
+                      confidence: consumer.confidence,
+                      relationType: `CROSS_REPO_${consumer.matchMethod.toUpperCase()}`,
+                    });
+                    // Track which dep symbol triggered this cross-repo discovery
+                    const existing = triggeredByMap.get(symId) ?? [];
+                    if (!existing.includes(triggerKey)) {
+                      existing.push(triggerKey);
+                    }
+                    triggeredByMap.set(symId, existing);
+                  }
+                }
+              } catch (e) {
+                logQueryError('impacted-endpoints:cross-repo-file-symbols', e);
+                // Non-fatal — add the consumer itself as fallback
+                if (!visited.has(consumer.id)) {
+                  visited.add(consumer.id);
+                  expandedMeta.set(consumer.id, {
+                    depth: 1,
+                    confidence: consumer.confidence,
+                    relationType: `CROSS_REPO_${consumer.matchMethod.toUpperCase()}`,
+                  });
+                  // Track trigger for fallback consumer too
+                  const existing = triggeredByMap.get(consumer.id) ?? [];
+                  if (!existing.includes(triggerKey)) {
+                    existing.push(triggerKey);
+                  }
+                  triggeredByMap.set(consumer.id, existing);
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        logQueryError('impacted-endpoints:cross-repo-bridging', e);
+        // Non-fatal — continue without cross-repo results
+      }
+    }
+
+    // ── 4. Route Discovery (4 parallel queries) ────────────────────
+    const expandedIds = Array.from(visited);
+    const changedIdSet = new Set(changedIds);
+
+    // Helper: for each Route, track which original changed symbols led to it
+    // We build a mapping from expanded symbol → original changed ancestors via BFS metadata
+    // Simplified: any expanded symbol that is a changed symbol (depth 0) is the root cause
+
+    const [handlerRows, ownershipRows, fetchesRows, annotationRows] = await Promise.all([
+      // Query 1: reverse-CALLS (handler methods)
+      executeParameterized(repo.id, `
+        MATCH (m:Method)-[c:CodeRelation {type: 'CALLS'}]->(s)
+        WHERE s.id IN $expandedIds AND c.confidence >= $minConfidence
+        MATCH (r:Route)-[rc:CodeRelation {type: 'CALLS'}]->(m)
+        RETURN r.routePath AS path, r.httpMethod AS method,
+               r.filePath AS file_path, r.lineNumber AS line,
+               r.controllerName AS controller, r.methodName AS handler,
+               s.name AS affected_name, s.id AS affected_id,
+               c.type AS relation, 'reverse-CALLS' AS discovery_path
+      `, { expandedIds, minConfidence }).catch((e) => {
+        logQueryError('impacted-endpoints:reverse-calls', e);
+        return [];
+      }),
+
+      // Query 2: DEFINES/HANDLES_ROUTE (direct ownership)
+      executeParameterized(repo.id, `
+        MATCH (s)-[d:CodeRelation]->(r:Route)
+        WHERE s.id IN $expandedIds
+          AND d.type IN ['DEFINES', 'HANDLES_ROUTE']
+          AND d.confidence >= $minConfidence
+        RETURN r.routePath AS path, r.httpMethod AS method,
+               r.filePath AS file_path, r.lineNumber AS line,
+               r.controllerName AS controller, r.methodName AS handler,
+               s.name AS affected_name, s.id AS affected_id,
+               d.type AS relation, 'DEFINES/HANDLES_ROUTE' AS discovery_path
+      `, { expandedIds, minConfidence }).catch((e) => {
+        logQueryError('impacted-endpoints:defines-handles', e);
+        return [];
+      }),
+
+      // Query 3: FETCHES (API consumers)
+      executeParameterized(repo.id, `
+        MATCH (s)-[f:CodeRelation {type: 'FETCHES'}]->(r:Route)
+        WHERE s.id IN $expandedIds AND f.confidence >= $minConfidence
+        RETURN r.routePath AS path, r.httpMethod AS method,
+               r.filePath AS file_path, r.lineNumber AS line,
+               r.controllerName AS controller, r.methodName AS handler,
+               s.name AS affected_name, s.id AS affected_id,
+               f.type AS relation, 'FETCHES' AS discovery_path
+      `, { expandedIds, minConfidence }).catch((e) => {
+        logQueryError('impacted-endpoints:fetches', e);
+        return [];
+      }),
+
+      // Query 4: Annotation-based route fallback
+      // Find expanded Method nodes in Controller files that contain mapping annotations
+      executeParameterized(repo.id, `
+        MATCH (m:Method)
+        WHERE m.id IN $expandedIds
+          AND m.filePath CONTAINS 'Controller'
+        RETURN m.id AS id, m.name AS handler, m.filePath AS filePath,
+               m.content AS content, m.startLine AS line
+      `, { expandedIds }).catch((e) => {
+        logQueryError('impacted-endpoints:annotation-fallback', e);
+        return [];
+      }),
+    ]);
+
+    const allRouteRows = [...handlerRows, ...ownershipRows, ...fetchesRows];
+
+    // ── 4b. Annotation-based route fallback processing ──────────────
+    // For each Method node returned by Query 4, parse @XxxMapping annotations
+    // to discover routes when Route nodes don't exist in the graph.
+    const annotationFallbackRows: any[] = [];
+    if (annotationRows && annotationRows.length > 0) {
+      // Batch-query class-level @RequestMapping prefixes (one query per unique controller filePath)
+      const controllerFiles = [...new Set(annotationRows.map((r: any) => r.filePath || r[2] || '').filter(Boolean))];
+      const classPrefixCache = new Map<string, string | undefined>();
+
+      for (const filePath of controllerFiles) {
+        try {
+          const classRows = await executeParameterized(repo.id, `
+            MATCH (c:Class)
+            WHERE c.filePath = $filePath
+            RETURN c.content AS classContent
+            LIMIT 1
+          `, { filePath });
+          if (classRows && classRows.length > 0) {
+            const classContent = classRows[0].classContent ?? classRows[0][0] ?? '';
+            const prefix = parseClassLevelPrefix(classContent);
+            classPrefixCache.set(filePath, prefix ?? undefined);
+          }
+        } catch (e) {
+          logQueryError('impacted-endpoints:class-prefix', e);
+          // Non-fatal — continue without class prefix
+        }
+      }
+
+      // Process each annotation method
+      for (const row of annotationRows) {
+        const methodId = row.id || row[0] || '';
+        const handler = row.handler || row[1] || '';
+        const filePath = row.filePath || row[2] || '';
+        const content = row.content || row[3] || '';
+        const line = row.line || row[4] || 0;
+
+        if (!content) continue; // Skip methods without content
+
+        const parsed = parseMethodLevelMapping(content);
+        if (!parsed) continue; // No mapping annotation found
+
+        const { httpMethod, routePath } = parsed;
+
+        // Combine class prefix with method path
+        const classPrefix = classPrefixCache.get(filePath);
+        const fullPath = combinePaths(classPrefix, routePath);
+
+        // Derive controller name from filePath
+        const fileName = filePath.split('/').pop() ?? 'Unknown';
+        const controller = fileName.replace(/\.[^.]+$/, '');
+
+        annotationFallbackRows.push({
+          method: httpMethod === '*' ? 'GET' : httpMethod.toUpperCase(), // Default '*' to GET for tier classification
+          path: fullPath,
+          file_path: filePath,
+          line,
+          controller,
+          handler,
+          affected_name: handler,
+          affected_id: methodId,
+          relation: 'CALLS',
+          discovery_path: 'annotation-fallback',
+        });
+      }
+    }
+
+    // Dedup annotation-fallback rows against route-node rows
+    // Route-node entries take precedence (higher confidence)
+    const routeNodeKeys = new Set(allRouteRows.map((r: any) => {
+      const m = (r.method || r[1] || '').toUpperCase();
+      const p = r.path || r[0] || '';
+      return `${m} ${p}`;
+    }));
+
+    for (const fallbackRow of annotationFallbackRows) {
+      const key = `${fallbackRow.method} ${fallbackRow.path}`;
+      if (!routeNodeKeys.has(key)) {
+        allRouteRows.push(fallbackRow);
+      }
+    }
+
+    // ── 5. Dedup + Tier Classification ──────────────────────────────
+    // Dedup by (method, path); keep shallowest depth; worst-tier wins
+    const routeMap = new Map<string, {
+      method: string; path: string; file_path: string; line: number;
+      controller: string; handler: string;
+      depth: number; confidence: number;
+      affected_by: Set<string>;
+      discovery_paths: Set<string>;
+      affected_id: string;
+    }>();
+
+    for (const row of allRouteRows) {
+      const method = (row.method || row[1] || '').toUpperCase();
+      const path = row.path || row[0] || '';
+      const key = `${method} ${path}`;
+      if (!method || !path) continue;
+
+      const affectedId = row.affected_id || row[6] || '';
+      const discoveryPath = row.discovery_path || row[9] || '';
+
+      // Determine depth: if the affected_id is a changed symbol, depth=0;
+      // otherwise look up BFS metadata
+      const depth = changedIdSet.has(affectedId)
+        ? 0
+        : (expandedMeta.get(affectedId)?.depth ?? maxDepth + 1);
+
+      // Confidence along the path: minimum of the edge to the affected symbol
+      // Annotation-fallback confidence is capped at 0.8 (lower than Route-node confidence)
+      const baseConfidence = changedIdSet.has(affectedId)
+        ? 1.0
+        : (expandedMeta.get(affectedId)?.confidence ?? 0.5);
+      const confidence = discoveryPath === 'annotation-fallback'
+        ? Math.min(baseConfidence, 0.8)
+        : baseConfidence;
+
+      if (!routeMap.has(key) || depth < routeMap.get(key)!.depth) {
+        // Preserve existing affected_by when overwriting with shallower depth
+        const existingAffectedBy = routeMap.has(key)
+          ? routeMap.get(key)!.affected_by
+          : new Set<string>();
+        if (changedIdSet.has(affectedId)) existingAffectedBy.add(affectedId);
+        routeMap.set(key, {
+          method, path,
+          file_path: row.file_path || row[2] || '',
+          line: row.line || row[3] || 0,
+          controller: row.controller || row[4] || '',
+          handler: row.handler || row[5] || '',
+          depth,
+          confidence,
+          affected_by: existingAffectedBy,
+          discovery_paths: routeMap.has(key)
+            ? routeMap.get(key)!.discovery_paths
+            : new Set([discoveryPath]),
+          affected_id: affectedId,
+        });
+      } else {
+        const existing = routeMap.get(key)!;
+        // Merge affected_by from additional paths
+        if (changedIdSet.has(affectedId)) {
+          existing.affected_by.add(affectedId);
+        }
+        existing.discovery_paths.add(discoveryPath);
+        // Keep shallowest depth (worst tier wins)
+        if (depth < existing.depth) {
+          existing.depth = depth;
+          existing.confidence = Math.min(existing.confidence, confidence);
+        }
+      }
+    }
+
+    // Track which changed symbols lead to each expanded symbol (for affected_by tracing)
+    // For efficiency, build a simple parent map from BFS traversal metadata
+    // We trace back: for each non-changed expanded symbol, find changed symbols at depth 0
+    // that are reachable. Simplification: use changedIds as the root set.
+    // For Routes whose affected_id is NOT a changed symbol, trace via the expanded set.
+    // We'll do a separate query to find which changed symbols are upstream of each
+    // intermediate symbol. For now, use a simpler approach: mark the affected_id directly.
+
+    // Assign tiers
+    const WILL_BREAK: any[] = [];
+    const LIKELY_AFFECTED: any[] = [];
+    const MAY_NEED_TESTING: any[] = [];
+
+    for (const [key, route] of routeMap) {
+      // Collect _triggered_by entries from all affected symbols in this route.
+      // A route may be discovered via multiple expanded symbols; merge triggers from all.
+      const triggeredByEntries = new Set<string>();
+      for (const affId of route.affected_by) {
+        const triggers = triggeredByMap.get(affId);
+        if (triggers) {
+          for (const t of triggers) triggeredByEntries.add(t);
+        }
+      }
+      // Also check the primary affected_id for cross-repo triggers
+      if (route.affected_id && triggeredByMap.has(route.affected_id)) {
+        for (const t of triggeredByMap.get(route.affected_id)!) triggeredByEntries.add(t);
+      }
+
+      const entry: Record<string, unknown> = {
+        method: route.method,
+        path: route.path,
+        file_path: route.file_path,
+        line: route.line,
+        controller: route.controller,
+        handler: route.handler,
+        confidence: route.confidence,
+        affected_by: Array.from(route.affected_by),
+        discovery_paths: Array.from(route.discovery_paths),
+      };
+
+      // Only add _triggered_by for cross-repo discoveries
+      if (triggeredByEntries.size > 0) {
+        entry._triggered_by = Array.from(triggeredByEntries);
+      }
+
+      if (route.depth <= 1 && route.confidence >= 0.85) {
+        WILL_BREAK.push(entry);
+      } else if (route.depth <= 3 && route.confidence >= 0.7) {
+        LIKELY_AFFECTED.push(entry);
+      } else {
+        MAY_NEED_TESTING.push(entry);
+      }
+    }
+
+    // ── 6. Enrichment: affected processes and modules ───────────────
+    const expandedSymbols = Array.from(expandedMeta.entries())
+      .filter(([id]) => !changedIdSet.has(id))
+      .map(([id, meta]) => ({
+        id,
+        depth: meta.depth,
+        confidence: meta.confidence,
+        relationType: meta.relationType,
+      }));
+
+    let affectedProcesses: any[] = [];
+    let affectedModules: any[] = [];
+
+    const allImpactedIds = Array.from(visited);
+    const d1Ids = Array.from(expandedMeta.entries())
+      .filter(([, m]) => m.depth === 1)
+      .map(([id]) => id);
+
+    const CHUNK_SIZE = 100;
+    const chunkIds = (ids: string[]): string[][] => {
+      const chunks: string[][] = [];
+      for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+        chunks.push(ids.slice(i, i + CHUNK_SIZE));
+      }
+      return chunks;
+    };
+
+    // Affected processes
+    const maxChunks = parseInt(process.env.IMPACT_MAX_CHUNKS || '999999', 10);
+    const processChunks = chunkIds(allImpactedIds);
+    const processRows: any[] = [];
+    const processedIds: string[] = [];
+    let chunksProcessed = 0;
+    for (const chunk of processChunks) {
+      if (chunksProcessed >= maxChunks) {
+        traversalComplete = false;
+        break;
+      }
+      processedIds.push(...chunk);
+      const result = await executeParameterized(repo.id, `
+        MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+        WHERE s.id IN $ids
+        RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits,
+               MIN(r.step) AS minStep, p.stepCount AS stepCount
+        ORDER BY hits DESC
+        LIMIT 20
+      `, { ids: chunk }).catch(() => []);
+      processRows.push(...result);
+      chunksProcessed++;
+    }
+
+    // Re-aggregate across chunks
+    const aggregatedProcesses = new Map<string, any>();
+    for (const row of processRows) {
+      const procName = row.name || row[0];
+      if (aggregatedProcesses.has(procName)) {
+        const existing = aggregatedProcesses.get(procName);
+        existing.hits += row.hits || row[1] || 0;
+        if ((row.minStep ?? row[2]) < existing.minStep) {
+          existing.minStep = row.minStep ?? row[2];
+        }
+      } else {
+        aggregatedProcesses.set(procName, {
+          name: procName,
+          hits: row.hits || row[1] || 0,
+          minStep: row.minStep ?? row[2],
+          stepCount: row.stepCount ?? row[3],
+        });
+      }
+    }
+    affectedProcesses = Array.from(aggregatedProcesses.values())
+      .sort((a, b) => b.hits - a.hits)
+      .slice(0, 20)
+      .map(r => ({
+        name: r.name,
+        total_hits: r.hits,
+        broken_at_step: r.minStep,
+        step_count: r.stepCount,
+      }));
+
+    // Affected modules — chunked + parameterized (same pattern as process enrichment)
+    if (processedIds.length > 0) {
+      const moduleChunks = chunkIds(processedIds);
+      const d1FilteredIds = d1Ids.filter(id => processedIds.includes(id));
+      const d1Chunks = chunkIds(d1FilteredIds);
+      let moduleRows: any[] = [];
+      let directModuleRows: any[] = [];
+      let moduleChunksProcessed = 0;
+
+      for (const chunk of moduleChunks) {
+        if (moduleChunksProcessed >= maxChunks) {
+          traversalComplete = false;
+          break;
+        }
+        const result = await executeParameterized(repo.id, `
+          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE s.id IN $ids
+          RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
+          ORDER BY hits DESC
+          LIMIT 20
+        `, { ids: chunk }).catch(() => []);
+        moduleRows.push(...result);
+        moduleChunksProcessed++;
+      }
+
+      // Aggregate module hits across chunks
+      const aggregatedModules = new Map<string, number>();
+      for (const row of moduleRows) {
+        const name = row.name || row[0];
+        const hits = row.hits || row[1] || 0;
+        aggregatedModules.set(name, (aggregatedModules.get(name) ?? 0) + hits);
+      }
+      // Re-sort and limit to 20 after aggregation
+      moduleRows = Array.from(aggregatedModules.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 20)
+        .map(([name, hits]) => ({ name, hits }));
+
+      for (const chunk of d1Chunks) {
+        const result = await executeParameterized(repo.id, `
+          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE s.id IN $ids
+          RETURN DISTINCT c.heuristicLabel AS name
+        `, { ids: chunk }).catch(() => []);
+        directModuleRows.push(...result);
+      }
+
+      const directModuleSet = new Set(directModuleRows.map((r: any) => r.name || r[0]));
+      affectedModules = moduleRows.map((r: any) => {
+        const name = r.name || r[0];
+        return {
+          name,
+          hits: r.hits || r[1],
+          impact: directModuleSet.has(name) ? 'direct' : 'indirect',
+        };
+      });
+    }
+
+    // ── 7. Risk scoring ────────────────────────────────────────────
+    const endpointCount = WILL_BREAK.length + LIKELY_AFFECTED.length + MAY_NEED_TESTING.length;
+    const processCount = affectedProcesses.length;
+    const moduleCount = affectedModules.length;
+    let risk = 'LOW';
+    if (endpointCount >= 30 || processCount >= 5 || moduleCount >= 5 || expandedSymbols.length >= 200) {
+      risk = 'CRITICAL';
+    } else if (endpointCount >= 15 || processCount >= 3 || moduleCount >= 3 || expandedSymbols.length >= 100) {
+      risk = 'HIGH';
+    } else if (endpointCount >= 5 || expandedSymbols.length >= 30) {
+      risk = 'MEDIUM';
+    }
+
+    // ── 8. Return shape ─────────────────────────────────────────────
+    return {
+      summary: {
+        changed_files: changedFiles.length,
+        changed_symbols: changedSymbols.length,
+        impacted_endpoints: endpointCount,
+        risk_level: risk,
+      },
+      impacted_endpoints: {
+        WILL_BREAK,
+        LIKELY_AFFECTED,
+        MAY_NEED_TESTING,
+      },
+      changed_symbols: changedSymbols,
+      affected_processes: affectedProcesses,
+      affected_modules: affectedModules,
+      _meta: {
+        version: '1.0',
+        generated_at: new Date().toISOString(),
+        ...(!traversalComplete && { partial: true }),
+      },
+      ...(_diagnostics && { _diagnostics }),
     };
   }
 
@@ -2590,6 +3622,42 @@ export class LocalBackend {
 
     return Promise.all(queryPromises);
   }
+
+  /**
+   * Auto-expand a single repo to include its consumers via CrossRepoRegistry.
+   * Returns the deduplicated repo list [sourceRepoId, ...consumerRepoIds],
+   * or null if no consumers found / registry not available (caller falls back to single-repo).
+   */
+  private async expandToConsumers(sourceRepoId: string): Promise<string[] | null> {
+    // Lazy-initialize registry if needed
+    if (!this.crossRepoRegistry) {
+      if (!this.crossRepoInitPromise) {
+        this.crossRepoInitPromise = this.initCrossRepoRegistry();
+      }
+      await this.crossRepoInitPromise;
+    }
+
+    if (!this.crossRepoRegistry?.isInitialized()) {
+      return null;
+    }
+
+    const consumerRepoIds = this.crossRepoRegistry.findConsumers(sourceRepoId);
+    if (consumerRepoIds.length === 0) {
+      return null;
+    }
+
+    // Deduplicate: source repo always included, consumers filtered to exclude source
+    const seen = new Set<string>([sourceRepoId]);
+    const allRepoIds = [sourceRepoId];
+    for (const id of consumerRepoIds) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        allRepoIds.push(id);
+      }
+    }
+    return allRepoIds;
+  }
+
 
   /**
    * Get the manifest for a registered repo.

@@ -655,3 +655,252 @@ describe('Edge cases', () => {
     expect(result!.repoId).toBe('repo-a');
   });
 });
+
+// ─── WI-2: CrossRepoResolver Tests ──────────────────────────────────────────
+
+import {
+  CrossRepoResolver,
+  filePathToPackagePath,
+  type RepoHandle as ResolverRepoHandle,
+  type ChangedSymbol,
+  type ResolvedConsumer,
+} from '../../src/mcp/local/cross-repo-resolver.js';
+
+describe('WI-2: CrossRepoResolver', () => {
+  let resolver: CrossRepoResolver;
+  let consumerQuery: ReturnType<typeof vi.fn>;
+  let consumerRepo: ResolverRepoHandle;
+  let depRepo: ResolverRepoHandle;
+
+  beforeEach(() => {
+    resolver = new CrossRepoResolver();
+    consumerQuery = vi.fn();
+    consumerRepo = { repoId: 'consumer-repo', query: consumerQuery };
+    depRepo = { repoId: 'dep-repo', query: vi.fn() };
+  });
+
+  // T-CR-08: Stage 1 match — IMPORTS edge with matching file path
+  it('T-CR-08: Stage 1 — IMPORTS edge match returns confidence 0.9', async () => {
+    const changedSymbols: ChangedSymbol[] = [
+      {
+        id: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+        name: 'TradingDto',
+        filePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+    ];
+
+    consumerQuery.mockResolvedValue([
+      {
+        id: 'Method:src/main/java/com/tcbs/bond/service/BondServiceImpl.java:getBondbyId',
+        name: 'getBondbyId',
+        filePath: 'src/main/java/com/tcbs/bond/service/BondServiceImpl.java',
+        matchedFilePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+    ]);
+
+    const results = await resolver.resolveDepConsumers(consumerRepo, depRepo, changedSymbols);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      id: 'Method:src/main/java/com/tcbs/bond/service/BondServiceImpl.java:getBondbyId',
+      name: 'getBondbyId',
+      confidence: 0.9,
+      matchMethod: 'file-imports',
+      matchedDepSymbol: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+    });
+  });
+
+  // T-CR-09: Stage 2 fallback — no IMPORTS edge, Class name match
+  it('T-CR-09: Stage 2 fallback — Class name match returns confidence 0.8', async () => {
+    const changedSymbols: ChangedSymbol[] = [
+      {
+        id: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+        name: 'TradingDto',
+        filePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+    ];
+
+    // Stage 1 returns no IMPORTS matches
+    consumerQuery.mockResolvedValueOnce([]);
+    // Stage 2 returns Class name match
+    consumerQuery.mockResolvedValueOnce([
+      {
+        id: 'Class:src/main/java/com/tcbs/bond/service/dto/TradingDto.java:TradingDto',
+        name: 'TradingDto',
+        filePath: 'src/main/java/com/tcbs/bond/service/dto/TradingDto.java',
+      },
+    ]);
+
+    const results = await resolver.resolveDepConsumers(consumerRepo, depRepo, changedSymbols);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      id: 'Class:src/main/java/com/tcbs/bond/service/dto/TradingDto.java:TradingDto',
+      name: 'TradingDto',
+      confidence: 0.8,
+      matchMethod: 'class-name',
+      matchedDepSymbol: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+    });
+  });
+
+  // T-CR-10: Stage 3 fallback — no IMPORTS, no Class match, package path match
+  it('T-CR-10: Stage 3 fallback — package path match returns confidence 0.7', async () => {
+    const changedSymbols: ChangedSymbol[] = [
+      {
+        id: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+        name: 'TradingDto',
+        filePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+    ];
+
+    // Stage 1: no IMPORTS match
+    consumerQuery.mockResolvedValueOnce([]);
+    // Stage 2: no Class match
+    consumerQuery.mockResolvedValueOnce([]);
+    // Stage 3: IMPORTS edge pointing to package path
+    consumerQuery.mockResolvedValueOnce([
+      {
+        id: 'File:src/main/java/com/tcbs/bond/service/BondServiceImpl.java',
+        name: 'BondServiceImpl.java',
+        filePath: 'src/main/java/com/tcbs/bond/service/BondServiceImpl.java',
+      },
+    ]);
+    // Stage 3: find Method/Class symbols in the importing file
+    consumerQuery.mockResolvedValueOnce([
+      {
+        id: 'Method:src/main/java/com/tcbs/bond/service/BondServiceImpl.java:getBondbyId',
+        name: 'getBondbyId',
+        filePath: 'src/main/java/com/tcbs/bond/service/BondServiceImpl.java',
+      },
+    ]);
+
+    const results = await resolver.resolveDepConsumers(consumerRepo, depRepo, changedSymbols);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      id: 'Method:src/main/java/com/tcbs/bond/service/BondServiceImpl.java:getBondbyId',
+      name: 'getBondbyId',
+      confidence: 0.7,
+      matchMethod: 'package-path',
+      matchedDepSymbol: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+    });
+  });
+
+  // T-CR-11: All stages empty — returns empty array
+  it('T-CR-11: All stages empty returns empty array', async () => {
+    const changedSymbols: ChangedSymbol[] = [
+      {
+        id: 'Class:src/main/java/com/tcbs/Unknown.java:Unknown',
+        name: 'Unknown',
+        filePath: 'src/main/java/com/tcbs/Unknown.java',
+      },
+    ];
+
+    // Stage 1: empty
+    consumerQuery.mockResolvedValueOnce([]);
+    // Stage 2: empty
+    consumerQuery.mockResolvedValueOnce([]);
+    // Stage 3: IMPORTS query empty
+    consumerQuery.mockResolvedValueOnce([]);
+
+    const results = await resolver.resolveDepConsumers(consumerRepo, depRepo, changedSymbols);
+
+    expect(results).toHaveLength(0);
+  });
+
+  // T-CR-12: Error handling — query throws, returns empty array
+  it('T-CR-12: Error handling — query throws returns empty array', async () => {
+    const changedSymbols: ChangedSymbol[] = [
+      {
+        id: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+        name: 'TradingDto',
+        filePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+    ];
+
+    consumerQuery.mockRejectedValue(new Error('DB connection lost'));
+
+    const results = await resolver.resolveDepConsumers(consumerRepo, depRepo, changedSymbols);
+
+    expect(results).toEqual([]);
+  });
+
+  // T-CR-13: Multiple changed symbols — batch resolution
+  it('T-CR-13: Multiple changed symbols batched', async () => {
+    const changedSymbols: ChangedSymbol[] = [
+      {
+        id: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+        name: 'TradingDto',
+        filePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+      {
+        id: 'Class:src/main/java/com/tcbs/bond/trading/dto/BondDto.java:BondDto',
+        name: 'BondDto',
+        filePath: 'src/main/java/com/tcbs/bond/trading/dto/BondDto.java',
+      },
+    ];
+
+    // Stage 1 matches both files via IMPORTS
+    consumerQuery.mockResolvedValue([
+      {
+        id: 'Method:src/main/java/com/tcbs/bond/service/BondServiceImpl.java:getBondbyId',
+        name: 'getBondbyId',
+        filePath: 'src/main/java/com/tcbs/bond/service/BondServiceImpl.java',
+        matchedFilePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+      {
+        id: 'Method:src/main/java/com/tcbs/bond/service/BondServiceImpl.java:createBond',
+        name: 'createBond',
+        filePath: 'src/main/java/com/tcbs/bond/service/BondServiceImpl.java',
+        matchedFilePath: 'src/main/java/com/tcbs/bond/trading/dto/BondDto.java',
+      },
+    ]);
+
+    const results = await resolver.resolveDepConsumers(consumerRepo, depRepo, changedSymbols);
+
+    // Should return results for both symbols
+    expect(results.length).toBeGreaterThanOrEqual(2);
+    expect(results.every(r => r.confidence === 0.9)).toBe(true);
+    expect(results.every(r => r.matchMethod === 'file-imports')).toBe(true);
+  });
+
+  // T-CR-14: Stage 1 returns results — Stage 2 and 3 not called
+  it('T-CR-14: Stage 1 match skips Stage 2 and 3', async () => {
+    const changedSymbols: ChangedSymbol[] = [
+      {
+        id: 'Class:src/main/java/com/tcbs/bond/trading/dto/TradingDto.java:TradingDto',
+        name: 'TradingDto',
+        filePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+    ];
+
+    // Stage 1 returns results
+    consumerQuery.mockResolvedValueOnce([
+      {
+        id: 'Method:src/main/java/com/tcbs/bond/service/BondServiceImpl.java:getBondbyId',
+        name: 'getBondbyId',
+        filePath: 'src/main/java/com/tcbs/bond/service/BondServiceImpl.java',
+        matchedFilePath: 'src/main/java/com/tcbs/bond/trading/dto/TradingDto.java',
+      },
+    ]);
+
+    const results = await resolver.resolveDepConsumers(consumerRepo, depRepo, changedSymbols);
+
+    expect(results).toHaveLength(1);
+    expect(results[0].matchMethod).toBe('file-imports');
+    // Only one query call (Stage 1 only)
+    expect(consumerQuery).toHaveBeenCalledTimes(1);
+  });
+
+  // T-CR-15: filePath conversion for Java
+  it('T-CR-15: filePathToPackagePath converts Java paths', () => {
+    const result = filePathToPackagePath('src/main/java/com/tcbs/bond/trading/dto/TradingDto.java');
+    expect(result).toBe('com.tcbs.bond.trading.dto.TradingDto');
+  });
+
+  // T-CR-16: filePath conversion for Kotlin
+  it('T-CR-16: filePathToPackagePath converts Kotlin paths', () => {
+    const result = filePathToPackagePath('src/main/kotlin/com/tcbs/bond/trading/dto/TradingDto.kt');
+    expect(result).toBe('com.tcbs.bond.trading.dto.TradingDto');
+  });
+});

@@ -52,7 +52,8 @@ interface GlobalRegistry {
 export class CrossRepoRegistry {
   private entries: Map<string, RegistryEntry> = new Map();
   private packageToRepo: Map<string, string> = new Map();
-  private unscopedIndex: Map<string, string> = new Map(); // unscoped name -> repoId for npm scoped packages
+  private unscopedIndex: Map<string, string> = new Map();
+  private reverseDepMap: Map<string, Set<string>> = new Map(); // unscoped name -> repoId for npm scoped packages
   private loaded = false;
 
   /**
@@ -66,6 +67,7 @@ export class CrossRepoRegistry {
 
     this.entries.clear();
     this.packageToRepo.clear();
+    this.reverseDepMap.clear();
 
     // Load manifests in parallel
     const manifestPromises = repoInfos.map(async (info) => {
@@ -133,7 +135,26 @@ export class CrossRepoRegistry {
       }
     }
 
+    // Mark as loaded before building reverseDepMap so findDepRepo works
     this.loaded = true;
+
+    // Build reverse dependency map: provider repoId -> set of consumer repoIds
+    this.reverseDepMap.clear();
+    for (const entry of results) {
+      if (entry.manifest) {
+        for (const dep of entry.manifest.dependencies) {
+          const providerRepoId = this.findDepRepo(dep);
+          if (providerRepoId) {
+            let consumers = this.reverseDepMap.get(providerRepoId);
+            if (!consumers) {
+              consumers = new Set<string>();
+              this.reverseDepMap.set(providerRepoId, consumers);
+            }
+            consumers.add(entry.repoId);
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -144,6 +165,7 @@ export class CrossRepoRegistry {
     this.entries.clear();
     this.packageToRepo.clear();
     this.unscopedIndex.clear();
+    this.reverseDepMap.clear();
 
     const globalRegistryPath = this.getGlobalRegistryPath();
     let globalRegistry: GlobalRegistry;
@@ -214,9 +236,28 @@ export class CrossRepoRegistry {
       }
     }
 
+    // Mark as loaded before building reverseDepMap so findDepRepo works
     this.loaded = true;
-  }
 
+    // Build reverse dependency map: provider repoId -> set of consumer repoIds
+    this.reverseDepMap.clear();
+    for (const entry of globalRegistry.repos || []) {
+      const manifest = this.entries.get(entry.repoId)?.manifest;
+      if (manifest) {
+        for (const dep of manifest.dependencies) {
+          const providerRepoId = this.findDepRepo(dep);
+          if (providerRepoId) {
+            let consumers = this.reverseDepMap.get(providerRepoId);
+            if (!consumers) {
+              consumers = new Set<string>();
+              this.reverseDepMap.set(providerRepoId, consumers);
+            }
+            consumers.add(entry.repoId);
+          }
+        }
+      }
+    }
+  }
   /**
    * Find repoId for a dependency given a package prefix or module name.
    *
@@ -313,6 +354,15 @@ export class CrossRepoRegistry {
   }
 
   /**
+   * Find all consumer repoIds that depend on the given provider repoId.
+   * Returns empty array for unknown repoId.
+   */
+  findConsumers(repoId: string): string[] {
+    const consumers = this.reverseDepMap.get(repoId);
+    return consumers ? Array.from(consumers) : [];
+  }
+
+  /**
    * List all registered repositories.
    *
    * @returns Array of repos with their manifests
@@ -346,6 +396,7 @@ export class CrossRepoRegistry {
     this.entries.clear();
     this.packageToRepo.clear();
     this.unscopedIndex.clear();
+    this.reverseDepMap.clear();
     this.loaded = false;
   }
 
