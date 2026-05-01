@@ -121,6 +121,14 @@ export const TYPESCRIPT_QUERIES = `
   arguments: (arguments
     (string (string_fragment) @http_client.url))) @http_client
 
+; Expo Router navigation: router.push('/path'), router.replace('/path'), router.navigate('/path')
+(call_expression
+  function: (member_expression
+    object: (identifier) @_router_obj (#eq? @_router_obj "router")
+    property: (property_identifier) @expo_nav.method)
+  arguments: (arguments
+    (string (string_fragment) @expo_nav.url))) @expo_nav
+
 ; Decorators: @Controller, @Get, @Post, etc.
 (decorator
   (call_expression
@@ -225,6 +233,14 @@ export const JAVASCRIPT_QUERIES = `
   arguments: (arguments
     (string (string_fragment) @http_client.url))) @http_client
 
+; Expo Router navigation: router.push('/path'), router.replace('/path'), router.navigate('/path')
+(call_expression
+  function: (member_expression
+    object: (identifier) @_router_obj (#eq? @_router_obj "router")
+    property: (property_identifier) @expo_nav.method)
+  arguments: (arguments
+    (string (string_fragment) @expo_nav.url))) @expo_nav
+
 ; Express/Hono route registration
 (call_expression
   function: (member_expression
@@ -306,6 +322,16 @@ export const PYTHON_QUERIES = `
       attribute: (identifier) @decorator.name)
     arguments: (argument_list
       (string (string_content) @decorator.arg)?))) @decorator
+
+; MCP tool decorators: @mcp.tool() - capture the decorated_definition which contains both decorator and function
+(decorated_definition
+  (decorator
+    (call
+      function: (attribute
+        object: (identifier) @_mcp_obj
+        attribute: (identifier) @_tool_method)))
+  definition: (function_definition
+    name: (identifier) @mcp_tool.name)) @mcp_tool
 `;
 
 // Java queries - works with tree-sitter-java
@@ -335,13 +361,20 @@ export const JAVA_QUERIES = `
 ; Constructor calls: new Foo()
 (object_creation_expression type: (type_identifier) @call.name) @call
 
-; Heritage - extends class
+; Heritage - extends class (plain and generic)
 (class_declaration name: (identifier) @heritage.class
-  (superclass (type_identifier) @heritage.extends)) @heritage
+  (superclass [(type_identifier) @heritage.extends
+               (generic_type (type_identifier) @heritage.extends)])) @heritage
 
-; Heritage - implements interfaces
+; Heritage - implements interfaces (plain and generic)
 (class_declaration name: (identifier) @heritage.class
-  (super_interfaces (type_list (type_identifier) @heritage.implements))) @heritage.impl
+  (super_interfaces (type_list [(type_identifier) @heritage.implements
+                                 (generic_type (type_identifier) @heritage.implements)]))) @heritage.impl
+
+; Heritage - interface extends (plain and generic)
+(interface_declaration name: (identifier) @heritage.class
+  (extends_interfaces (type_list [(type_identifier) @heritage.extends
+                                   (generic_type (type_identifier) @heritage.extends)]))) @heritage
 
 ; Write access: obj.field = value
 (assignment_expression

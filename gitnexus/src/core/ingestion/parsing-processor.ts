@@ -13,8 +13,13 @@ import { buildTypeEnv } from './type-env.js';
 import type { FieldInfo, FieldExtractorContext } from './field-types.js';
 import type { LanguageProvider } from './language-provider.js';
 import { WorkerPool } from './workers/worker-pool.js';
-import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, ExtractedDecoratorRoute, ExtractedToolDef, FileConstructorBindings, FileTypeEnvBindings, ExtractedORMQuery } from './workers/parse-worker.js';
+import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, ExtractedDecoratorRoute, ExtractedToolDef, FileConstructorBindings, FileTypeEnvBindings, ExtractedORMQuery, ExtractedExpoNav } from './workers/parse-worker.js';
+import { extractClassFields, extractMethodParameterAnnotations, extractORMQueries, extractExpressRoutes } from './workers/parse-worker.js';
+import { extractSpringRoutes, collectFileConstants } from './workers/spring-route-extractor.js';
+import { extractLaravelRoutes } from './workers/parse-worker.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
+import { isVerboseIngestionEnabled } from './utils/verbose.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
 
@@ -25,6 +30,7 @@ export interface WorkerExtractedData {
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   fetchCalls: ExtractedFetchCall[];
+  expoNavCalls: ExtractedExpoNav[];
   decoratorRoutes: ExtractedDecoratorRoute[];
   toolDefs: ExtractedToolDef[];
   ormQueries: ExtractedORMQuery[];
@@ -51,7 +57,7 @@ const processParsingWithWorkers = async (
     if (lang) parseableFiles.push({ path: file.path, content: file.content });
   }
 
-  if (parseableFiles.length === 0) return { imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [] };
+  if (parseableFiles.length === 0) return { imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], expoNavCalls: [], decoratorRoutes: [], toolDefs: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [] };
 
   const total = files.length;
 
@@ -70,12 +76,16 @@ const processParsingWithWorkers = async (
   const allHeritage: ExtractedHeritage[] = [];
   const allRoutes: ExtractedRoute[] = [];
   const allFetchCalls: ExtractedFetchCall[] = [];
+  const allExpoNavCalls: ExtractedExpoNav[] = [];
   const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
   const allToolDefs: ExtractedToolDef[] = [];
   const allORMQueries: ExtractedORMQuery[] = [];
   const allConstructorBindings: FileConstructorBindings[] = [];
   const allTypeEnvBindings: FileTypeEnvBindings[] = [];
+  let symbolCount = 0;
+  let fileCount = 0;
   for (const result of chunkResults) {
+    fileCount++;
     for (const node of result.nodes) {
       graph.addNode({
         id: node.id,
@@ -89,7 +99,7 @@ const processParsingWithWorkers = async (
     }
 
     for (const sym of result.symbols) {
-      symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
+      symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type as NodeLabel, {
         parameterCount: sym.parameterCount,
         requiredParameterCount: sym.requiredParameterCount,
         parameterTypes: sym.parameterTypes,
@@ -97,19 +107,35 @@ const processParsingWithWorkers = async (
         declaredType: sym.declaredType,
         ownerId: sym.ownerId,
       });
+      symbolCount++;
     }
 
     allImports.push(...result.imports);
     allCalls.push(...result.calls);
-    allAssignments.push(...result.assignments);
+    if (result.assignments) allAssignments.push(...result.assignments);
     allHeritage.push(...result.heritage);
     allRoutes.push(...result.routes);
-    allFetchCalls.push(...result.fetchCalls);
-    allDecoratorRoutes.push(...result.decoratorRoutes);
-    allToolDefs.push(...result.toolDefs);
+    if (result.fetchCalls) allFetchCalls.push(...result.fetchCalls);
+    if (result.expoNavCalls) allExpoNavCalls.push(...result.expoNavCalls);
+    if (result.decoratorRoutes) allDecoratorRoutes.push(...result.decoratorRoutes);
+    if (result.toolDefs) allToolDefs.push(...result.toolDefs);
     if (result.ormQueries) allORMQueries.push(...result.ormQueries);
     allConstructorBindings.push(...result.constructorBindings);
-    allTypeEnvBindings.push(...result.typeEnvBindings);
+    if (result.typeEnvBindings) allTypeEnvBindings.push(...result.typeEnvBindings);
+  }
+
+  // Count nodes by label
+  const nodesByLabel: Record<string, number> = {};
+  for (const result of chunkResults) {
+    for (const node of result.nodes) {
+      nodesByLabel[node.label] = (nodesByLabel[node.label] || 0) + 1;
+    }
+  }
+  
+  if (isVerboseIngestionEnabled()) {
+    console.debug(`[route-parse] Added ${symbolCount} symbols to symbol table`);
+    console.debug(`[route-parse] Extracted ${allRoutes.length} routes from ${fileCount} files`);
+    console.debug(`[route-parse] Nodes by label: ${JSON.stringify(nodesByLabel)}`);
   }
 
   // Merge and log skipped languages from workers
@@ -128,7 +154,7 @@ const processParsingWithWorkers = async (
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return { imports: allImports, calls: allCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, fetchCalls: allFetchCalls, decoratorRoutes: allDecoratorRoutes, toolDefs: allToolDefs, ormQueries: allORMQueries, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings };
+  return { imports: allImports, calls: allCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, fetchCalls: allFetchCalls, expoNavCalls: allExpoNavCalls, decoratorRoutes: allDecoratorRoutes, toolDefs: allToolDefs, ormQueries: allORMQueries, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings };
 };
 
 // ============================================================================
@@ -199,10 +225,48 @@ const processParsingSequential = async (
   symbolTable: SymbolTable,
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback
-) => {
+): Promise<WorkerExtractedData> => {
   const parser = await loadParser();
   const total = files.length;
   const skippedLanguages = new Map<string, number>();
+
+  // Collect extracted data for routes (imports/calls/heritage are processed via direct graph writes)
+  const allRoutes: ExtractedRoute[] = [];
+  const allORMQueries: ExtractedORMQuery[] = [];
+  const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
+  const allFetchCalls: ExtractedFetchCall[] = [];
+  const allExpoNavCalls: ExtractedExpoNav[] = [];
+  const allToolDefs: ExtractedToolDef[] = [];
+
+  // ── Pre-pass: collect all Java file constants and trees for cross-file resolution ──
+  const javaConstants = new Map<string, string>();
+  const javaFileMap = new Map<string, { content: string; tree: Parser.Tree }>();
+
+  for (const file of files) {
+    const language = getLanguageFromFilename(file.path);
+    if (language !== SupportedLanguages.Java) continue;
+
+    try {
+      await loadLanguage(language, file.path);
+    } catch {
+      continue;
+    }
+
+    if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
+
+    let tree;
+    try {
+      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+    } catch {
+      continue;
+    }
+
+    javaFileMap.set(file.path, { content: file.content, tree });
+    const fileConstants = collectFileConstants(tree.rootNode);
+    for (const [k, v] of fileConstants) {
+      if (!javaConstants.has(k)) javaConstants.set(k, v);
+    }
+  }
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -229,26 +293,158 @@ const processParsingSequential = async (
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
+    // For Java files already parsed in pre-pass, reuse the tree
+    const isJavaFile = language === SupportedLanguages.Java && javaFileMap.has(file.path);
+    let tree: Parser.Tree;
+
+    // Always ensure parser has correct language loaded (critical for query creation)
     try {
       await loadLanguage(language, file.path);
     } catch {
       continue;  // parser unavailable — safety net
     }
 
-    let tree;
-    try {
-      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
-    } catch (parseError) {
-      console.warn(`Skipping unparseable file: ${file.path}`);
-      continue;
+    if (isJavaFile) {
+      tree = javaFileMap.get(file.path)!.tree;
+      astCache.set(file.path, tree);
+    } else {
+      try {
+        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+      } catch (parseError) {
+        console.warn(`Skipping unparseable file: ${file.path}`);
+        continue;
+      }
+
+      astCache.set(file.path, tree);
     }
 
-    astCache.set(file.path, tree);
+    // Extract Laravel routes from route files
+    if (language === SupportedLanguages.PHP && (file.path.includes('/routes/') || file.path.startsWith('routes/')) && file.path.endsWith('.php')) {
+      const extractedRoutes = extractLaravelRoutes(tree, file.path);
+      allRoutes.push(...extractedRoutes);
+    }
+
+    // Extract Spring routes from Java controller files
+    if (language === SupportedLanguages.Java && (file.content.includes('@Controller') || file.content.includes('@RestController'))) {
+      const springRoutes = extractSpringRoutes(tree, file.path, javaConstants);
+      if (isVerboseIngestionEnabled()) {
+        console.debug(`[route-seq] Extracted ${springRoutes.length} Spring routes from ${file.path}`);
+      }
+      allRoutes.push(...springRoutes);
+    }
+
+    // Extract Express/Hono routes from JS/TS files
+    if (language === SupportedLanguages.JavaScript || language === SupportedLanguages.TypeScript) {
+      const expressRoutes = extractExpressRoutes(tree, file.path);
+      if (expressRoutes.length > 0) {
+        allDecoratorRoutes.push(...expressRoutes);
+      }
+    }
+
+    // Extract ORM queries (Prisma and Supabase)
+    const extractedORMQueries = extractORMQueries(tree, file.path);
+    if (extractedORMQueries.length > 0) {
+      allORMQueries.push(...extractedORMQueries);
+    }
 
     const provider = getProvider(language);
     const queryString = provider.treeSitterQueries;
     if (!queryString) {
       continue;
+    }
+
+    // Extract MCP tool definitions from Python files (@mcp.tool() decorators)
+    if (language === SupportedLanguages.Python) {
+      try {
+        const lang = parser.getLanguage();
+        const mcpQuery = new Parser.Query(lang, queryString);
+        for (const match of mcpQuery.matches(tree.rootNode)) {
+          const captureMap: Record<string, any> = {};
+          match.captures.forEach(c => { captureMap[c.name] = c.node; });
+
+          // MCP tool decorators: @mcp.tool()
+          if (captureMap['mcp_tool'] && captureMap['mcp_tool.name']) {
+            const mcpObj = captureMap['_mcp_obj'];
+            const toolMethod = captureMap['_tool_method'];
+            if (mcpObj?.text === 'mcp' && toolMethod?.text === 'tool') {
+              const funcNameNode = captureMap['mcp_tool.name'];
+              const decoratorNode = captureMap['mcp_tool'];
+              allToolDefs.push({
+                filePath: file.path,
+                name: funcNameNode.text,
+                lineNumber: decoratorNode.startPosition.row,
+              });
+            }
+          }
+        }
+      } catch { /* no mcp tools in this file */ }
+    }
+
+    // Extract Expo Router navigation calls (router.push, router.replace, router.navigate)
+    if (language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript) {
+      try {
+        const lang = parser.getLanguage();
+        const expoNavQuery = new Parser.Query(lang, queryString);
+        for (const match of expoNavQuery.matches(tree.rootNode)) {
+          const captureMap: Record<string, any> = {};
+          match.captures.forEach(c => { captureMap[c.name] = c.node; });
+          if (captureMap['expo_nav'] && captureMap['expo_nav.url']) {
+            const url = captureMap['expo_nav.url'].text;
+            const navMethod = captureMap['expo_nav.method']?.text;
+            allExpoNavCalls.push({
+              filePath: file.path,
+              url,
+              method: navMethod?.toUpperCase() ?? 'PUSH',
+              sourceId: generateId('File', file.path),
+              lineNumber: captureMap['expo_nav'].startPosition.row,
+            });
+          }
+        }
+      } catch { /* no expo nav calls in this file */ }
+    }
+
+    // Extract fetch() calls and HTTP client calls for API tracking
+    if (language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript) {
+      try {
+        const lang = parser.getLanguage();
+        const fetchQuery = new Parser.Query(lang, queryString);
+        for (const match of fetchQuery.matches(tree.rootNode)) {
+          const captureMap: Record<string, any> = {};
+          match.captures.forEach(c => { captureMap[c.name] = c.node; });
+
+          // Extract fetch() calls: fetch('/api/grants')
+          if (captureMap['route.fetch']) {
+            const urlNode = captureMap['route.url'] ?? captureMap['route.template_url'];
+            if (urlNode) {
+              allFetchCalls.push({
+                filePath: file.path,
+                url: urlNode.text,
+                method: 'GET',
+                sourceId: generateId('File', file.path),
+                fetchURL: urlNode.text,
+                lineNumber: captureMap['route.fetch'].startPosition.row,
+              });
+            }
+          }
+
+          // Extract HTTP client calls (axios.get, $.post, etc.) — consumer, not route definition
+          if (captureMap['http_client'] && captureMap['http_client.url']) {
+            const method = captureMap['http_client.method']?.text;
+            const url = captureMap['http_client.url'].text;
+            const EXPRESS_ROUTE_METHODS = new Set(['get', 'post', 'put', 'delete', 'patch', 'all', 'use', 'route']);
+            if (method && !EXPRESS_ROUTE_METHODS.has(method) && url.startsWith('/')) {
+              allFetchCalls.push({
+                filePath: file.path,
+                url,
+                method: method.toUpperCase(),
+                sourceId: generateId('File', file.path),
+                fetchURL: url,
+                lineNumber: captureMap['http_client'].startPosition.row,
+              });
+            }
+          }
+        }
+      } catch { /* no fetch calls in this file */ }
     }
 
     let query;
@@ -264,6 +460,12 @@ const processParsingSequential = async (
 
     // Build per-file type environment for FieldExtractor context (lightweight — skipped if no fieldExtractor)
     const typeEnv = provider.fieldExtractor ? buildTypeEnv(tree, language, { enclosingFunctionFinder: provider.enclosingFunctionFinder }) : null;
+
+    // Track method name occurrences per file to generate unique IDs for overloaded methods.
+    // Java/Kotlin/C# support method overloading — multiple methods with the same name but different
+    // signatures. Without disambiguation, overloaded methods collide on the same node ID and only
+    // the first overload survives in the graph.
+    const methodNameCounts = new Map<string, number>();
 
     matches.forEach(match => {
       const captureMap: Record<string, any> = {};
@@ -282,7 +484,21 @@ const processParsingSequential = async (
 
       const definitionNodeForRange = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNodeForRange ? definitionNodeForRange.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+
+      // Generate unique node ID for Method/Constructor nodes, handling method overloading.
+      // For overloaded methods (same name, different parameters), append a 0-based index suffix
+      // to distinguish them. Overload 0 keeps the original format for backward compatibility.
+      let nodeId: string;
+      if (nodeLabel === 'Method' || nodeLabel === 'Constructor') {
+        const nameKey = `${file.path}:${nodeName}`;
+        const overloadIndex = methodNameCounts.get(nameKey) ?? 0;
+        methodNameCounts.set(nameKey, overloadIndex + 1);
+        nodeId = overloadIndex > 0
+          ? `${generateId(nodeLabel, `${file.path}:${nodeName}`)}:${overloadIndex}`
+          : generateId(nodeLabel, `${file.path}:${nodeName}`);
+      } else {
+        nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+      }
 
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
       const frameworkHint = definitionNode
@@ -304,6 +520,26 @@ const processParsingSequential = async (
         }
       }
 
+      // ── Field extraction for DTO/Entity classes ──
+      let fields: string | undefined;
+      if (nodeLabel === 'Class' && definitionNode) {
+        const classFields = extractClassFields(definitionNode, language);
+        if (classFields.length > 0) {
+          fields = JSON.stringify(classFields);
+        }
+      }
+
+      // ── Parameter annotation extraction for Java/Kotlin methods ──
+      let parameterAnnotations: string | undefined;
+      if ((language === 'java' || language === 'kotlin') &&
+          (nodeLabel === 'Method' || nodeLabel === 'Constructor') &&
+          definitionNode) {
+        const params = extractMethodParameterAnnotations(definitionNode, language);
+        if (params.length > 0) {
+          parameterAnnotations = JSON.stringify(params);
+        }
+      }
+
       const node: GraphNode = {
         id: nodeId,
         label: nodeLabel as any,
@@ -321,9 +557,11 @@ const processParsingSequential = async (
           ...(methodSig ? {
             parameterCount: methodSig.parameterCount,
             ...(methodSig.requiredParameterCount !== undefined ? { requiredParameterCount: methodSig.requiredParameterCount } : {}),
-            ...(methodSig.parameterTypes ? { parameterTypes: methodSig.parameterTypes } : {}),
+            ...(methodSig.parameterTypes ? { parameterTypes: JSON.stringify(methodSig.parameterTypes) } : {}),
             returnType: methodSig.returnType,
           } : {}),
+          ...(fields ? { fields } : {}),
+          ...(parameterAnnotations ? { parameterAnnotations } : {}),
         },
       };
 
@@ -410,6 +648,21 @@ const processParsingSequential = async (
       .join(', ');
     console.warn(`  Skipped unsupported languages: ${summary}`);
   }
+
+  return {
+    imports: [],
+    calls: [],
+    assignments: [],
+    heritage: [],
+    routes: allRoutes,
+    fetchCalls: allFetchCalls,
+    expoNavCalls: allExpoNavCalls,
+    decoratorRoutes: allDecoratorRoutes,
+    toolDefs: allToolDefs,
+    ormQueries: allORMQueries,
+    constructorBindings: [],
+    typeEnvBindings: [],
+  };
 };
 
 // ============================================================================
@@ -423,7 +676,7 @@ export const processParsing = async (
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback,
   workerPool?: WorkerPool,
-): Promise<WorkerExtractedData | null> => {
+): Promise<WorkerExtractedData> => {
   if (workerPool) {
     try {
       return await processParsingWithWorkers(graph, files, symbolTable, astCache, workerPool, onFileProgress);
@@ -432,7 +685,6 @@ export const processParsing = async (
     }
   }
 
-  // Fallback: sequential parsing (no pre-extracted data)
-  await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
-  return null;
+  // Fallback: sequential parsing
+  return processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
 };

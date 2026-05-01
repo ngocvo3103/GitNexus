@@ -23,8 +23,12 @@ import {
 import { buildTypeEnv, isSubclassOf } from './type-env.js';
 import type { ConstructorBinding } from './type-env.js';
 import { getTreeSitterBufferSize } from './constants.js';
-import type { ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, FileConstructorBindings } from './workers/parse-worker.js';
-import { normalizeFetchURL, routeMatches } from './route-extractors/nextjs.js';
+import type { ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, ExtractedExpoNav, FileConstructorBindings, FileTypeEnvBindings, ExtractedORMQuery, ExtractedDecoratorRoute, ExtractedToolDef } from './workers/parse-worker.js';
+import { extractPHPResponseShapes, extractResponseShapes } from './route-extractors/response-shapes.js';
+import { normalizeFetchURL, routeMatches, nextjsFileToRouteURL } from './route-extractors/nextjs.js';
+import { extractMiddlewareChain, extractNextjsMiddlewareConfig, compileMatcher, compiledMatcherMatchesRoute } from './route-extractors/middleware.js';
+import { expoFileToRouteURL } from './route-extractors/expo.js';
+import { phpFileToRouteURL } from './route-extractors/php.js';
 import { extractReturnTypeName, stripNullable } from './type-extractors/shared.js';
 import type { LiteralTypeInferrer } from './type-extractors/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
@@ -942,6 +946,25 @@ const resolveCallTarget = (
       if (ownerFiltered.length === 1) {
         return toResolveResult(ownerFiltered[0], tiered.tier);
       }
+      // D5. Interface implementation lookup: when D4 fails and the receiver type is an
+      // interface, find concrete classes that implement it and filter candidates to those.
+      const primaryCandidate = typeResolved.candidates[0];
+      if (primaryCandidate.type === 'Interface' && ctx.findImplementations) {
+        const implementerIds = ctx.findImplementations(typeNodeIds);
+        if (implementerIds.size > 0) {
+          const interfaceFiltered = pool.filter(c =>
+            c.ownerId && implementerIds.has(c.ownerId),
+          );
+          if (interfaceFiltered.length === 1) {
+            return toResolveResult(interfaceFiltered[0], tiered.tier);
+          }
+          // Multiple implementers - try overload disambiguation
+          if (interfaceFiltered.length > 1 && overloadHints) {
+            const disambiguated = tryOverloadDisambiguation(interfaceFiltered, overloadHints);
+            if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
+          }
+        }
+      }
       // E. Try overload disambiguation on the narrowed pool
       if ((fileFiltered.length > 1 || ownerFiltered.length > 1) && overloadHints) {
         const overloadPool = ownerFiltered.length > 1 ? ownerFiltered : fileFiltered;
@@ -1210,7 +1233,14 @@ export const processCallsFromExtracted = async (
   ctx: ResolutionContext,
   onProgress?: (current: number, total: number) => void,
   constructorBindings?: FileConstructorBindings[],
+  typeEnvBindings?: FileTypeEnvBindings[],
 ) => {
+  const logVerbose = isVerboseIngestionEnabled();
+  let totalCalls = 0;
+  let resolvedCalls = 0;
+  let failedCalls = 0;
+  const failedByReason = new Map<string, number>();
+
   // Scope-aware receiver types: keyed by filePath → "funcName\0varName" → typeName.
   // The scope dimension prevents collisions when two functions in the same file
   // have same-named locals pointing to different constructor types.
@@ -1220,6 +1250,27 @@ export const processCallsFromExtracted = async (
       const verified = verifyConstructorBindings(bindings, filePath, ctx, graph);
       if (verified.size > 0) {
         fileReceiverTypes.set(filePath, buildReceiverTypeIndex(verified));
+      }
+    }
+  }
+
+  // FILE_SCOPE type bindings: keyed by filePath → varName → typeName.
+  // Contains field declarations (e.g., `private CashService cashService;`) and
+  // file-level constants. Used to resolve receiver types for calls like
+  // `cashService.unholdMoney()` where `cashService` is a field.
+  const fileTypeEnv = new Map<string, Map<string, string>>();
+  if (typeEnvBindings) {
+    if (logVerbose) {
+      console.debug(`[call-resolution] Processing ${typeEnvBindings.length} typeEnvBindings files`);
+    }
+    for (const { filePath, bindings } of typeEnvBindings) {
+      fileTypeEnv.set(filePath, bindings);
+      // DEBUG: Log typeEnvBindings for controller files
+      if (logVerbose && filePath.includes('Controller')) {
+        console.debug(`[call-resolution] typeEnvBindings for ${filePath}: ${bindings.size} bindings`);
+        for (const [name, type] of bindings) {
+          console.debug(`[call-resolution]   - ${name} : ${type}`);
+        }
       }
     }
   }
@@ -1243,12 +1294,34 @@ export const processCallsFromExtracted = async (
     ctx.enableCache(filePath);
     const widenCache: WidenCache = new Map();
     const receiverMap = fileReceiverTypes.get(filePath);
+    const typeEnvMap = fileTypeEnv.get(filePath);
+
+    // DEBUG: Log when typeEnvMap is available for files with calls
+    if (logVerbose && typeEnvMap && typeEnvMap.size > 0 && filePath.includes('Controller')) {
+      console.debug(`[call-resolution] File ${filePath}: ${calls.length} calls, typeEnvMap has ${typeEnvMap.size} entries`);
+    }
 
     for (const call of calls) {
       let effectiveCall = call;
 
-      // Step 1: resolve receiver type from constructor bindings
-      if (!call.receiverTypeName && call.receiverName && receiverMap) {
+      // Step 0: resolve receiver type from FILE_SCOPE bindings (field declarations)
+      // This handles Spring DI pattern: @Autowired private CashService cashService;
+      // Fields are captured in FILE_SCOPE and should resolve before constructor bindings.
+      if (!call.receiverTypeName && call.receiverName && typeEnvMap) {
+        const resolvedType = typeEnvMap.get(call.receiverName);
+        if (resolvedType) {
+          if (logVerbose && filePath.includes('Controller')) {
+            console.debug(`[call-resolution] Step 0: resolved receiver '${call.receiverName}' to type '${resolvedType}' from FILE_SCOPE`);
+          }
+          effectiveCall = { ...call, receiverTypeName: resolvedType };
+        } else if (logVerbose && filePath.includes('Controller') && call.receiverName) {
+          // DEBUG: Log when receiver is not found in FILE_SCOPE
+          console.debug(`[call-resolution] Step 0: receiver '${call.receiverName}' NOT FOUND in FILE_SCOPE for ${filePath}`);
+        }
+      }
+
+      // Step 1: resolve receiver type from constructor bindings (var x = new Type())
+      if (!effectiveCall.receiverTypeName && call.receiverName && receiverMap) {
         const callFuncName = extractFuncNameFromSourceId(call.sourceId);
         const resolvedType = lookupReceiverType(receiverMap, callFuncName, call.receiverName);
         if (resolvedType) {
@@ -1296,7 +1369,31 @@ export const processCallsFromExtracted = async (
       }
 
       const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx, undefined, widenCache);
-      if (!resolved) continue;
+      totalCalls++;
+      if (!resolved) {
+        failedCalls++;
+        // Log resolution failure reason
+        if (logVerbose) {
+          const tiered = ctx.resolve(effectiveCall.calledName, effectiveCall.filePath);
+          const reason = !tiered ? 'no-tiered-result'
+            : tiered.candidates.length === 0 ? 'no-candidates'
+            : tiered.candidates.length > 1 ? 'ambiguous-candidates'
+            : 'filtered-out';
+          const count = failedByReason.get(reason) ?? 0;
+          failedByReason.set(reason, count + 1);
+          if (failedCalls <= 10) { // Log first 10 failures
+            console.debug(`[call-resolution] FAILED: calledName="${effectiveCall.calledName}" filePath="${effectiveCall.filePath}" receiverTypeName="${effectiveCall.receiverTypeName ?? 'none'}" reason="${reason}" candidates="${tiered?.candidates.length ?? 0}"`);
+          }
+        }
+        continue;
+      }
+
+      // DEBUG: Log successful resolution for controller calls
+      if (logVerbose && effectiveCall.filePath.includes('Controller') && effectiveCall.receiverTypeName) {
+        console.debug(`[call-resolution] RESOLVED: ${effectiveCall.receiverName}.${effectiveCall.calledName} -> ${resolved.nodeId} (via ${resolved.reason})`);
+      }
+
+      resolvedCalls++;
 
       const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${resolved.nodeId}`);
       graph.addRelationship({
@@ -1313,6 +1410,13 @@ export const processCallsFromExtracted = async (
   }
 
   onProgress?.(totalFiles, totalFiles);
+
+  if (logVerbose) {
+    console.debug(`[call-resolution] Processed ${totalCalls} calls: ${resolvedCalls} resolved, ${failedCalls} failed`);
+    for (const [reason, count] of failedByReason) {
+      console.debug(`[call-resolution]   ${reason}: ${count}`);
+    }
+  }
 };
 
 /**
@@ -1381,6 +1485,14 @@ export const processRoutesFromExtracted = async (
   ctx: ResolutionContext,
   onProgress?: (current: number, total: number) => void,
 ) => {
+  const logVerbose = isVerboseIngestionEnabled();
+  if (logVerbose) {
+    console.debug(`[route-processing] Processing ${extractedRoutes.length} routes`);
+  }
+
+  let created = 0;
+  let skipped = 0;
+
   for (let i = 0; i < extractedRoutes.length; i++) {
     const route = extractedRoutes[i];
     if (i % 50 === 0) {
@@ -1391,42 +1503,759 @@ export const processRoutesFromExtracted = async (
     if (!route.controllerName || !route.methodName) continue;
 
     const controllerResolved = ctx.resolve(route.controllerName, route.filePath);
-    if (!controllerResolved || controllerResolved.candidates.length === 0) continue;
-    if (controllerResolved.tier === 'global' && controllerResolved.candidates.length > 1) continue;
+    // Debug logging for resolution failures
+    if (!controllerResolved || controllerResolved.candidates.length === 0) {
+      if (logVerbose) {
+        console.debug(`[route-resolution] FAILED: controller="${route.controllerName}" from="${route.filePath}" tier="${controllerResolved?.tier ?? 'null'}" candidates="${controllerResolved?.candidates.length ?? 0}"`);
+      }
+      skipped++;
+      continue;
+    }
+    if (controllerResolved.tier === 'global' && controllerResolved.candidates.length > 1) {
+      // Log ambiguous global resolution with candidate file paths
+      if (logVerbose) {
+        const candidatePaths = controllerResolved.candidates.map(c => c.filePath).join(', ');
+        console.debug(`[route-resolution] AMBIGUOUS: controller="${route.controllerName}" from="${route.filePath}" candidates=[${candidatePaths}]`);
+      }
+      continue;
+    }
 
     const controllerDef = controllerResolved.candidates[0];
     const confidence = TIER_CONFIDENCE[controllerResolved.tier];
 
     const methodResolved = ctx.resolve(route.methodName, controllerDef.filePath);
-    const methodId = methodResolved?.tier === 'same-file' ? methodResolved.candidates[0]?.nodeId : undefined;
-    const sourceId = generateId('File', route.filePath);
+    // Accept method resolution from same-file or via imports (for inherited methods)
+    // When multiple overloads exist, prefer the one with @RequestBody (for Spring routes
+    // that accept JSON bodies) or with @PathVariable coverage (for routes with path variables).
+    let methodId = methodResolved?.candidates[0]?.nodeId;
+    if (methodResolved?.candidates?.length > 1) {
+      // First, try to find a candidate with @RequestBody
+      const bodyCandidate = methodResolved.candidates.find(c => {
+        const node = graph.getNode(c.nodeId);
+        const paramAnns = (node?.properties as Record<string, unknown>)?.parameterAnnotations;
+        if (typeof paramAnns === 'string') {
+          try {
+            const parsed = JSON.parse(paramAnns);
+            return parsed.some((p: any) => p.annotations?.includes('@RequestBody'));
+          } catch { return false; }
+        }
+        return false;
+      });
+      if (bodyCandidate) {
+        methodId = bodyCandidate.nodeId;
+      } else {
+        // No @RequestBody candidate - check for @PathVariable coverage
+        // Extract path variables from the route path
+        const pathVarMatch = route.routePath?.match(/\{([^}]+)\}/g);
+        const pathVars = pathVarMatch ? pathVarMatch.map((m: string) => m.slice(1, -1)) : [];
 
-    if (!methodId) {
-      const guessedId = generateId('Method', `${controllerDef.filePath}:${route.methodName}`);
-      const relId = generateId('CALLS', `${sourceId}:route->${guessedId}`);
+        if (pathVars.length > 0) {
+          // Find candidate with @PathVariable coverage for all path variables
+          const pathVarCandidate = methodResolved.candidates.find(c => {
+            const node = graph.getNode(c.nodeId);
+            const paramAnns = (node?.properties as Record<string, unknown>)?.parameterAnnotations;
+            if (typeof paramAnns === 'string') {
+              try {
+                const parsed = JSON.parse(paramAnns);
+                // Extract @PathVariable names from parameterAnnotations
+                const coveredVars = new Set<string>();
+                for (const p of parsed) {
+                  const annotations = p.annotations || [];
+                  for (const ann of annotations) {
+                    if (ann.startsWith('@PathVariable')) {
+                      // Extract argument: @PathVariable("tcbsId")
+                      const argMatch = ann.match(/@PathVariable\s*\(\s*"([^"]+)"\s*\)/);
+                      if (argMatch) {
+                        coveredVars.add(argMatch[1]);
+                      } else if (p.name) {
+                        coveredVars.add(p.name);
+                      }
+                    }
+                  }
+                }
+                // Check if all path variables are covered
+                return pathVars.every((v: string) => coveredVars.has(v));
+              } catch { return false; }
+            }
+            return false;
+          });
+          if (pathVarCandidate) {
+            methodId = pathVarCandidate.nodeId;
+          }
+        }
+      }
+    }
+
+    // Spring routes (isControllerClass: true) create Route nodes
+    if (route.isControllerClass) {
+      // Skip if method not resolved - can't create valid Route without handler
+      if (!methodId) continue;
+
+      // Create Route node
+      const routeId = generateId('Route', `${route.filePath}:${route.httpMethod}:${route.routePath}`);
+      graph.addNode({
+        id: routeId,
+        label: 'Route',
+        properties: {
+          name: `${route.httpMethod} ${route.routePath}`,
+          httpMethod: route.httpMethod,
+          routePath: route.routePath,
+          controllerName: route.controllerName,
+          methodName: route.methodName,
+          filePath: route.filePath,
+          startLine: route.lineNumber,
+          lineNumber: route.lineNumber,
+          isInherited: route.isInherited ?? false,
+          repoId: ctx.repoId,
+        },
+      });
+      created++;
+
+      // Create DEFINES edge (File → Route)
+      const fileId = generateId('File', route.filePath);
+      graph.addRelationship({
+        id: generateId('DEFINES', `${fileId}:${routeId}`),
+        sourceId: fileId,
+        targetId: routeId,
+        type: 'DEFINES',
+        confidence: 1.0,
+        reason: 'spring-route',
+      });
+
+      // Create CALLS edge (Route → Method)
+      graph.addRelationship({
+        id: generateId('CALLS', `${routeId}:${methodId}`),
+        sourceId: routeId,
+        targetId: methodId,
+        type: 'CALLS',
+        confidence: confidence,
+        reason: 'spring-route',
+      });
+    } else {
+      // Laravel routes: create CALLS edge from File to Method (no Route node)
+      const sourceId = generateId('File', route.filePath);
+
+      if (!methodId) {
+        const guessedId = generateId('Method', `${controllerDef.filePath}:${route.methodName}`);
+        const relId = generateId('CALLS', `${sourceId}:route->${guessedId}`);
+        graph.addRelationship({
+          id: relId,
+          sourceId,
+          targetId: guessedId,
+          type: 'CALLS',
+          confidence: confidence * 0.8,
+          reason: 'laravel-route',
+        });
+        continue;
+      }
+
+      const relId = generateId('CALLS', `${sourceId}:route->${methodId}`);
       graph.addRelationship({
         id: relId,
         sourceId,
-        targetId: guessedId,
+        targetId: methodId,
         type: 'CALLS',
-        confidence: confidence * 0.8,
+        confidence,
         reason: 'laravel-route',
       });
-      continue;
     }
+  }
 
-    const relId = generateId('CALLS', `${sourceId}:route->${methodId}`);
-    graph.addRelationship({
-      id: relId,
-      sourceId,
-      targetId: methodId,
-      type: 'CALLS',
-      confidence,
-      reason: 'laravel-route',
-    });
+  if (logVerbose) {
+    console.debug(`[route-processing] Created ${created} Route nodes, skipped ${skipped}`);
   }
 
   onProgress?.(extractedRoutes.length, extractedRoutes.length);
+};
+
+
+// WI-12: repoId parameter variant — used by pipeline.ts post-processing
+export const processExpoRoutesWithRepoId = (
+  graph: KnowledgeGraph,
+  filePaths: string[],
+  repoId: string,
+): Map<string, string> => {
+  const routeRegistry = new Map<string, string>();
+  const nextjsRoutePattern = /(?:^|\/)app\/api\/.*\/route\.(ts|js|tsx|jsx)$/;
+
+  for (const filePath of filePaths) {
+    if (nextjsRoutePattern.test(filePath)) continue;
+    const routeURL = expoFileToRouteURL(filePath);
+    if (!routeURL) continue;
+
+    const routeId = generateId('Route', routeURL);
+    const fileId = generateId('File', filePath);
+
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        filePath,
+        routeType: 'expo-router',
+        repoId,
+      },
+    });
+
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}->${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'expo-router-file',
+    });
+
+    routeRegistry.set(routeURL, filePath);
+  }
+
+  return routeRegistry;
+};
+
+export const processNextjsRoutesWithRepoId = (
+  graph: KnowledgeGraph,
+  filePaths: string[],
+  fileContents: Map<string, string>,
+  repoId: string,
+): Map<string, string> => {
+  const routeRegistry = new Map<string, string>();
+  let created = 0;
+
+  for (const filePath of filePaths) {
+    const routeURL = nextjsFileToRouteURL(filePath);
+    if (!routeURL) continue;
+    const content = fileContents.get(filePath);
+    if (!content) continue;
+
+    const { responseKeys, errorKeys } = extractResponseShapes(content);
+    const mwResult = extractMiddlewareChain(content);
+    const middleware = mwResult?.chain ?? [];
+
+    const routeId = generateId('Route', routeURL);
+    const fileId = generateId('File', filePath);
+
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        routePath: routeURL,
+        filePath,
+        routeType: 'nextjs-app-router',
+        repoId,
+        ...(responseKeys && responseKeys.length > 0 && { responseKeys }),
+        ...(errorKeys && errorKeys.length > 0 && { errorKeys }),
+        ...(middleware.length > 0 && { middleware }),
+      },
+    });
+
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}->${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'nextjs-app-router',
+    });
+
+    routeRegistry.set(routeURL, filePath);
+    created++;
+  }
+
+  return routeRegistry;
+};
+
+export const processDecoratorRoutesWithRepoId = (
+  graph: KnowledgeGraph,
+  decoratorRoutes: ExtractedDecoratorRoute[],
+  repoId: string,
+): void => {
+  const logVerbose = isVerboseIngestionEnabled();
+  let created = 0;
+
+  for (const route of decoratorRoutes) {
+    const routePath = route.path;
+    if (!routePath) continue;
+    const httpMethod = (route.decorator || 'get').toUpperCase();
+    if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'ALL'].includes(httpMethod)) continue;
+
+    const routeId = generateId('Route', `${route.filePath}:${route.decorator}:${routePath}`);
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routePath,
+        httpMethod,
+        routePath,
+        filePath: route.filePath,
+        startLine: route.lineNumber,
+        lineNumber: route.lineNumber,
+        repoId,
+      },
+    });
+    created++;
+
+    const fileId = generateId('File', route.filePath);
+
+    graph.addRelationship({
+      id: generateId('DEFINES', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'DEFINES',
+      confidence: 1.0,
+      reason: 'express-route',
+    });
+
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'express-route',
+    });
+  }
+};
+
+export const processPHPRoutesWithRepoId = (
+  graph: KnowledgeGraph,
+  phpFilePaths: string[],
+  phpFileContents: Map<string, string>,
+  repoId: string,
+): void => {
+  const logVerbose = isVerboseIngestionEnabled();
+  let created = 0;
+
+  for (const filePath of phpFilePaths) {
+    const routeURL = phpFileToRouteURL(filePath);
+    if (!routeURL) continue;
+    const content = phpFileContents.get(filePath);
+    if (!content) continue;
+
+    const { responseKeys, errorKeys } = extractPHPResponseShapes(content);
+
+    const routeId = generateId('Route', `${filePath}:${routeURL}`);
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        routePath: routeURL,
+        filePath,
+        httpMethod: 'GET',
+        repoId,
+        ...(responseKeys !== undefined && { responseKeys }),
+        ...(errorKeys !== undefined && { errorKeys }),
+      },
+    });
+    created++;
+
+    const fileId = generateId('File', filePath);
+
+    graph.addRelationship({
+      id: generateId('DEFINES', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'DEFINES',
+      confidence: 1.0,
+      reason: 'php-file-route',
+    });
+
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'php-file-route',
+    });
+  }
+};
+
+/**
+ * Process Express/Hono decorator routes (app.get(), router.post(), etc.)
+ * extracted from JavaScript/TypeScript files during parsing.
+ *
+ * - Creates Route nodes for each route registration
+ * - Creates HANDLES_ROUTE edges (File -> Route)
+ */
+export const processDecoratorRoutes = (
+  graph: KnowledgeGraph,
+  decoratorRoutes: ExtractedDecoratorRoute[],
+): void => {
+  const logVerbose = isVerboseIngestionEnabled();
+  let created = 0;
+
+  for (const route of decoratorRoutes) {
+    const routePath = route.path;
+    if (!routePath) continue;
+
+    // Normalize the HTTP method
+    const httpMethod = (route.decorator || 'get').toUpperCase();
+    if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'ALL'].includes(httpMethod)) continue;
+
+    // Create Route node
+    const routeId = generateId('Route', `${route.filePath}:${route.decorator}:${routePath}`);
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routePath,
+        httpMethod,
+        routePath,
+        filePath: route.filePath,
+        startLine: route.lineNumber,
+        lineNumber: route.lineNumber,
+      },
+    });
+    created++;
+
+    // Create File node if it doesn't exist
+    const fileId = generateId('File', route.filePath);
+
+    // Create DEFINES edge (File -> Route)
+    graph.addRelationship({
+      id: generateId('DEFINES', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'DEFINES',
+      confidence: 1.0,
+      reason: 'express-route',
+    });
+
+    // Create HANDLES_ROUTE edge (File -> Route)
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'express-route',
+    });
+  }
+
+  if (logVerbose && created > 0) {
+    console.debug(`[decorator-route-processing] Created ${created} Route nodes from Express/Hono routes`);
+  }
+};
+
+/**
+ * Process PHP file-based routes (direct file routing without framework).
+ * For each PHP file in api/ directory, creates a Route node and extracts
+ * response shapes from json_encode() calls using extractPHPResponseShapes.
+ *
+ * - Creates Route nodes for api/*.php files
+ * - Creates HANDLES_ROUTE edges (File -> Route)
+ * - Extracts responseKeys/errorKeys from json_encode() calls
+ */
+export const processPHPRoutes = (
+  graph: KnowledgeGraph,
+  phpFilePaths: string[],
+  phpFileContents: Map<string, string>,
+): void => {
+  const logVerbose = isVerboseIngestionEnabled();
+  let created = 0;
+
+  for (const filePath of phpFilePaths) {
+    const routeURL = phpFileToRouteURL(filePath);
+    if (!routeURL) continue;
+
+    const content = phpFileContents.get(filePath);
+    if (!content) continue;
+
+    // Extract response shapes from json_encode() calls
+    const { responseKeys, errorKeys } = extractPHPResponseShapes(content);
+
+    // Create Route node
+    const routeId = generateId('Route', `${filePath}:${routeURL}`);
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        routePath: routeURL,
+        filePath,
+        httpMethod: 'GET',
+        ...(responseKeys !== undefined && { responseKeys }),
+        ...(errorKeys !== undefined && { errorKeys }),
+      },
+    });
+    created++;
+
+    // Create File node if it doesn't exist
+    const fileId = generateId('File', filePath);
+
+    // Create DEFINES edge (File -> Route)
+    graph.addRelationship({
+      id: generateId('DEFINES', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'DEFINES',
+      confidence: 1.0,
+      reason: 'php-file-route',
+    });
+
+    // Create HANDLES_ROUTE edge (File -> Route)
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}:${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'php-file-route',
+    });
+  }
+
+  if (logVerbose && created > 0) {
+    console.debug(`[php-route-processing] Created ${created} Route nodes from PHP files`);
+  }
+};
+
+/**
+ * Process Next.js App Router route files (app/api/glob/route.ts pattern).
+ * - Creates Route nodes for each API route
+ * - Extracts responseKeys/errorKeys from NextResponse.json() calls
+ * - Extracts middleware wrapper chains from handler exports
+ * - Creates HANDLES_ROUTE edges (File -> Route)
+ * - Returns a route registry (routeURL -> filePath) for use in processNextjsFetchRoutes
+ */
+export const processNextjsRoutes = (
+  graph: KnowledgeGraph,
+  filePaths: string[],
+  fileContents: Map<string, string>,
+): Map<string, string> => {
+  const logVerbose = isVerboseIngestionEnabled();
+  const routeRegistry = new Map<string, string>(); // routeURL -> filePath
+  let created = 0;
+
+  for (const filePath of filePaths) {
+    const routeURL = nextjsFileToRouteURL(filePath);
+    if (!routeURL) continue;
+
+    const content = fileContents.get(filePath);
+    if (!content) continue;
+
+    // Extract response shapes from NextResponse.json() calls
+    const { responseKeys, errorKeys } = extractResponseShapes(content);
+
+    // Extract middleware wrapper chain
+    const mwResult = extractMiddlewareChain(content);
+    const middleware = mwResult?.chain ?? [];
+
+    // Create Route node
+    const routeId = generateId('Route', routeURL);
+    const fileId = generateId('File', filePath);
+
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        routePath: routeURL,
+        filePath,
+        routeType: 'nextjs-app-router',
+        ...(responseKeys && responseKeys.length > 0 && { responseKeys }),
+        ...(errorKeys && errorKeys.length > 0 && { errorKeys }),
+        ...(middleware.length > 0 && { middleware }),
+      },
+    });
+
+    // Create HANDLES_ROUTE edge (File -> Route)
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}->${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'nextjs-app-router',
+    });
+
+    routeRegistry.set(routeURL, filePath);
+    created++;
+
+    if (logVerbose) {
+      console.debug(`[nextjs-route] Created Route ${routeURL} from ${filePath}`);
+    }
+  }
+
+  if (logVerbose && created > 0) {
+    console.debug(`[nextjs-route-processing] Created ${created} Route nodes from Next.js App Router files`);
+  }
+
+  return routeRegistry;
+};
+
+/**
+ * Process ORM queries extracted from parse-worker.ts:
+ * - Creates CodeElement nodes for ORM models (user, post, bookings, etc.)
+ * - Creates QUERIES edges from enclosing function to model CodeElement
+ */
+export const processORMQueriesFromExtracted = (
+  graph: KnowledgeGraph,
+  ormQueries: ExtractedORMQuery[],
+): void => {
+  const logVerbose = isVerboseIngestionEnabled();
+
+  // Track created CodeElement nodes to avoid duplicates
+  const modelNodes = new Map<string, string>(); // entityType -> nodeId
+
+  for (const query of ormQueries) {
+    // Create or reuse CodeElement node for the model
+    let modelNodeId = modelNodes.get(query.entityType);
+    if (!modelNodeId) {
+      modelNodeId = generateId('CodeElement', `orm-model:${query.entityType}`);
+      graph.addNode({
+        id: modelNodeId,
+        label: 'CodeElement',
+        properties: {
+          name: query.entityType,
+          description: 'model/table',
+          entityType: query.entityType,
+        },
+      });
+      modelNodes.set(query.entityType, modelNodeId);
+    }
+
+    // Create QUERIES edge from sourceId (function) to model CodeElement
+    const relId = generateId('QUERIES', `${query.sourceId}:${query.entityType}:${query.operation}`);
+    graph.addRelationship({
+      id: relId,
+      sourceId: query.sourceId,
+      targetId: modelNodeId,
+      type: 'QUERIES',
+      confidence: 1.0,
+      reason: query.operation,
+    });
+  }
+
+  if (logVerbose && ormQueries.length > 0) {
+    console.debug(`[orm-processing] Created ${modelNodes.size} CodeElement nodes and ${ormQueries.length} QUERIES edges`);
+  }
+};
+
+/**
+ * Process Expo Router file-based routes:
+ * - Creates Route nodes for files in app/ directory
+ * - Creates HANDLES_ROUTE edges (File -> Route)
+ * - Returns a route registry (routeURL -> filePath) for use in processExpoRouterNavigations
+ *
+ * NOTE: Skips Next.js App Router route.ts files - those are handled by processNextjsRoutes
+ * which extracts responseKeys, errorKeys, and middleware.
+ */
+export const processExpoRoutes = (
+  graph: KnowledgeGraph,
+  filePaths: string[],
+): Map<string, string> => {
+  const logVerbose = isVerboseIngestionEnabled();
+  const routeRegistry = new Map<string, string>(); // routeURL -> filePath
+
+  // Next.js App Router route pattern: app/api/**/route.ts
+  // These should be handled by processNextjsRoutes, not here
+  const nextjsRoutePattern = /(?:^|\/)app\/api\/.*\/route\.(ts|js|tsx|jsx)$/;
+
+  for (const filePath of filePaths) {
+    // Skip Next.js App Router route handlers - they need responseKeys/errorKeys/middleware extraction
+    if (nextjsRoutePattern.test(filePath)) continue;
+
+    const routeURL = expoFileToRouteURL(filePath);
+    if (!routeURL) continue;
+
+    // Create Route node
+    const routeId = generateId('Route', routeURL);
+    const fileId = generateId('File', filePath);
+
+    graph.addNode({
+      id: routeId,
+      label: 'Route',
+      properties: {
+        name: routeURL,
+        filePath,
+        routeType: 'expo-router',
+      },
+    });
+
+    // Create HANDLES_ROUTE edge (File -> Route)
+    graph.addRelationship({
+      id: generateId('HANDLES_ROUTE', `${fileId}->${routeId}`),
+      sourceId: fileId,
+      targetId: routeId,
+      type: 'HANDLES_ROUTE',
+      confidence: 1.0,
+      reason: 'expo-router-file',
+    });
+
+    routeRegistry.set(routeURL, filePath);
+
+    if (logVerbose) {
+      console.debug(`[expo-route] Created Route ${routeURL} from ${filePath}`);
+    }
+  }
+
+  if (logVerbose && routeRegistry.size > 0) {
+    console.debug(`[expo-route] Created ${routeRegistry.size} Expo Router routes`);
+  }
+
+  return routeRegistry;
+};
+
+/**
+ * Process Next.js project-level middleware.ts file and link it to matching routes.
+ * - Finds middleware.ts at project root
+ * - Extracts config.matcher patterns
+ * - Updates Route nodes that match the patterns with middleware property
+ */
+export const processNextjsMiddleware = (
+  graph: KnowledgeGraph,
+  filePaths: string[],
+  fileContents: Map<string, string>,
+): void => {
+  const logVerbose = isVerboseIngestionEnabled();
+
+  // Find project-level middleware.ts (not in node_modules or app/ directories)
+  const middlewarePath = filePaths.find(p =>
+    (p === 'middleware.ts' || p === 'middleware.js' || p.endsWith('/middleware.ts') || p.endsWith('/middleware.js')) &&
+    !p.includes('node_modules') &&
+    !p.includes('/app/')
+  );
+
+  if (!middlewarePath) return;
+
+  const content = fileContents.get(middlewarePath);
+  if (!content) return;
+
+  const mwConfig = extractNextjsMiddlewareConfig(content);
+  if (!mwConfig || mwConfig.matchers.length === 0) return;
+
+  if (logVerbose) {
+    console.debug(`[nextjs-middleware] Found middleware at ${middlewarePath} with matchers: ${mwConfig.matchers.join(', ')}`);
+  }
+
+  // Compile matchers
+  const compiledMatchers = mwConfig.matchers
+    .map(m => compileMatcher(m))
+    .filter((m): m is NonNullable<typeof m> => m !== null);
+
+  // Find all Route nodes and update those that match
+  graph.forEachNode(node => {
+    if (node.label !== 'Route') return;
+    const routeURL = node.properties.routePath ?? node.properties.name;
+    if (typeof routeURL !== 'string') return;
+
+    // Check if route matches any matcher
+    const matches = compiledMatchers.some(cm => compiledMatcherMatchesRoute(cm, routeURL));
+    if (!matches) return;
+
+    // Update middleware property
+    const existingMiddleware = node.properties.middleware as string[] | undefined;
+    const mwName = mwConfig.exportedName;
+    if (existingMiddleware) {
+      if (!existingMiddleware.includes(mwName)) {
+        node.properties.middleware = [...existingMiddleware, mwName];
+      }
+    } else {
+      node.properties.middleware = [mwName];
+    }
+  });
 };
 
 /**
@@ -1526,13 +2355,22 @@ export const processNextjsFetchRoutes = (
   routeRegistry: Map<string, string>,  // routeURL → handlerFilePath
   consumerContents?: Map<string, string>,  // filePath → file content
 ) => {
+  if (isVerboseIngestionEnabled()) {
+    console.debug(`[fetch-routes] Processing ${fetchCalls.length} fetch calls against ${routeRegistry.size} routes`);
+  }
   // Pre-count how many routes each consumer file matches (for confidence attribution)
   const routeCountByFile = new Map<string, number>();
   for (const call of fetchCalls) {
     const normalized = normalizeFetchURL(call.fetchURL);
+    if (isVerboseIngestionEnabled()) {
+      console.debug(`[fetch-routes] Normalized '${call.fetchURL}' → '${normalized}'`);
+    }
     if (!normalized) continue;
     for (const [routeURL] of routeRegistry) {
       if (routeMatches(normalized, routeURL)) {
+        if (isVerboseIngestionEnabled()) {
+          console.debug(`[fetch-routes] MATCH: normalized '${normalized}' ↔ route '${routeURL}'`);
+        }
         routeCountByFile.set(call.filePath, (routeCountByFile.get(call.filePath) ?? 0) + 1);
         break;
       }
@@ -1574,6 +2412,50 @@ export const processNextjsFetchRoutes = (
           confidence: 0.9,
           reason,
         });
+        if (isVerboseIngestionEnabled()) {
+          console.debug(`[fetch-routes] Created FETCHES: ${sourceId} → ${routeNodeId}, reason=${reason}`);
+        }
+        break;
+      }
+    }
+  }
+};
+
+/**
+ * Create FETCHES edges from Expo Router navigation calls (router.push/replace/navigate).
+ * These represent client-side navigation between routes, not HTTP fetches.
+ * We model them the same way as fetch() calls for consistency in the consumer graph.
+ */
+export const processExpoRouterNavigations = (
+  graph: KnowledgeGraph,
+  expoNavCalls: ExtractedExpoNav[],
+  routeRegistry: Map<string, string>,  // routeURL → handlerFilePath
+) => {
+  if (isVerboseIngestionEnabled()) {
+    console.debug(`[expo-nav] Processing ${expoNavCalls.length} navigation calls against ${routeRegistry.size} routes`);
+  }
+
+  for (const nav of expoNavCalls) {
+    // Strip quotes from URL
+    const normalized = nav.url.replace(/^['"]|['"]$/g, '');
+    if (!normalized || !normalized.startsWith('/')) continue;
+
+    for (const [routeURL] of routeRegistry) {
+      if (routeMatches(normalized, routeURL)) {
+        const sourceId = generateId('File', nav.filePath);
+        const routeNodeId = generateId('Route', routeURL);
+
+        graph.addRelationship({
+          id: generateId('FETCHES', `${sourceId}->${routeNodeId}`),
+          sourceId,
+          targetId: routeNodeId,
+          type: 'FETCHES',
+          confidence: 0.85,
+          reason: `expo-router:${nav.method.toLowerCase()}`,
+        });
+        if (isVerboseIngestionEnabled()) {
+          console.debug(`[expo-nav] Created FETCHES: ${sourceId} → ${routeNodeId} via ${nav.method}`);
+        }
         break;
       }
     }
@@ -1627,6 +2509,9 @@ export const extractFetchCallsFromFiles = async (
         if (urlNode) {
           result.push({
             filePath: file.path,
+            url: urlNode.text,
+            method: 'GET',
+            sourceId: generateId('File', file.path),
             fetchURL: urlNode.text,
             lineNumber: captureMap['route.fetch'].startPosition.row,
           });
@@ -1636,11 +2521,144 @@ export const extractFetchCallsFromFiles = async (
         const url = captureMap['http_client.url'].text;
         const HTTP_CLIENT_ONLY = new Set(['head', 'options', 'request', 'ajax']);
         if (method && HTTP_CLIENT_ONLY.has(method) && url.startsWith('/')) {
-          result.push({ filePath: file.path, fetchURL: url, lineNumber: captureMap['http_client'].startPosition.row });
+          result.push({
+            filePath: file.path,
+            url,
+            method,
+            sourceId: generateId('File', file.path),
+            fetchURL: url,
+            lineNumber: captureMap['http_client'].startPosition.row,
+          });
         }
       }
     }
   }
 
   return result;
+};
+
+/**
+ * Extract Expo Router navigation calls (router.push/replace/navigate) from source files (sequential path).
+ * Workers handle this via tree-sitter captures in parse-worker; this function
+ * provides the same extraction for the sequential fallback path.
+ */
+export const extractExpoNavCallsFromFiles = async (
+  files: { path: string; content: string }[],
+  astCache: ASTCache,
+): Promise<ExtractedExpoNav[]> => {
+  const parser = await loadParser();
+  const result: ExtractedExpoNav[] = [];
+
+  for (const file of files) {
+    const language = getLanguageFromFilename(file.path);
+    if (!language) continue;
+    if (!isLanguageAvailable(language)) continue;
+
+    const provider = getProvider(language);
+    const queryStr = provider.treeSitterQueries;
+    if (!queryStr) continue;
+
+    await loadLanguage(language, file.path);
+
+    let tree = astCache.get(file.path);
+    if (!tree) {
+      try {
+        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+      } catch { continue; }
+      astCache.set(file.path, tree);
+    }
+
+    let matches;
+    try {
+      const lang = parser.getLanguage();
+      const query = new Parser.Query(lang, queryStr);
+      matches = query.matches(tree.rootNode);
+    } catch { continue; }
+
+    for (const match of matches) {
+      const captureMap: Record<string, any> = {};
+      match.captures.forEach(c => captureMap[c.name] = c.node);
+
+      if (captureMap['expo_nav'] && captureMap['expo_nav.url']) {
+        const url = captureMap['expo_nav.url'].text;
+        const navMethod = captureMap['expo_nav.method']?.text;
+        result.push({
+          filePath: file.path,
+          url,
+          method: navMethod?.toUpperCase() ?? 'PUSH',
+          sourceId: generateId('File', file.path),
+          lineNumber: captureMap['expo_nav'].startPosition.row,
+        });
+      }
+    }
+  }
+
+  return result;
+};
+
+/**
+ * Process extracted MCP tool definitions from @mcp.tool() decorators.
+ * Creates Tool nodes and HANDLES_TOOL edges from handler files to tools.
+ */
+export const processToolDefsFromExtracted = async (
+  graph: KnowledgeGraph,
+  toolDefs: ExtractedToolDef[],
+  ctx: ResolutionContext,
+  onProgress?: (current: number, total: number) => void,
+): Promise<void> => {
+  const logVerbose = isVerboseIngestionEnabled();
+  if (logVerbose) {
+    console.debug(`[tool-processing] Processing ${toolDefs.length} tool definitions`);
+  }
+
+  for (let i = 0; i < toolDefs.length; i++) {
+    const toolDef = toolDefs[i];
+    if (i % 50 === 0) {
+      onProgress?.(i, toolDefs.length);
+      await yieldToEventLoop();
+    }
+
+    // Create Tool node
+    const toolId = generateId('Tool', `${toolDef.filePath}:${toolDef.name}`);
+    graph.addNode({
+      id: toolId,
+      label: 'Tool',
+      properties: {
+        name: toolDef.name,
+        filePath: toolDef.filePath,
+        description: toolDef.description,
+        lineNumber: toolDef.lineNumber,
+      },
+    });
+
+    // Create HANDLES_TOOL edge (File → Tool)
+    const fileId = generateId('File', toolDef.filePath);
+    graph.addRelationship({
+      id: generateId('HANDLES_TOOL', `${fileId}:${toolId}`),
+      sourceId: fileId,
+      targetId: toolId,
+      type: 'HANDLES_TOOL',
+      confidence: 1.0,
+      reason: 'mcp-tool-decorator',
+    });
+
+    // Try to resolve the function and create CALLS edge (Tool → Function)
+    const funcResolved = ctx.resolve(toolDef.name, toolDef.filePath);
+    if (funcResolved && funcResolved.candidates.length > 0) {
+      const funcId = funcResolved.candidates[0].nodeId;
+      const confidence = TIER_CONFIDENCE[funcResolved.tier];
+      graph.addRelationship({
+        id: generateId('CALLS', `${toolId}:${funcId}`),
+        sourceId: toolId,
+        targetId: funcId,
+        type: 'CALLS',
+        confidence,
+        reason: 'mcp-tool-handler',
+      });
+    }
+  }
+
+  if (logVerbose) {
+    console.debug(`[tool-processing] Created ${toolDefs.length} Tool nodes`);
+  }
 };

@@ -52,7 +52,10 @@ Returns results grouped by process (execution flow):
 - process_symbols: all symbols in those flows with file locations and module (functional area)
 - definitions: standalone types/interfaces not in any process
 
-Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.`,
+Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank Fusion.
+
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to query across repositories.
+Results from multi-repo queries include '_repoId' attribution for each item.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -63,6 +66,7 @@ Hybrid ranking: BM25 keyword + semantic vector search, ranked by Reciprocal Rank
         max_symbols: { type: 'number', description: 'Max symbols per process (default: 10)', default: 10 },
         include_content: { type: 'boolean', description: 'Include full symbol source code (default: false)', default: false },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+        repos: { type: 'array', items: { type: 'string' }, description: 'Multiple repos for cross-repo queries. When provided, queries all listed repos in parallel and returns aggregated results with repoId attribution.' },
       },
       required: ['query'],
     },
@@ -75,10 +79,10 @@ WHEN TO USE: Complex structural queries that search/explore can't answer. READ g
 AFTER THIS: Use context() on result symbols for deeper context.
 
 SCHEMA:
-- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, Route, Tool
+- Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process
 - Multi-language nodes (use backticks): \`Struct\`, \`Enum\`, \`Trait\`, \`Impl\`, etc.
 - All edges via single CodeRelation table with 'type' property
-- Edge types: CONTAINS, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, ACCESSES, OVERRIDES, MEMBER_OF, STEP_IN_PROCESS, HANDLES_ROUTE, FETCHES, HANDLES_TOOL, ENTRY_POINT_OF
+- Edge types: CONTAINS, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, OVERRIDES, MEMBER_OF, STEP_IN_PROCESS
 - Edge properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32)
 
 EXAMPLES:
@@ -94,12 +98,6 @@ EXAMPLES:
 • Find all methods of a class:
   MATCH (c:Class {name: "UserService"})-[r:CodeRelation {type: 'HAS_METHOD'}]->(m:Method) RETURN m.name, m.parameterCount, m.returnType
 
-• Find all properties of a class:
-  MATCH (c:Class {name: "User"})-[r:CodeRelation {type: 'HAS_PROPERTY'}]->(p:Property) RETURN p.name, p.declaredType
-
-• Find all writers of a field:
-  MATCH (f:Function)-[r:CodeRelation {type: 'ACCESSES', reason: 'write'}]->(p:Property) WHERE p.name = "address" RETURN f.name, f.filePath
-
 • Find method overrides (MRO resolution):
   MATCH (winner:Method)-[r:CodeRelation {type: 'OVERRIDES'}]->(loser:Method) RETURN winner.name, winner.filePath, loser.filePath, r.reason
 
@@ -110,14 +108,18 @@ OUTPUT: Returns { markdown, row_count } — results formatted as a Markdown tabl
 
 TIPS:
 - All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
-- Community = auto-detected functional area (Leiden algorithm). Properties: heuristicLabel, cohesion, symbolCount, keywords, description, enrichedBy
-- Process = execution flow trace from entry point to terminal. Properties: heuristicLabel, processType, stepCount, communities, entryPointId, terminalId
-- Use heuristicLabel (not label) for human-readable community/process names`,
+- Community = auto-detected functional area (Leiden algorithm)
+- Process = execution flow trace from entry point to terminal
+- Use heuristicLabel (not label) for human-readable community/process names
+
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to query across repositories.
+Results from multi-repo queries include '_repoId' attribution for each row.`,
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Cypher query to execute' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+        repos: { type: 'array', items: { type: 'string' }, description: 'Multiple repos for cross-repo queries. When provided, queries all listed repos in parallel and returns aggregated results with repoId attribution.' },
       },
       required: ['query'],
     },
@@ -125,14 +127,15 @@ TIPS:
   {
     name: 'context',
     description: `360-degree view of a single code symbol.
-Shows categorized incoming/outgoing references (calls, imports, extends, implements, methods, properties, overrides), process participation, and file location.
+Shows categorized incoming/outgoing references (calls, imports, extends, implements), process participation, and file location.
 
 WHEN TO USE: After query() to understand a specific symbol in depth. When you need to know all callers, callees, and what execution flows a symbol participates in.
 AFTER THIS: Use impact() if planning changes, or READ gitnexus://repo/{name}/process/{processName} for full execution trace.
 
 Handles disambiguation: if multiple symbols share the same name, returns candidates for you to pick from. Use uid param for zero-ambiguity lookup from prior results.
 
-NOTE: ACCESSES edges (field read/write tracking) are included in context results with reason 'read' or 'write'. CALLS edges resolve through field access chains and method-call chains (e.g., user.address.getCity().save() produces CALLS edges at each step).`,
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to search across repositories.
+Results from multi-repo queries include '_repoId' attribution.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -141,6 +144,7 @@ NOTE: ACCESSES edges (field read/write tracking) are included in context results
         file_path: { type: 'string', description: 'File path to disambiguate common names' },
         include_content: { type: 'boolean', description: 'Include full symbol source code (default: false)', default: false },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+        repos: { type: 'array', items: { type: 'string' }, description: 'Multiple repos for cross-repo queries. When provided, searches all listed repos in parallel and returns aggregated results with repoId attribution.' },
       },
       required: [],
     },
@@ -208,89 +212,125 @@ Depth groups:
 - d=2: LIKELY AFFECTED (indirect)
 - d=3: MAY NEED TESTING (transitive)
 
-TIP: Default traversal uses CALLS/IMPORTS/EXTENDS/IMPLEMENTS. For class members, include HAS_METHOD and HAS_PROPERTY in relationTypes. For field access analysis, include ACCESSES in relationTypes.
+EdgeType: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, OVERRIDES
+Confidence: 1.0 = certain, <0.8 = fuzzy match
 
-EdgeType: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, OVERRIDES, ACCESSES
-Confidence: 1.0 = certain, <0.8 = fuzzy match`,
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to analyze impact across repositories.
+Results from multi-repo queries include '_repoId' attribution.`,
     inputSchema: {
       type: 'object',
       properties: {
         target: { type: 'string', description: 'Name of function, class, or file to analyze' },
         direction: { type: 'string', description: 'upstream (what depends on this) or downstream (what this depends on)' },
         maxDepth: { type: 'number', description: 'Max relationship depth (default: 3)', default: 3 },
-        relationTypes: { type: 'array', items: { type: 'string' }, description: 'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, OVERRIDES, ACCESSES (default: usage-based, ACCESSES excluded by default)' },
+        relationTypes: { type: 'array', items: { type: 'string' }, description: 'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, OVERRIDES (default: usage-based)' },
         includeTests: { type: 'boolean', description: 'Include test files (default: false)' },
         minConfidence: { type: 'number', description: 'Minimum confidence 0-1 (default: 0.7)' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+        repos: { type: 'array', items: { type: 'string' }, description: 'Multiple repos for cross-repo queries. When provided, analyzes impact across all listed repos in parallel with repoId attribution.' },
       },
       required: ['target', 'direction'],
     },
   },
   {
-    name: 'route_map',
-    description: `Show API route mappings: which components/hooks fetch which API endpoints, and which handler files serve them.
+    name: 'document-endpoint',
+    description: `Generate API documentation JSON for an HTTP endpoint.
 
-WHEN TO USE: Understanding API consumption patterns, finding orphaned routes. For pre-change analysis, prefer \`api_impact\` which combines this data with mismatch detection and risk assessment.
-AFTER THIS: Use impact() on specific route handlers to see full blast radius.
+Returns schema-valid JSON with:
+- Request/response specifications (params, body, validation, response codes)
+- External dependencies (downstream APIs, messaging, persistence)
+- Logic flow placeholder and code diagram
+- Retry logic, transaction management, security annotations
 
-Returns: route nodes with their handlers, middleware wrapper chains (e.g., withAuth, withRateLimit), and consumers.`,
+Two modes:\n- openapi (default): Returns OpenAPI 3.1.0 YAML string with x-extensions for downstream dependencies\n- ai_context: Returns full JSON with _context fields, BodySchema payloads, and TODO_AI_ENRICH placeholders
+
+Use this to quickly document an endpoint's complete call chain and dependencies.`,
     inputSchema: {
       type: 'object',
       properties: {
-        route: { type: 'string', description: 'Filter by route path (e.g., "/api/grants"). Omit for all routes.' },
+        method: { type: 'string', description: 'HTTP method (GET, POST, PUT, DELETE, PATCH)' },
+        path: { type: 'string', description: 'Path or path keyword to match (e.g., "users", "/api/users/{id}")' },
+        depth: { type: 'number', description: 'Max call chain depth to trace (default: 10)', default: 10 },
+        mode: { type: 'string', enum: ['openapi', 'ai_context'], description: 'Output mode: "openapi" for OpenAPI YAML (default), "ai_context" for AI-enriched JSON with source context', default: 'openapi' },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: ['method', 'path'],
+    },
+  },
+  {
+    name: 'endpoints',
+    description: `Query API endpoints by HTTP method and/or path pattern.
+
+Returns matching Route nodes with controller class, handler method, file path, and line number.
+
+WHEN TO USE: Find the entry point for an API endpoint before tracing its call chain.
+AFTER THIS: Use context() on the handler method for deeper analysis, or document-endpoint for full documentation.
+
+Supports partial path matching (e.g., "users" matches "/api/users/{id}").`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        method: { type: 'string', description: 'HTTP method (GET, POST, PUT, DELETE, PATCH)', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] },
+        path: { type: 'string', description: 'Path or path keyword to match (e.g., "users", "/api/users/{id}")' },
         repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
       },
       required: [],
     },
   },
   {
-    name: 'tool_map',
-    description: `Show MCP/RPC tool definitions: which tools are defined, where they're handled, and their descriptions.
+    name: 'impacted_endpoints',
+    description: `Find which HTTP endpoints are impacted by code changes in a git diff.
 
-WHEN TO USE: Understanding tool APIs, finding tool implementations, impact analysis for tool changes.
+Runs git diff against a base ref, maps changed files to graph symbols, then traverses the
+knowledge graph to discover all affected API endpoints.
 
-Returns: tool nodes with their handler files and descriptions.`,
+WHEN TO USE: Before committing or merging — understand what API endpoints your changes affect.
+Especially useful for PR review, release planning, and regression risk assessment.
+
+AFTER THIS: Use document-endpoint on high-risk routes for full documentation with downstream
+dependencies.
+
+Output includes:
+- tiers: WILL_BREAK (d=1, direct), LIKELY_AFFECTED (d=2, indirect), MAY_NEED_TESTING (d=3, transitive)
+- affected_processes: execution flows broken and at which step
+- affected_modules: functional areas hit (direct vs indirect)
+- risk: LOW / MEDIUM / HIGH / CRITICAL
+
+Each endpoint appears in exactly one tier (shallowest discovered path wins).
+
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to analyze across repositories.
+Results from multi-repo queries include '_repoId' attribution.`,
     inputSchema: {
       type: 'object',
       properties: {
-        tool: { type: 'string', description: 'Filter by tool name. Omit for all tools.' },
-        repo: { type: 'string', description: 'Repository name or path.' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'shape_check',
-    description: `Check response shapes for API routes against their consumers' property accesses.
-
-WHEN TO USE: Detecting mismatches between what an API route returns and what consumers expect. Finding shape drift. For pre-change analysis, prefer \`api_impact\` which combines this data with mismatch detection and risk assessment.
-REQUIRES: Route nodes with responseKeys (extracted from .json({...}) calls during indexing).
-
-Returns routes that have both detected response keys AND consumers. Shows top-level keys each endpoint returns (e.g., data, pagination, error) and what keys each consumer accesses. Reports MISMATCH status when a consumer accesses keys not present in the route's response shape.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        route: { type: 'string', description: 'Check a specific route (e.g., "/api/grants"). Omit to check all routes.' },
-        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'api_impact',
-    description: `Pre-change impact report for an API route handler.
-
-WHEN TO USE: BEFORE modifying any API route handler. Shows what consumers depend on, what response fields they access, what middleware protects the route, and what execution flows it triggers. Requires at least "route" or "file" parameter.
-
-Risk levels: LOW (0-3 consumers), MEDIUM (4-9 or any mismatches), HIGH (10+ consumers or mismatches with 4+ consumers). Mismatches with confidence "low" indicate the consumer file fetches multiple routes — property attribution is approximate.
-
-Returns: single route object when one match, or { routes: [...], total: N } for multiple matches. Combines route_map, shape_check, and impact data.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        route: { type: 'string', description: 'Route path (e.g., "/api/grants")' },
-        file: { type: 'string', description: 'Handler file path (alternative to route)' },
-        repo: { type: 'string', description: 'Repository name or path.' },
+        scope: {
+          type: 'string',
+          description: 'What to analyze: "unstaged" (default), "staged", "all", or "compare"',
+          enum: ['unstaged', 'staged', 'all', 'compare'],
+          default: 'unstaged',
+        },
+        base_ref: {
+          type: 'string',
+          description: 'Branch/commit for "compare" scope (e.g., "main")',
+        },
+        max_depth: {
+          type: 'number',
+          description: 'Max BFS traversal depth (default: 3)',
+          default: 3,
+        },
+        min_confidence: {
+          type: 'number',
+          description: 'Minimum edge confidence 0-1 (default: 0.7)',
+        },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+        repos: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Multiple repos for cross-repo queries. When provided, analyzes across all listed repos in parallel with _repoId attribution.',
+        },
       },
       required: [],
     },

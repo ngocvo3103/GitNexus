@@ -14,6 +14,7 @@ export interface RepoMeta {
   repoPath: string;
   lastCommit: string;
   indexedAt: string;
+  schemaVersion?: number;
   stats?: {
     files?: number;
     nodes?: number;
