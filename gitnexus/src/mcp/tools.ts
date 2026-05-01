@@ -277,4 +277,62 @@ Supports partial path matching (e.g., "users" matches "/api/users/{id}").`,
       required: [],
     },
   },
+  {
+    name: 'impacted_endpoints',
+    description: `Find which HTTP endpoints are impacted by code changes in a git diff.
+
+Runs git diff against a base ref, maps changed files to graph symbols, then traverses the
+knowledge graph to discover all affected API endpoints.
+
+WHEN TO USE: Before committing or merging — understand what API endpoints your changes affect.
+Especially useful for PR review, release planning, and regression risk assessment.
+
+AFTER THIS: Use document-endpoint on high-risk routes for full documentation with downstream
+dependencies.
+
+Output includes:
+- tiers: WILL_BREAK (d=1, direct), LIKELY_AFFECTED (d=2, indirect), MAY_NEED_TESTING (d=3, transitive)
+- affected_processes: execution flows broken and at which step
+- affected_modules: functional areas hit (direct vs indirect)
+- risk: LOW / MEDIUM / HIGH / CRITICAL
+
+Each endpoint appears in exactly one tier (shallowest discovered path wins).
+
+CROSS-REPO: Use 'repos' parameter with multiple repo IDs to analyze across repositories.
+Results from multi-repo queries include '_repoId' attribution.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: {
+          type: 'string',
+          description: 'What to analyze: "unstaged" (default), "staged", "all", or "compare"',
+          enum: ['unstaged', 'staged', 'all', 'compare'],
+          default: 'unstaged',
+        },
+        base_ref: {
+          type: 'string',
+          description: 'Branch/commit for "compare" scope (e.g., "main")',
+        },
+        max_depth: {
+          type: 'number',
+          description: 'Max BFS traversal depth (default: 3)',
+          default: 3,
+        },
+        min_confidence: {
+          type: 'number',
+          description: 'Minimum edge confidence 0-1 (default: 0.7)',
+        },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+        repos: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Multiple repos for cross-repo queries. When provided, analyzes across all listed repos in parallel with _repoId attribution.',
+        },
+      },
+      required: [],
+    },
+  },
 ];

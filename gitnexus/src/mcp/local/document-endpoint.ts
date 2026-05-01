@@ -16,6 +16,7 @@ import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
 import { generateId } from '../../lib/utils.js';
 import { shouldSkipSchema, extractGenericInnerType, extractPackagePrefix } from '../../core/ingestion/type-extractors/shared.js';
 import type { BodySchemaField } from '../../core/openapi/schema-builder.js';
+import { parseMethodLevelMapping, parseClassLevelPrefix, combinePaths, METHOD_TO_ANNOTATIONS } from './route-annotation-parser.js';
 
 // ============================================================================
 // Constants
@@ -654,15 +655,7 @@ export async function findHandlerByPathPattern(
   `;
 
   // Try different mapping annotations based on HTTP method
-  const methodToAnnotation: Record<string, string[]> = {
-    'GET': ['GetMapping', 'RequestMapping'],
-    'POST': ['PostMapping', 'RequestMapping'],
-    'PUT': ['PutMapping', 'RequestMapping'],
-    'DELETE': ['DeleteMapping', 'RequestMapping'],
-    'PATCH': ['PatchMapping', 'RequestMapping'],
-  };
-
-  const annotations = methodToAnnotation[upperMethod] || ['Mapping'];
+  const annotations = METHOD_TO_ANNOTATIONS[upperMethod] || ['Mapping'];
   const paths = pathPattern.split('/').filter(p => p.length > 0);
 
   // Collect all candidates with their scores
@@ -700,10 +693,9 @@ export async function findHandlerByPathPattern(
             const line = row.line ?? row[2];
             const content = row.content ?? row[3] ?? '';
 
-            // Extract the method-level path from the annotation
-            const pathMatch = content.match(new RegExp(`@(?:${upperMethod}Mapping|RequestMapping)\\s*\\(\\s*[^)]*value\\s*=\\s*[\"']([^\"']+)[\"']`, 'i'))
-              || content.match(new RegExp(`@(?:${upperMethod}Mapping|RequestMapping)\\s*\\(\\s*[\"']([^\"']+)[\"']`, 'i'));
-            const annotationPath = pathMatch?.[1];
+            // Extract the method-level path from the annotation using shared parser
+            const parsed = parseMethodLevelMapping(content, upperMethod);
+            const annotationPath = parsed?.routePath;
 
             if (!annotationPath) continue; // Skip if no annotation path found
 
@@ -725,11 +717,9 @@ export async function findHandlerByPathPattern(
                 if (classRows && classRows.length > 0) {
                   const classContent = classRows[0].classContent ?? classRows[0][0] ?? '';
 
-                  // Extract class-level @RequestMapping path (must be before 'class' or 'interface' keyword)
-                  const classPathMatch = classContent.match(/@RequestMapping\s*\(\s*["']([^"']+)["']\s*\)\s*(?:\n\s*)*(?:@\w+\s*(?:\([^)]*\)\s*)?\s*)*(?:public\s+)?(?:class|interface)/i)
-                    || classContent.match(/@RequestMapping\s*\(\s*[^)]*value\s*=\s*["']([^"']+)["'][^)]*\)\s*(?:\n\s*)*(?:@\w+\s*(?:\([^)]*\)\s*)?\s*)*(?:public\s+)?(?:class|interface)/i);
+                  // Extract class-level @RequestMapping path using shared parser
+                  classPath = parseClassLevelPrefix(classContent) ?? undefined;
 
-                  classPath = classPathMatch?.[1];
                 }
               } catch (e) {
                 if (DEBUG) console.error('[GitNexus DEBUG] Class path query failed:', e);
@@ -738,10 +728,8 @@ export async function findHandlerByPathPattern(
               cpCache.set(filePath, classPath);
             }
 
-            // Combine class prefix with method path
-            const normalizedClassPath = classPath ? classPath.replace(/\/$/, '') : '';
-            const normalizedMethodPath = annotationPath.startsWith('/') ? annotationPath : '/' + annotationPath;
-            const fullPath = normalizedClassPath + normalizedMethodPath;
+            // Combine class prefix with method path using shared utility
+            const fullPath = combinePaths(classPath, annotationPath);
 
             // STRUCTURAL VALIDATION: Check if FULL path (class + method) matches input path
             let isValidCandidate = true;

@@ -570,3 +570,5 @@ export const SCHEMA_QUERIES = [
   ...REL_SCHEMA_QUERIES,
   EMBEDDING_SCHEMA,
 ];
+/** Schema version derived from table count — increments when tables are added/removed. */
+export const SCHEMA_VERSION = NODE_SCHEMA_QUERIES.length + REL_SCHEMA_QUERIES.length;

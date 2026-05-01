@@ -2,18 +2,18 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 9 tools are defined
+ * - All 10 tools are defined
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
- * - Cross-repo 'repos' parameter on query, context, impact, cypher
+ * - Cross-repo 'repos' parameter on query, context, impact, cypher, impacted_endpoints
  */
 import { describe, it, expect } from 'vitest';
 import { GITNEXUS_TOOLS, type ToolDefinition } from '../../src/mcp/tools.js';
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports exactly 9 tools', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(9);
+  it('exports exactly 10 tools', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(10);
   });
 
   it('contains all expected tool names', () => {
@@ -22,6 +22,7 @@ describe('GITNEXUS_TOOLS', () => {
       expect.arrayContaining([
         'list_repos', 'query', 'cypher', 'context',
         'detect_changes', 'rename', 'impact', 'endpoints', 'document-endpoint',
+        'impacted_endpoints',
       ])
     );
   });
@@ -151,5 +152,45 @@ describe('GITNEXUS_TOOLS', () => {
         expect(tool.inputSchema.properties.repos).toBeUndefined();
       }
     }
+  });
+});
+
+// ─── WI-7: impacted_endpoints tool registration ───────────────────────
+
+describe('impacted_endpoints tool registration', () => {
+  const tool = GITNEXUS_TOOLS.find(t => t.name === 'impacted_endpoints')!;
+
+  it('tool exists in GITNEXUS_TOOLS', () => {
+    expect(tool).toBeDefined();
+    expect(tool.name).toBe('impacted_endpoints');
+  });
+
+  it('has valid inputSchema with type object and properties', () => {
+    expect(tool.inputSchema.type).toBe('object');
+    expect(tool.inputSchema.properties).toBeDefined();
+    expect(typeof tool.inputSchema.properties).toBe('object');
+  });
+
+  it('defines base_ref property', () => {
+    expect(tool.inputSchema.properties.base_ref).toBeDefined();
+    expect(tool.inputSchema.properties.base_ref.type).toBe('string');
+  });
+
+  it('repo parameter is optional (not in required array)', () => {
+    expect(tool.inputSchema.properties.repo).toBeDefined();
+    expect(tool.inputSchema.required).not.toContain('repo');
+  });
+
+  it('description is non-empty string', () => {
+    expect(tool.description).toBeTruthy();
+    expect(typeof tool.description).toBe('string');
+    expect(tool.description.length).toBeGreaterThan(0);
+  });
+
+  it('repos parameter is defined for cross-repo queries', () => {
+    expect(tool.inputSchema.properties.repos).toBeDefined();
+    expect(tool.inputSchema.properties.repos.type).toBe('array');
+    expect(tool.inputSchema.properties.repos.items).toEqual({ type: 'string' });
+    expect(tool.inputSchema.required).not.toContain('repos');
   });
 });
