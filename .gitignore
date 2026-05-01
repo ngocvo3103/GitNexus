@@ -72,6 +72,23 @@ eval/.hypothesis/
 # Design docs (local only)
 docs/plans/
 
+# Local-only docs and artifacts
+gitnexus/docs/bug/
+gitnexus/docs/context/
+gitnexus/docs/designs/
+gitnexus/docs/plans/
+gitnexus/docs/story/
+gitnexus/docs/e2e.md
+gitnexus/docs/progress.md
+gitnexus/docs/scripts/
+
+# Binary files
+abc.json
+abc.md
+gitnexus/bond-exception-handler
+gitnexus/tcbs-bond-amqp
+gitnexus/tcbs-bond-amqp-message
+
 gitnexus/test/fixtures/mini-repo/*.md
 gitnexus/test/fixtures/mini-repo/.claude
 gitnexus/test/fixtures/mini-repo/.gitignore
