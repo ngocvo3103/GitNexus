@@ -1,7 +1,11 @@
 
-export function validateRequest(input: string) {
+export function validate(input: string) {
   if (!input) throw new Error('Invalid');
   return true;
+}
+
+export function checkSchema(schema: any) {
+  return schema && typeof schema === 'object';
 }
 
 export function sanitize(input: string) {
