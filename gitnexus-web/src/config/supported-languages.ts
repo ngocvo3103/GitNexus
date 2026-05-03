@@ -1,0 +1,16 @@
+export enum SupportedLanguages {
+    JavaScript = 'javascript',
+    TypeScript = 'typescript',
+    Python = 'python',
+    Java = 'java',
+    C = 'c',
+    CPlusPlus = 'cpp',
+    CSharp = 'csharp',
+    Go = 'go',
+    Rust = 'rust',
+    PHP = 'php',
+    Ruby = 'ruby',
+    Kotlin = 'kotlin',
+    Swift = 'swift',
+    Dart = 'dart',
+}
