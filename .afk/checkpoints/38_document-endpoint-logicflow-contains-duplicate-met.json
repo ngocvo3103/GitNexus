@@ -1,0 +1,21 @@
+{
+  "issue": {
+    "number": 38,
+    "title": "document-endpoint logicFlow contains duplicate method names in call chain",
+    "body": "## Summary\nThe `document-endpoint` tool's `logicFlow` field produces duplicate method names in the call chain, making the flow appear to call the same method consecutively.\n\n## Reproduction\n1. Run `document-endpoint(method=\"GET\", path=\"/e/v1/bonds/{id}\", repo=\"tcbs-bond-trading\", mode=\"ai_context\")`\n2. Inspect the `logicFlow` field\n\n## Observed\n```\n\"logicFlow\": \"getBondbyId → getBondById → getBondById → getCode → getProductBondInfo → IssuerDto → getProductBondInfo\"\n```\n\n`getBondById` appears twice consecutively, and `getProductBondInfo` also appears twice.\n\n## Expected\nThe logic flow should not contain consecutive duplicate method names. Either:\n- The flow should trace distinct methods (if there are overloaded versions, differentiate them)\n- Or duplicates should be deduplicated\n\n## Impact\nThe duplicated method names make the call chain confusing and suggest the method calls itself in a loop, which is inaccurate. The `codeDiagram` (Mermaid) also reflects this duplication: `A --> B --> C` with only 3 nodes while the logicFlow lists 7 steps.",
+    "labels": [
+      "medium",
+      "confirmed"
+    ],
+    "comments": []
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "baseBranch": "main",
+  "branchName": "feature/38_document-endpoint-logicflow-contains-duplicate-met",
+  "sessionId": "d1043eca-86b3-46f9-af66-bf4c05022b75",
+  "completedSteps": [
+    "label"
+  ],
+  "createdAt": "2026-05-03T08:13:19.025Z",
+  "updatedAt": "2026-05-03T08:13:21.270Z"
+}

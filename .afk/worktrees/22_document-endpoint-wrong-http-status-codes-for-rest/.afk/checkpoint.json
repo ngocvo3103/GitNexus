@@ -1,0 +1,22 @@
+{
+  "issue": {
+    "number": 22,
+    "title": "document-endpoint wrong HTTP status codes for REST endpoints",
+    "body": "## Steps to reproduce\n1. Call `document-endpoint(method=\"POST\", path=\"/api/users\", repo=\"sample-spring-minimal\")`\n2. Call `document-endpoint(method=\"DELETE\", path=\"/api/orders/{id}\", repo=\"sample-spring-minimal\")`\n\n## Actual behavior\n- POST /api/users returns status 200 instead of 201 (CREATED)\n- DELETE /api/orders/{id} returns status 200 instead of 204 (NO_CONTENT)\n\n## Expected behavior\n- POST creating a resource should return 201\n- DELETE should return 204 when no body is returned\n\n## User impact\nGenerated API documentation conveys incorrect semantics. Consumers of the documentation may implement incorrect error handling.\n\n## Evidence\n```json\ndocument-endpoint(method=\"POST\", path=\"/api/users\", ...) →\n{ \"responseCodes\": [{ \"code\": \"200\" }] }\n// Expected: [{ \"code\": \"201\" }]\n\ndocument-endpoint(method=\"DELETE\", path=\"/api/orders/{id}\", ...) →\n{ \"responseCodes\": [{ \"code\": \"200\" }] }\n// Expected: [{ \"code\": \"204\" }]\n```",
+    "labels": [
+      "bug",
+      "confirmed"
+    ],
+    "comments": []
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "baseBranch": "main",
+  "branchName": "feature/22_document-endpoint-wrong-http-status-codes-for-rest",
+  "worktreePath": "/Users/NgocVo_1/Documents/sourceCode/GitNexus/.afk/worktrees/22_document-endpoint-wrong-http-status-codes-for-rest",
+  "sessionId": "362f439e-c728-4668-ab84-436931f811d4",
+  "completedSteps": [
+    "label"
+  ],
+  "createdAt": "2026-05-02T23:22:19.696Z",
+  "updatedAt": "2026-05-02T23:22:21.351Z"
+}

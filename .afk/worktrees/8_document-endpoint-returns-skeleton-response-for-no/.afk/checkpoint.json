@@ -1,0 +1,22 @@
+{
+  "issue": {
+    "number": 8,
+    "title": "document-endpoint returns skeleton response for non-existent paths",
+    "body": "## Steps to reproduce\n1. Call `document-endpoint(method=\"GET\", path=\"/nonexistent/path\", repo=\"tcbs-bond-trading\")`\n\n## Actual behavior\nReturns BOTH a full skeleton response (with `specs`, `externalDependencies`, `logicFlow: \"TODO_AI_ENRICH\"`, etc.) AND an `error: \"No endpoint found for GET /nonexistent/path\"` field. The skeleton looks like valid endpoint documentation at a glance.\n\n## Expected behavior\nWhen no endpoint matches, return ONLY the error. Do not return a fabricated skeleton.\n\n## User impact\nUsers could mistakenly treat fabricated skeletons as real documentation, leading to incorrect understanding of API structure.\n\n## Evidence\n```json\ndocument-endpoint(method=\"GET\", path=\"/nonexistent/path\", repo=\"tcbs-bond-trading\") →\n{\n  \"error\": \"No endpoint found for GET /nonexistent/path\",\n  \"specs\": { ... full skeleton ... },\n  \"logicFlow\": \"TODO_AI_ENRICH\",\n  ...\n}\n```",
+    "labels": [
+      "medium",
+      "confirmed"
+    ],
+    "comments": []
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "baseBranch": "main",
+  "branchName": "feature/8_document-endpoint-returns-skeleton-response-for-no",
+  "worktreePath": "/Users/NgocVo_1/Documents/sourceCode/GitNexus/.afk/worktrees/8_document-endpoint-returns-skeleton-response-for-no",
+  "sessionId": "67378fe2-010b-4933-ba59-c200e0db60b1",
+  "completedSteps": [
+    "label"
+  ],
+  "createdAt": "2026-05-02T23:22:10.215Z",
+  "updatedAt": "2026-05-02T23:22:13.005Z"
+}

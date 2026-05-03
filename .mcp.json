@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gitnexus": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/Users/NgocVo_1/Documents/sourceCode/GitNexus/gitnexus/dist/cli/index.js", "mcp"]
+    }
+  }
+}

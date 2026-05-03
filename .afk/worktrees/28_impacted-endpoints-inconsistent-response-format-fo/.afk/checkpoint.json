@@ -1,0 +1,23 @@
+{
+  "issue": {
+    "number": 28,
+    "title": "impacted_endpoints inconsistent response format for changed_files",
+    "body": "## Steps to reproduce\n1. Call `impacted_endpoints(repo=\"sample-spring-minimal\")` — `changed_files` is a number\n2. Call `impacted_endpoints(repos=[\"sample-spring-minimal\"])` — `changed_files` is an object with repo keys\n3. Call with multiple repos — `changed_files` has multiple repo keys\n\n## Actual behavior\nThe `changed_files` field has inconsistent types across different parameter combinations:\n- Sometimes a number\n- Sometimes an object with single repo key\n- Sometimes an object with multiple repo keys\n\n## Expected behavior\nResponse format should be consistent regardless of whether `repo` or `repos` parameter is used. Prefer a consistent object format.\n\n## User impact\nClient code cannot reliably parse the response without type-checking the `changed_files` field, making integration fragile.\n\n## Evidence\n```json\n// repo parameter:\n{ \"changed_files\": 3 }\n\n// repos parameter:\n{ \"changed_files\": { \"sample-spring-minimal\": [...] } }\n```",
+    "labels": [
+      "bug",
+      "medium",
+      "confirmed"
+    ],
+    "comments": []
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "baseBranch": "main",
+  "branchName": "feature/28_impacted-endpoints-inconsistent-response-format-fo",
+  "worktreePath": "/Users/NgocVo_1/Documents/sourceCode/GitNexus/.afk/worktrees/28_impacted-endpoints-inconsistent-response-format-fo",
+  "sessionId": "bad4b881-655b-4d1d-8600-a770c76ebc28",
+  "completedSteps": [
+    "label"
+  ],
+  "createdAt": "2026-05-02T23:22:01.330Z",
+  "updatedAt": "2026-05-02T23:22:03.313Z"
+}

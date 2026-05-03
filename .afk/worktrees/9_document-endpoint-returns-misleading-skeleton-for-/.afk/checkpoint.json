@@ -1,0 +1,22 @@
+{
+  "issue": {
+    "number": 9,
+    "title": "document-endpoint returns misleading skeleton for FastAPI/Gin repos",
+    "body": "## Steps to reproduce\n1. Call `document-endpoint(method=\"GET\", path=\"/api/users\", repo=\"sample-fastapi\")`\n2. Since FastAPI endpoints are never indexed (see H1), every call returns the same skeleton + error pattern.\n\n## Actual behavior\nReturns full skeleton with all `TODO_AI_ENRICH` fields plus `error: \"No endpoint found for GET /api/users\"`.\n\n## Expected behavior\nReturn only the error, not a fake skeleton. Same root cause as the non-existent path issue but exacerbated because ALL paths will fail for non-Spring repos.\n\n## User impact\nEvery `document-endpoint` call against FastAPI/Gin repos produces misleading output.\n\n## Evidence\n```json\ndocument-endpoint(method=\"GET\", path=\"/api/users\", repo=\"sample-fastapi\") →\n{\n  \"error\": \"No endpoint found for GET /api/users\",\n  \"specs\": { ... skeleton ... }\n}\n```",
+    "labels": [
+      "medium",
+      "confirmed"
+    ],
+    "comments": []
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "baseBranch": "main",
+  "branchName": "feature/9_document-endpoint-returns-misleading-skeleton-for-",
+  "worktreePath": "/Users/NgocVo_1/Documents/sourceCode/GitNexus/.afk/worktrees/9_document-endpoint-returns-misleading-skeleton-for-",
+  "sessionId": "caeebf8e-743f-4e7b-b09b-999e2d8ac427",
+  "completedSteps": [
+    "label"
+  ],
+  "createdAt": "2026-05-02T23:22:07.633Z",
+  "updatedAt": "2026-05-02T23:22:09.401Z"
+}

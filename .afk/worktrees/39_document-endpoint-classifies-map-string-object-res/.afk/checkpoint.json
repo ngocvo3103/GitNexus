@@ -1,0 +1,22 @@
+{
+  "issue": {
+    "number": 39,
+    "title": "document-endpoint classifies Map<String,Object> response body as source 'primitive'",
+    "body": "## Summary\nThe `document-endpoint` tool classifies `Map<String, Object>` response body types as `source: \"primitive\"` instead of recognizing them as container/complex types.\n\n## Reproduction\n1. Run `document-endpoint(method=\"GET\", path=\"/i/v1/trading\", repo=\"tcbs-bond-trading\", mode=\"ai_context\")`\n2. Inspect the `response.body` field\n\n## Observed\n```json\n\"body\": {\n  \"typeName\": \"Map<String, Object>\",\n  \"source\": \"primitive\",\n  \"isContainer\": true\n}\n```\n\nThe `source` is \"primitive\" but `isContainer` is true, which is contradictory. A `Map<String, Object>` is not a primitive type.\n\n## Expected\n`source` should be \"container\" or \"complex\" for Map types, not \"primitive\". Alternatively, the schema should expand Map types with their generic parameters.\n\n## Impact\nMisleading type classification. Downstream consumers of the documentation may treat the response as a simple primitive type, missing the fact that it's a structured key-value container.",
+    "labels": [
+      "low",
+      "confirmed"
+    ],
+    "comments": []
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "baseBranch": "main",
+  "branchName": "feature/39_document-endpoint-classifies-map-string-object-res",
+  "worktreePath": "/Users/NgocVo_1/Documents/sourceCode/GitNexus/.afk/worktrees/39_document-endpoint-classifies-map-string-object-res",
+  "sessionId": "89c0e6e5-57bb-4ffe-b8be-9e4bb9f816bf",
+  "completedSteps": [
+    "label"
+  ],
+  "createdAt": "2026-05-02T23:22:13.801Z",
+  "updatedAt": "2026-05-02T23:22:16.381Z"
+}

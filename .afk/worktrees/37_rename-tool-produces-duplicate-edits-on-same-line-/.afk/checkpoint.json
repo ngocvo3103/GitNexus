@@ -1,0 +1,21 @@
+{
+  "issue": {
+    "number": 37,
+    "title": "rename tool produces duplicate edits on same line for implementation class",
+    "body": "## Summary\nThe `rename` tool produces two identical edits on the same line when renaming a class that has both EXTENDS and IMPORTS graph edges pointing to it from the same file.\n\n## Reproduction\n1. Run `rename(symbol_name=\"BondServiceImpl\", new_name=\"BondServiceV3\", repo=\"tcbs-bond-trading\", dry_run=true)`\n2. Observe the `changes` array\n\n## Observed\n```json\n{\n  \"files_affected\": 1,\n  \"total_edits\": 2,\n  \"changes\": [\n    {\n      \"file_path\": \"src/main/java/com/tcbs/bond/trading/service/impl/v2/BondServiceV2Impl.java\",\n      \"edits\": [\n        {\n          \"line\": 14,\n          \"old_text\": \"import com.tcbs.bond.trading.service.impl.BondServiceImpl;\",\n          \"new_text\": \"import com.tcbs.bond.trading.service.impl.BondServiceV3;\",\n          \"confidence\": \"graph\"\n        },\n        {\n          \"line\": 14,\n          \"old_text\": \"import com.tcbs.bond.trading.service.impl.BondServiceImpl;\",\n          \"new_text\": \"import com.tcbs.bond.trading.service.impl.BondServiceV3;\",\n          \"confidence\": \"graph\"\n        }\n      ]\n    }\n  ]\n}\n```\n\nThe same import statement on line 14 is listed twice with identical old_text and new_text.\n\n## Root Cause\nBondServiceV2Impl has two graph edges to BondServiceImpl: one EXTENDS edge and one IMPORTS edge. Both resolve to the same import statement in the source file. The rename tool finds both edges but doesn't deduplicate edits that target the same line with identical content.\n\n## Expected\nOnly one edit per unique line should be produced. The tool should deduplicate edits before returning results.\n\n## Impact\nIf `dry_run=false`, the tool would attempt to apply the same edit twice, which could cause errors or unexpected behavior. Even in dry_run mode, the duplicate inflates `total_edits` count and makes review harder.",
+    "labels": [
+      "confirmed"
+    ],
+    "comments": []
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "baseBranch": "main",
+  "branchName": "feature/37_rename-tool-produces-duplicate-edits-on-same-line-",
+  "worktreePath": "/Users/NgocVo_1/Documents/sourceCode/GitNexus/.afk/worktrees/37_rename-tool-produces-duplicate-edits-on-same-line-",
+  "sessionId": "314db605-9efb-4a66-b221-612926418467",
+  "completedSteps": [
+    "label"
+  ],
+  "createdAt": "2026-05-02T23:22:17.177Z",
+  "updatedAt": "2026-05-02T23:22:18.897Z"
+}

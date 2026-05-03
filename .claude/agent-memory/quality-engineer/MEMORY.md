@@ -1,0 +1,8 @@
+- [R2 QA Findings 2026-05](R2-qa-findings-2026-05.md) — 18 new issues (3 HIGH, 9 MEDIUM, 6 LOW) from deep cross-language testing of GitNexus tools
+- [R3 QA Findings 2026-05](R3-qa-findings-2026-05.md) — 6 new issues (1 HIGH, 3 MEDIUM, 2 LOW) from tool-edge-case testing on tcbs-bond-trading
+- [R4 QA Findings 2026-05](R4-qa-findings-2026-05.md) — 5 new issues (1 HIGH, 3 MEDIUM, 1 LOW) from cross-repo and document-endpoint testing
+- [R5 QA Findings 2026-05](R5-qa-findings-2026-05.md) — 6 new issues (2 HIGH, 2 MEDIUM, 2 LOW) from cross-repo tracing, CLI, and data consistency testing
+- [R6 QA Findings 2026-05](R6-qa-findings-2026-05.md) — 7 new issues (0 HIGH, 4 MEDIUM, 3 LOW) from deep codebase inspection and query/impact tool testing
+- [R7 QA Findings 2026-05](R7-qa-findings-2026-05.md) — 11 new issues (3 HIGH, 4 MEDIUM, 4 LOW) from rename, impacted_endpoints, document-endpoint, Cypher, and Express testing
+- [R8 QA Findings 2026-05](R8-qa-findings-2026-05.md) — 3 new issues (0 HIGH, 2 MEDIUM, 1 LOW) from ingestion pipeline, cluster resources, config property, and class-level impact testing
+- [R9 QA Findings 2026-05](R9-qa-findings-2026-05.md) — 14 new issues (4 HIGH, 7 MEDIUM, 3 LOW) from Python/Go/TS ingestion, missing route extractors, document-endpoint DELETE, and Cypher testing
