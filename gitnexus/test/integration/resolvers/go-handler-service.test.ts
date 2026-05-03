@@ -9,7 +9,7 @@ import {
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
-// TODO: Go struct field type resolution not yet producing nodes — skip until fixed (Issue #19)
+// TODO: Go struct field type resolution not yet producing nodes — skip until fixed (#102)
 describe.skip('Go handler → service field chain resolution (Issue #19)', () => {
   let result: PipelineResult;
 
