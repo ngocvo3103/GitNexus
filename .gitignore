@@ -1,0 +1,128 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+.claude/settings.local.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+coverage/
+
+# Misc
+*.local
+HANDOFF.md
+HANDOFF*.md
+
+.vercel
+.serena/
+*/docs/tmp/
+
+
+
+
+
+
+.env*.local
+.gitnexus
+.claude/settings.local.json
+
+# Claude Code worktrees
+.claude/worktrees/
+
+# Claude code skills
+.claude/skills/generated/
+
+# Assets (screenshots, images)
+assets/
+
+# Generated files (should not be indexed)
+repomix-output*
+
+# Playwright artifacts
+gitnexus-web/playwright-report/
+gitnexus-web/test-results/
+
+# Python test artifacts
+eval/.coverage
+eval/.hypothesis/
+
+# Design docs (local only)
+docs/plans/
+
+# Local-only docs and artifacts
+gitnexus/docs/bug/
+gitnexus/docs/context/
+gitnexus/docs/designs/
+gitnexus/docs/plans/
+gitnexus/docs/story/
+gitnexus/docs/e2e.md
+gitnexus/docs/progress.md
+gitnexus/docs/scripts/
+
+# Binary / scratch files
+abc.json
+abc.md
+gitnexus/bond-exception-handler
+gitnexus/tcbs-bond-amqp
+gitnexus/tcbs-bond-amqp-message
+gitnexus/matching-engine-client
+gitnexus/tcbs-bond-trading
+gitnexus/tcbs-bond-trading-core
+
+# Claude local config
+gitnexus/.claude/
+
+# Local scripts
+gitnexus/scripts/
+
+# Local scratch files
+gitnexus/CLAUDE.md
+gitnexus/test-doc-endpoint.ts
+
+gitnexus/test/fixtures/mini-repo/*.md
+gitnexus/test/fixtures/mini-repo/.claude
+gitnexus/test/fixtures/mini-repo/.gitignore
+
+# Ignore csharp generated obj and bin folders
+gitnexus/test/fixtures/lang-resolution/**/obj
+gitnexus/test/fixtures/lang-resolution/**/bin
+GitNexus.sln
+# Git worktrees
+.worktrees/
+
+/github/scripts/triage/__pycache__/
+
+.claude-flow/
+
+.claude/agents/
+.claude/commands/
+.claude/helpers
+.claude/skills/
+!.claude/skills/gitnexus/
+
+.history/
+
+.swarm/
