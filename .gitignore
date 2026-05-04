@@ -37,8 +37,10 @@ HANDOFF.md
 HANDOFF*.md
 
 .vercel
+.afk
 .serena/
 */docs/tmp/
+*/docs/design/
 
 
 
