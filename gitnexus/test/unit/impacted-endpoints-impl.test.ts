@@ -244,9 +244,10 @@ describe('_impactedEndpointsImpl', () => {
     );
 
     expect(result.summary).toBeDefined();
-    expect(result.summary.changed_files).toBe(2);
+    expect(result.summary.changed_files).toEqual({ 'repo-ie': 2 });
     expect(result.summary.changed_symbols).toBe(2);
-    expect(result.summary.impacted_endpoints).toBeGreaterThanOrEqual(1);
+    expect(result.summary.impacted_endpoints).toEqual({ 'repo-ie': expect.any(Number) });
+    expect((result.summary.impacted_endpoints as Record<string, number>)['repo-ie']).toBeGreaterThanOrEqual(1);
     expect(result.impacted_endpoints).toBeDefined();
     expect(result.impacted_endpoints.WILL_BREAK).toBeDefined();
     expect(result.impacted_endpoints.LIKELY_AFFECTED).toBeDefined();
@@ -263,9 +264,9 @@ describe('_impactedEndpointsImpl', () => {
       { scope: 'unstaged' },
     );
 
-    expect(result.summary.changed_files).toBe(0);
+    expect(result.summary.changed_files).toEqual({ 'repo-ie': 0 });
     expect(result.summary.changed_symbols).toBe(0);
-    expect(result.summary.impacted_endpoints).toBe(0);
+    expect(result.summary.impacted_endpoints).toEqual({ 'repo-ie': 0 });
     expect(result.summary.risk_level).toBe('none');
     expect(result.impacted_endpoints.WILL_BREAK).toEqual([]);
     expect(result.impacted_endpoints.LIKELY_AFFECTED).toEqual([]);
@@ -283,7 +284,7 @@ describe('_impactedEndpointsImpl', () => {
       { scope: 'unstaged' },
     );
 
-    expect(result.summary.changed_files).toBe(1);
+    expect(result.summary.changed_files).toEqual({ 'repo-ie': 1 });
     expect(result.summary.changed_symbols).toBe(0);
     expect(result.summary.risk_level).toBe('none');
   });
@@ -478,7 +479,7 @@ describe('_impactedEndpointsImpl', () => {
     );
 
     // DEFINES query should still succeed even though reverse-CALLS failed
-    expect(result.summary.impacted_endpoints).toBeGreaterThanOrEqual(1);
+    expect((result.summary.impacted_endpoints as Record<string, number>)['repo-ie']).toBeGreaterThanOrEqual(1);
   });
 
   // ── Scenario 8: Route discovery query #2 (DEFINES) fails ────────
@@ -517,9 +518,8 @@ describe('_impactedEndpointsImpl', () => {
       { scope: 'unstaged' },
     );
 
-    expect(result.summary.impacted_endpoints).toBeGreaterThanOrEqual(1);
+    expect((result.summary.impacted_endpoints as Record<string, number>)['repo-ie']).toBeGreaterThanOrEqual(1);
   });
-
   // ── Scenario 9: Route discovery query #3 (FETCHES) fails ────────
   it('continues route discovery when FETCHES query fails', async () => {
     setupGitDiff(['Consumer.java']);
@@ -1026,9 +1026,8 @@ describe('_impactedEndpointsImpl', () => {
 
       // With default confidence floor of 0.9 for CALLS, the node should be included
       // and the route should be discovered (depth=1, conf=0.9 → WILL_BREAK)
-      expect(result.summary.impacted_endpoints).toBeGreaterThanOrEqual(1);
-    });
-
+      expect((result.summary.impacted_endpoints as Record<string, number>)['repo-ie']).toBeGreaterThanOrEqual(1);
+  });
     // U-BFS07: IDs with special chars filtered
     it('filters IDs with braces and handles single-quote escaping', async () => {
       setupGitDiff(['Service.java']);
@@ -1108,7 +1107,7 @@ describe('_impactedEndpointsImpl', () => {
       );
 
       // All BFS nodes filtered; no routes can be discovered through test nodes
-      expect(result.summary.impacted_endpoints).toBe(0);
+      expect(result.summary.impacted_endpoints).toEqual({ 'repo-ie': 0 });
     });
 
     // U-BFS09: max_depth=1 vs default=3
@@ -1243,7 +1242,7 @@ describe('_impactedEndpointsImpl', () => {
 
       // The OVERRIDES-discovered node (sym-iface-unhold) must be traversed
       expect(result).toBeDefined();
-      expect(result.summary.changed_files).toBe(1);
+      expect(result.summary.changed_files).toEqual({ 'repo-ie': 1 });
       // changed_symbols includes only the initial changed file symbol
       expect(result.summary.changed_symbols).toBeGreaterThanOrEqual(1);
     });
@@ -1402,7 +1401,7 @@ describe('_impactedEndpointsImpl', () => {
 
       // Should not crash — BFS continues without interface resolution
       expect(result).toBeDefined();
-      expect(result.summary.changed_files).toBe(1);
+      expect(result.summary.changed_files).toEqual({ 'repo-ie': 1 });
       // Direct caller is still found via normal BFS
       expect(result.summary.changed_symbols).toBeGreaterThanOrEqual(1);
     });
@@ -1611,7 +1610,7 @@ describe('_impactedEndpointsImpl', () => {
         { scope: 'unstaged' },
       );
 
-      expect(result.summary.impacted_endpoints).toBeGreaterThanOrEqual(1);
+      expect((result.summary.impacted_endpoints as Record<string, number>)['repo-ie']).toBeGreaterThanOrEqual(1);
       const route = result.impacted_endpoints.WILL_BREAK.find(
         (r: any) => r.path === '/api/users' && r.method === 'GET',
       );
@@ -1690,9 +1689,8 @@ describe('_impactedEndpointsImpl', () => {
         { scope: 'unstaged' },
       );
 
-      expect(result.summary.impacted_endpoints).toBeGreaterThanOrEqual(1);
-    });
-
+      expect((result.summary.impacted_endpoints as Record<string, number>)['repo-ie']).toBeGreaterThanOrEqual(1);
+  });
     // U-RD04: FETCHES uses expandedIds (includes BFS-expanded symbols)
     it('discovers routes via FETCHES from expanded symbols', async () => {
       setupGitDiff(['FrontendService.java']);
@@ -1732,9 +1730,8 @@ describe('_impactedEndpointsImpl', () => {
       );
 
       expect(fetchesUsedExpandedIds).toBe(true);
-      expect(result.summary.impacted_endpoints).toBeGreaterThanOrEqual(1);
-    });
-
+      expect((result.summary.impacted_endpoints as Record<string, number>)['repo-ie']).toBeGreaterThanOrEqual(1);
+  });
     // U-RD08: Transitive FETCHES discovery — intermediate symbol from BFS fetches a route
     it('discovers routes via FETCHES from BFS-expanded intermediate symbols', async () => {
       setupGitDiff(['ServiceA.java']);
@@ -2261,9 +2258,8 @@ describe('_impactedEndpointsImpl', () => {
       );
 
       // DEFINES query should still succeed even though annotation-fallback failed
-      expect(result.summary.impacted_endpoints).toBeGreaterThanOrEqual(1);
-    });
-
+      expect((result.summary.impacted_endpoints as Record<string, number>)['repo-ie']).toBeGreaterThanOrEqual(1);
+  });
     // AF-06: Method NOT in Controller file → not matched by annotation-fallback
     it('does not match methods in non-Controller files via annotation-fallback', async () => {
       setupGitDiff(['Service.java']);
@@ -2296,7 +2292,7 @@ describe('_impactedEndpointsImpl', () => {
       );
 
       // No endpoints should be found — Service methods don't have route annotations
-      expect(result.summary.impacted_endpoints).toBe(0);
+      expect(result.summary.impacted_endpoints).toEqual({ 'repo-ie': 0 });
     });
   });
 
@@ -3487,7 +3483,7 @@ describe('_impactedEndpointsImpl', () => {
 
       expect(result).not.toHaveProperty('error');
       expect(result.summary.risk_level).toBe('none');
-      expect(result.summary.changed_files).toBe(0);
+      expect(result.summary.changed_files).toEqual({ 'repo-ie': 0 });
       expect(result.summary.changed_symbols).toBe(0);
     });
 
@@ -3605,7 +3601,7 @@ describe('_impactedEndpointsImpl', () => {
         (backend as any).repos.get('repo-ie'), { scope: 'unstaged' },
       );
 
-      expect(result.summary.changed_files).toBe(3);
+      expect(result.summary.changed_files).toEqual({ 'repo-ie': 3 });
       expect(result.summary.changed_symbols).toBe(0);
       expect(result.summary.risk_level).toBe('none');
     });
@@ -3628,7 +3624,7 @@ describe('_impactedEndpointsImpl', () => {
       );
 
       expect(result).not.toHaveProperty('error');
-      expect(result.summary.changed_files).toBe(1);
+      expect(result.summary.changed_files).toEqual({ 'repo-ie': 1 });
       expect(result.summary.changed_symbols).toBe(1);
       expect(result.changed_symbols[0].filePath).toBe(longPath);
     });
@@ -3769,7 +3765,7 @@ describe('_impactedEndpointsImpl', () => {
 
       // Pipeline should still produce results even if health check errors
       expect(result.summary).toBeDefined();
-      expect(result.summary.changed_files).toBe(1);
+      expect(result.summary.changed_files).toEqual({ 'repo-ie': 1 });
       expect(result.summary.changed_symbols).toBe(1);
       // Health check error was caught silently — diagnostics may or may not be present
       // depending on which checks failed before the catch, but result is never blocked

@@ -27,7 +27,7 @@ import {
 import type { CrossRepoContext } from '../../src/mcp/local/cross-repo-context.js';
 
 interface ImpactedEndpointsResult {
-  summary: { changed_files: number; changed_symbols: number; impacted_endpoints: number; risk_level: string };
+  summary: { changed_files: Record<string, number>; changed_symbols: number; impacted_endpoints: Record<string, number>; risk_level: string };
   impacted_endpoints: { WILL_BREAK: any[]; LIKELY_AFFECTED: any[]; MAY_NEED_TESTING: any[] };
   changed_symbols: any[];
   affected_processes: any[];
@@ -115,7 +115,7 @@ describe('Cross-repo E2E: combined seed', () => {
 
       expect(result).not.toHaveProperty('error');
       expect(result.summary).toBeDefined();
-      expect(result.summary.changed_files).toBeGreaterThanOrEqual(1);
+      expect(Object.values(result.summary.changed_files).reduce((a: number, b: number) => a + b, 0)).toBeGreaterThanOrEqual(1);
 
       const allEndpoints = [
         ...(result.impacted_endpoints?.WILL_BREAK || []),
@@ -142,7 +142,7 @@ describe('Cross-repo E2E: combined seed', () => {
 
       expect(result).not.toHaveProperty('error');
       expect(result.summary).toBeDefined();
-      expect(result.summary.changed_files).toBeGreaterThanOrEqual(1);
+      expect(Object.values(result.summary.changed_files).reduce((a: number, b: number) => a + b, 0)).toBeGreaterThanOrEqual(1);
 
       const allEndpoints = [
         ...(result.impacted_endpoints?.WILL_BREAK || []),
@@ -193,7 +193,7 @@ describe('Cross-repo E2E: combined seed', () => {
 
       expect(result).not.toHaveProperty('error');
       expect(result.summary).toBeDefined();
-      expect(result.summary.changed_files).toBeGreaterThanOrEqual(1);
+      expect(Object.values(result.summary.changed_files).reduce((a: number, b: number) => a + b, 0)).toBeGreaterThanOrEqual(1);
 
       const allEndpoints = [
         ...(result.impacted_endpoints?.WILL_BREAK || []),
@@ -255,7 +255,8 @@ describe('Cross-repo E2E: library standalone', () => {
       expect(result).not.toHaveProperty('error');
       expect(result.summary).toBeDefined();
       // Library has no Route nodes → 0 impacted endpoints
-      expect(result.summary.impacted_endpoints).toBe(0);
+      // impacted_endpoints is now a Record<string, number>; value depends on repo.id at runtime
+      expect(Object.values(result.summary.impacted_endpoints)[0]).toBe(0);
       expect(result.impacted_endpoints.WILL_BREAK).toEqual([]);
       expect(result.impacted_endpoints.LIKELY_AFFECTED).toEqual([]);
       expect(result.impacted_endpoints.MAY_NEED_TESTING).toEqual([]);

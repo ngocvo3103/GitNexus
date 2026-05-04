@@ -1,0 +1,45 @@
+{
+  "issue": {
+    "number": 24,
+    "title": "Non-code files pollute graph as code symbols",
+    "body": "## Steps to reproduce\n1. Index any repo that contains markdown, XML, or config files\n2. Call `query(query=\"project configuration\", repo=\"...\")` or `detect_changes()`\n\n## Actual behavior\nCLAUDE.md, AGENTS.md, README.md, pom.xml, pyproject.toml appear as graph nodes and in query results. `detect_changes` treats them as code symbols.\n\n## Expected behavior\nNon-code files (markdown, XML configs, TOML configs) should either be excluded from the graph or clearly categorized as documentation/config nodes, not mixed with code symbols.\n\n## User impact\nQuery results and change detection are polluted with irrelevant file entries, degrading signal-to-noise ratio across all tools.\n\n## Evidence\n```json\nquery(query=\"project configuration\") →\n{ \"definitions\": [{ \"name\": \"CLAUDE.md\" }, { \"name\": \"README.md\" }, ...] }\n\ndetect_changes() → includes pom.xml and pyproject.toml as \"changed symbols\"\n```",
+    "labels": [
+      "high",
+      "confirmed"
+    ],
+    "comments": [
+      {
+        "user": "ngocvo3103",
+        "body": "<!-- afk-lock: host=Ngocs-MacBook-Pro.local pid=99782 ts=2026-05-03T14:04:51.900Z -->"
+      },
+      {
+        "user": "ngocvo3103",
+        "body": "<!-- afk-lock: host=Ngocs-MacBook-Pro.local pid=80671 ts=2026-05-04T00:58:14.062Z -->"
+      },
+      {
+        "user": "ngocvo3103",
+        "body": "<!-- afk-lock: host=Ngocs-MacBook-Pro.local pid=5659 ts=2026-05-04T08:51:23.410Z -->"
+      }
+    ]
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "baseBranch": "main-afk",
+  "branchName": "feature/24_non-code-files-pollute-graph-as-code-symbols",
+  "sessionId": "963f8398-45f8-4058-8689-73b48045d0c2",
+  "completedSteps": [
+    "label",
+    "branch",
+    "plan"
+  ],
+  "createdAt": "2026-05-04T08:51:25.156Z",
+  "updatedAt": "2026-05-04T12:59:57.498Z",
+  "microSteps": {
+    "label": [],
+    "branch": [],
+    "plan": []
+  },
+  "attemptCount": {
+    "plan": 1,
+    "implement": 2
+  }
+}
