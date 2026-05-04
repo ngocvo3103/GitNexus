@@ -1,0 +1,44 @@
+{
+  "issue": {
+    "number": 28,
+    "title": "impacted_endpoints inconsistent response format for changed_files"
+  },
+  "repo": "ngocvo3103/GitNexus",
+  "branch": "feature/28_impacted-endpoints-inconsistent-response-format-fo",
+  "status": "failed",
+  "stepDurationsMs": {
+    "implement": 2897845,
+    "qa": 341446,
+    "verify": 45,
+    "commit": 46842
+  },
+  "startedAt": "2026-05-04T00:03:23.608Z",
+  "verifyOutput": "",
+  "filesChanged": [
+    ".afk/checkpoints/28_impacted-endpoints-inconsistent-response-format-fo.json",
+    ".afk/locks/28_impacted-endpoints-inconsistent-response-format-fo.lock",
+    ".afk/plan-checkpoints/28.json",
+    ".afk/runs/28_impacted-endpoints-inconsistent-response-format-fo.json",
+    ".gitignore",
+    ".mcp.json",
+    "CLAUDE.md",
+    "docs/.afk-plan/28/phase1-parse.json",
+    "docs/.afk-plan/28/scouts/backend.md",
+    "docs/.afk-plan/28/scouts/impact.md",
+    "docs/.afk-plan/28/serena-context.txt",
+    "docs/designs/28.solution-design.md",
+    "docs/story/28.impacted-endpoints-consistent-format.md",
+    "gitnexus/src/cli/eval-server.ts",
+    "gitnexus/src/mcp/local/local-backend.ts",
+    "gitnexus/test/fixtures/sample-angular",
+    "gitnexus/test/fixtures/sample-fastapi",
+    "gitnexus/test/fixtures/sample-gin",
+    "gitnexus/test/fixtures/sample-spring-minimal",
+    "gitnexus/test/integration/impacted-endpoints-cross-repo.test.ts",
+    "gitnexus/test/unit/calltool-dispatch.test.ts",
+    "gitnexus/test/unit/eval-formatters.test.ts",
+    "gitnexus/test/unit/impacted-endpoints-impl.test.ts"
+  ],
+  "endedAt": "2026-05-04T00:58:11.666Z",
+  "error": "Error: Command failed: git push -u origin feature/28_impacted-endpoints-inconsistent-response-format-fo"
+}

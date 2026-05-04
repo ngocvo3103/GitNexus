@@ -1469,8 +1469,8 @@ describe('impacted_endpoints auto-expand to consumers', () => {
 
     expect(result).toBeDefined();
     expect((result as any)).toHaveProperty('summary');
-    // Single-repo result has flat changed_files (number, not Record)
-    expect(typeof (result as any).summary.changed_files).toBe('number');
+    // Single-repo result now has Record changed_files (keyed by repo id)
+    expect(typeof (result as any).summary.changed_files).toBe('object');
     // findConsumers WAS called — it checked and found nothing
     expect((backend as any).crossRepoRegistry.findConsumers).toHaveBeenCalledWith('test-project');
   });
@@ -1587,9 +1587,45 @@ describe('impacted_endpoints auto-expand to consumers', () => {
     // Falls back to single-repo since registry not initialized
     expect(result).toBeDefined();
     expect((result as any)).toHaveProperty('summary');
-    expect(typeof (result as any).summary.changed_files).toBe('number');
+    expect(typeof (result as any).summary.changed_files).toBe('object');
     // findConsumers NOT called because registry reports uninitialized
     expect((backend as any).crossRepoRegistry.findConsumers).not.toHaveBeenCalled();
+  });
+
+  it('throws when _impactedEndpointsImpl returns primitive changed_files (regression detection)', async () => {
+    // Simulate a regression where _impactedEndpointsImpl returns number instead of Record
+    vi.spyOn(backend as any, '_impactedEndpointsImpl').mockResolvedValue({
+      summary: { changed_files: 3, changed_symbols: 1, impacted_endpoints: 1, risk_level: 'low' },
+      impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
+      changed_symbols: [], affected_processes: [], affected_modules: [],
+      _meta: { version: '1.0', generated_at: new Date().toISOString() },
+    });
+
+    // No consumers → single-repo fallback path, which runs assertObjectType
+    (backend as any).crossRepoRegistry = mockRegistry({
+      findConsumers: vi.fn().mockReturnValue([]),
+    });
+
+    await expect(
+      backend.callTool('impacted_endpoints', { scope: 'unstaged' })
+    ).rejects.toThrow('Unexpected changed_files type: number');
+  });
+
+  it('passes assertObjectType when _impactedEndpointsImpl returns Record changed_files', async () => {
+    vi.spyOn(backend as any, '_impactedEndpointsImpl').mockResolvedValue({
+      summary: { changed_files: { 'test-project': 3 }, changed_symbols: 1, impacted_endpoints: { 'test-project': 1 }, risk_level: 'low' },
+      impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
+      changed_symbols: [], affected_processes: [], affected_modules: [],
+      _meta: { version: '1.0', generated_at: new Date().toISOString() },
+    });
+
+    (backend as any).crossRepoRegistry = mockRegistry({
+      findConsumers: vi.fn().mockReturnValue([]),
+    });
+
+    const result = await backend.callTool('impacted_endpoints', { scope: 'unstaged' });
+    expect(result).toBeDefined();
+    expect(typeof (result as any).summary.changed_files).toBe('object');
   });
 });
 
@@ -1632,7 +1668,7 @@ describe('impacted_endpoints multi-repo dispatch — detailed scenarios', () => 
         if (repoResults[id]) return repoResults[id];
         // Default empty result
         return {
-          summary: { changed_files: 0, changed_symbols: 0, impacted_endpoints: 0, risk_level: 'none' },
+          summary: { changed_files: { [id]: 0 }, changed_symbols: 0, impacted_endpoints: { [id]: 0 }, risk_level: 'none' },
           impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
           changed_symbols: [], affected_processes: [], affected_modules: [],
           _meta: { version: '1.0', generated_at: new Date().toISOString() },
@@ -1642,14 +1678,15 @@ describe('impacted_endpoints multi-repo dispatch — detailed scenarios', () => 
   }
 
   /** Build a standard result with the given risk_level and endpoints */
-  function makeResult(opts: { risk_level?: string; will_break?: any[]; likely_affected?: any[]; may_need_testing?: any[]; partial?: boolean }) {
+  function makeResult(opts: { risk_level?: string; will_break?: any[]; likely_affected?: any[]; may_need_testing?: any[]; partial?: boolean; repoId?: string }) {
     const wb = opts.will_break || [];
     const la = opts.likely_affected || [];
     const mnt = opts.may_need_testing || [];
+    const id = opts.repoId || 'test-project';
     return {
       summary: {
-        changed_files: 1, changed_symbols: 1,
-        impacted_endpoints: wb.length + la.length + mnt.length,
+        changed_files: { [id]: 1 }, changed_symbols: 1,
+        impacted_endpoints: { [id]: wb.length + la.length + mnt.length },
         risk_level: opts.risk_level || 'LOW',
       },
       impacted_endpoints: { WILL_BREAK: wb, LIKELY_AFFECTED: la, MAY_NEED_TESTING: mnt },

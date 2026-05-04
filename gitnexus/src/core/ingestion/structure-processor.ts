@@ -1,5 +1,6 @@
 import { generateId } from "../../lib/utils.js";
 import { KnowledgeGraph, GraphNode, GraphRelationship } from "../graph/types.js";
+import { getFileType } from "./utils/language-detection.js";
 
 export const processStructure = ( graph: KnowledgeGraph, paths: string[])=>{
     paths.forEach( path => {
@@ -20,7 +21,8 @@ export const processStructure = ( graph: KnowledgeGraph, paths: string[])=>{
                 label: label,
                 properties: {
                     name: part,
-                    filePath: currentPath
+                    filePath: currentPath,
+                    ...(isFile ? { fileType: getFileType(currentPath) } : {}),
                 }
             }
             graph.addNode(node)

@@ -116,6 +116,21 @@ export interface RepoHandle {
   stats?: RegistryEntry['stats'];
 }
 
+/** Summary shape for impacted_endpoints — always uses Record<string, number> for per-repo counts. */
+interface ImpactedEndpointsSummary {
+  changed_files: Record<string, number>;
+  impacted_endpoints: Record<string, number>;
+  risk_level: string;
+  changed_symbols?: number;
+}
+
+/** Asserts that a value is a non-null object (Record<string, number>), not a bare number. */
+function assertObjectType(value: unknown, fieldName: string): asserts value is Record<string, number> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`Unexpected ${fieldName} type: ${typeof value}. Expected Record<string, number>.`);
+  }
+}
+
 export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
@@ -349,7 +364,11 @@ export class LocalBackend {
         return this.callToolMultiRepo(method, { ...params, repos: expanded }) as T;
       }
       // No consumers found or registry not available — single-repo fallback
-      return this._impactedEndpointsImpl(repo, params) as T;
+      const result = await this._impactedEndpointsImpl(repo, params);
+      if (!result.error) {
+        assertObjectType(result.summary?.changed_files, 'changed_files');
+      }
+      return result as T;
     }
 
     // Single-repo routing (backward compatible)
@@ -636,8 +655,20 @@ export class LocalBackend {
           if (error) {
             aggregated.errors.push({ repoId, error });
           } else if (result) {
-            aggregated.summary.changed_files[repoId] = result.summary?.changed_files ?? 0;
-            aggregated.summary.impacted_endpoints[repoId] = result.summary?.impacted_endpoints ?? 0;
+            // Merge changed_files: Record format or coerce bare number (backward compat)
+            const cf = result.summary?.changed_files;
+            if (typeof cf === 'object' && cf !== null) {
+              Object.assign(aggregated.summary.changed_files, cf);
+            } else if (typeof cf === 'number') {
+              aggregated.summary.changed_files[repoId] = cf;
+            }
+            // Merge impacted_endpoints: Record format or coerce bare number (backward compat)
+            const ie = result.summary?.impacted_endpoints;
+            if (typeof ie === 'object' && ie !== null) {
+              Object.assign(aggregated.summary.impacted_endpoints, ie);
+            } else if (typeof ie === 'number') {
+              aggregated.summary.impacted_endpoints[repoId] = ie;
+            }
             if (result.changed_symbols) {
               aggregated.changed_symbols.push(...result.changed_symbols.map((s: any) => ({ ...s, _repoId: repoId })));
             }
@@ -929,6 +960,40 @@ export class LocalBackend {
       return true;
     });
     
+    // Filter out non-code File nodes from definitions
+    if (definitions.length > 0) {
+      const filePaths = definitions
+        .filter(d => d.type === 'File')
+        .map(d => d.filePath);
+      
+      if (filePaths.length > 0) {
+        try {
+          // Batch lookup fileType for all File definitions
+          const fileTypeRows = await executeParameterized(repo.id, `
+            MATCH (n:File)
+            WHERE n.filePath IN $filePaths
+            RETURN n.filePath AS filePath, n.fileType AS fileType
+          `, { filePaths });
+          
+          const nonCodePaths = new Set(
+            fileTypeRows
+              .filter(r => {
+                const ft = r.fileType || r[1];
+                return ft && ft !== 'code';
+              })
+              .map(r => r.filePath || r[0])
+          );
+          
+          // Remove non-code File definitions (backward compat: keep if fileType is null/undefined)
+          for (let i = definitions.length - 1; i >= 0; i--) {
+            if (definitions[i].type === 'File' && nonCodePaths.has(definitions[i].filePath)) {
+              definitions.splice(i, 1);
+            }
+          }
+        } catch (e) { logQueryError('query:fileType-filter', e); }
+      }
+    }
+    
     return {
       processes,
       process_symbols: dedupedSymbols,
@@ -957,12 +1022,26 @@ export class LocalBackend {
         const symbols = await executeParameterized(repo.id, `
           MATCH (n)
           WHERE n.filePath = $filePath
-          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.fileType AS fileType
           LIMIT 3
         `, { filePath: fullPath });
         
         if (symbols.length > 0) {
-          for (const sym of symbols) {
+          // Check if all symbols are File nodes — if any are non-code, skip the entire result
+          const codeSymbols = symbols.filter(sym => {
+            const type = sym.type || sym[2];
+            const fileType = sym.fileType || sym[6];
+            // Keep non-File symbols, and File symbols with fileType='code' or no fileType
+            if (type !== 'File') return true;
+            return !fileType || fileType === 'code';
+          });
+          
+          if (codeSymbols.length === 0) {
+            // All symbols are non-code File nodes — skip this bm25Result
+            continue;
+          }
+          
+          for (const sym of codeSymbols) {
             results.push({
               nodeId: sym.id || sym[0],
               name: sym.name || sym[1],
@@ -1055,6 +1134,36 @@ export class LocalBackend {
             });
           }
         } catch {}
+      }
+      
+      // Batch filter: remove non-code File nodes (avoids N+1 per-node query)
+      const fileNodeIds = results
+        .filter(r => r.type === 'File' && r.nodeId)
+        .map(r => r.nodeId);
+
+      if (fileNodeIds.length > 0) {
+        try {
+          const fileTypeRows = await executeParameterized(repo.id, `
+            MATCH (n:File)
+            WHERE n.id IN $nodeIds
+            RETURN n.id AS nodeId, n.fileType AS fileType
+          `, { nodeIds: fileNodeIds });
+
+          const nonCodeNodeIds = new Set(
+            fileTypeRows
+              .filter(r => {
+                const ft = r.fileType || r[1];
+                return ft && ft !== 'code';
+              })
+              .map(r => r.nodeId || r[0])
+          );
+
+          for (let i = results.length - 1; i >= 0; i--) {
+            if (results[i].type === 'File' && nonCodeNodeIds.has(results[i].nodeId)) {
+              results.splice(i, 1);
+            }
+          }
+        } catch (e) { logQueryError('semanticSearch:fileType-batch-filter', e); }
       }
       
       return results;
@@ -1637,14 +1746,19 @@ export class LocalBackend {
       try {
         const symbols = await executeParameterized(repo.id, `
           MATCH (n) WHERE n.filePath CONTAINS $filePath
-          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.fileType AS fileType
           LIMIT 20
         `, { filePath: normalizedFile });
         for (const sym of symbols) {
+          const type = sym.type || sym[2];
+          const fileType = sym.fileType || sym[4];
+          // Skip non-code File nodes (backward compat: include if fileType is null)
+          if (type === 'File' && fileType && fileType !== 'code') continue;
+          
           changedSymbols.push({
             id: sym.id || sym[0],
             name: sym.name || sym[1],
-            type: sym.type || sym[2],
+            type: type,
             filePath: sym.filePath || sym[3],
             change_type: 'Modified',
           });
@@ -1743,7 +1857,7 @@ export class LocalBackend {
       fileLineRanges = new Map(); // empty = whole-file resolution
     } else if (lineDiffResult.length === 0) {
       return {
-        summary: { changed_files: 0, changed_symbols: 0, impacted_endpoints: 0, risk_level: 'none' },
+        summary: { changed_files: { [repo.id]: 0 }, changed_symbols: 0, impacted_endpoints: { [repo.id]: 0 }, risk_level: 'none' },
         impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
         changed_symbols: [], affected_processes: [], affected_modules: [],
         _meta: { version: '1.0', generated_at: new Date().toISOString() },
@@ -1757,7 +1871,7 @@ export class LocalBackend {
 
     if (changedFiles.length === 0) {
       return {
-        summary: { changed_files: 0, changed_symbols: 0, impacted_endpoints: 0, risk_level: 'none' },
+        summary: { changed_files: { [repo.id]: 0 }, changed_symbols: 0, impacted_endpoints: { [repo.id]: 0 }, risk_level: 'none' },
         impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
         changed_symbols: [], affected_processes: [], affected_modules: [],
         _meta: { version: '1.0', generated_at: new Date().toISOString() },
@@ -1816,9 +1930,9 @@ export class LocalBackend {
     if (changedSymbols.length === 0) {
       return {
         summary: {
-          changed_files: changedFiles.length,
+          changed_files: { [repo.id]: changedFiles.length },
           changed_symbols: 0,
-          impacted_endpoints: 0,
+          impacted_endpoints: { [repo.id]: 0 },
           risk_level: 'none',
         },
         impacted_endpoints: {
@@ -2557,9 +2671,9 @@ export class LocalBackend {
     // ── 8. Return shape ─────────────────────────────────────────────
     return {
       summary: {
-        changed_files: changedFiles.length,
+        changed_files: { [repo.id]: changedFiles.length },
         changed_symbols: changedSymbols.length,
-        impacted_endpoints: endpointCount,
+        impacted_endpoints: { [repo.id]: endpointCount },
         risk_level: risk,
       },
       impacted_endpoints: {
