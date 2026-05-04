@@ -125,6 +125,22 @@ program
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
 
+program
+  .command('document-endpoint')
+  .description('Generate API documentation JSON for an endpoint')
+  .option('--all', 'Document all endpoints (always uses openapi mode, requires --outputPath)')
+  .option('--allow-partial', 'Exit 0 if >=1 endpoint succeeds (default: exit 1 on any failure)')
+  .option('--method <method>', 'HTTP method (GET, POST, PUT, DELETE, PATCH)')
+  .option('--path <pattern>', 'Path pattern to match (e.g., "suggest", "/bookings/{id}")')
+  .option('--depth <n>', 'Max trace depth (default: 10)', '10')
+  .option('--mode <mode>', 'Output mode: openapi (default) or ai_context', 'openapi')
+  .option('--input-yaml <path>', 'CLI-only: path to existing YAML to enrich')
+  .option('--outputPath <path>', 'Output directory for JSON and OpenAPI YAML files')
+  .option('--schema-path <path>', 'Path to custom JSON schema file (default: bundled schema)')
+  .option('--strict', 'Fail on schema validation errors (default: warn)', false)
+  .option('-r, --repo <name>', 'Target repository')
+  .action(createLazyAction(() => import('./tool.js'), 'documentEndpointCommand'));
+
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 
 program

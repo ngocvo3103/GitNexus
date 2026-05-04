@@ -54,6 +54,7 @@ describe('Next.js route mapping', () => {
 
   it('links project-level middleware.ts to matching API routes', () => {
     const routes = getNodesByLabelFull(result, 'Route');
+    console.log('ROUTE NODES:', routes.map(r => ({ name: r.name, properties: r.properties })));
     const grants = routes.find(r => r.name === '/api/grants');
     expect(grants).toBeDefined();
     expect(grants!.properties.middleware).toBeDefined();
@@ -62,6 +63,7 @@ describe('Next.js route mapping', () => {
 
   it('links middleware to all routes matching the matcher pattern', () => {
     const routes = getNodesByLabelFull(result, 'Route');
+    console.log('ROUTE NODES:', routes.map(r => ({ name: r.name, properties: r.properties })));
     const apiRoutes = routes.filter(r => (r.name as string).startsWith('/api/'));
     expect(apiRoutes.length).toBeGreaterThanOrEqual(2);
     for (const route of apiRoutes) {

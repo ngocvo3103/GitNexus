@@ -29,20 +29,22 @@ export type NodeLabel =
   | 'Static'
   | 'Property'
   | 'Record'
+  | 'Route'
+  | 'Tool'
   | 'Delegate'
   | 'Annotation'
   | 'Constructor'
   | 'Template'
-  | 'Section'
-  | 'Route'        // API route endpoint (e.g., /api/grants)
-  | 'Tool';        // MCP tool definition
+  | 'Section';
 
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
 
 export type NodeProperties = {
   name: string,
-  filePath: string,
+  filePath?: string,
+  // Cross-repo resolution — identifies which repo this node belongs to
+  repoId?: string,
   startLine?: number,
   endLine?: number,
   language?: SupportedLanguages,
@@ -68,20 +70,36 @@ export type NodeProperties = {
   entryPointReason?: string,
   // Method signature (for MRO disambiguation)
   parameterCount?: number,
-  // Section-specific (markdown heading level, 1-6)
-  level?: number,
+  requiredParameterCount?: number,
+  parameterTypes?: string,  // JSON array of parameter type names
   returnType?: string,
-  // Field/property metadata (populated by FieldExtractor)
-  declaredType?: string,
-  visibility?: string,       // 'public' | 'private' | 'protected' | 'internal' etc.
+  // Property visibility and modifiers
+  visibility?: string,
   isStatic?: boolean,
   isReadonly?: boolean,
+  declaredType?: string,
+  // Route-specific properties (for HTTP endpoints)
+  routeType?: string,
+  httpMethod?: string,
+  routePath?: string,
+  controllerName?: string,
+  methodName?: string,
+  lineNumber?: number,
+  isInherited?: boolean,
   // Response shape (top-level keys from NextResponse.json({...}) / res.json({...}))
   responseKeys?: string[],
   // Error response shape (top-level keys from .json() calls with status >= 400)
   errorKeys?: string[],
   // Middleware wrapper chain (outermost first): ['withRateLimit', 'withCSRF', 'withAuth']
   middleware?: string[],
+  // Class fields (for DTO/Entity schema resolution)
+  fields?: string,
+  // Annotations (for Java/Kotlin)
+  annotations?: string,
+  // Section level (for markdown)
+  level?: number,
+  // ORM model / entity type name
+  entityType?: string,
 }
 
 export type RelationshipType =
@@ -97,15 +115,18 @@ export type RelationshipType =
   | 'EXTENDS'
   | 'HAS_METHOD'
   | 'HAS_PROPERTY'
-  | 'ACCESSES'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
-  | 'HANDLES_ROUTE'  // Function/File → Route (handler serves this endpoint)
-  | 'FETCHES'        // Function/File → Route (consumer calls this endpoint)
-  | 'HANDLES_TOOL'   // Function/File → Tool (handler implements this tool)
-  | 'ENTRY_POINT_OF'  // Route/Tool → Process (this endpoint starts this execution flow)
-  | 'WRAPS'           // Function → Function (middleware wrapper chain) — Reserved: future middleware graph traversal (not yet emitted)
-  | 'QUERIES'          // File/Function → CodeElement (ORM query to model/table)
+  // Cross-repo dependency tracking
+  | 'CROSS_IMPORTS'
+  // Additional relationship types
+  | 'ACCESSES'
+  | 'FETCHES'
+  | 'QUERIES'
+  | 'HANDLES_ROUTE'
+  | 'HANDLES_TOOL'
+  | 'ENTRY_POINT_OF'
+  | 'WRAPS'
 
 export interface GraphNode {
   id:  string,
@@ -120,7 +141,7 @@ export interface GraphRelationship {
   type: RelationshipType,
   /** Confidence score 0-1 (1.0 = certain, lower = uncertain resolution) */
   confidence: number,
-  /** Semantics are edge-type-dependent: CALLS uses resolution tier, ACCESSES uses 'read'/'write', OVERRIDES uses MRO reason */
+  /** Resolution reason: 'import-resolved', 'same-file', 'fuzzy-global', or empty for non-CALLS */
   reason: string,
   /** Step number for STEP_IN_PROCESS relationships (1-indexed) */
   step?: number,
@@ -145,6 +166,6 @@ export interface KnowledgeGraph {
   addNode: (node: GraphNode) => void,
   addRelationship: (relationship: GraphRelationship) => void,
   removeNode: (nodeId: string) => boolean,
-  removeNodesByFile: (filePath: string) => number,
   removeRelationship: (relationshipId: string) => boolean,
+  removeNodesByFile: (filePath: string) => number,
 }

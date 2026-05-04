@@ -17,33 +17,12 @@ let db: lbug.Database | null = null;
 let conn: lbug.Connection | null = null;
 let currentDbPath: string | null = null;
 let ftsLoaded = false;
-
-/** Expose the current Database for pool adapter reuse in tests. */
-export const getDatabase = (): lbug.Database | null => db;
+const DB_LOCK_RETRY_ATTEMPTS = 3;
+const DB_LOCK_RETRY_DELAY_MS = 500;
 
 // Global session lock for operations that touch module-level lbug globals.
 // This guarantees no DB switch can happen while an operation is running.
 let sessionLock: Promise<void> = Promise.resolve();
-
-/** Number of times to retry on a BUSY / lock-held error before giving up. */
-const DB_LOCK_RETRY_ATTEMPTS = 3;
-/** Base back-off in ms between BUSY retries (multiplied by attempt number). */
-const DB_LOCK_RETRY_DELAY_MS = 500;
-
-/**
- * Return true when the error message indicates that another process holds
- * an exclusive lock on the LadybugDB file (e.g. `gitnexus analyze` or
- * `gitnexus serve` running at the same time).
- */
-export const isDbBusyError = (err: unknown): boolean => {
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  return (
-    msg.includes('busy')
-    || msg.includes('lock')
-    || msg.includes('already in use')
-    || msg.includes('could not set lock')
-  );
-};
 
 const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> => {
   const previous = sessionLock;
@@ -69,11 +48,17 @@ export const initLbug = async (dbPath: string) => {
 /**
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
- *
- * Automatically retries up to DB_LOCK_RETRY_ATTEMPTS times when the
- * database is busy (e.g. `gitnexus analyze` holds the write lock).
- * Each retry waits DB_LOCK_RETRY_DELAY_MS * attempt milliseconds.
  */
+export const isDbBusyError = (err: unknown): boolean => {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('busy') ||
+    msg.includes('lock') ||
+    msg.includes('already in use') ||
+    msg.includes('could not set lock')
+  );
+};
+
 export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>): Promise<T> => {
   let lastError: unknown;
   for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
@@ -84,25 +69,11 @@ export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>)
       });
     } catch (err) {
       lastError = err;
-      if (!isDbBusyError(err) || attempt === DB_LOCK_RETRY_ATTEMPTS) {
-        throw err;
-      }
-      // Close stale connection inside the session lock to prevent race conditions
-      // with concurrent operations that might acquire the lock between cleanup steps
-      await runWithSessionLock(async () => {
-        try { if (conn) await conn.close(); } catch { /* best-effort */ }
-        try { if (db) await db.close(); } catch { /* best-effort */ }
-        conn = null;
-        db = null;
-        currentDbPath = null;
-        ftsLoaded = false;
-      });
-      // Sleep outside the lock — no need to block others while waiting
+      if (!isDbBusyError(err) || attempt === DB_LOCK_RETRY_ATTEMPTS) throw err;
+      // Cleanup and backoff before retry
       await new Promise(resolve => setTimeout(resolve, DB_LOCK_RETRY_DELAY_MS * attempt));
     }
   }
-  // This line is unreachable — the loop either returns or throws inside,
-  // but TypeScript needs an explicit throw to satisfy the return type.
   throw lastError;
 };
 
@@ -145,8 +116,14 @@ const doInitLbug = async (dbPath: string) => {
       await fs.rm(dbPath, { recursive: true, force: true });
     }
     // If it's a file, assume it's an existing LadybugDB database - LadybugDB will open it
+    if (process.env.GITNEXUS_VERBOSE) {
+      process.stderr.write(`[DEBUG] Existing database file found at ${dbPath}, will be overwritten\n`);
+    }
   } catch {
     // Path doesn't exist, which is what LadybugDB wants for a new database
+    if (process.env.GITNEXUS_VERBOSE) {
+      process.stderr.write(`[DEBUG] No existing database at ${dbPath}, creating fresh\n`);
+    }
   }
 
   // Ensure parent directory exists
@@ -156,14 +133,15 @@ const doInitLbug = async (dbPath: string) => {
   db = new lbug.Database(dbPath);
   conn = new lbug.Connection(db);
 
+  // Create schema tables
   for (const schemaQuery of SCHEMA_QUERIES) {
     try {
       await conn.query(schemaQuery);
     } catch (err) {
-      // Only ignore "already exists" errors - log everything else
+      // Ignore "already exists" errors for idempotent schema creation
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes('already exists')) {
-        console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+        throw err;
       }
     }
   }
@@ -385,17 +363,14 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   if (table === 'Process') {
     return `COPY ${t}(id, label, heuristicLabel, processType, stepCount, communities, entryPointId, terminalId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
-  if (table === 'Section') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, level, content, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  if (table === 'Method') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType, parameters, annotations, parameterAnnotations) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'Class') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, fields, annotations) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Route') {
-    return `COPY ${t}(id, name, filePath, responseKeys, errorKeys, middleware) FROM "${filePath}" ${COPY_CSV_OPTS}`;
-  }
-  if (table === 'Tool') {
-    return `COPY ${t}(id, name, filePath, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
-  }
-  if (table === 'Method') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    return `COPY ${t}(id, name, httpMethod, routePath, controllerName, methodName, filePath, startLine, lineNumber, isInherited, repoId, responseKeys, errorKeys, middleware) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   // TypeScript/JS code element tables have isExported; multi-language tables do not
   if (TABLES_WITH_EXPORTED.has(table)) {
@@ -438,9 +413,8 @@ export const insertNodeToLbug = async (
       query = `CREATE (n:File {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, content: ${escapeValue(properties.content || '')}})`;
     } else if (label === 'Folder') {
       query = `CREATE (n:Folder {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}})`;
-    } else if (label === 'Section') {
-      const descPart = properties.description ? `, description: ${escapeValue(properties.description)}` : '';
-      query = `CREATE (n:Section {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, level: ${properties.level || 1}, content: ${escapeValue(properties.content || '')}${descPart}})`;
+    } else if (label === 'Route') {
+      query = `CREATE (n:Route {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, httpMethod: ${escapeValue(properties.httpMethod ?? '')}, routePath: ${escapeValue(properties.routePath ?? '')}, controllerName: ${escapeValue(properties.controllerName ?? '')}, methodName: ${escapeValue(properties.methodName ?? '')}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine ?? 0}, lineNumber: ${properties.lineNumber ?? 0}, isInherited: ${!!properties.isInherited}, repoId: ${escapeValue(properties.repoId ?? '')}, responseKeys: ${escapeValue(properties.responseKeys ?? [])}, errorKeys: ${escapeValue(properties.errorKeys ?? [])}, middleware: ${escapeValue(properties.middleware ?? [])}})`;
     } else if (TABLES_WITH_EXPORTED.has(label)) {
       const descPart = properties.description ? `, description: ${escapeValue(properties.description)}` : '';
       query = `CREATE (n:${t} {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, isExported: ${!!properties.isExported}, content: ${escapeValue(properties.content || '')}${descPart}})`;
@@ -512,9 +486,8 @@ export const batchInsertNodesToLbug = async (
           query = `MERGE (n:File {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.content = ${escapeValue(properties.content || '')}`;
         } else if (label === 'Folder') {
           query = `MERGE (n:Folder {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}`;
-        } else if (label === 'Section') {
-          const descPart = properties.description ? `, n.description = ${escapeValue(properties.description)}` : '';
-          query = `MERGE (n:Section {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.level = ${properties.level || 1}, n.content = ${escapeValue(properties.content || '')}${descPart}`;
+        } else if (label === 'Route') {
+          query = `MERGE (n:Route {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.httpMethod = ${escapeValue(properties.httpMethod)}, n.routePath = ${escapeValue(properties.routePath)}, n.controllerName = ${escapeValue(properties.controllerName)}, n.methodName = ${escapeValue(properties.methodName)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine ?? 0}, n.lineNumber = ${properties.lineNumber ?? 0}, n.isInherited = ${!!properties.isInherited}, n.repoId = ${escapeValue(properties.repoId ?? '')}, n.responseKeys = ${escapeValue(properties.responseKeys ?? [])}, n.errorKeys = ${escapeValue(properties.errorKeys ?? [])}, n.middleware = ${escapeValue(properties.middleware ?? [])}`;
         } else if (TABLES_WITH_EXPORTED.has(label)) {
           const descPart = properties.description ? `, n.description = ${escapeValue(properties.description)}` : '';
           query = `MERGE (n:${t} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.isExported = ${!!properties.isExported}, n.content = ${escapeValue(properties.content || '')}${descPart}`;
@@ -666,6 +639,12 @@ export const closeLbug = async (): Promise<void> => {
 
 export const isLbugReady = (): boolean => conn !== null && db !== null;
 
+/**
+ * Get the underlying LadybugDB Database instance.
+ * Used by test helpers to share the open Database with pool adapters,
+ * avoiding file-lock conflicts between writable and read-only connections.
+ */
+export const getDatabase = (): lbug.Database | null => db;
 
 /**
  * Delete all nodes (and their relationships) for a specific file from LadybugDB

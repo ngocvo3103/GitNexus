@@ -3,6 +3,7 @@
 import { SupportedLanguages } from '../../../../config/supported-languages.js';
 import type { FieldExtractionConfig } from '../generic.js';
 import { extractSimpleTypeName } from '../../type-extractors/shared.js';
+import type { SyntaxNode } from '../../utils/ast-helpers.js';
 
 /**
  * Go field extraction config.
@@ -64,5 +65,41 @@ export const goConfig: FieldExtractionConfig = {
 
   isReadonly(_node) {
     return false; // Go fields are not readonly
+  },
+
+  /**
+   * Go type_declaration has no named fields — children are type_spec nodes.
+   * Navigate: type_declaration > type_spec > name:type_identifier
+   */
+  nameResolver(node: SyntaxNode) {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child?.type === 'type_spec') {
+        return child.childForFieldName('name');
+      }
+    }
+    return null;
+  },
+
+  /**
+   * Go field_declaration_list is nested 3 levels deep:
+   *   type_declaration > type_spec > struct_type > field_declaration_list
+   * type_declaration and struct_type have no named fields — walk by node type.
+   */
+  bodyResolver(node: SyntaxNode) {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const typeSpec = node.namedChild(i);
+      if (typeSpec?.type !== 'type_spec') continue;
+      const typeNode = typeSpec.childForFieldName('type');
+      if (!typeNode) continue;
+      // struct_type and interface_type have unnamed field_declaration_list children
+      for (let j = 0; j < typeNode.namedChildCount; j++) {
+        const body = typeNode.namedChild(j);
+        if (body?.type === 'field_declaration_list') {
+          return [body];
+        }
+      }
+    }
+    return [];
   },
 };

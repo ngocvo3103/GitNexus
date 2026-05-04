@@ -56,7 +56,18 @@ export function edgeSet(edges: Array<{ source: string; target: string }>): strin
 export function getNodesByLabelFull(result: PipelineResult, label: string): Array<{ name: string; properties: Record<string, any> }> {
   const nodes: Array<{ name: string; properties: Record<string, any> }> = [];
   result.graph.forEachNode(n => {
-    if (n.label === label) nodes.push({ name: n.properties.name, properties: n.properties });
+    if (n.label === label) {
+      const props = { ...n.properties };
+      // Parse JSON-stringified fields back to arrays for test assertions
+      if (typeof props.parameterTypes === 'string') {
+        try {
+          props.parameterTypes = JSON.parse(props.parameterTypes);
+        } catch {
+          // Leave as-is if parse fails
+        }
+      }
+      nodes.push({ name: props.name, properties: props });
+    }
   });
   return nodes.sort((a, b) => a.name.localeCompare(b.name));
 }

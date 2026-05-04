@@ -634,6 +634,137 @@ describe('processCallsFromExtracted', () => {
     expect(rels[0].sourceId).toBe('Function:src/index.ts:processUser');
     expect(rels[1].sourceId).toBe('Function:src/index.ts:processRepo');
   });
+
+  // ---- D5: Interface implementation lookup ----
+
+  function makeMockGraph(relationships: Array<{ sourceId: string; targetId: string; type: string }>) {
+    const rels = [...relationships];
+    return {
+      addRelationship: (rel: { id: string; sourceId: string; targetId: string; type: string; confidence: number; reason: string }) => {
+        rels.push(rel);
+        return rel.id;
+      },
+      forEachRelationship: (fn: (rel: { id?: string; sourceId: string; targetId: string; type: string; confidence?: number; reason?: string }) => void) => {
+        rels.forEach(fn);
+      },
+      relationships: rels,
+    } as unknown as import('../../src/core/graph/graph.js').KnowledgeGraph;
+  }
+
+  it('D5: resolves method call to implementing class when receiver type is an Interface', async () => {
+    // Receiver type 'Repository' is an Interface with one implementer 'UserRepo'
+    // D4 ownerId fallback fails (no match), D5 finds 'UserRepo' as the implementer
+    // and filters the method pool to methods owned by UserRepo
+    ctx.symbols.add('src/types.ts', 'Repository', 'Interface:src/types.ts:Repository', 'Interface');
+    ctx.symbols.add('src/models.ts', 'UserRepo', 'Class:src/models.ts:UserRepo', 'Class');
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:UserRepo' });
+    ctx.importMap.set('src/index.ts', new Set(['src/types.ts', 'src/models.ts']));
+
+    const graph = makeMockGraph([
+      { sourceId: 'Class:src/models.ts:UserRepo', targetId: 'Interface:src/types.ts:Repository', type: 'IMPLEMENTS' },
+    ]);
+    ctx.graph = graph;
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/index.ts:main',
+      receiverTypeName: 'Repository',
+      callForm: 'member',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].targetId).toBe('Method:src/models.ts:save');
+    expect(rels[0].reason).toBe('import-resolved'); // D5 tier (Interface found via import resolution)
+  });
+
+  it('D5: returns null when D4 fails and interface has no implementers', async () => {
+    // D4 ownerId fallback fails; D5 finds no implementing classes -> returns null
+    // Must have multiple candidates to reach D5 (single candidate returns early)
+    ctx.symbols.add('src/types.ts', 'Repository', 'Interface:src/types.ts:Repository', 'Interface');
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:UserRepo' });
+    // Add another save candidate to force D1-D5 resolution path
+    ctx.symbols.add('src/other.ts', 'save', 'Method:src/other.ts:save', 'Method', { ownerId: 'Class:src/other.ts:OtherRepo' });
+    ctx.importMap.set('src/index.ts', new Set(['src/types.ts']));
+
+    const graph = makeMockGraph([]); // No IMPLEMENTS edges
+    ctx.graph = graph;
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/index.ts:main',
+      receiverTypeName: 'Repository',
+      callForm: 'member',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(0);
+  });
+
+  it('D5: no D5 activation for class types (D4 behavior preserved)', async () => {
+    // When receiver type is a Class (not Interface), D5 should not activate.
+    // D4 ownerId matching handles it.
+    ctx.symbols.add('src/models.ts', 'User', 'Class:src/models.ts:User', 'Class');
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:User' });
+    ctx.importMap.set('src/index.ts', new Set(['src/models.ts']));
+
+    const graph = makeMockGraph([
+      // Even if there is an IMPLEMENTS edge, D5 should not fire for Class types
+      { sourceId: 'Class:src/models.ts:User', targetId: 'Interface:src/types.ts:Repository', type: 'IMPLEMENTS' },
+    ]);
+    ctx.graph = graph;
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/index.ts:main',
+      receiverTypeName: 'User',
+      callForm: 'member',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].targetId).toBe('Method:src/models.ts:save');
+  });
+
+  it('D5: multiple implementers — ambiguous, returns null without overload hints', async () => {
+    // Two classes implement 'Repository': UserRepo and AdminRepo.
+    // Both have 'save' methods. Without overload disambiguation, this is ambiguous.
+    ctx.symbols.add('src/types.ts', 'Repository', 'Interface:src/types.ts:Repository', 'Interface');
+    ctx.symbols.add('src/models.ts', 'UserRepo', 'Class:src/models.ts:UserRepo', 'Class');
+    ctx.symbols.add('src/models.ts', 'AdminRepo', 'Class:src/models.ts:AdminRepo', 'Class');
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:UserRepo' });
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:AdminRepo' });
+    ctx.importMap.set('src/index.ts', new Set(['src/types.ts', 'src/models.ts']));
+
+    const graph = makeMockGraph([
+      { sourceId: 'Class:src/models.ts:UserRepo', targetId: 'Interface:src/types.ts:Repository', type: 'IMPLEMENTS' },
+      { sourceId: 'Class:src/models.ts:AdminRepo', targetId: 'Interface:src/types.ts:Repository', type: 'IMPLEMENTS' },
+    ]);
+    ctx.graph = graph;
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/index.ts:main',
+      receiverTypeName: 'Repository',
+      callForm: 'member',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    // Multiple implementers, no overload hints -> ambiguous
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(0);
+  });
 });
 
 describe('extractReturnTypeName', () => {

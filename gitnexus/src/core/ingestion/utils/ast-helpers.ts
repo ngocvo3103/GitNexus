@@ -114,6 +114,8 @@ export const CLASS_CONTAINER_TYPES = new Set([
   // Kotlin
   'object_declaration',
   'companion_object',
+  // Go
+  'type_declaration',
 ]);
 
 export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
@@ -135,6 +137,7 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   module: 'Module',
   object_declaration: 'Class',
   companion_object: 'Class',
+  type_declaration: 'Struct',
 };
 
 /** Check if a Kotlin function_declaration capture is inside a class_body (i.e., a method).
