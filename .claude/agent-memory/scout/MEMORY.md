@@ -1,0 +1,1 @@
+- [CLI registration + warm-backend lifecycle prior art](seam-cli-registration-and-warm-backend.md) — createLazyAction pattern, LocalBackend init/disconnect lifecycle, eval-server text formatter + next-step hints

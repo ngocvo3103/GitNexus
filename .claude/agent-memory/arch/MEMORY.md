@@ -1,1 +1,7 @@
 - [Issue triage batch plan 2026-06-04](issue-triage-batch-plan-2026-06-04.md) — 48 open issues, 12 batches, one batch per session; next session resumes in-flight #72
+- [Incremental cycle planning](feedback-incremental-cycle-planning.md) — large multi-phase RFCs: plan ONE slice per cycle, not the whole thing (user-validated on #159)
+- [Plan-artifact validator schema](feedback-plan-artifact-validator-schema.md) — deterministic PostToolUse hook validates docs/plans/*.md against a strict schema; author to the shape first-try
+- [Verify adversarial sub-agent citations](feedback-verify-adversarial-citations.md) — spot-verify the most damning, cheap file/line claims before relaying; review agents fabricate even when the conclusion is right
+- [Verify "pre-existing failure" claims](feedback-verify-pre-existing-claims.md) — run the CLI E2E suites; tsc-clean + scoped-unit-green hides circular-import/TDZ runtime crashes
+- [P3 Mode A wired into active path (IMPLEMENTED #166)](project-p3-mode-a-inert-on-active-path.md) — #159 --lsp augments via processCalls@pipeline.ts:492; ⚠️ B1 REVERSAL (in-memory CALLS DO stamp source:'heuristic' — never coalesce the :370/:486 guards); inject-bug→#167
+- [P3 Mode A reconciliation semantics](project-p3-mode-a-reconciliation-semantics.md) — #159 LSP-augmented CALLS decision table; confidence 0.70 IMPLEMENTED; callee-label precondition CALLABLE_SYMBOL_TYPES

@@ -5,4 +5,12 @@
 - [TSX queries grammar isolation](feedback-tsx-queries-grammar-isolation.md) — JSX patterns fail in TYPESCRIPT_QUERIES (used for .ts); keep them in a separate TSX_QUERIES string registered under `${TypeScript}:tsx`
 - [React/TSX indexing fixes (Issue #107)](project-react-tsx-indexing-fixes.md) — JSX elements (CodeElement), type_alias_declaration (TypeAlias), and React hook bindings (const = useCallback) added 2026-06
 - [Angular CALLS edge extractor (Issue #31)](project-angular-call-edge-extractor.md) — extractAngularCalls() emits CALLS edges for @NgModule providers and @Component template bindings
-- [Rename accuracy test pattern (Batch G)](feedback-rename-accuracy-batch-g-test-pattern.md) — vi.hoisted fs+rg mocks + query-sniffed executeParameterized for LocalBackend.rename dispatch tests
+- [impacted_endpoints reverse-CALLS labels](feedback-impacted-endpoints-reverse-calls-broaden.md) — reverse-CALLS Query 1 must match both Method AND Function; top-level TS functions are Function, not Method
+- [Kùzu ALTER TABLE has no IF NOT EXISTS](feedback-kuzu-alter-table-no-if-not-exists.md) — use `ALTER TABLE X ADD col TYPE` and rely on error suppression for idempotency
+- [Mode A session test pattern](feedback-mode-a-session-test-pattern.md) — withReconciliationSession mock: positional 4-arg (repo, candidates, fn, deps), overrides spread into deps; mirrors withReferenceProvider
+- [node:fs/promises lazy import bypasses vi.mock](feedback-node-fs-promises-lazy-import-bypasses-vi-mock.md) — `await import('node:fs/promises')` is not intercepted by vi.mock('fs/promises'); mock both
+- [rename(precision:'lsp') test pattern](feedback-rename-lsp-precision-test-pattern.md) — mirror rename-accuracy.test.ts and mock the LSP funnel via vi.mock
+- [vitest fs default-import mock](feedback-vitest-fs-default-import-mock.md) — mock BOTH the namespace AND `default` export; `import fs from 'fs'` resolves to namespace under esModuleInterop
+- [Go cross-file IMPLEMENTS (Issue #85)](project-go-cross-file-implements-wi-h85.md) — two-pass detector: global interface registry pre-pass + per-file match at 0.7, reason 'cross-file-structural-match'
+- [LSP consumer funnel contract](project-lsp-consumer-funnel-contract-2026-06.md) — withReferenceProvider consumer in local-backend.ts now expects {publicChanges, lspChanges}, not just lspChanges
+- [lbug-db inject() undefined in full suite (→#167)](project-vitest-lbug-db-inject-undefined.md) — vitest 4.x projects+globalSetup drops lbugDbPath for lbug-db forks; env-fallback mitigation applied
