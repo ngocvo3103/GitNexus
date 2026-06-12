@@ -1007,7 +1007,12 @@ describe('flow-fate — DT-27: I-7 --before SHA enforcement', () => {
 // ─── DT-26: no-write invariant — flow-fate source has no write-API tokens
 
 describe('flow-fate — DT-26: no-write invariant (KD-8 / I-2)', () => {
-  it('flow-fate.ts source has no initLbug / executeQuery / addNode / addRelationship / DROP', () => {
+  it('flow-fate.ts source has no executeQuery / addNode / addRelationship / DROP', () => {
+    // Lifecycle tokens (initLbug, closeLbug) are permitted: flow-fate
+    // calls them to open the cold Kùzu pool before reading Process
+    // nodes (I-3 lock discipline). The banned set covers only
+    // graph-write dispatch tokens.  initLbugWithDb is still banned —
+    // flow-fate has no reason to use the low-level variant.
     const here = dirname(fileURLToPath(import.meta.url));
     // test/unit/scripts/flow-fate.test.ts → gitnexus/ (4 levels up)
     const srcPath = join(here, '..', '..', '..', 'scripts', 'flow-fate.ts');
@@ -1019,7 +1024,7 @@ describe('flow-fate — DT-26: no-write invariant (KD-8 / I-2)', () => {
     const FORBIDDEN: RegExp[] = [
       /\bexecuteQuery\s*\(/,
       /\bimport\b[^\n;]*\bexecuteQuery\b/,
-      /\binitLbug\s*\(/,
+      // initLbugWithDb is the low-level variant — flow-fate must not use it.
       /\binitLbugWithDb\s*\(/,
       /\baddNode\s*\(/,
       /\baddRelationship\s*\(/,

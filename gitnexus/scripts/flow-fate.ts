@@ -989,10 +989,22 @@ let _runCypherCache: RunCypherFn | null = null;
 let _loadMetaCache: LoadMetaFn | null = null;
 let _getStoragePathsCache: GetStoragePathsFn | null = null;
 let _execCache: ((cmd: string, args: string[], cwd: string) => Promise<{ stdout: string; stderr: string; code: number }>) | null = null;
+/** Cached lbug-adapter module — shared with `defaultRunCypher` so
+ *  both lifecycle calls (`initLbug`, `closeLbug`) and query dispatch
+ *  (`executeParameterized`) resolve from the same dynamic import. */
+let _lbugAdapterModCache: any = null;
+
+/** Return the lbug-adapter module, importing it once and caching.
+ *  KD-8: dynamic import keeps the no-write static sweep clean. */
+async function defaultLbugAdapter(): Promise<any> {
+  if (_lbugAdapterModCache) return _lbugAdapterModCache;
+  _lbugAdapterModCache = await import('../dist/mcp/core/lbug-adapter.js');
+  return _lbugAdapterModCache;
+}
 
 async function defaultRunCypher(): Promise<RunCypherFn> {
   if (_runCypherCache) return _runCypherCache;
-  const mod: any = await import('../dist/mcp/core/lbug-adapter.js');
+  const mod = await defaultLbugAdapter();
   _runCypherCache = mod.executeParameterized as RunCypherFn;
   return _runCypherCache;
 }
@@ -1092,54 +1104,89 @@ export async function loadProcessNodes(
     }
   }
 
-  let rows: any[];
-  try {
-    rows = await runCypher(repoId, DEFAULT_PROCESS_QUERY, {});
-  } catch (e: any) {
-    // A legacy index without `Process` rows (or no `Process`
-    // table at all) returns [] on a successful query, or throws
-    // here. We surface a halt so the operator can re-analyze.
-    throw new FlowFateHaltError(
-      3,
-      `error: failed to load Process nodes from '${repoPath}': ${e?.message ?? String(e)}`,
-    );
+  // I-3 lock discipline: when the production runCypher seam is
+  // active (i.e. NOT injected by tests), we must open the Kùzu
+  // pool ourselves — `analyze` runs as a subprocess that closes
+  // the DB on exit, so the pool is cold when we arrive here.
+  //
+  // Design choice: each side (before / after) is opened, read,
+  // and closed independently in sequence. The two sides have
+  // distinct repoIds (e.g. `gitnexus-438600e` vs
+  // `gitnexus-b83ddb1`), so there is no cross-side lock contention.
+  // Opening one at a time is the safest discipline — if the process
+  // is interrupted between the two sides the first DB is already
+  // closed and consistent.
+  //
+  // Guard: when `deps.runCypher` is injected (test path), the
+  // stubs manage their own state; calling initLbug against a
+  // non-existent fixture DB would throw.
+  const _lbugMod: any = !deps.runCypher ? await defaultLbugAdapter() : null;
+  if (_lbugMod && !_lbugMod.isLbugReady(repoId)) {
+    await _lbugMod.initLbug(repoId, paths.lbugPath);
   }
-  const rowToNode = deps.rowToProcessNode ?? rowToProcessNode;
-  const rawNodes = filterValidProcessNodes(
-    (Array.isArray(rows) ? rows : []).map(rowToNode).filter((x): x is ProcessNode => x !== null),
-  );
-  // KD-6: entry-point candidates are derived via a SEPARATE cypher
-  // query (the production `Process` table does not persist the
-  // entry-point score). When the candidate set is non-empty, each
-  // process node is annotated with `isEntryPointCandidate` so the
-  // pure classifier can emit `entryPointCandidatesBefore/After`.
-  // When the query returns an empty set (legacy index without
-  // `Process` rows), nodes are returned un-annotated and the
-  // verdict annotates "no candidate info available" — the count
-  // is `0` but it is a legitimate answer, not a contract
-  // violation.
+
+  let rows: any[];
+  let rawNodes: ProcessNode[];
   let nodes: ProcessNode[];
   let entryPointQueryError: string | undefined;
   try {
-    const candidates = await deriveEntryPointCandidateIds(repoId, runCypher);
-    nodes = annotateWithEntryPointCandidates(rawNodes, candidates);
-  } catch (error) {
-    // A cypher dispatch error on the candidate query should not
-    // abort the whole flow-fate run — the per-side `MATCH
-    // (p:Process)` query has already succeeded, so we have the
-    // raw nodes. Annotate with an empty set and let the classifier
-    // emit `entryPointCandidatesBefore/After: 0` (the verdict
-    // will annotate the absence). Capture the error message
-    // (coerced to string for non-Error throws) on the result so
-    // the verdict can distinguish "cypher dispatch failed" from
-    // "legitimate empty result" downstream.
-    nodes = rawNodes;
-    entryPointQueryError =
-      typeof error === 'string'
-        ? error
-        : (error as Error)?.message ?? String(error);
+    try {
+      rows = await runCypher(repoId, DEFAULT_PROCESS_QUERY, {});
+    } catch (e: any) {
+      // A legacy index without `Process` rows (or no `Process`
+      // table at all) returns [] on a successful query, or throws
+      // here. We surface a halt so the operator can re-analyze.
+      throw new FlowFateHaltError(
+        3,
+        `error: failed to load Process nodes from '${repoPath}': ${e?.message ?? String(e)}`,
+      );
+    }
+    const rowToNode = deps.rowToProcessNode ?? rowToProcessNode;
+    rawNodes = filterValidProcessNodes(
+      (Array.isArray(rows) ? rows : []).map(rowToNode).filter((x): x is ProcessNode => x !== null),
+    );
+    // KD-6: entry-point candidates are derived via a SEPARATE cypher
+    // query (the production `Process` table does not persist the
+    // entry-point score). When the candidate set is non-empty, each
+    // process node is annotated with `isEntryPointCandidate` so the
+    // pure classifier can emit `entryPointCandidatesBefore/After`.
+    // When the query returns an empty set (legacy index without
+    // `Process` rows), nodes are returned un-annotated and the
+    // verdict annotates "no candidate info available" — the count
+    // is `0` but it is a legitimate answer, not a contract
+    // violation.
+    try {
+      const candidates = await deriveEntryPointCandidateIds(repoId, runCypher);
+      nodes = annotateWithEntryPointCandidates(rawNodes, candidates);
+    } catch (error) {
+      // A cypher dispatch error on the candidate query should not
+      // abort the whole flow-fate run — the per-side `MATCH
+      // (p:Process)` query has already succeeded, so we have the
+      // raw nodes. Annotate with an empty set and let the classifier
+      // emit `entryPointCandidatesBefore/After: 0` (the verdict
+      // will annotate the absence). Capture the error message
+      // (coerced to string for non-Error throws) on the result so
+      // the verdict can distinguish "cypher dispatch failed" from
+      // "legitimate empty result" downstream.
+      nodes = rawNodes;
+      entryPointQueryError =
+        typeof error === 'string'
+          ? error
+          : (error as Error)?.message ?? String(error);
+    }
+  } finally {
+    // Close the pool after all reads for this side are complete.
+    // This releases the Kùzu file lock so the next side (or any
+    // subsequent tool invocation) can open the DB cleanly.
+    if (_lbugMod) {
+      try {
+        await _lbugMod.closeLbug(repoId);
+      } catch {
+        /* best-effort — ignore close errors */
+      }
+    }
   }
-  return { nodes, repoId, dbSizeBytes, meta, sha: headSha, entryPointQueryError };
+  return { nodes: nodes!, repoId, dbSizeBytes, meta, sha: headSha, entryPointQueryError };
 }
 
 /** Default `repoId` derivation: lowercased basename of the

@@ -24,14 +24,17 @@
  *
  * Decision table (per WI-1b Tests block + Verify findings):
  *
- *   | case                | .gitnexus | exec(analyze)        | runCypher | sampledCap | verify |
- *   |---------------------|-----------|----------------------|-----------|------------|--------|
- *   | fresh repo          | absent    | called (no flag)     | rows      | =N         | ok     |
- *   | pre-indexed repo    | present   | NOT called           | rows      | =N         | ok     |
- *   | legacy index        | present   | NOT called           | []        | =N         | ok     |
- *   | under-sampled       | present   | NOT called    | rows      | <N         | ok     |
- *   | verifier rejects    | present   | NOT called    | rows      | n/a        | throws |
- *   | both legs           | present   | NOT called    | rows      | =N         | ok×2   |
+ *   | case                     | .gitnexus  | exec(baseline)            | exec(lsp)                  | sampledCap | verify |
+ *   |--------------------------|------------|---------------------------|----------------------------|------------|--------|
+ *   | fresh repo (baseline)    | absent     | analyze <repo>            | n/a                        | =N         | ok     |
+ *   | fresh repo (lsp)         | absent     | n/a                       | analyze --lsp <repo>       | =N         | ok     |
+ *   | pre-indexed (baseline)   | present    | NOT called (reuse)        | n/a                        | =N         | ok     |
+ *   | pre-indexed (lsp)        | present    | n/a                       | analyze --lsp <repo>       | =N         | ok     |
+ *   | both legs (.gitnexus=∅)  | absent     | analyze <repo>            | analyze --lsp <repo>       | =N         | ok×2   |
+ *   | both legs (.gitnexus=✓)  | present    | NOT called (reuse)        | analyze --lsp <repo>       | =N         | ok×2   |
+ *   | legacy index             | present    | NOT called (reuse)        | n/a                        | =N         | ok     |
+ *   | under-sampled            | present    | NOT called (reuse)        | n/a                        | <N         | ok     |
+ *   | verifier rejects         | present    | NOT called (reuse)        | n/a                        | n/a        | throws |
  *
  * Methodology: stubs for every I/O seam. The default `stat`
  * returns 1024 (1KB) — the unit tests only care that the value is
@@ -41,48 +44,33 @@
  *
  * This suite pins TWO classes of contract, intentionally distinct:
  *
- *   1. **Implementation contract (this slice, current behavior).**
- *      The harness in this slice runs `analyze` AT MOST ONCE per
- *      repo (no `--lsp` flag; `.gitnexus`-absent gate only), so
- *      both legs share the SAME index. The "leg" label is an
- *      artifact-envelope attribute (`artifact.leg`), not an
- *      index-shape attribute. Tests that pin this:
- *        - DT-7 ("both legs (same-index per KD-3)")  lines 366-413
- *        - "legs=[baseline, lsp] with .gitnexus absent → ONE
- *           analyze call shared by both legs"  lines 415-443
- *        - "legs=[lsp] only → exactly one analyze call (no --lsp
- *           flag — same index)"  lines 466-491
- *      These assertions are coupled to the current implementation
- *      and would have to be deleted/rewritten when the harness is
- *      refactored to the per-leg analyze model.
+ *   1. **Implementation contract (per-leg analyze, gh #173).**
+ *      Each leg runs its own `analyze` call with the leg-specific
+ *      flag:
+ *        - baseline → `analyze <repoPath>`       (no --lsp)
+ *        - lsp      → `analyze --lsp <repoPath>`
+ *      The `baseline` leg reuses a pre-existing `.gitnexus` index
+ *      when present on entry; the `lsp` leg ALWAYS re-analyzes
+ *      (it needs an LSP-augmented index regardless of what was on
+ *      disk). `buildRealVerifyOpts` is called ONCE PER LEG so the
+ *      graph connection is always fresh for the just-written index.
+ *      Tests that pin this:
+ *        - DT-7 ("both legs — per-leg analyze")
+ *        - "legs=[baseline, lsp] with .gitnexus absent → 2 analyze
+ *           calls (baseline no --lsp, lsp with --lsp)"
+ *        - "legs=[lsp] only → analyze --lsp called"
+ *        - "artifact carries analyzeCommand and analyzeRanForThisLeg"
  *
- *   2. **Design contract (the spec, not this slice).**
- *      Per `docs/designs/159-mode-c-measurement.md` §KeyDecisions
- *      KD-3 + the sequence diagram "sd-campaign-tobe": the harness
- *      re-runs `analyze` per leg when the leg's required flag
- *      differs from the last-analyzed leg's flag — distinct
- *      indexes (heuristic vs LSP-augmented), a TRUE pre/post
- *      comparison. The shipped implementation explicitly defers
- *      this to a follow-up WI (see `measure-mode-c.ts` lines
- *      483-485: "True pre/post index comparison (a distinct
- *      LSP-augmented index) requires per-leg `analyze --lsp`
- *      support — a follow-up WI, NOT this slice.").
+ *   2. **Design contract (stable across analyze-model changes).**
+ *      DT-1..DT-6: every per-leg invariant (leg labels in
+ *      artifacts, `underSampled` flagging, verifier-rejection
+ *      surface, `runCypher` legacy-index tolerance) does NOT
+ *      depend on the analyze model. These assertions hold under
+ *      both the old same-index model and the new per-leg model.
  *
- *      Tests that pin the DESIGN contract (stable across the
- *      per-leg refactor):
- *        - DT-1..DT-6: every per-leg invariant (leg labels in
- *          artifacts, `underSampled` flagging, verifier-rejection
- *          surface, `runCypher` legacy-index tolerance) does NOT
- *          depend on whether the harness re-runs analyze. The
- *          assertions all hold under both the same-index and the
- *          per-leg-analyze implementations.
- *
- * Refactor guard: tests marked **[IMPL]** (in the `it()` titles
- * below) pin the current slice's implementation; tests marked
- * **[DESIGN]** pin the design contract and should survive a
- * same-index → per-leg-analyze refactor without modification. If
- * a refactor lands per-leg analyze, the [IMPL] assertions below
- * are the ones to update — not the [DESIGN] ones.
+ * Refactor guard: tests marked **[IMPL]** pin the per-leg-analyze
+ * implementation; tests marked **[DESIGN]** pin the design
+ * contract and are stable across analyze-model changes.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -210,15 +198,11 @@ function makeMeta(over: Partial<{ files: number; nodes: number; edges: number; c
 }
 
 /** Canonical happy-path cypher rows (edge counts by source & reason).
- *  The shape mirrors what a real Kùzu engine returns when the
- *  bucket query carries an explicit `GROUP BY r.${column}`: one
- *  row per (bucket, count) tuple, where `count` is the aggregate
- *  over the matched relationships. (The earlier fixture used
- *  multi-row entries per bucket; that shape was the smell that
- *  surfaced the missing-GROUP-BY bug — with GROUP BY the engine
- *  collapses multi-row buckets into a single row per bucket, and
- *  the JS-side sum becomes a defensive net rather than the
- *  primary aggregation mechanism.) */
+ *  The shape mirrors what a real Kùzu engine returns with implicit
+ *  grouping (openCypher spec): one row per (bucket, count) tuple,
+ *  where `count` is the aggregate over the matched relationships.
+ *  The JS-side sum in `bucketEdgeCounts` is a defensive net in case
+ *  a future engine version returns multi-row buckets. */
 const HAPPY_CYPHER_ROWS_BY_SOURCE = [
   { bucket: 'heuristic', count: 120 },
   { bucket: 'lsp-confirmed', count: 30 },
@@ -402,17 +386,21 @@ describe('measure-mode-c — DT-6: verify rejection', () => {
   });
 });
 
-// ─── DT-7: both legs present → 2 artifacts ────────────────────────────
+// ─── DT-7: both legs present → 2 artifacts, per-leg analyze ──────────────
 //
-// KD-3 + EdgeCases (design doc): both legs share the SAME index.
-// The `lsp` leg differs from `baseline` only by `meta.leg` and
-// (in the real-verify path) by the LspClient wiring inside the
-// verifier. The harness never re-runs `analyze --lsp` — true
-// per-leg index comparison is a follow-up WI, not this slice.
+// Per-leg analyze design (gh #173): each leg runs its own analyze call
+// with the leg-specific flag. The `lsp` leg always runs `analyze --lsp`;
+// the `baseline` leg reuses a pre-existing index when present. This
+// makes the comparison non-theatrical: the two legs see different graph
+// topologies (heuristic vs LSP-augmented), which is the only way the
+// campaign can measure a real LSP-at-index delta.
 
-describe('measure-mode-c — DT-7: both legs (same-index per KD-3)', () => {
+describe('measure-mode-c — DT-7: both legs (per-leg analyze)', () => {
   it('[DESIGN] legs=[baseline, lsp] → 2 artifacts in order, with distinct leg labels', async () => {
-    const stat = makeStat(2048); // .gitnexus present → no analyze
+    // With .gitnexus present: baseline reuses existing index (zero
+    // exec calls for baseline); lsp always re-analyzes with --lsp
+    // (one exec call). Two verify calls total.
+    const stat = makeStat(2048); // .gitnexus present on entry
     const verify = makeVerify();
     const exec = makeExec();
     const opts = makeOptions({
@@ -425,19 +413,14 @@ describe('measure-mode-c — DT-7: both legs (same-index per KD-3)', () => {
     expect(result.artifacts.length).toBe(2);
     expect(result.artifacts[0].leg).toBe('baseline');
     expect(result.artifacts[1].leg).toBe('lsp');
-    // Same-index contract (KD-3): .gitnexus is present on entry
-    // → zero exec calls; both legs reuse the cached index.
-    expect((exec as any).mock.calls.length).toBe(0);
-    // Two verify calls (one per leg), sharing the same LspClient
-    // (in the real-verify path) or the same stub (in tests).
+    // Two verify calls (one per leg).
     expect((verify as any).mock.calls.length).toBe(2);
   });
 
-  it('[IMPL] legs=[baseline, lsp] with .gitnexus present → NO analyze, both legs reuse the cached index', async () => {
-    // Cached .gitnexus: the harness MUST trust the pre-existing
-    // index for BOTH legs. Neither leg forces a re-analyze; the
-    // `lsp` leg varies the verifier wiring only, not the
-    // underlying index.
+  it('[IMPL] legs=[baseline, lsp] with .gitnexus present → baseline reuses index, lsp re-analyzes with --lsp', async () => {
+    // .gitnexus present on entry:
+    //   - baseline leg: NO analyze (reuses heuristic index)
+    //   - lsp leg: analyze --lsp (builds LSP-augmented index)
     const stat = makeStat(2048);
     const calls: string[][] = [];
     const exec = makeExec(async (cmd, args) => {
@@ -452,17 +435,29 @@ describe('measure-mode-c — DT-7: both legs (same-index per KD-3)', () => {
       legs: ['baseline', 'lsp'],
     });
     const result = await measureModeC(opts);
-    // Zero exec calls — neither leg re-runs analyze.
-    expect(calls.length).toBe(0);
-    // Both legs report analyzeRanFirst:false (the cached index).
-    expect(result.artifacts[0].analyzeRanFirst).toBe(false);
-    expect(result.artifacts[1].analyzeRanFirst).toBe(false);
+    // Exactly one exec call — for the lsp leg only.
+    expect(calls.length).toBe(1);
+    expect(calls[0]).toContain('--lsp');
+    expect(calls[0]).toContain('analyze');
+    // --force is mandatory on every per-leg analyze: without it the
+    // CLI's incremental check short-circuits ("Already up to date")
+    // on a fresh index and the lsp leg silently reuses the heuristic
+    // index — byte-identical-legs theater (caught in the first
+    // campaign re-run: analyzeWallMs:0, sources {heuristic} only).
+    expect(calls[0]).toContain('--force');
+    // baseline: reused index → analyzeRanForThisLeg:false, empty analyzeCommand
+    expect(result.artifacts[0].analyzeRanForThisLeg).toBe(false);
+    expect(result.artifacts[0].analyzeCommand).toEqual([]);
+    // lsp: re-analyzed → analyzeRanForThisLeg:true, analyzeCommand has --lsp
+    expect(result.artifacts[1].analyzeRanForThisLeg).toBe(true);
+    expect(result.artifacts[1].analyzeCommand).toContain('--lsp');
+    expect(result.artifacts[1].analyzeCommand).toContain('analyze');
   });
 
-  it('[IMPL] legs=[baseline, lsp] with .gitnexus absent → ONE analyze call shared by both legs', async () => {
-    // No cached index: the harness runs analyze exactly once
-    // (no flag) before the per-leg loop. Both legs share the
-    // resulting index. This is the same-index contract.
+  it('[IMPL] legs=[baseline, lsp] with .gitnexus absent → 2 analyze calls (baseline no --lsp, lsp with --lsp)', async () => {
+    // No cached index: each leg runs its own analyze.
+    //   baseline → analyze <repo>       (no --lsp)
+    //   lsp      → analyze --lsp <repo>
     const stat = vi.fn(async (_p: string) => null as any);
     const calls: string[][] = [];
     const exec = makeExec(async (cmd, args) => {
@@ -477,21 +472,31 @@ describe('measure-mode-c — DT-7: both legs (same-index per KD-3)', () => {
       legs: ['baseline', 'lsp'],
     });
     const result = await measureModeC(opts);
-    // Exactly one exec call total — the per-leg loop does NOT
-    // re-analyze, even though the lsp leg is requested.
-    expect(calls.length).toBe(1);
-    // The single call has NO --lsp flag (KD-3: same index).
-    expect(calls[0]).not.toContain('--lsp');
+    // Exactly two exec calls — one per leg.
+    expect(calls.length).toBe(2);
+    // First call: baseline → no --lsp.
     expect(calls[0]).toContain('analyze');
-    // Both artifacts flag analyzeRanFirst:true (the analyze
-    // cost is shared by every leg in the run).
-    expect(result.artifacts[0].analyzeRanFirst).toBe(true);
-    expect(result.artifacts[1].analyzeRanFirst).toBe(true);
+    expect(calls[0]).not.toContain('--lsp');
+    // Second call: lsp → --lsp present.
+    expect(calls[1]).toContain('analyze');
+    expect(calls[1]).toContain('--lsp');
+    // Both per-leg analyzes carry --force (skip-theater guard; also
+    // covers the leg-order hazard: an un-forced baseline analyze
+    // running AFTER an lsp leg would skip and silently reuse the
+    // augmented index for the heuristic leg).
+    expect(calls[0]).toContain('--force');
+    expect(calls[1]).toContain('--force');
+    // Both artifacts flag analyzeRanForThisLeg:true.
+    expect(result.artifacts[0].analyzeRanForThisLeg).toBe(true);
+    expect(result.artifacts[1].analyzeRanForThisLeg).toBe(true);
+    // Provenance: analyzeCommand echoes the actual argv.
+    expect(result.artifacts[0].analyzeCommand).not.toContain('--lsp');
+    expect(result.artifacts[0].analyzeCommand).toContain('analyze');
+    expect(result.artifacts[1].analyzeCommand).toContain('--lsp');
   });
 
-  it('[IMPL] legs=[baseline] only → at most one analyze call when .gitnexus absent', async () => {
-    // Single-leg run: only baseline. One exec call (no --lsp)
-    // when .gitnexus is absent, zero when present.
+  it('[IMPL] legs=[baseline] only → at most one analyze call (no --lsp) when .gitnexus absent', async () => {
+    // Single-leg baseline run: one exec call (no --lsp) when absent.
     const stat = vi.fn(async (_p: string) => null as any);
     const calls: string[][] = [];
     const exec = makeExec(async (cmd, args) => {
@@ -505,16 +510,20 @@ describe('measure-mode-c — DT-7: both legs (same-index per KD-3)', () => {
       verify: verify as any,
       legs: ['baseline'],
     });
-    await measureModeC(opts);
+    const result = await measureModeC(opts);
     expect(calls.length).toBe(1);
     expect(calls[0]).not.toContain('--lsp');
+    expect(calls[0]).toContain('analyze');
+    expect(calls[0]).toContain('--force'); // skip-theater guard
+    // Artifact provenance.
+    expect(result.artifacts[0].analyzeRanForThisLeg).toBe(true);
+    expect(result.artifacts[0].analyzeCommand).not.toContain('--lsp');
   });
 
-  it('[IMPL] legs=[lsp] only → exactly one analyze call (no --lsp flag — same index)', async () => {
-    // Single-leg lsp run. The harness runs analyze ONCE without
-    // --lsp (the per-leg --lsp flag is a follow-up WI). The
-    // artifact's `leg:'lsp'` is the only marker of the LSP path;
-    // the underlying index is identical to a baseline run.
+  it('[IMPL] legs=[lsp] only → analyze --lsp called', async () => {
+    // Single-leg lsp run: the harness runs `analyze --lsp` (not the
+    // old no-flag analyze). The artifact's `leg:'lsp'` and
+    // `analyzeCommand` both confirm the lsp analyze path.
     const stat = vi.fn(async (_p: string) => null as any);
     const calls: string[][] = [];
     const exec = makeExec(async (cmd, args) => {
@@ -528,13 +537,14 @@ describe('measure-mode-c — DT-7: both legs (same-index per KD-3)', () => {
       verify: verify as any,
       legs: ['lsp'],
     });
-    await measureModeC(opts);
+    const result = await measureModeC(opts);
     expect(calls.length).toBe(1);
-    // Same-index contract: the analyze call carries NO --lsp
-    // flag. The lsp leg's LspClient wiring is the verifier's
-    // concern, not the analyze subprocess's.
-    expect(calls[0]).not.toContain('--lsp');
+    // lsp leg MUST carry --lsp.
+    expect(calls[0]).toContain('--lsp');
     expect(calls[0]).toContain('analyze');
+    expect(calls[0]).toContain('--force'); // skip-theater guard
+    expect(result.artifacts[0].analyzeRanForThisLeg).toBe(true);
+    expect(result.artifacts[0].analyzeCommand).toContain('--lsp');
   });
 });
 
@@ -705,23 +715,33 @@ describe('measure-mode-c — strict sequential ordering per repo', () => {
 // ─── No-write invariant: harness source must pass the sweep ─────────
 
 describe('measure-mode-c — no-write invariant (KD-8)', () => {
-  it('harness source has no initLbug / executeQuery / DROP / etc.', () => {
-    // Static sweep over the new file. Mirrors the
-    // `assertNoGraphWriteImports` check from mode-c-verifier.
-    // We re-implement the regex set here to keep this test
-    // self-contained (it doesn't import the verifier).
+  it('harness source has no executeQuery / DROP / write-API tokens (lifecycle open permitted)', () => {
+    // Static sweep over the harness source. The harness is permitted
+    // to call the DB lifecycle API (`initLbug`, `closeLbug`) for
+    // per-leg pool management (LadybugDB lock discipline, I-3) —
+    // these are NOT graph writes. The forbidden set covers only
+    // graph-mutating tokens: `executeQuery` (write-mode dispatch),
+    // `addNode`, `addRelationship`, and DDL verbs.
+    //
+    // The authoritative version of this sweep (including the
+    // `allowLifecycle:true` flag and its rationale) lives in
+    // `test/unit/scripts/scripts-no-write-invariant.test.ts`, which
+    // uses the production helper `assertNoGraphWriteImports`. This
+    // inline re-implementation is kept self-contained but must stay
+    // in sync with the `allowLifecycle:true` behaviour.
     const here = dirname(fileURLToPath(import.meta.url));
-    // test/unit/scripts/measure-mode-c.test.ts → gitnexus/ (4 levels up)
+    // test/unit/scripts/measure-mode-c.test.ts → gitnexus/ (3 levels up)
     const srcPath = join(here, '..', '..', '..', 'scripts', 'measure-mode-c.ts');
     const src = readFileSync(srcPath, 'utf-8');
     // Strip block + line comments to avoid matching documentation.
     const stripped = src
       .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
       .replace(/\/\/[^\n]*/g, (m) => m.replace(/[^\n]/g, ' '));
+    // Graph-write tokens only — lifecycle tokens (initLbug, closeLbug)
+    // are intentionally omitted from this FORBIDDEN list.
     const FORBIDDEN: RegExp[] = [
       /\bexecuteQuery\s*\(/,
       /\bimport\b[^\n;]*\bexecuteQuery\b/,
-      /\binitLbug\s*\(/,
       /\binitLbugWithDb\s*\(/,
       /\bDROP\s+(?:NODE\s+)?TABLE\b/i,
     ];
@@ -1350,25 +1370,43 @@ describe('measure-mode-c — KD-9 verify seam captures the full RunModeCVerifyOp
     const verify = vi.fn(async (_opts: any) =>
       makeReport({ sampledCap: 50, sampleSize: 50, matches: 30, n: 50 }),
     );
-    // Stub client / probe / mapper / executeParameterized —
-    // identity-shaped so the typecheck passes. The test asserts
-    // on PRESENCE (typeof === 'function' for the methods,
-    // defined-but-any for client/probe), not on identity.
-    const stubClient = { stop: vi.fn() };
-    const stubProbe = vi.fn(async () => ({ ready: true }));
+    // Return a DISTINCT client+probe per call so the second-leg closure
+    // cannot mask the "probe closes over stopped client" bug.
+    //
+    // Each probe uses the `_c` argument (not a closed-over client) to
+    // derive its verdict — mirroring the contract that
+    // defaultBuildRealVerifyOpts now guarantees. The test captures each
+    // returned client so we can assert identity: leg2's verify opts must
+    // carry client1 (the warm sharedLspClient), not client2 (the
+    // just-stopped throwaway).
     const stubMapper = vi.fn(async (_loc: any, _repoId: string) => ({ nodeId: 'stub-node' }));
     const stubExecute = vi.fn(async () => []);
-    const buildRealVerifyOpts = vi.fn(async (args: any) => ({
-      repoId: args.repoId,
-      client: stubClient,
-      probe: stubProbe,
-      mapLocationToNodeId: stubMapper,
-      executeParameterized: stubExecute,
-      seed: args.seed,
-      sampleSize: args.sampleSize,
-      hardCap: args.sampleSize,
-      serverVersion: args.serverVersion,
-    }));
+    const returnedClients: any[] = [];
+    const returnedProbes: any[] = [];
+    const buildRealVerifyOpts = vi.fn(async (args: any) => {
+      // Each invocation produces its own client object.
+      const client = { id: `client-${returnedClients.length + 1}`, stop: vi.fn(async () => { client.id += '-stopped'; }) };
+      // The probe uses _c (the client passed at call time). If the probe
+      // incorrectly closed over the local `client` variable, assertions (a)
+      // and (b) below would still pass because they check identity — but
+      // (c) directly calls probe with a known-distinct client, so a closure
+      // bug would cause identity (a) to fail in the pre-fix code path where
+      // verifyOpts.client = client1 but probe internally used client2.
+      const probe = vi.fn(async (_c: any) => ({ ready: true, clientId: _c.id }));
+      returnedClients.push(client);
+      returnedProbes.push(probe);
+      return {
+        repoId: args.repoId,
+        client,
+        probe,
+        mapLocationToNodeId: stubMapper,
+        executeParameterized: stubExecute,
+        seed: args.seed,
+        sampleSize: args.sampleSize,
+        hardCap: args.sampleSize,
+        serverVersion: args.serverVersion,
+      };
+    });
     const opts = makeOptions({
       stat: makeStat(2048) as any, // .gitnexus present → no analyze
       exec: makeExec() as any,
@@ -1381,25 +1419,56 @@ describe('measure-mode-c — KD-9 verify seam captures the full RunModeCVerifyOp
       legs: ['baseline', 'lsp'],
     });
     const result = await measureModeC(opts);
-    // The seam was invoked once (cached for both legs).
-    expect(buildRealVerifyOpts).toHaveBeenCalledTimes(1);
+    // Per-leg design (gh #173): the builder seam is called once
+    // per leg so each leg's graph connection is fresh for the
+    // just-written index (the lsp analyze rewrites the DB).
+    expect(buildRealVerifyOpts).toHaveBeenCalledTimes(2);
     // Both legs produced an artifact (the real-verify path
     // returned a populated report for each).
     expect(result.artifacts.length).toBe(2);
     // The verify stub was called twice (once per leg), and the
     // opts the stub received are the FULL shape (per KD-9).
     expect(verify.mock.calls.length).toBe(2);
-    const optsPassedToVerify = verify.mock.calls[0][0];
-    // ── 9 required fields, asserted in shape-pinning order ──
-    expect(optsPassedToVerify.repoId).toBe('repo'); // deriveRepoId('/tmp/repo') = 'repo'
-    expect(optsPassedToVerify.client).toBe(stubClient);
-    expect(optsPassedToVerify.probe).toBe(stubProbe);
-    expect(optsPassedToVerify.mapLocationToNodeId).toBe(stubMapper);
-    expect(optsPassedToVerify.executeParameterized).toBe(stubExecute);
-    expect(optsPassedToVerify.seed).toBe('kd9-shape-seed');
-    expect(optsPassedToVerify.sampleSize).toBe(50);
-    expect(optsPassedToVerify.hardCap).toBe(50);
-    expect(optsPassedToVerify.serverVersion).toBe('4.3.3');
+
+    // ── First leg: 9 required fields pinned in shape order ──
+    const leg1Opts = verify.mock.calls[0][0];
+    expect(leg1Opts.repoId).toBe('repo'); // deriveRepoId('/tmp/repo') = 'repo'
+    expect(leg1Opts.client).toBeDefined();
+    expect(leg1Opts.probe).toBeInstanceOf(Function);
+    expect(leg1Opts.mapLocationToNodeId).toBe(stubMapper);
+    expect(leg1Opts.executeParameterized).toBe(stubExecute);
+    expect(leg1Opts.seed).toBe('kd9-shape-seed');
+    expect(leg1Opts.sampleSize).toBe(50);
+    expect(leg1Opts.hardCap).toBe(50);
+    expect(leg1Opts.serverVersion).toBe('4.3.3');
+
+    // ── Second leg (P0 regression guard) ──────────────────────
+    // buildRealVerifyOpts was called twice — once per leg.
+    // returnedClients[0] = client1 (first leg, warm/sharedLspClient).
+    // returnedClients[1] = client2 (second leg, immediately stopped).
+    //
+    // The harness must:
+    //   1. Stop client2 (resource leak prevention).
+    //   2. Swap baseOpts.client → client1 (warm client reuse).
+    //   3. Pass the swapped opts to verify — so leg2Opts.client === client1.
+    //
+    // The pre-fix bug: baseOpts.probe still closed over client2 (stopped).
+    // The fix: probe uses _c at call time. The test verifies the harness
+    // wired the correct client by asserting OBJECT IDENTITY:
+    //   (a) leg2's verify received client1 (not client2).
+    //   (b) leg2's probe is distinct from leg1's probe (per-call objects).
+    //   (c) leg2's probe, when called with client2 (the throwaway), echoes
+    //       client2's id — proving the probe honours _c, not a closed-over var.
+    const leg2Opts = verify.mock.calls[1][0];
+    const client1 = returnedClients[0];
+    const client2 = returnedClients[1];
+    expect(leg2Opts.probe).not.toBe(leg1Opts.probe);       // (b) distinct probe objects
+    expect(leg2Opts.client).toBe(client1);                 // (a) warm client — not the stopped client2
+    expect(leg2Opts.client).not.toBe(client2);             // (a) negative: client2 was discarded
+    // (c) The probe uses _c: calling it with client1 echoes client1's id,
+    //     not client2's. A closed-over-client2 probe would return
+    //     clientId: client2.id when called with client1, failing this assertion.
+    expect(await leg2Opts.probe(client1)).toEqual({ ready: true, clientId: client1.id });
   });
 
   it('non-real-verify path: verify stub receives a minimal opts (test seam only)', async () => {
@@ -1656,7 +1725,7 @@ describe('measure-mode-c — AC-2 recallRegressionForResult (MeasureModeCResult 
   });
 });
 
-// ─── GROUP BY assertion: the bucket query must GROUP BY the column ───
+// ─── Bucket-query shape assertion ────────────────────────────────────
 //
 // The query is RELATIONSHIP-AGNOSTIC (no `WHERE r.type = $relType`)
 // per the design doc §Contracts "Source-distribution query": the
@@ -1664,21 +1733,21 @@ describe('measure-mode-c — AC-2 recallRegressionForResult (MeasureModeCResult 
 // ALL `CodeRelation` rows, not just CALLS, so the campaign's KPI
 // (which edge types LSP is helping or hurting) is driven by the
 // full distribution. A CALLS-only filter was a review BLOCKER.
+//
+// NOTE on GROUP BY: This Kùzu/LadybugDB build does not support an
+// explicit `GROUP BY` clause — it causes a parser exception
+// ("Invalid input < GROUP>"). Kùzu follows the openCypher spec
+// where grouping is IMPLICIT when a non-aggregate key is projected
+// alongside an aggregate. The bucket query therefore uses implicit
+// grouping (`RETURN r.${column} AS bucket, COUNT(r) AS count`) and
+// MUST NOT include an explicit `GROUP BY` clause.
 
-describe('measure-mode-c — bucketEdgeCounts cypher carries GROUP BY (relationship-agnostic)', () => {
-  it('the cypher dispatched via runCypher contains GROUP BY r.${column} and NO relType param', async () => {
-    // The fix to the openCypher spec compliance: the bucket
-    // query must carry an explicit `GROUP BY` so a real Kùzu
-    // engine returns one row per bucket rather than one row
-    // per matched relationship. We pin the dispatched cypher
-    // text here so a future refactor that drops the GROUP BY
-    // is caught by the unit suite (not just the integration
-    // test). This is the "pin it with a real-Cypher integration
-    // test, not just stub rows" requirement from the review.
-    //
-    // The relationship-agnostic fix: no `WHERE r.type = $relType`
-    // filter, no `relType` parameter. The query returns the
-    // distribution over ALL CodeRelation rows.
+describe('measure-mode-c — bucketEdgeCounts cypher shape (relationship-agnostic, implicit grouping)', () => {
+  it('the cypher dispatched via runCypher uses COUNT aggregation with NO explicit GROUP BY and NO relType param', async () => {
+    // Pin the dispatched cypher text: it must aggregate via
+    // COUNT (implicit grouping), must NOT include an explicit
+    // `GROUP BY` clause (unsupported by this Kùzu build), and
+    // must be relationship-agnostic (no relType filter).
     const stat = makeStat(2048);
     let captured: { cypher: string; params: any } | null = null;
     const runCypher = vi.fn(async (_repoId: string, cypher: string, params: any) => {
@@ -1693,7 +1762,11 @@ describe('measure-mode-c — bucketEdgeCounts cypher carries GROUP BY (relations
     });
     await measureModeC(opts);
     expect(captured).not.toBeNull();
-    expect(captured!.cypher).toMatch(/GROUP BY r\.source/i);
+    // Must use COUNT aggregation.
+    expect(captured!.cypher).toMatch(/COUNT\(r\)/i);
+    // Must NOT use explicit GROUP BY (unsupported by this Kùzu build;
+    // grouping is implicit per openCypher spec).
+    expect(captured!.cypher).not.toMatch(/GROUP BY/i);
     // No relationship-type filter (review BLOCKER — the artifact
     // must reflect ALL edge types, not just CALLS).
     expect(captured!.cypher).not.toMatch(/type:\s*\$relType/i);
@@ -1793,14 +1866,13 @@ describe('measure-mode-c — main() --lsp-server-path operator-pinned path (poli
 
 // ─── Polish-review gap: bucketEdgeCounts multi-row sum ────────────────
 //
-// `bucketEdgeCounts` is the harness's defensive aggregation
-// helper. The `GROUP BY r.${column}` clause in the dispatched
-// cypher is the PRIMARY correctness mechanism (openCypher spec);
-// the JS-side `out[k] = (out[k] ?? 0) + c` sum is a SAFETY NET
-// for a future engine version that returns multi-row buckets
-// (one row per matched relationship). These tests pin the
-// safety net: when the helper is fed multi-row input, it must
-// collapse the per-bucket counts into a single summed value.
+// `bucketEdgeCounts` uses Kùzu's implicit grouping (no explicit
+// `GROUP BY` — unsupported by this Kùzu build). The JS-side
+// `out[k] = (out[k] ?? 0) + c` sum is a SAFETY NET for a future
+// engine version that returns multi-row buckets (one row per matched
+// relationship). These tests pin the safety net: when the helper
+// is fed multi-row input, it must collapse per-bucket counts into
+// a single summed value.
 
 import { __test__ as measureModeCTestInternals } from '../../../scripts/measure-mode-c.js';
 
