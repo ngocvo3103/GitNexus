@@ -1,14 +1,22 @@
-<!-- version: 1.2.0 -->
+<!-- version: 1.3.0 -->
 <!--
   Metadata: version, last reviewed, scope, model policy, reference docs, changelog.
-  Last updated: 2026-03-22
+  Last updated: 2026-06-12
 -->
 
-Last reviewed: 2026-03-24
+Last reviewed: 2026-06-12
 
 **Project:** GitNexus · **Environment:** dev · **Maintainer:** repository maintainers (see GitHub)
 
 Follow **AGENTS.md** for the canonical rules; this file adds Claude Code–specific deltas. Cursor-specific notes live only in `AGENTS.md`.
+
+## Branch Policy
+
+**The working main branch of this repository is `main-afk`** (not `main`).
+
+- All new work MUST branch off `main-afk` and merge back into `main-afk`.
+- Target PRs at `main-afk`. Do not base branches on, or merge into, `main` unless the user explicitly instructs it.
+- `git diff`/`detect_changes` comparisons against "main" should use `main-afk` as the base ref.
 
 ## Scope
 
@@ -41,6 +49,7 @@ If always-on instructions grow, load deep conventions via conditional reads (e.g
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-06-12 | 1.3.0 | Added Branch Policy: `main-afk` is the working main branch; all work branches off and merges back into it. |
 | 2026-03-24 | 1.2.0 | Removed duplicated gitnexus:start block and scope table; replaced with pointers to AGENTS.md. |
 | 2026-03-23 | 1.1.0 | Updated agent instructions to match AGENTS.md. |
 | 2026-03-22 | 1.0.0 | Added structured header and changelog. |
