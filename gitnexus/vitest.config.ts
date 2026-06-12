@@ -4,6 +4,10 @@ export default defineConfig({
   test: {
     // Shared settings — inherited by all projects via extends: true
     globalSetup: ['test/global-setup.ts'],
+    // Per-fork registry isolation (gh #175): runs once per fork before each
+    // test file, mkdtemps a unique GITNEXUS_HOME child under the run-level
+    // parent created by global-setup.ts.  See test/per-fork-setup.ts.
+    setupFiles: ['test/per-fork-setup.ts'],
     testTimeout: 30000,
     hookTimeout: 120000,
     pool: 'forks',

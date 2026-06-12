@@ -31,12 +31,19 @@ import {
 
 export default async function setup({ provide }: GlobalSetupContext) {
   // ── 1. Registry isolation ─────────────────────────────────────────────
-  // Create a per-run tmpdir for all global GitNexus state.  Set it BEFORE
-  // any module that reads process.env.GITNEXUS_HOME is imported by a fork.
-  const registryTmpDir = await fs.mkdtemp(
-    path.join(os.tmpdir(), 'gitnexus-registry-'),
+  // Create ONE parent tmpdir for the entire run.  Individual per-fork
+  // isolation is done by test/per-fork-setup.ts (a setupFiles entry),
+  // which mkdtemps a UNIQUE child dir under this parent and sets
+  // process.env.GITNEXUS_HOME for that fork.  We do NOT set GITNEXUS_HOME
+  // here — doing so would make every fork share the same registry dir,
+  // which is the contention root described in gh #175.
+  //
+  // The parent dir is exported via env so that per-fork-setup.ts can
+  // create children under it, and so teardown can remove the whole tree.
+  const registryParentDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'gitnexus-registry-parent-'),
   );
-  process.env.GITNEXUS_HOME = registryTmpDir;
+  process.env.GITNEXUS_TEST_HOME_PARENT = registryParentDir;
 
   // ── 2. Shared LadybugDB ───────────────────────────────────────────────
   const tmpHandle = await createTempDir('gitnexus-shared-');
@@ -80,7 +87,7 @@ export default async function setup({ provide }: GlobalSetupContext) {
   return async () => {
     await tmpHandle.cleanup();
     try {
-      await fs.rm(registryTmpDir, { recursive: true, force: true });
+      await fs.rm(registryParentDir, { recursive: true, force: true });
     } catch {
       // best-effort: tmpdir may already be gone
     }

@@ -141,14 +141,23 @@ describe('API key file permissions', () => {
 // ─── GITNEXUS_HOME override (gh #175 — test-suite isolation) ─────────
 
 describe('getGlobalDir — GITNEXUS_HOME override', () => {
-  const originalHome = process.env.GITNEXUS_HOME;
+  // Save/restore per-test so mutations never leak to sibling tests within
+  // this fork.  Capturing at describe-evaluation time is not safe because
+  // per-fork-setup.ts may run after module evaluation on some vitest
+  // versions — beforeEach guarantees we snapshot the value that was
+  // actually in effect when the test begins.
+  let savedHome: string | undefined;
+
+  beforeEach(() => {
+    savedHome = process.env.GITNEXUS_HOME;
+  });
 
   afterEach(() => {
-    // Restore whatever was set before each test (the test suite's own override).
-    if (originalHome === undefined) {
+    // Restore whatever was set before this specific test ran.
+    if (savedHome === undefined) {
       delete process.env.GITNEXUS_HOME;
     } else {
-      process.env.GITNEXUS_HOME = originalHome;
+      process.env.GITNEXUS_HOME = savedHome;
     }
   });
 
@@ -184,13 +193,13 @@ describe('getGlobalDir — GITNEXUS_HOME override', () => {
 
 describe('test-suite isolation guard (gh #175)', () => {
   it('resolved global dir is under GITNEXUS_HOME, not the real home', () => {
-    // This test fails loudly if GITNEXUS_HOME was not set by global-setup.ts.
+    // This test fails loudly if GITNEXUS_HOME was not set by per-fork-setup.ts.
     // That would mean the test suite is writing to the real ~/.gitnexus —
     // the regression described in gh #175.
     const gitnexusHome = process.env.GITNEXUS_HOME;
     expect(
       gitnexusHome,
-      'GITNEXUS_HOME must be set by global-setup.ts before any test runs',
+      'GITNEXUS_HOME must be set by per-fork-setup.ts before any test runs',
     ).toBeTruthy();
 
     const resolvedDir = getGlobalDir();
@@ -206,5 +215,34 @@ describe('test-suite isolation guard (gh #175)', () => {
       resolvedDir.startsWith(realHome),
       `Registry dir (${resolvedDir}) must not be under the real home (${realHome})`,
     ).toBe(false);
+  });
+
+  it('per-fork GITNEXUS_HOME is a unique child of GITNEXUS_TEST_HOME_PARENT', () => {
+    // Asserts that the per-fork isolation from per-fork-setup.ts is in effect:
+    // GITNEXUS_HOME must exist AND must be a subdirectory of the run-level
+    // parent (GITNEXUS_TEST_HOME_PARENT) created by global-setup.ts.
+    const gitnexusHome = process.env.GITNEXUS_HOME;
+    const parent = process.env.GITNEXUS_TEST_HOME_PARENT;
+
+    expect(gitnexusHome, 'GITNEXUS_HOME must be set').toBeTruthy();
+
+    if (parent) {
+      // Normal suite run: per-fork dir must be under the parent.
+      expect(
+        gitnexusHome!.startsWith(parent),
+        `Per-fork GITNEXUS_HOME (${gitnexusHome}) must be under ` +
+          `GITNEXUS_TEST_HOME_PARENT (${parent})`,
+      ).toBe(true);
+
+      // The per-fork dir must be different from the parent itself
+      // (i.e. a real child, not the parent reused).
+      expect(
+        gitnexusHome,
+        'Per-fork GITNEXUS_HOME must be a child of the parent, not the parent itself',
+      ).not.toBe(parent);
+    }
+    // If GITNEXUS_TEST_HOME_PARENT is absent (standalone run / fallback path
+    // in per-fork-setup.ts), we only assert that GITNEXUS_HOME is set and
+    // not the real homedir — both already checked above.
   });
 });
