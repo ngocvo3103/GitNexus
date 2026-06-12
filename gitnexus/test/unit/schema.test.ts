@@ -34,6 +34,8 @@ import {
   PROCESS_SCHEMA_MIGRATION,
   ROUTE_SCHEMA_MIGRATION,
   CODEREL_SOURCE_MIGRATION,
+  CODEREL_SOURCELINE_MIGRATION,
+  CODEREL_SOURCECOL_MIGRATION,
 } from '../../src/core/lbug/schema.js';
 import { NodeProperties, RelationshipType } from '../../src/core/graph/types.js';
 import { SupportedLanguages } from '../../src/config/supported-languages.js';
@@ -402,6 +404,55 @@ describe('LadybugDB Schema', () => {
       expect(SCHEMA_QUERIES).toHaveLength(30);
       expect(NODE_TABLES).toHaveLength(28);
       expect(REL_TYPES).toContain('CROSS_IMPORTS');
+    });
+  });
+
+  // ─── #174: call-site position columns on CodeRelation ─────────────────
+
+  describe('RELATION_SCHEMA: sourceLine/sourceCol columns (#174)', () => {
+    it('declares sourceLine INT64 and sourceCol INT64 after source STRING', () => {
+      // #174: the two call-site position columns are INT64 (nullable — NULL
+      // means legacy/synthetic edge). Column order must put them AFTER
+      // `source STRING` so older readers that don't know about them can
+      // still consume the earlier columns via HEADER=true.
+      expect(RELATION_SCHEMA).toContain('sourceLine INT64');
+      expect(RELATION_SCHEMA).toContain('sourceCol INT64');
+      const sourceIdx = RELATION_SCHEMA.indexOf('source STRING');
+      expect(RELATION_SCHEMA.indexOf('sourceLine INT64')).toBeGreaterThan(sourceIdx);
+      expect(RELATION_SCHEMA.indexOf('sourceCol INT64')).toBeGreaterThan(sourceIdx);
+    });
+
+    it('CODEREL_SOURCELINE_MIGRATION is a plain ADD sourceLine INT64 (Kùzu-safe, no IF NOT EXISTS)', () => {
+      expect(CODEREL_SOURCELINE_MIGRATION).toContain('ALTER TABLE CodeRelation ADD sourceLine INT64');
+      expect(CODEREL_SOURCELINE_MIGRATION).not.toContain('IF NOT EXISTS');
+      expect(CODEREL_SOURCELINE_MIGRATION).not.toContain('ADD COLUMN');
+    });
+
+    it('CODEREL_SOURCECOL_MIGRATION is a plain ADD sourceCol INT64 (Kùzu-safe, no IF NOT EXISTS)', () => {
+      expect(CODEREL_SOURCECOL_MIGRATION).toContain('ALTER TABLE CodeRelation ADD sourceCol INT64');
+      expect(CODEREL_SOURCECOL_MIGRATION).not.toContain('IF NOT EXISTS');
+      expect(CODEREL_SOURCECOL_MIGRATION).not.toContain('ADD COLUMN');
+    });
+
+    it('SCHEMA_MIGRATIONS includes both position migrations in order after CODEREL_SOURCE_MIGRATION', () => {
+      expect(SCHEMA_MIGRATIONS).toContain(CODEREL_SOURCELINE_MIGRATION);
+      expect(SCHEMA_MIGRATIONS).toContain(CODEREL_SOURCECOL_MIGRATION);
+      // sourceLine must come after source (the existing column), and sourceCol
+      // must come after sourceLine so the runner applies them in order.
+      const sourceIdx = SCHEMA_MIGRATIONS.indexOf(CODEREL_SOURCE_MIGRATION);
+      const lineIdx   = SCHEMA_MIGRATIONS.indexOf(CODEREL_SOURCELINE_MIGRATION);
+      const colIdx    = SCHEMA_MIGRATIONS.indexOf(CODEREL_SOURCECOL_MIGRATION);
+      expect(lineIdx).toBeGreaterThan(sourceIdx);
+      expect(colIdx).toBeGreaterThan(lineIdx);
+    });
+
+    it('table-count invariant unchanged (#174 only adds columns, not tables)', () => {
+      // Column-adds do NOT bump SCHEMA_VERSION (table-count-derived).
+      // Duplicate of the WI-1 count test — if either test fails, a table
+      // was accidentally added or removed.
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(28);
+      expect(REL_SCHEMA_QUERIES).toHaveLength(1);
+      expect(SCHEMA_QUERIES).toHaveLength(30);
     });
   });
 });

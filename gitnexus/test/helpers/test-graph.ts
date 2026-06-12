@@ -25,6 +25,10 @@ export interface TestRelInput {
   confidence?: number;
   reason?: string;
   step?: number;
+  /** #174: 0-based call-site line (nameNode.startPosition.row). */
+  line?: number;
+  /** #174: 0-based call-site column (nameNode.startPosition.column). */
+  column?: number;
 }
 
 /**
@@ -60,6 +64,9 @@ export function buildTestGraph(
       confidence: r.confidence ?? 1.0,
       reason: r.reason ?? '',
       step: r.step,
+      // #174: thread call-site position through for CSV serialization tests.
+      line: r.line,
+      column: r.column,
     });
   }
 

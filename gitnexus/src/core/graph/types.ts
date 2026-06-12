@@ -173,15 +173,23 @@ export interface GraphRelationship {
    */
   source?: EdgeSource;
   /**
-   * 0-based source line of the call/parent identifier (WI-1 / #159).
-   * In-memory only — NOT serialized to CSV. Carried ONLY on per-site
-   * CALLS edges (heuristic + LSP-minted) and on heritage edges that
-   * were emitted from a worker with a captured position. Absent on
-   * synthetic edges (route/tool) and on legacy emitters that did not
-   * capture a call name node. Used by the Mode A engine to make
-   * collapse keys + correction lookup site-precise.
+   * 0-based source line of the call/parent identifier (WI-1 / #159; #174).
+   * Serialized to the `sourceLine INT64` column on CodeRelation (#174).
+   * Carried on per-site CALLS edges (heuristic + LSP-minted) and on heritage
+   * edges emitted with a captured position. Absent on synthetic edges
+   * (route/tool) and on legacy emitters that did not capture a call name node.
+   * Used by the Mode A engine (collapse keys + correction lookup) and by
+   * the Mode C verifier (probe at the persisted call-site position, #174).
    */
   line?: number;
+  /**
+   * 0-based source column of the call/parent identifier (#174).
+   * Serialized to the `sourceCol INT64` column on CodeRelation (#174).
+   * Mirrors `line` in semantics: absent on synthetic/legacy edges.
+   * Uses tree-sitter / LSP 0-based column convention
+   * (nameNode.startPosition.column).
+   */
+  column?: number;
 }
 
 /**

@@ -362,9 +362,12 @@ const fallbackRelationshipInserts = async (
       // #159 P3 Mode A (WI-1): 7th capture group = `source`. Defaults to
       // 'heuristic' when the CSV row is from a pre-WI-1 run (the regex
       // group is optional, so existing 6-column rows still match).
-      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)(?:,"([^"]*)")?/);
+      // #174: 8th/9th capture groups = sourceLine / sourceCol (optional
+      // INT64 digits, empty cell → NULL). Regex permits absence for
+      // backward-compat with pre-#174 CSVs.
+      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)(?:,"([^"]*)")?(?:,([0-9]*))?(?:,([0-9]*))?/);
       if (!match) continue;
-      const [, fromId, toId, relType, confidenceStr, reason, stepStr, sourceStr] = match;
+      const [, fromId, toId, relType, confidenceStr, reason, stepStr, sourceStr, sourceLineStr, sourceColStr] = match;
       const fromLabel = getNodeLabel(fromId);
       const toLabel = getNodeLabel(toId);
       if (!validTables.has(fromLabel) || !validTables.has(toLabel)) continue;
@@ -373,12 +376,18 @@ const fallbackRelationshipInserts = async (
       const step = parseInt(stepStr) || 0;
       // Hard invariant: `source` is non-NULL — fallback to 'heuristic' if absent.
       const source = (sourceStr && sourceStr.length > 0) ? sourceStr : 'heuristic';
+      // #174: sourceLine / sourceCol are nullable INT64. Parse if present;
+      // use NULL literal in the CREATE query when absent or empty.
+      const sourceLineVal = (sourceLineStr !== undefined && sourceLineStr !== '') ? parseInt(sourceLineStr, 10) : null;
+      const sourceColVal  = (sourceColStr  !== undefined && sourceColStr  !== '') ? parseInt(sourceColStr,  10) : null;
+      const sourceLineCql = sourceLineVal !== null && !isNaN(sourceLineVal) ? String(sourceLineVal) : 'NULL';
+      const sourceColCql  = sourceColVal  !== null && !isNaN(sourceColVal)  ? String(sourceColVal)  : 'NULL';
 
       const esc = (s: string) => s.replace(/'/g, "''").replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
       await conn.query(`
         MATCH (a:${escapeLabel(fromLabel)} {id: '${esc(fromId)}' }),
               (b:${escapeLabel(toLabel)} {id: '${esc(toId)}' })
-        CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}, source: '${esc(source)}'}]->(b)
+        CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}, source: '${esc(source)}', sourceLine: ${sourceLineCql}, sourceCol: ${sourceColCql}}]->(b)
       `);
     } catch {
       // skip

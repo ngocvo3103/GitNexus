@@ -1565,6 +1565,11 @@ function makeLspRelationship(d: Decision): GraphRelationship {
     reason: d.reason,
     source: d.source ?? 'heuristic',
     line: d.candidate.line,
+    // #174: thread call-site column through so LSP-minted edges carry the
+    // same position data as heuristic edges. The candidate's `character`
+    // field (0-based LSP column) is already threaded from the parse-worker
+    // via the correction feed in call-processor.ts.
+    column: d.candidate.character,
   };
 }
 

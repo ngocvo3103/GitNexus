@@ -101,6 +101,7 @@ function renderReport(report: {
     falseConfident: number;
     n: number;
   };
+  positionCoverage?: number;
   sampleSize: number;
   serverVersion: string | null;
 }): void {
@@ -123,6 +124,13 @@ function renderReport(report: {
   out(`  precision: ${pct(report.overall.precision)}`);
   out(`  recall:    ${pct(report.overall.recall)}`);
   out(`  false-confident: ${pct(report.overall.falseConfidentRate)} (${report.overall.falseConfident}/${report.overall.n})`);
+  if (report.positionCoverage !== undefined) {
+    const totalEdges = report.overall.n > 0
+      ? Math.round(report.overall.n / report.positionCoverage)
+      : 0;
+    const positionedEdges = Math.round(report.positionCoverage * totalEdges);
+    out(`  position coverage: ${pct(report.positionCoverage)} (${positionedEdges}/${totalEdges})`);
+  }
   out('');
   out('source: lsp | heuristic | both');
 }

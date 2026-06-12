@@ -94,6 +94,10 @@ function row(over: Partial<{
   targetName: string;
   confidence: number;
   reason: string;
+  /** #174: call-site line (r.sourceLine on CodeRelation). NULL → unpositioned. */
+  callLine: number | null;
+  /** #174: call-site column (r.sourceCol on CodeRelation). NULL → unpositioned. */
+  callCol: number | null;
 }> = {}) {
   return {
     sourceId: over.sourceId ?? 'src:caller',
@@ -107,6 +111,11 @@ function row(over: Partial<{
     targetName: over.targetName ?? 'target',
     confidence: over.confidence ?? 1.0,
     reason: over.reason ?? 'same-file',
+    // #174: default to a positioned row so existing tests that don't care
+    // about position still exercise the classification path (not unpositioned).
+    // Tests that specifically test the NULL/unpositioned path pass callLine: null.
+    callLine: over.callLine !== undefined ? over.callLine : 5,
+    callCol: over.callCol !== undefined ? over.callCol : 0,
   };
 }
 
@@ -154,6 +163,8 @@ function zero(): VerifyMetrics {
     recallMisses: 0,
     refusals: 0,
     recallGains: 0,
+    // #174: unpositioned counter — always present, even in empty/zero metrics.
+    unpositioned: 0,
     n: 0,
   };
 }

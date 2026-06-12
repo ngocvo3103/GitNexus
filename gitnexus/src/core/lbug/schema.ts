@@ -534,7 +534,9 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   confidence DOUBLE,
   reason STRING,
   step INT32,
-  source STRING
+  source STRING,
+  sourceLine INT64,
+  sourceCol INT64
 )`;
 
 // #159 P3 Mode A (WI-1): additive migration for the new `source` STRING
@@ -544,6 +546,23 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
 // thrown on re-runs against an existing DB, keeping it idempotent.
 export const CODEREL_SOURCE_MIGRATION = `
 ALTER TABLE CodeRelation ADD source STRING`;
+
+// #174: additive migrations for call-site position columns on CodeRelation.
+// Column names `sourceLine` / `sourceCol` match the GraphRelationship fields
+// emitted by call-processor.ts and serialised by csv-generator.ts (#174).
+//
+// Design: same pattern as CODEREL_SOURCE_MIGRATION — plain ALTER TABLE ADD
+// without IF NOT EXISTS (Kùzu does not support that clause). The runner in
+// lbug-adapter.doInitLbug suppresses "already has property" on re-runs
+// (idempotent). Column-adds do NOT bump SCHEMA_VERSION (table-count-derived).
+//
+// 0-based LSP/tree-sitter convention: nameNode.startPosition.{row,column}.
+// NULL means the edge was emitted before #174 or was a synthetic edge that
+// carries no call-site position (route/tool/heritage).
+export const CODEREL_SOURCELINE_MIGRATION = `
+ALTER TABLE CodeRelation ADD sourceLine INT64`;
+export const CODEREL_SOURCECOL_MIGRATION = `
+ALTER TABLE CodeRelation ADD sourceCol INT64`;
 
 // ============================================================================
 // EMBEDDING TABLE SCHEMA
@@ -665,6 +684,11 @@ export const SCHEMA_MIGRATIONS = [
   // the ALTER path both produce the same shape; runner suppresses
   // "already has property" on re-runs against an existing DB.
   CODEREL_SOURCE_MIGRATION,
+  // #174: call-site position columns (0-based row/col, tree-sitter convention).
+  // The runner suppresses "already has property" on re-runs (idempotent).
+  // NULL in legacy rows is handled by mode-c-verifier's `unpositioned` counter.
+  CODEREL_SOURCELINE_MIGRATION,
+  CODEREL_SOURCECOL_MIGRATION,
 ];
 
 /** Schema version derived from table count — increments when tables are added/removed. */

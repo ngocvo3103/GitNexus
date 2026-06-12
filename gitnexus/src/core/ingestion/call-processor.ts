@@ -707,6 +707,9 @@ export const processCalls = async (
         reason: resolved.reason,
         source: 'heuristic',
         line: callRow,
+        // #174: persist call-site column so Mode C can probe at the exact
+        // call-site position rather than the caller's declaration line.
+        column: nameNode.startPosition.column,
       });
     });
 
@@ -1582,7 +1585,12 @@ export const processCallsFromExtracted = async (
         confidence: resolved.confidence,
         reason: resolved.reason,
         source: 'heuristic',
-        line: callRow,
+        // #174 P1: persist the raw optional fields so absent position →
+        // NULL in DB. `callRow` (with ?? 0) is used only for the :L id
+        // suffix above; the persisted `line`/`column` must be undefined
+        // when the emitter has no position, not a fabricated 0.
+        line: effectiveCall.line,
+        column: effectiveCall.character,
       });
     }
 

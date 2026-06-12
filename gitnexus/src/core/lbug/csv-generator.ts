@@ -454,7 +454,11 @@ export const streamAllCSVsToDisk = async (
   // here (serializer-side) per the design contract: callers never
   // produce a NULL/undefined `source` into the DB.
   const relCsvPath = path.join(csvDir, 'relations.csv');
-  const relWriter = new BufferedCSVWriter(relCsvPath, 'from,to,type,confidence,reason,step,source');
+  // #174: header gains sourceLine + sourceCol (0-based tree-sitter/LSP coords).
+  // Kùzu COPY uses HEADER=true and binds by column name, so adding columns
+  // to the right is safe for readers that don't yet know these columns.
+  // Empty string in a row → Kùzu reads as NULL (INT64 null for missing position).
+  const relWriter = new BufferedCSVWriter(relCsvPath, 'from,to,type,confidence,reason,step,source,sourceLine,sourceCol');
   for (const rel of graph.iterRelationships()) {
     // Default 'heuristic' is the EdgeSource union member for pre-WI-1
     // rows; see `graph/types.ts` for the source of truth.
@@ -478,6 +482,13 @@ export const streamAllCSVsToDisk = async (
     // T1: `step` is optional on `GraphRelationship`; `??`
     // handles the absent case the same way the `source`
     // coercion does. The `(rel as any).step` cast is gone.
+    // #174: sourceLine / sourceCol are 0-based INT64 columns. When the
+    // in-memory edge carries a numeric value we serialize it as a plain
+    // integer; when absent (undefined) we emit '""' (quoted empty) so
+    // Kùzu reads the cell as NULL for INT64. Bare empty (,,) in a 9-col
+    // header triggers "expected 9 values, got 8" — quoted empty is safe.
+    const sourceLineStr = typeof rel.line === 'number' ? String(rel.line) : '""';
+    const sourceColStr  = typeof rel.column === 'number' ? String(rel.column) : '""';
     await relWriter.addRow([
       escapeCSVField(rel.sourceId),
       escapeCSVField(rel.targetId),
@@ -486,6 +497,8 @@ export const streamAllCSVsToDisk = async (
       escapeCSVField(rel.reason),
       escapeCSVNumber(rel.step ?? 0, 0),
       escapeCSVField(sourceValue),
+      sourceLineStr,
+      sourceColStr,
     ].join(','));
   }
   await relWriter.finish();

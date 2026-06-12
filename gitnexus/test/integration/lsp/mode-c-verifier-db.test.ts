@@ -129,15 +129,15 @@ withTestLbugDB('mode-c-verifier', (handle) => {
       };
       const report = await runModeCVerify(opts);
 
-      // The seed wrote exactly 2 CALLS edges. We expect n >= 1
-      // (sampleSize is large enough to take all 2; the sampling
-      // math gives `import-scoped` (reason='import-resolved')
-      // 10 * 2/6.5 = 3, capped at popCount=1 → 1, and `global`
-      // (reason='direct' — defensive default) 10 * 1/6.5 = 1,
-      // capped at popCount=1 → 1. So we expect n=2.
-      expect(report.overall.n).toBeGreaterThanOrEqual(1);
+      // #174: The seed wrote exactly 2 CALLS edges, but they carry
+      // NO sourceLine (synthetic Cypher CREATE without position data).
+      // After #174, edges without sourceLine are `unpositioned` — they
+      // are counted but NOT sampled (probing char:0 of the declaration
+      // line was the pre-#174 bug). So n=0 and unpositioned=2.
+      expect(report.overall.n).toBe(0);
+      expect(report.overall.unpositioned).toBe(2);
       // The sum across tiers equals the overall n (Invariant 7
-      // bookkeeping).
+      // bookkeeping) — holds even at n=0.
       expect(sumAcross(report, 'n')).toBe(report.overall.n);
       // The verifier's own executor was called at least once
       // (the bulk CALLS read).
@@ -286,10 +286,12 @@ withTestLbugDB('mode-c-verifier', (handle) => {
         hardCap: 200,
         seed: 'tier-import',
       });
-      // The import-resolved edge is in the seed. With
-      // sampleSize=200 and the seed having only 2 CALLS edges
-      // total, both should be picked.
-      expect(report.perTier['import-scoped'].n).toBeGreaterThan(0);
+      // #174: The seed CALLS edges have no sourceLine → all unpositioned.
+      // The import-resolved edge IS in the seed and IS in the
+      // import-scoped tier, but it is unpositioned → goes to
+      // `unpositioned` counter, NOT sampled. So n=0, unpositioned>0.
+      expect(report.perTier['import-scoped'].n).toBe(0);
+      expect(report.perTier['import-scoped'].unpositioned).toBeGreaterThan(0);
     });
 
     it("unknown reasons (e.g. 'direct') fall through to the 'global' defensive default", () => {
@@ -338,17 +340,15 @@ withTestLbugDB('mode-c-verifier', (handle) => {
         hardCap: 200,
         seed: 'custom-mapper',
       });
-      // Total: 2 edges. The mapper says both are 'func:validate'.
-      // The first edge (func:login→func:validate) matches; the
-      // second (func:login→func:hash) is false-confident.
-      // We assert the per-edge totals without pinning the
-      // exact per-tier breakdown (the tier mix depends on the
-      // `reason` values, which are 'direct' and
-      // 'import-resolved' respectively).
-      expect(report.overall.n).toBe(2);
-      expect(report.overall.matches + report.overall.falseConfident).toBe(2);
-      expect(report.overall.matches).toBeGreaterThanOrEqual(1);
-      expect(report.overall.falseConfident).toBeGreaterThanOrEqual(1);
+      // #174: Seed edges have no sourceLine → all unpositioned → n=0.
+      // The custom mapper is never called because no edges are sampled.
+      // We assert the structural invariants hold even for an empty sample.
+      expect(report.overall.n).toBe(0);
+      expect(report.overall.unpositioned).toBe(2);
+      // No edges were sampled, so no mapper calls were made.
+      expect(customMapper).not.toHaveBeenCalled();
+      // matches + falseConfident = 0 (nothing was classified).
+      expect(report.overall.matches + report.overall.falseConfident).toBe(0);
     });
   });
 }, {

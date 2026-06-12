@@ -937,6 +937,63 @@ describe('processCallsFromExtracted', () => {
       character: 8,
     }]);
   });
+
+  it('#174 P1: ExtractedCall without line/character persists undefined on GraphRelationship (not fabricated 0)', async () => {
+    // The pre-#174 bug: `line: callRow` where `callRow = effectiveCall.line ?? 0`
+    // persisted 0 for any call with no position, polluting the sourceLine column
+    // with a fabricated value. Mode C would then probe at (0, 0) — the first
+    // character of the file — for every legacy/synthetic edge, causing a
+    // structurally-guaranteed false-confident result. The fix persists
+    // `line: effectiveCall.line` (undefined when absent) → NULL in the DB.
+    ctx.symbols.add('src/other.ts', 'nopos', 'Function:src/other.ts:nopos', 'Function');
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'nopos',
+      sourceId: 'Function:src/index.ts:main',
+      // No `line` or `character` fields — simulates an emitter that couldn't
+      // determine the call-site position (e.g. Angular DI, JS dynamic dispatch).
+    }];
+
+    await processCallsFromExtracted(
+      graph, calls, ctx, undefined, undefined, undefined,
+      undefined,
+    );
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Critical: must be undefined (→ NULL in DB), NOT 0 (fabricated position).
+    expect(rels[0].line, '#174 P1: line must be undefined for positionless call').toBeUndefined();
+    expect(rels[0].column, '#174 P1: column must be undefined for positionless call').toBeUndefined();
+    // The :L suffix must still be deterministic (uses callRow ?? 0).
+    expect(rels[0].id).toMatch(/:L0$/);
+  });
+
+  it('#174 P1: ExtractedCall WITH line/character persists those values unchanged', async () => {
+    // Positive case: when position is available it must survive to the
+    // persisted GraphRelationship (not truncated, not shifted).
+    ctx.symbols.add('src/other.ts', 'withpos', 'Function:src/other.ts:withpos', 'Function');
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'withpos',
+      sourceId: 'Function:src/index.ts:main',
+      line: 37,
+      character: 12,
+    }];
+
+    await processCallsFromExtracted(
+      graph, calls, ctx, undefined, undefined, undefined,
+      undefined,
+    );
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].line).toBe(37);
+    expect(rels[0].column).toBe(12);
+    // The :L suffix must use the integer position.
+    expect(rels[0].id).toMatch(/:L37$/);
+  });
 });
 
 describe('processCalls — Mode A candidate feeds (WI-1 / #166)', () => {

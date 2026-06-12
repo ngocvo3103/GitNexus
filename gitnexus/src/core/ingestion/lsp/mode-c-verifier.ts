@@ -100,7 +100,18 @@ export interface VerifyMetrics {
   refusals: number;
   /** Heuristic was null/unknown but LSP DID resolve — heuristic missed. */
   recallGains: number;
-  /** Total sampled edges in this tier. */
+  /**
+   * #174: Edge had NULL sourceLine (legacy/pre-#174 row, synthetic edge, or
+   * non-CALLS type). These edges are NOT probed — the LSP cannot meaningfully
+   * answer "what is at character 0 of the caller's declaration line" (which
+   * was the pre-#174 bug). They are counted separately so operators can see
+   * index coverage degrading VISIBLY on older DBs rather than silently
+   * inflating the refusals counter with wrong-position probes.
+   *
+   * unpositioned edges are EXCLUDED from n (they are not sampled at all).
+   */
+  unpositioned: number;
+  /** Total sampled edges in this tier (excludes unpositioned). */
   n: number;
 }
 
@@ -116,6 +127,15 @@ export interface VerifyReport {
   reason?: string;
   /** Sampled cap (number actually attempted) — diagnostic. */
   sampledCap?: number;
+  /**
+   * #174: fraction of CALLS rows in the DB that carry a non-NULL sourceLine
+   * (i.e. were emitted by a #174+ analyzer). 0.0 = all rows are legacy/NULL,
+   * 1.0 = every row is positioned. Operators use this to decide whether
+   * to re-run `npx gitnexus analyze` before trusting Mode C metrics.
+   *
+   * Computed over ALL rows (before sampling), not just the sampled subset.
+   */
+  positionCoverage?: number;
 }
 
 /**
@@ -211,6 +231,7 @@ function emptyMetrics(): VerifyMetrics {
     recallMisses: 0,
     refusals: 0,
     recallGains: 0,
+    unpositioned: 0,
     n: 0,
   };
 }
@@ -256,6 +277,17 @@ export async function runModeCVerify(opts: RunModeCVerifyOpts): Promise<VerifyRe
   // we need to reconstruct the call-site Location AND the
   // heuristic target's nodeId. `tier` is NOT in the schema — we
   // derive it from `reason` in `reasonToTier()`.
+  // #174: project r.sourceLine and r.sourceCol from the persisted edge so
+  // classifyEdge probes the exact call-site rather than the caller's
+  // declaration line. NULL values (legacy rows / synthetic edges) are
+  // handled by the new `unpositioned` counter — those edges are NOT probed.
+  //
+  // ORDER BY: Kùzu 0.15.x does not support the SQL NULLS LAST / NULLS FIRST
+  // syntax. The equivalent is `r.sourceLine IS NULL ASC` — the IS NULL
+  // expression evaluates to 0 (false) for positioned rows and 1 (true) for
+  // NULL rows, so ASC sorts positioned rows first and NULLs last. This keeps
+  // the deterministic seed reproducible within the positioned subset (which
+  // is the only subset that enters sampling).
   const cypher = [
     'MATCH (a)-[r:CodeRelation {type: $relType}]->(b)',
     'WHERE a.filePath IS NOT NULL AND b.filePath IS NOT NULL',
@@ -270,8 +302,10 @@ export async function runModeCVerify(opts: RunModeCVerifyOpts): Promise<VerifyRe
     '       b.name AS targetName,',
     '       b.id AS targetId,',
     '       r.confidence AS confidence,',
-    '       r.reason AS reason',
-    'ORDER BY a.startLine ASC, a.id ASC, b.id ASC',
+    '       r.reason AS reason,',
+    '       r.sourceLine AS callLine,',
+    '       r.sourceCol AS callCol',
+    'ORDER BY r.sourceLine IS NULL ASC, r.sourceLine ASC, a.id ASC, b.id ASC',
   ].join(' ');
   const rows = await opts.executeParameterized(opts.repoId, cypher, {
     relType: 'CALLS',
@@ -288,11 +322,39 @@ export async function runModeCVerify(opts: RunModeCVerifyOpts): Promise<VerifyRe
     global: [],
     external: [],
   };
+
+  // #174: track position coverage over the FULL row set (before sampling)
+  // so the report reflects the DB's actual positionCoverage, not just the
+  // sample's. unpositioned edges (callLine === -1 sentinel) are counted per
+  // tier but NOT added to the sampling buckets — they cannot be probed.
+  let totalRows = 0;
+  let positionedRows = 0;
+  const unpositionedPerTier: Record<Tier, number> = {
+    'same-file': 0,
+    'import-scoped': 0,
+    global: 0,
+    external: 0,
+  };
+
   for (const row of rows ?? []) {
     const edge = projectEdge(row);
     if (!edge) continue;
-    buckets[edge.tier].push(edge);
+    totalRows++;
+    if (edge.callLine < 0) {
+      // Unpositioned (legacy/synthetic) — count but don't bucket for sampling.
+      unpositionedPerTier[edge.tier]++;
+    } else {
+      positionedRows++;
+      buckets[edge.tier].push(edge);
+    }
   }
+
+  // positionCoverage: fraction of all projected rows that carry a non-NULL
+  // sourceLine. undefined = empty graph (no rows at all, not a 0% rate);
+  // 0.0 = legacy index where rows exist but all lack position (re-analyze
+  // required for Mode C to work). Callers must distinguish the two states:
+  // undefined → no data; 0 → data exists but unpositioned.
+  const positionCoverage = totalRows > 0 ? positionedRows / totalRows : undefined;
 
   // ── 4) Stratified sampling (KD-8) ──────────────────────────────────
   // We compute each tier's allocated share of `sampleSize` by
@@ -368,12 +430,21 @@ export async function runModeCVerify(opts: RunModeCVerifyOpts): Promise<VerifyRe
   // the definition at the call-site, (b) map the response to a
   // nodeId, (c) classify the verdict. Refusals NEVER count as
   // matches (Invariant 3).
+  //
+  // #174: unpositioned edges (callLine < 0) are pre-bucketed into
+  // `unpositionedPerTier` above and are NOT sampled. They are
+  // materialised into the metrics counters here so the report shape is
+  // stable (unpositioned always appears in every VerifyMetrics, even when 0).
   const perTierCounters: Record<Tier, VerifyMetrics> = {
     'same-file': emptyMetrics(),
     'import-scoped': emptyMetrics(),
     global: emptyMetrics(),
     external: emptyMetrics(),
   };
+  // Seed the unpositioned counters from the pre-pass above.
+  for (const t of ALL_TIERS) {
+    perTierCounters[t].unpositioned = unpositionedPerTier[t];
+  }
   for (const t of ALL_TIERS) {
     for (const edge of sampled[t]) {
       const cls = await classifyEdge(edge, opts, requestTimeoutMs);
@@ -391,6 +462,7 @@ export async function runModeCVerify(opts: RunModeCVerifyOpts): Promise<VerifyRe
     overall.recallMisses += c.recallMisses;
     overall.refusals += c.refusals;
     overall.recallGains += c.recallGains;
+    overall.unpositioned += c.unpositioned;
     overall.n += c.n;
   }
   finalizeMetrics(overall);
@@ -404,6 +476,10 @@ export async function runModeCVerify(opts: RunModeCVerifyOpts): Promise<VerifyRe
     sampleSize: sampledCap,
     serverVersion: opts.serverVersion ?? null,
     sampledCap,
+    // #174: positionCoverage is the fraction of all DB rows that carry a
+    // non-NULL sourceLine. Operators use this to decide whether to re-run
+    // `npx gitnexus analyze` before trusting Mode C metrics.
+    positionCoverage,
   };
 }
 
@@ -422,8 +498,20 @@ interface CallEdge {
   heuristicTarget: string;
   /** File the call was made from. */
   sourceFile: string;
-  /** 0-indexed line of the call. */
-  sourceLine: number;
+  /**
+   * #174: 0-indexed call-site line from the persisted `sourceLine` column.
+   * This is the line of the callee identifier (e.g. `save` in `user.save()`),
+   * NOT the caller's declaration line (`a.startLine`). The pre-#174 bug
+   * probed `a.startLine` at character:0 — which resolved to the enclosing
+   * function itself, structurally preventing any match.
+   */
+  callLine: number;
+  /**
+   * #174: 0-indexed call-site column from the persisted `sourceCol` column.
+   * Defaults to 0 when the column is NULL (defensive: probing col 0 is
+   * safer than refusing, but callers should prefer positioned rows).
+   */
+  callCol: number;
   /** Derived tier for stratified sampling. */
   tier: Tier;
 }
@@ -432,6 +520,14 @@ interface CallEdge {
  * Coerce a DB row into a `CallEdge`. Defensive — every field is
  * type-checked. Returns `null` on a malformed row (the row is
  * dropped; this never throws into the report).
+ *
+ * #174: `callLine` / `callCol` come from the persisted `r.sourceLine` /
+ * `r.sourceCol` columns on CodeRelation. When `callLine` is NULL (legacy
+ * row or synthetic edge) the function returns a sentinel where
+ * `callLine === -1` — callers must route these to the `unpositioned` counter
+ * rather than probing LSP (probing col:0 of the caller's declaration line
+ * was the pre-#174 bug). The sentinel is type-safe because `CallEdge.callLine`
+ * is always a number; callers distinguish legacy rows via `callLine < 0`.
  */
 function projectEdge(row: any): CallEdge | null {
   if (!row || typeof row !== 'object') return null;
@@ -440,15 +536,26 @@ function projectEdge(row: any): CallEdge | null {
   const targetId = typeof row.targetId === 'string' ? row.targetId : '';
   const reason = typeof row.reason === 'string' ? row.reason : '';
   if (!sourceFile) return null;
-  // sourceLine: 0-indexed integer. Anything else means a
-  // partially-indexed edge we cannot ask LSP about — drop it.
+  // sourceLine (node property): 0-indexed integer. Anything else means a
+  // partially-indexed node we cannot ask LSP about — drop it.
   const sourceLine = typeof row.sourceLine === 'number' ? row.sourceLine : NaN;
   if (!Number.isFinite(sourceLine) || sourceLine < 0) return null;
+
+  // #174: callLine / callCol from the persisted edge columns. NULL → -1 sentinel
+  // (unpositioned row — must NOT be probed; routes to unpositioned counter).
+  const callLine = typeof row.callLine === 'number' && Number.isFinite(row.callLine) && row.callLine >= 0
+    ? row.callLine
+    : -1;
+  const callCol = typeof row.callCol === 'number' && Number.isFinite(row.callCol) && row.callCol >= 0
+    ? row.callCol
+    : 0;
+
   return {
     sourceId,
     heuristicTarget: targetId,
     sourceFile,
-    sourceLine,
+    callLine,
+    callCol,
     tier: reasonToTier(reason),
   };
 }
@@ -547,9 +654,15 @@ async function classifyEdge(
     // response).
     return edge.heuristicTarget === '' ? 'recallMisses' : 'refusals';
   }
+  // #174: probe at the PERSISTED call-site position (callLine / callCol),
+  // NOT at the caller's declaration line (the pre-#174 bug was
+  // `position: { line: a.startLine, character: 0 }` which resolved to the
+  // enclosing function itself — structurally preventing any match).
+  // `edge.callLine >= 0` is guaranteed by the bucketing step (unpositioned
+  // edges have callLine === -1 and are never passed to classifyEdge).
   const params = {
     textDocument: { uri },
-    position: { line: edge.sourceLine, character: 0 },
+    position: { line: edge.callLine, character: edge.callCol },
   };
   let locations: any = null;
   try {
