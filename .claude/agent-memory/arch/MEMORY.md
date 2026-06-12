@@ -1,1 +1,2 @@
 - [Issue triage batch plan 2026-06-04](issue-triage-batch-plan-2026-06-04.md) — 48 open issues, 12 batches, one batch per session; next session resumes in-flight #72
+- [rtk git output compaction](feedback-rtk-git-output-compaction.md) — never trust piped counts on rtk-wrapped git; use rtk git diff --no-compact or grep files directly
