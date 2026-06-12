@@ -386,6 +386,73 @@ describe('withReconciliationSession — X4: Location|Location[] normalization', 
   });
 });
 
+// ─── X4b: request URI is anchored to the repo root (Bug F4-forward) ──
+
+describe('withReconciliationSession — X4b: definition request URI is repo-root-anchored', () => {
+  it('repo-relative candidate.file → file:// URI under repo.repoPath, NOT process.cwd()', async () => {
+    // REGRESSION (Bug F4-forward): a candidate's `file` is a
+    // repo-relative POSIX path (`src/a.ts`). The session builds the
+    // `textDocument/definition` URI via `pathToFileURL`, which resolves
+    // a RELATIVE path against `process.cwd()` — producing a URI for a
+    // file that does not exist in the analyzed workspace (the LSP server
+    // is rooted at `repo.repoPath`). The server then returns null for
+    // every request, and every candidate becomes NO_NODE.
+    //
+    // The fix anchors `candidate.file` to `repo.repoPath` before the
+    // URI conversion. This test pins that: the request URI MUST be
+    // `<repoPath>/src/a.ts`, and MUST NOT be the cwd-resolved path.
+    //
+    // This is the blind spot the prior mapper tests missed: they all
+    // passed synthetic, pre-absolute `file:///...` URIs, so the
+    // relative-path-to-URI construction at the request site was never
+    // exercised end-to-end. With the bug present, this assertion fails
+    // because the URI resolves to `${process.cwd()}/src/a.ts`.
+    const captured: any[] = [];
+    const { client } = makeMockClient({
+      requestImpl: async (_method: string, params: any) => {
+        captured.push(params);
+        return null;
+      },
+    });
+    const deps = makeDeps({ client });
+    // REPO.repoPath is '/workspace/repo'; the candidate file is the
+    // repo-relative 'src/a.ts'.
+    const input: Candidate[] = [mkCandidate({ file: 'src/a.ts' })];
+    const fn = vi.fn(async () => undefined);
+    await withReconciliationSession(REPO, input, fn, deps);
+
+    expect(captured.length).toBe(1);
+    const uri: string = captured[0].textDocument.uri;
+    // Anchored to the repo root — the load-bearing assertion.
+    expect(uri).toBe(`file://${REPO.repoPath}/src/a.ts`);
+    // And explicitly NOT resolved against the process cwd (the bug).
+    expect(uri).not.toContain(process.cwd());
+  });
+
+  it('absolute candidate.file is passed through unchanged (no double-join)', async () => {
+    // Defensive: a producer that already resolved the path to an
+    // absolute filesystem path must not be re-anchored under repoPath.
+    const captured: any[] = [];
+    const { client } = makeMockClient({
+      requestImpl: async (_method: string, params: any) => {
+        captured.push(params);
+        return null;
+      },
+    });
+    const deps = makeDeps({ client });
+    const absFile = '/some/other/abs/path/x.ts';
+    const input: Candidate[] = [mkCandidate({ file: absFile })];
+    const fn = vi.fn(async () => undefined);
+    await withReconciliationSession(REPO, input, fn, deps);
+
+    expect(captured.length).toBe(1);
+    const uri: string = captured[0].textDocument.uri;
+    expect(uri).toBe(`file://${absFile}`);
+    // The repo root must NOT have been prepended.
+    expect(uri).not.toContain(REPO.repoPath);
+  });
+});
+
 // ─── X5: Location[] of N → all N handed to engine ────────────────────
 
 describe('withReconciliationSession — X5: multi-Location pass-through', () => {

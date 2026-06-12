@@ -58,6 +58,7 @@ import type { GraphRelationship, KnowledgeGraph, EdgeSource } from '../graph/typ
 import { CALLABLE_SYMBOL_TYPES } from './call-processor.js';
 import { generateId } from '../../lib/utils.js';
 import { pathToFileURL } from 'node:url';
+import { isAbsolute as pathIsAbsolute, resolve as pathResolve } from 'node:path';
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -442,7 +443,7 @@ export async function withReconciliationSession<T>(
       selected,
       CONCURRENT_DEFINITION_REQUESTS,
       async (candidate) => {
-        const locations = await fetchDefinitionForCandidate(client, candidate, requestTimeoutMs, uriCache);
+        const locations = await fetchDefinitionForCandidate(client, candidate, requestTimeoutMs, uriCache, repo.repoPath);
         await handToEngine(candidate, locations);
       },
     );
@@ -591,6 +592,13 @@ async function fetchDefinitionForCandidate(
   // `uriCache?.set(...)` write — the cache is now invariant:
   // always a real Map.
   uriCache: Map<string, string>,
+  // Bug F4-forward fix: the repo root the candidate's
+  // repo-relative `file` is anchored to when building the
+  // `file://` URI. Required — the session always has
+  // `repo.repoPath`. Without it a relative `candidate.file`
+  // resolves against `process.cwd()` and the LSP server (rooted
+  // at the repo) sees a non-existent / out-of-workspace path.
+  repoRoot: string,
 ): Promise<Location[]> {
   // M8: validate the file path is one the engine would ever
   // index. Vendored / declaration / dist paths are
@@ -643,7 +651,21 @@ async function fetchDefinitionForCandidate(
       uri = cached;
     } else {
       try {
-        uri = pathToFileURL(candidate.file).toString();
+        // Bug F4-forward fix: `candidate.file` is a
+        // repo-relative POSIX path (e.g. `src/db.ts`) — the same
+        // form the graph stores. `pathToFileURL` on a relative
+        // path resolves it against `process.cwd()`, NOT the
+        // analyzed repo, so the resulting URI points at a file
+        // that does not exist in the LSP workspace and every
+        // `textDocument/definition` returns null → every
+        // candidate becomes NO_NODE. We MUST anchor the relative
+        // path to the repo root before building the URI. Absolute
+        // inputs (a producer that already resolved the path) are
+        // passed through untouched.
+        const absFile = pathIsAbsolute(candidate.file)
+          ? candidate.file
+          : pathResolve(repoRoot, candidate.file);
+        uri = pathToFileURL(absFile).toString();
         uriCache.set(candidate.file, uri);
       } catch {
         // `pathToFileURL` can throw on bizarre inputs (e.g.

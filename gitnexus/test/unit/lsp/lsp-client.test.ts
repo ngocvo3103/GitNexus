@@ -33,6 +33,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { PassThrough, type Writable, type Readable } from 'stream';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import {
   createMessageConnection,
   StreamMessageReader,
@@ -770,5 +773,96 @@ describe('LspClient', () => {
     // a tick to land in the log.
     await new Promise<void>((r) => setTimeout(r, 50));
     expect(fx.server.log.didOpenUris).toEqual(['file:///x.ts']);
+  });
+});
+
+// ─── F3: symlinked workspaceRoot containment fix ──────────────────────
+//
+// Bug A: `maybeDidOpenForDefinition` realpath-syncs the FILE but not
+// the workspaceRoot. On macOS, /tmp → /private/tmp means a workspace
+// at `/tmp/abc` resolves to `/tmp/abc` lexically while the file path
+// realpath resolves to `/private/tmp/abc/src/x.ts`. path.relative then
+// computes `../../private/tmp/abc/src/x.ts` → starts with `..` → bail.
+// The fix: `realWorkspaceRootCached()` realpath-syncs the root once
+// and caches it.
+
+describe('F3 — symlinked workspaceRoot: didOpen IS sent for a contained file', () => {
+  let tmpRoot: string;
+  let symRoot: string;
+  let wire: ReturnType<typeof makeWire>;
+  let server: FakeServerHandle;
+  let clientConn: ReturnType<typeof createMessageConnection>;
+  let client: LspClient;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-f3-test-'));
+    // Create a real file inside the tmpdir.
+    const srcDir = path.join(tmpRoot, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'x.ts'), 'export const x = 1;\n');
+
+    // Create a symlink to the tmpdir so the "workspace root" is a symlink.
+    symRoot = path.join(os.tmpdir(), `gn-f3-sym-${Date.now()}`);
+    try {
+      fs.symlinkSync(tmpRoot, symRoot, 'dir');
+    } catch {
+      // If symlinking fails (e.g. Windows without privileges), fall
+      // back to using tmpRoot directly — the test still verifies the
+      // containment path, just without a symlink.
+      symRoot = tmpRoot;
+    }
+
+    wire = makeWire();
+    server = makeFakeServer(wire);
+    const clientProc = makeFakeChildProcess(wire);
+    clientConn = createMessageConnection(
+      new StreamMessageReader(wire.clientStdout),
+      new StreamMessageWriter(wire.clientStdin),
+      NullLogger,
+    );
+    // The workspaceRoot is the SYMLINK path — the bug is that without
+    // realpath-syncing the root, the containment check fails.
+    client = new LspClient({
+      workspaceRoot: symRoot,
+      _inject: {
+        spawn: () => ({ process: clientProc, connection: clientConn }),
+      },
+    });
+  });
+
+  afterEach(async () => {
+    try { await client.stop(); } catch { /* noop */ }
+    server.dispose();
+    try { clientConn.dispose(); } catch { /* noop */ }
+    wire.destroy();
+    try {
+      if (symRoot !== tmpRoot) fs.unlinkSync(symRoot);
+    } catch { /* noop */ }
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* noop */ }
+  });
+
+  it('didOpen IS sent for a file contained in the symlinked workspace root', async () => {
+    await client.start();
+
+    // Build the URI for a file under the SYMLINK root — this is what
+    // the LSP server returns in a definition response (absolute path).
+    const fileInSymRoot = path.join(symRoot, 'src', 'x.ts');
+    const uri = 'file://' + fileInSymRoot;
+
+    // Trigger maybeDidOpenForDefinition via a definition request.
+    await client.request<any>(
+      'textDocument/definition',
+      { textDocument: { uri }, position: { line: 0, character: 0 } },
+      3_000,
+    );
+
+    // Give the notification a tick to land in the server log.
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    // The file IS inside the workspace; didOpen must have been sent.
+    expect(
+      server.log.didOpenUris,
+      'didOpen must be sent for a file inside a symlinked workspace root (F3 fix)',
+    ).toContain(uri);
   });
 });

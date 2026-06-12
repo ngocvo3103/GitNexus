@@ -46,10 +46,11 @@ import { writeSync } from 'node:fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { runModeCVerify } from '../core/ingestion/lsp/mode-c-verifier.js';
 import { probeWorkspaceReadiness } from '../core/ingestion/lsp/workspace-readiness-probe.js';
+import { buildCanarySamples } from '../core/ingestion/lsp/canary-sampler.js';
 import { discoverServers } from '../core/ingestion/lsp/server-discovery.js';
 import { mapLocationToNodeId } from '../core/ingestion/lsp/location-mapper.js';
 import { LspClient } from '../core/ingestion/lsp/lsp-client.js';
-import { executeParameterized } from '../mcp/core/lbug-adapter.js';
+import { initLbug, isLbugReady, executeParameterized } from '../mcp/core/lbug-adapter.js';
 
 export interface VerifyCommandOptions {
   lsp?: boolean;
@@ -182,6 +183,25 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
     process.exit(1);
   }
 
+  // ── 4b) Ensure the LadybugDB adapter is initialized for the repo ─
+  // `runModeCVerify` calls `executeParameterized` which requires the
+  // pool entry for `repoHandle.id` to exist. Other CLI commands that
+  // query the graph (e.g. `query`, `context`) go through
+  // `LocalBackend.ensureInitialized` (private) before every DB call.
+  // Verify bypasses LocalBackend for the actual query work
+  // (it delegates to `runModeCVerify` directly), so we must
+  // trigger the same lazy-init here — otherwise
+  // `executeParameterized` throws "LadybugDB not initialized for
+  // repo …. Call initLbug first."
+  if (!isLbugReady(repoHandle.id)) {
+    try {
+      await initLbug(repoHandle.id, repoHandle.lbugPath);
+    } catch (e: any) {
+      out(`Error: failed to initialize graph database: ${e?.message ?? String(e)}`);
+      process.exit(1);
+    }
+  }
+
   // ── 5) Discover the LSP server (degrade/strict on absence) ──────
   // Server discovery never throws (per WI-#2 contract). A null
   // result is the "absent" verdict. We treat absent and
@@ -201,9 +221,13 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
   // ── 6) Start the LSP client + probe workspace readiness ─────────
   // The client is per-invocation (per the warm-singleton contract
   // of WI-#3). We MUST stop it on every code path, including the
-  // error paths — hence the try/finally. The probe uses a single
-  // canary request against the workspace's `package.json` so we
-  // don't have to enumerate real TS files up-front.
+  // error paths — hence the try/finally. The probe uses canary
+  // samples built from real .ts files in the repo root via
+  // `buildCanarySamples`. This replaces the former package.json
+  // canary, which could NEVER produce a non-empty definition
+  // response (typescript-language-server does not serve
+  // definitions for JSON files), making the probe permanently
+  // stuck at ready:false regardless of workspace state.
   const client = new LspClient({
     binaryPath: servers.typescript.path,
     workspaceRoot: repoHandle.repoPath,
@@ -211,10 +235,7 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
 
   try {
     await client.start();
-    const samples = [{
-      textDocument: { uri: `file://${repoHandle.repoPath}/package.json` },
-      position: { line: 0, character: 0 },
-    }];
+    const samples = await buildCanarySamples(repoHandle.repoPath);
     const probe = await probeWorkspaceReadiness(client, samples, {
       perRequestTimeoutMs: 3000,
     });
@@ -234,10 +255,22 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
     // `probe` we already ran is reused (we don't double-probe).
     // The seed is the verifier's default, which keeps the
     // report byte-stable across runs (Invariant 7).
+    //
+    // Bug B fix (#F4): pass `repoPath` so the mapper can rebase
+    // the absolute LSP `file://` URIs to repo-relative paths
+    // that match the graph's stored `filePath` values.
+    const repoPath = repoHandle.repoPath;
     const report = await runModeCVerify({
       repoId: repoHandle.id,
       client,
-      mapLocationToNodeId,
+      // Bug F4-forward fix: `classifyEdge` anchors each edge's
+      // repo-relative `sourceFile` to this root when building the
+      // `textDocument/definition` URI. Without it, `file://src/x.ts`
+      // is malformed (host=`src`) and every request returns null →
+      // 0% across all tiers.
+      repoPath,
+      mapLocationToNodeId: (loc, repoId) =>
+        mapLocationToNodeId(loc, repoId, { repoPath }),
       executeParameterized,
       probe: async () => probe, // already probed above
       sampleSize,

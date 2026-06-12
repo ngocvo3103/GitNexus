@@ -38,6 +38,9 @@
 import { generateId, normalizeFilePath } from '../../../lib/utils.js';
 import { executeParameterized } from '../../../mcp/core/lbug-adapter.js';
 import { VALID_NODE_LABELS } from './node-labels.js';
+import { fileURLToPath } from 'node:url';
+import * as nodePath from 'node:path';
+import { realpathSync } from 'node:fs';
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -77,6 +80,26 @@ export interface MapperDeps {
   generateId: (label: string, name: string) => string;
   /** Same shape as `lib/utils.normalizeFilePath`. Default: real fn. */
   normalizeFilePath: (p: string) => string;
+  /**
+   * Absolute path to the repository root. When set, the mapper
+   * rebases the LSP URI's absolute filesystem path to a repo-relative
+   * POSIX path before querying the graph.
+   *
+   * This is the fix for Bug B (#F4): LSP returns
+   * `file:///private/tmp/<dir>/src/x.ts`; after scheme-strip the
+   * path is `private/tmp/<dir>/src/x.ts`; graph nodes store
+   * repo-relative `src/x.ts`. Without rebasing, every real LSP
+   * definition resolves to `NO_NODE`.
+   *
+   * The value should be the realpath-resolved repo root (so the
+   * relative computation is symlink-safe). Optional; when absent
+   * the old scheme-strip-only behavior is preserved (unit tests
+   * that mock `executeParameterized` remain unaffected because
+   * they pass pre-normalized URIs like `file:///repo/src/foo.ts`
+   * whose scheme-strip already gives a non-absolute-looking path
+   * `repo/src/foo.ts`).
+   */
+  repoPath?: string;
 }
 
 // ─── Leaf node labels (the query union) ────────────────────────────────
@@ -339,8 +362,89 @@ export async function mapLocationToNodeId(
   // ── 1) Normalize URI → repo-relative POSIX path ───────────────────
   // EdgeCase 3 (node_modules / .d.ts) + EdgeCase 10 (Windows
   // backslashes) + Invariant 6 (single-source normalization).
-  const relPath = normalizeLocationUri(loc?.uri ?? '', resolvedDeps.normalizeFilePath);
+  //
+  // Bug B fix (#F4): LSP servers return absolute `file://` URIs,
+  // e.g. `file:///private/tmp/<dir>/src/x.ts`. After scheme-strip
+  // the path is an absolute filesystem path. The graph stores
+  // repo-relative POSIX paths (`src/x.ts`). Without rebasing the
+  // absolute path against the repo root, every match is
+  // `NO_NODE` in production — the path `private/tmp/<dir>/src/x.ts`
+  // never matches a graph node whose `filePath` is `src/x.ts`.
+  //
+  // When `deps.repoPath` is set we:
+  //   1. Convert the URI to an absolute filesystem path via
+  //      `fileURLToPath` (handles percent-encoding, Windows
+  //      drive letters, etc.).
+  //   2. realpath the absolute path (guarded) to resolve
+  //      macOS /tmp → /private/tmp and similar platform symlinks.
+  //   3. Compute `path.relative(realRepoRoot, realAbsPath)` →
+  //      repo-relative path. Convert backslashes → / (POSIX store).
+  //   4. Paths that resolve outside the repo (start with `..` or
+  //      are absolute after `path.relative`) are stdlib / external
+  //      deps — they yield `NO_NODE`, which is the correct refusal.
+  let relPath: string;
+  if (resolvedDeps.repoPath && (loc?.uri ?? '').startsWith('file://')) {
+    let absPath: string;
+    try {
+      absPath = fileURLToPath(loc.uri);
+    } catch {
+      // Malformed URI — fall back to scheme-strip path.
+      absPath = '';
+    }
+    // Attempt repo-relative rebase only when the absolute path exists
+    // on disk (can be realpath'd) AND resolves to a path within the
+    // repo root. This guards against two cases that should fall through
+    // to the old scheme-strip behavior:
+    //   1. Fake/synthetic URIs in tests (e.g. `file:///helper.ts` where
+    //      the path `/helper.ts` does not exist and is not under the repo).
+    //   2. stdlib / node_modules paths that are genuinely outside the repo.
+    let rebased: string | null = null;
+    if (absPath) {
+      let realAbsPath: string;
+      try {
+        realAbsPath = realpathSync(absPath);
+      } catch {
+        // File does not exist — cannot rebase via realpath. Fall through
+        // to scheme-strip (legacy behavior for synthetic test URIs).
+        realAbsPath = '';
+      }
+      if (realAbsPath) {
+        // realpath the repo root for symlink-safe comparison.
+        let realRepoRoot: string;
+        try {
+          realRepoRoot = realpathSync(resolvedDeps.repoPath);
+        } catch {
+          realRepoRoot = resolvedDeps.repoPath;
+        }
+        const rel = nodePath.relative(realRepoRoot, realAbsPath);
+        // Only use the rebase result when the path is INSIDE the repo
+        // (does not start with `..` and is not absolute — an absolute
+        // result from `path.relative` means cross-drive on Windows).
+        if (!rel.startsWith('..') && !nodePath.isAbsolute(rel)) {
+          // Convert Windows backslashes to POSIX separators.
+          rebased = rel.replace(/\\/g, '/');
+        }
+      }
+    }
+    if (rebased !== null) {
+      relPath = rebased;
+    } else {
+      // Fall back to the legacy scheme-strip normalization. This keeps
+      // existing tests that use synthetic `file:///relative-name.ts`
+      // URIs working, and handles the case where a file does not exist
+      // on disk (e.g. in-memory-only fixtures).
+      relPath = normalizeLocationUri(loc?.uri ?? '', resolvedDeps.normalizeFilePath);
+    }
+  } else {
+    relPath = normalizeLocationUri(loc?.uri ?? '', resolvedDeps.normalizeFilePath);
+  }
+
   if (isUnindexablePath(relPath)) {
+    return { kind: 'NO_NODE' };
+  }
+
+  // Outside-repo paths after rebase start with `..` — refuse.
+  if (relPath.startsWith('..') || nodePath.isAbsolute(relPath)) {
     return { kind: 'NO_NODE' };
   }
 

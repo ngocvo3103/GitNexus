@@ -760,6 +760,43 @@ describe('mode-c-verifier — read-only invariant (Invariant 1)', () => {
     expect(src).not.toMatch(/import\b[^\n]*\bexecuteQuery\b/);
   });
 
+  it('assertNoGraphWriteImports default (no opts) rejects initLbug( call sites', () => {
+    // Regression guard: the default mode must remain byte-identical
+    // to the pre-allowLifecycle behaviour — no caller breakage.
+    const srcWithLifecycle = `
+      import { initLbug } from './lbug-adapter.js';
+      async function open() { await initLbug('r', '/path'); }
+    `;
+    const { ok, violations } = assertNoGraphWriteImports(srcWithLifecycle);
+    expect(ok).toBe(false);
+    expect(violations.some((v) => /initLbug/.test(v))).toBe(true);
+  });
+
+  it('assertNoGraphWriteImports({ allowLifecycle: true }) permits initLbug( but still rejects executeQuery(', () => {
+    // The harness path: lifecycle open is permitted, but write-mode
+    // Cypher dispatch (`executeQuery`) must still be caught.
+    const srcLifecycleOnly = `
+      async function open(repoId: string, path: string) {
+        await initLbug(repoId, path);
+      }
+    `;
+    const resultLifecycle = assertNoGraphWriteImports(srcLifecycleOnly, { allowLifecycle: true });
+    expect(resultLifecycle.ok).toBe(true);
+    expect(resultLifecycle.violations).toEqual([]);
+
+    const srcWithWrite = `
+      async function bad(repoId: string, path: string) {
+        await initLbug(repoId, path);
+        await executeQuery('CREATE (n)');
+      }
+    `;
+    const resultWrite = assertNoGraphWriteImports(srcWithWrite, { allowLifecycle: true });
+    expect(resultWrite.ok).toBe(false);
+    expect(resultWrite.violations.some((v) => /executeQuery/.test(v))).toBe(true);
+    // initLbug itself is NOT reported as a violation when allowLifecycle:true
+    expect(resultWrite.violations.every((v) => !/initLbug/.test(v))).toBe(true);
+  });
+
   it('per-tier counters sum to overall counters', async () => {
     const client = makeMockClient({
       requestImpl: async () => [

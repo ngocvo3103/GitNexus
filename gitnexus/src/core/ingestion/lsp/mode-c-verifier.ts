@@ -61,6 +61,8 @@ import type { LspClient } from './lsp-client.js';
 import type { MapperResult } from './location-mapper.js';
 import type { ResolutionTier } from '../resolution-context.js';
 import { executeParameterized } from '../../../mcp/core/lbug-adapter.js';
+import { pathToFileURL } from 'node:url';
+import { isAbsolute as pathIsAbsolute, resolve as pathResolve } from 'node:path';
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -125,6 +127,18 @@ export interface RunModeCVerifyOpts {
   repoId: string;
   /** Used for `textDocument/definition` requests. */
   client: LspClient;
+  /**
+   * Absolute path to the repository root. The graph stores
+   * repo-relative file paths (`src/db.ts`); the LSP server is
+   * rooted at this path. `classifyEdge` anchors each edge's
+   * repo-relative `sourceFile` to this root before building the
+   * `file://` URI. Optional for backward compatibility with
+   * existing tests (which pass absolute `sourceFile` values or
+   * mock the client); when absent, a path that is already
+   * absolute is used as-is and a relative path is left relative
+   * (legacy behavior).
+   */
+  repoPath?: string;
   /** Maps an LSP Location to a graph nodeId. Default: real `mapLocationToNodeId`. */
   mapLocationToNodeId: (loc: any, repoId: string) => Promise<MapperResult>;
   /** Read-only Cypher dispatch. Default: `executeParameterized`. */
@@ -506,10 +520,33 @@ async function classifyEdge(
   timeoutMs: number,
 ): Promise<EdgeClass> {
   // ── Ask LSP for the definition at the call-site ──────────────────
-  // We use the file URI form (with `file://` prefix) because the
-  // location-mapper strips it via the same normalizer the indexer
-  // used; the call-site line is 0-indexed (Invariant 5).
-  const uri = `file://${edge.sourceFile}`;
+  // Build a well-formed `file://` URI for the call-site file.
+  // `edge.sourceFile` is the graph's repo-relative POSIX path
+  // (e.g. `src/db.ts`). Bug F4-forward fix: the old
+  // `` `file://${edge.sourceFile}` `` produced a MALFORMED URI for
+  // a relative path — `file://src/db.ts` parses `src` as the URI
+  // host, so the LSP server (rooted at the repo) never resolves
+  // the file and every definition request returns null → 0%
+  // precision/recall across all tiers. We anchor the relative
+  // path to the repo root and use `pathToFileURL` (handles spaces,
+  // non-ASCII, Windows drive letters). The call-site line is
+  // 0-indexed (Invariant 5). Absolute `sourceFile` inputs (or the
+  // legacy no-`repoPath` path) are handled without double-joining.
+  const absSourceFile =
+    pathIsAbsolute(edge.sourceFile) || !opts.repoPath
+      ? edge.sourceFile
+      : pathResolve(opts.repoPath, edge.sourceFile);
+  let uri: string;
+  try {
+    uri = pathIsAbsolute(absSourceFile)
+      ? pathToFileURL(absSourceFile).toString()
+      : `file://${absSourceFile}`;
+  } catch {
+    // `pathToFileURL` can throw on pathological inputs; refuse
+    // over guess (treat as a refusal/recall-miss like a null
+    // response).
+    return edge.heuristicTarget === '' ? 'recallMisses' : 'refusals';
+  }
   const params = {
     textDocument: { uri },
     position: { line: edge.sourceLine, character: 0 },
@@ -725,7 +762,48 @@ export function defaultProbe(
  * by the time the test runs, the imports are gone. The source-
  * text check pins the static surface.
  */
-export function assertNoGraphWriteImports(sourceText: string): {
+/**
+ * Runtime self-check: assert that this module imports no write
+ * API. The check is exposed as an exported function so a unit
+ * test can call it (the imports list is captured at module load
+ * time, when static `import` declarations have already been
+ * resolved).
+ *
+ * What "write API" means here, concretely:
+ *   - `executeQuery` (the write-mode cypher dispatch in lbug-adapter).
+ *   - `addNode` / `addRelationship` (the higher-level write helpers).
+ *   - `initLbug` / `initLbugWithDb` (DB lifecycle — not a "write"
+ *     in the sense of mutation, but it touches the DB schema and
+ *     MUST NOT be reached from the verifier).
+ *   - `CYPHER_WRITE_RE` is OK as a string constant — the verifier
+ *     imports it implicitly only if a future refactor pulls it
+ *     in; we forbid the whole lbug-adapter write surface.
+ *
+ * The check is intentionally string-based (regex over the
+ * module's source) because TS imports are resolved at runtime —
+ * by the time the test runs, the imports are gone. The source-
+ * text check pins the static surface.
+ *
+ * @param sourceText  The full source text of the module to check.
+ * @param opts.allowLifecycle  When `true`, the lifecycle-open
+ *   patterns (`initLbug` call sites and `initLbugWithDb` call
+ *   sites) are NOT treated as violations. This is the ONLY
+ *   carve-out. All graph-mutating tokens (`executeQuery`,
+ *   `addNode`, `addRelationship`, DROP/TABLE Cypher verbs, …)
+ *   remain forbidden regardless of this flag.
+ *
+ *   Rationale: a measurement harness (e.g. `scripts/measure-mode-c.ts`)
+ *   must open a connection pool via the lifecycle API before it
+ *   can read the graph via `executeParameterized`. Opening a pool
+ *   is a lifecycle operation — it does not write graph data.
+ *   The verifier itself must NEVER open the pool (it receives an
+ *   already-initialized `executeParameterized` seam), so the flag
+ *   defaults to `false` and every existing caller stays fully strict.
+ */
+export function assertNoGraphWriteImports(
+  sourceText: string,
+  opts?: { allowLifecycle?: boolean },
+): {
   ok: boolean;
   violations: string[];
 } {
@@ -740,17 +818,26 @@ export function assertNoGraphWriteImports(sourceText: string): {
   // pattern `/\bDROP ... TABLE\b/i` would match its own source
   // text, producing a false positive on the very file that
   // defines the check.
-  const FORBIDDEN = [
+  const FORBIDDEN_ALWAYS = [
     /\bexecuteQuery\s*\(/,
     /\bimport\b[^\n]*\bexecuteQuery\b/,
     /\baddNode\s*\(/,
     /\baddRelationship\s*\(/,
     /\bimport\b[^\n]*\baddNode\b/,
     /\bimport\b[^\n]*\baddRelationship\b/,
-    /\binitLbug\b\s*\(/,
-    /\binitLbugWithDb\b\s*\(/,
     /\bDROP\s+(?:NODE\s+)?TABLE\b/i,
   ];
+  // Lifecycle tokens: forbidden by default; permitted when
+  // `opts.allowLifecycle === true`. The distinction is documented
+  // in the JSDoc above — opening a pool is not a graph write.
+  const FORBIDDEN_LIFECYCLE = [
+    /\binitLbug\b\s*\(/,
+    /\binitLbugWithDb\b\s*\(/,
+  ];
+  const FORBIDDEN = opts?.allowLifecycle
+    ? FORBIDDEN_ALWAYS
+    : [...FORBIDDEN_ALWAYS, ...FORBIDDEN_LIFECYCLE];
+
   const violations: string[] = [];
   // Strip the body of THIS function from the source text so the
   // regex patterns themselves don't trigger themselves. We

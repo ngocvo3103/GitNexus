@@ -90,6 +90,7 @@ const lspDir = path.join(repoRoot, 'src', 'core', 'ingestion', 'lsp');
  * "I added lsp/foo.ts and it bypassed the audit".
  */
 const LSP_FILES = [
+  'canary-sampler.ts',
   'lsp-client.ts',
   'server-discovery.ts',
   'location-mapper.ts',

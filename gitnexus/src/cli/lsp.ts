@@ -33,10 +33,8 @@
 import { writeSync } from 'node:fs';
 import { LspClient } from '../core/ingestion/lsp/lsp-client.js';
 import { discoverServers } from '../core/ingestion/lsp/server-discovery.js';
-import {
-  probeWorkspaceReadiness,
-  type Sample,
-} from '../core/ingestion/lsp/workspace-readiness-probe.js';
+import { probeWorkspaceReadiness } from '../core/ingestion/lsp/workspace-readiness-probe.js';
+import { buildCanarySamples } from '../core/ingestion/lsp/canary-sampler.js';
 
 // ─── Public types ─────────────────────────────────────────────────────
 
@@ -98,29 +96,32 @@ async function runDoctor(options?: LspCommandOptions): Promise<void> {
   let reason: string | undefined;
 
   if (tsInfo) {
-    // The probe needs *some* sample to fire a `definition`
-    // request against. The spec accepts any known TS file
-    // in the workspace — we use `package.json` because (a)
-    // every Node-based repo has one, and (b) the LSP server
-    // can return `[]` for an unindexed file, which is a
-    // legitimate "workspace not built/resolved" answer
-    // (matches the probe's null/empty-equals-fail contract).
+    // The probe needs real TypeScript canary positions — spots in
+    // actual .ts files where a cross-file identifier (an import
+    // binding, an exported function name, etc.) lives. A language
+    // server that has resolved the module graph can answer a
+    // `textDocument/definition` request at such a position with a
+    // non-empty Location[]. We use `buildCanarySamples` rather than
+    // a hard-coded package.json path because:
+    //   (a) typescript-language-server does NOT serve definitions
+    //       for JSON files — a package.json canary always returns []
+    //       regardless of workspace readiness, so the probe could
+    //       NEVER report ready:true with that approach.
+    //   (b) A relative-import position is a genuine cross-file
+    //       resolution request — the strongest available signal
+    //       that the language server has actually built its module
+    //       graph for this workspace.
     //
-    // Note: we deliberately use `process.cwd()` as the sample
-    // path — when run from the project root, this points at
-    // *the* `package.json`. The probe is gated on `ready:false`
-    // meaning a missing/unbuilt workspace, NOT on a missing
-    // file at the sample path; a `[]` response is itself a
-    // meaningful "workspace not ready" signal.
-    const client = new LspClient({ binaryPath: tsInfo.path });
+    // `lsp doctor` runs pre-index (the graph doesn't exist yet),
+    // so we must use the FS-based sampler rather than a graph query.
+    // `buildCanarySamples` uses process.cwd() as the repo root when
+    // the command is run from the project root; the probe's own
+    // 'no samples provided' reason surfaces if no .ts files are
+    // found, which is correct for a TS-less workspace.
+    const client = new LspClient({ binaryPath: tsInfo.path, workspaceRoot: process.cwd() });
     try {
       await client.start();
-      const samples: Sample[] = [
-        {
-          textDocument: { uri: `file://${process.cwd()}/package.json` },
-          position: { line: 0, character: 0 },
-        },
-      ];
+      const samples = await buildCanarySamples(process.cwd());
       const probeResult = await probeWorkspaceReadiness(client, samples, {
         perRequestTimeoutMs: 3000,
       });

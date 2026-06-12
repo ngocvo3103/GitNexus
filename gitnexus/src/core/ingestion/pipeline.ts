@@ -779,6 +779,29 @@ export const runPipelineFromRepo = async (
           return { meta, selectedCount: selected.length, skipped };
         },
         {
+          // probe: wire a real canary-based readiness check.
+          // The `defaultProbe` in mode-a-reconciler.ts passes
+          // empty samples → probe always refuses (structural no-op).
+          // We override it here with `buildCanarySamples` so the
+          // session can actually gate on whether the TS server has
+          // resolved the workspace module graph.
+          //
+          // The probe signature wants the full `LspClient`; the
+          // session narrows it to `ReconciliationLspClient` for the
+          // work-fn seam. The narrowing is behavior-preserving (the
+          // four picked members are the only ones the probe touches
+          // in this codepath) — a structural cast is sound but TS
+          // can't prove it without the double-as. Mirrors the
+          // casting pattern in defaultProbe (mode-a-reconciler.ts).
+          probe: async (client) => {
+            const { probeWorkspaceReadiness } = await import('./lsp/workspace-readiness-probe.js');
+            const { buildCanarySamples } = await import('./lsp/canary-sampler.js');
+            return probeWorkspaceReadiness(
+              client as unknown as import('./lsp/lsp-client.js').LspClient,
+              await buildCanarySamples(repoPath),
+              { perRequestTimeoutMs: 3000 },
+            );
+          },
           // The session calls this once per candidate with
           // the normalized `Location[]` payload. We key on
           // the canonical four-tuple so the engine can look
@@ -815,7 +838,7 @@ export const runPipelineFromRepo = async (
         locations,
         {
           mapLocationToNodeId: (loc, repoId) =>
-            mapLocationToNodeId(loc, repoId, { executeParameterized: inMemoryQuery }),
+            mapLocationToNodeId(loc, repoId, { executeParameterized: inMemoryQuery, repoPath }),
           repoId: ctx.repoId ?? 'default',
           skipped: sessionSkipped,
         },

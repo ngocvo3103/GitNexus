@@ -233,6 +233,31 @@ export class LspClient {
   private readonly maxRestarts: number;
   private readonly inject: LspClientOptions['_inject'];
 
+  /**
+   * Realpath-resolved workspace root, computed once lazily.
+   * On macOS the system `/tmp` symlink resolves to `/private/tmp`;
+   * without this cache the containment check in
+   * `maybeDidOpenForDefinition` would compare a realpath'd file
+   * path against the non-realpath'd root and every workspace file
+   * would appear to be outside the root → didOpen never sent.
+   * The cache is `null` until first use (lazy) and is populated
+   * by `realWorkspaceRootCached()`.
+   */
+  private _realWorkspaceRoot: string | null = null;
+
+  /** Return the realpath-resolved workspace root, computing it once. */
+  private realWorkspaceRootCached(): string {
+    if (this._realWorkspaceRoot !== null) return this._realWorkspaceRoot;
+    try {
+      this._realWorkspaceRoot = realpathSync(this.workspaceRoot);
+    } catch {
+      // Workspace root does not exist yet (rare in tests) — fall back
+      // to the raw path. Subsequent calls retry (null check above).
+      return this.workspaceRoot;
+    }
+    return this._realWorkspaceRoot;
+  }
+
   constructor(opts: LspClientOptions = {}) {
     this.workspaceRoot = opts.workspaceRoot ?? process.cwd();
     this.binaryOverride = opts.binaryPath ?? null;
@@ -810,7 +835,10 @@ export class LspClient {
       return;
     }
     const resolved = path.resolve(p);
-    const root = path.resolve(this.workspaceRoot);
+    // Use the realpath-resolved root so symlinked workspace roots
+    // (e.g. macOS /tmp → /private/tmp) compare correctly against
+    // the realpath-resolved file path below.
+    const root = this.realWorkspaceRootCached();
     // S1 (M7 hardening): resolve symlinks via `realpathSync`
     // BEFORE the containment check. The lexical
     // `path.relative(root, resolved)` check (M7) and the
