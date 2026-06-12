@@ -228,9 +228,23 @@ export const addToGitignore = async (repoPath: string): Promise<void> => {
 // ─── Global Registry (~/.gitnexus/registry.json) ───────────────────────
 
 /**
- * Get the path to the global GitNexus directory
+ * Get the path to the global GitNexus home directory.
+ *
+ * Resolution order:
+ *   1. `GITNEXUS_HOME` environment variable (if set and non-empty) — used by
+ *      the test suite to redirect all registry and config I/O to a per-run
+ *      tmpdir, keeping the developer's real `~/.gitnexus` intact.
+ *   2. `~/.gitnexus` (default, OS homedir via `os.homedir()`).
+ *
+ * All other functions in this module derive their paths through this helper,
+ * so overriding `GITNEXUS_HOME` is the single knob that controls the entire
+ * global-state surface area.
  */
 export const getGlobalDir = (): string => {
+  const override = process.env.GITNEXUS_HOME;
+  if (override && override.length > 0) {
+    return override;
+  }
   return path.join(os.homedir(), '.gitnexus');
 };
 

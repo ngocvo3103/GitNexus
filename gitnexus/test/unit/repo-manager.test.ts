@@ -3,6 +3,8 @@
  *
  * Tests: getStoragePath, getStoragePaths, readRegistry, registerRepo, unregisterRepo
  * Covers hardening fixes #29 (API key file permissions) and #30 (case-insensitive paths on Windows)
+ *
+ * Also covers gh #175: GITNEXUS_HOME env override for test-suite isolation.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'path';
@@ -11,6 +13,7 @@ import fs from 'fs/promises';
 import {
   getStoragePath,
   getStoragePaths,
+  getGlobalDir,
   readRegistry,
   saveCLIConfig,
   loadCLIConfig,
@@ -132,5 +135,76 @@ describe('API key file permissions', () => {
     );
     expect(source).toContain('chmod(configPath, 0o600)');
     expect(source).toContain("process.platform !== 'win32'");
+  });
+});
+
+// ─── GITNEXUS_HOME override (gh #175 — test-suite isolation) ─────────
+
+describe('getGlobalDir — GITNEXUS_HOME override', () => {
+  const originalHome = process.env.GITNEXUS_HOME;
+
+  afterEach(() => {
+    // Restore whatever was set before each test (the test suite's own override).
+    if (originalHome === undefined) {
+      delete process.env.GITNEXUS_HOME;
+    } else {
+      process.env.GITNEXUS_HOME = originalHome;
+    }
+  });
+
+  it('returns GITNEXUS_HOME when set', () => {
+    process.env.GITNEXUS_HOME = '/tmp/custom-gitnexus-home';
+    expect(getGlobalDir()).toBe('/tmp/custom-gitnexus-home');
+  });
+
+  it('returns ~/.gitnexus when GITNEXUS_HOME is unset', () => {
+    delete process.env.GITNEXUS_HOME;
+    const expected = path.join(os.homedir(), '.gitnexus');
+    expect(getGlobalDir()).toBe(expected);
+  });
+
+  it('returns ~/.gitnexus when GITNEXUS_HOME is empty string', () => {
+    process.env.GITNEXUS_HOME = '';
+    const expected = path.join(os.homedir(), '.gitnexus');
+    expect(getGlobalDir()).toBe(expected);
+  });
+
+  it('getGlobalRegistryPath is under GITNEXUS_HOME when set', () => {
+    process.env.GITNEXUS_HOME = '/tmp/custom-gitnexus-home';
+    // getGlobalRegistryPath is derived from getGlobalDir; verify transitively
+    // that the override propagates to all callers.
+    const dir = getGlobalDir();
+    expect(dir).toBe('/tmp/custom-gitnexus-home');
+    // The registry file lives directly inside the home dir
+    expect(dir).not.toContain(os.homedir());
+  });
+});
+
+// ─── Guard: registry path is under GITNEXUS_HOME during the test suite ─
+
+describe('test-suite isolation guard (gh #175)', () => {
+  it('resolved global dir is under GITNEXUS_HOME, not the real home', () => {
+    // This test fails loudly if GITNEXUS_HOME was not set by global-setup.ts.
+    // That would mean the test suite is writing to the real ~/.gitnexus —
+    // the regression described in gh #175.
+    const gitnexusHome = process.env.GITNEXUS_HOME;
+    expect(
+      gitnexusHome,
+      'GITNEXUS_HOME must be set by global-setup.ts before any test runs',
+    ).toBeTruthy();
+
+    const resolvedDir = getGlobalDir();
+    expect(
+      resolvedDir,
+      `getGlobalDir() must return GITNEXUS_HOME (${gitnexusHome}), ` +
+        `got: ${resolvedDir}`,
+    ).toBe(gitnexusHome);
+
+    // Extra safety: the tmpdir must NOT be inside the real home dir.
+    const realHome = os.homedir();
+    expect(
+      resolvedDir.startsWith(realHome),
+      `Registry dir (${resolvedDir}) must not be under the real home (${realHome})`,
+    ).toBe(false);
   });
 });

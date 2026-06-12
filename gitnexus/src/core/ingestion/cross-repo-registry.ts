@@ -7,8 +7,8 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import os from 'os';
 import { readManifest, type RepoManifest } from '../../storage/repo-manifest.js';
+import { getGlobalDir } from '../../storage/repo-manager.js';
 
 /**
  * Dependency information with ecosystem details.
@@ -435,7 +435,7 @@ export class CrossRepoRegistry {
   // --- Private helpers ---
 
   private getGlobalRegistryPath(): string {
-    return path.join(os.homedir(), '.gitnexus', 'registry.json');
+    return path.join(getGlobalDir(), 'registry.json');
   }
 
   
