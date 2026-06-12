@@ -104,7 +104,7 @@ withTestLbugDB('source-column-roundtrip', (handle) => {
       sourceId: 'Function:src/x.ts:foo:1',
       targetId: 'Function:src/y.ts:bar:1',
       type: 'CALLS',
-      confidence: 0.7,
+      confidence: 0.9,
       reason: '',
       step: 0,
       source: 'lsp-corrected',
@@ -149,7 +149,7 @@ withTestLbugDB('source-column-roundtrip', (handle) => {
     // above).
     graph.addRelationship({
       id: 'r-confirmed', sourceId: 'Function:src/q.ts:f2:1', targetId: 'Function:src/p.ts:f1:1',
-      type: 'CALLS', confidence: 0.7, reason: '', source: 'lsp-confirmed',
+      type: 'CALLS', confidence: 0.9, reason: '', source: 'lsp-confirmed',
     });
     graph.addRelationship({
       id: 'r-recall', sourceId: 'Function:src/r.ts:f3:1', targetId: 'Function:src/p.ts:f1:1',
@@ -231,7 +231,7 @@ withTestLbugDB('source-column-roundtrip-fallback', (handle) => {
       sourceId: 'Function:src/fb_b.ts:beta:1',
       targetId: 'Function:src/fb_a.ts:alpha:1',
       type: 'CALLS',
-      confidence: 0.7,
+      confidence: 0.9,
       reason: '',
       source: 'lsp-corrected',
     });

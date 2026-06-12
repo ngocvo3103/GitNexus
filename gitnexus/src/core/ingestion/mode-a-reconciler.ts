@@ -784,8 +784,27 @@ function coerceLocation(item: unknown): Location | null {
  */
 export type ModeARelationSource = EdgeSource;
 
-/** Confidence assigned to every `lsp-*` edge (KD-6). */
-export const LSP_CONFIDENCE = 0.7;
+/**
+ * Confidence assigned to `lsp-confirmed` / `lsp-corrected` edges.
+ *
+ * Promoted 0.70 → 0.90 (#159 backlog item ③) on the campaign-159 v3
+ * evidence (2026-06-12): Mode C positionally valid for the first time
+ * (#174, positionCoverage ≥ 0.999), deterministic same-seed reports,
+ * and a Mode A funnel of confirmed:corrected = 237:1 across
+ * GitNexus/hono/zod — direct `textDocument/definition` evidence at the
+ * exact call site, corroborated by (confirm) or replacing (correct)
+ * the heuristic verdict. See the #159 thread for the decision record.
+ */
+export const LSP_CONFIDENCE = 0.9;
+
+/**
+ * Confidence assigned to `lsp-recall` edges — deliberately NOT
+ * promoted with confirm/correct. A recall edge has no heuristic
+ * agreement (the heuristics missed the site entirely); the LSP answer
+ * is one-legged evidence. Stays at 0.70 pending a dedicated
+ * recall-precision check (#159 backlog).
+ */
+export const LSP_RECALL_CONFIDENCE = 0.7;
 
 /** Confidence carried by the heuristic `global` tier (WI-2 feed). */
 export const HEURISTIC_GLOBAL_CONFIDENCE = 0.5;
@@ -1561,7 +1580,12 @@ function makeLspRelationship(d: Decision): GraphRelationship {
     sourceId: d.from,
     targetId: d.to,
     type: relType,
-    confidence: LSP_CONFIDENCE,
+    // ③ promotion split: corrected edges carry the promoted 0.90
+    // (call-site definition evidence replacing a wrong heuristic);
+    // recall edges stay at 0.70 (one-legged evidence — see the
+    // LSP_RECALL_CONFIDENCE doc block).
+    confidence:
+      d.source === 'lsp-recall' ? LSP_RECALL_CONFIDENCE : LSP_CONFIDENCE,
     reason: d.reason,
     source: d.source ?? 'heuristic',
     line: d.candidate.line,

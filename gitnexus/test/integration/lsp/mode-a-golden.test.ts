@@ -1076,7 +1076,7 @@ withTestLbugDB('mode-a-golden', (handle) => {
     // each caller to A. The reconciler's decision table
     // (AC-5 / I-4) says: caller1 → confirm (LSP agrees);
     // caller2 → correct (LSP disagrees) → atomic remove+insert
-    // at 0.70 with `lsp-corrected`. The collapse must keep
+    // at 0.90 with `lsp-corrected`. The collapse must keep
     // the higher-confidence row.
     const graph = createKnowledgeGraph();
     for (const id of ['Function:src/caller1.ts:main:1', 'Function:src/caller2.ts:main:1', 'Function:src/a.ts:target:1', 'Function:src/b.ts:target:1']) {
@@ -1239,7 +1239,7 @@ withTestLbugDB('mode-a-golden', (handle) => {
       sourceId: 'Function:src/q.ts:f2:1',
       targetId: 'Function:src/p.ts:f1:1',
       type: 'CALLS',
-      confidence: 0.7,
+      confidence: 0.9,
       reason: 'lsp-confirmed',
       source: 'lsp-confirmed',
     });
@@ -1278,10 +1278,11 @@ withTestLbugDB('mode-a-golden', (handle) => {
 // drive `applyDecisions` or `runPipelineFromRepo` with a
 // real LSP server. It is a BFS contract test that pins the
 // downstream behavior Mode A's reconciler must produce for.
-// To prove Mode A actually emits a 0.7 edge from a 0.5 input,
+// To prove Mode A actually emits a ≥0.7 edge from a 0.5 input,
 // see the unit-level `applyDecisions` tests in
 // `mode-a-engine.test.ts` (the `correct` action re-stamps
-// confidence to LSP_CONFIDENCE = 0.7).
+// confidence to LSP_CONFIDENCE = 0.9; the `add` action uses
+// LSP_RECALL_CONFIDENCE = 0.7; both pass the BFS floor).
 //
 // The test is still load-bearing for AC-7: if the BFS ever
 // changed the 0.5 / 0.7 classification (e.g. raising the
@@ -1596,9 +1597,10 @@ withTestLbugDB('mode-a-j-lsp', (handle) => {
 
 // ═══════════════════════════════════════════════════════════════════════
 // (AC-7) — Full pipeline end-to-end: runPipelineFromRepo --lsp
-//     → lsp-corrected 0.70 edge → loadGraphToLbug → impacted_endpoints
-//     → corrected route surfaces in LIKELY_AFFECTED (not WILL_BREAK)
-//       under --lsp, absent under parallel default (no-flag) run.
+//     → lsp-corrected 0.90 edge → loadGraphToLbug → impacted_endpoints
+//     → corrected route surfaces in WILL_BREAK (conf 0.90 ≥ 0.85) or
+//       LIKELY_AFFECTED (if lsp-recall path, conf 0.70 < 0.85) under --lsp,
+//       absent under parallel default (no-flag) run.
 //
 // This is the REAL Mode A reconciliation test — it drives
 // `runPipelineFromRepo` (not just `applyDecisions` directly)
@@ -1618,7 +1620,7 @@ withTestLbugDB('mode-a-j-lsp', (handle) => {
 // correction candidate, handing the pipeline a Location that
 // the real in-memory adapter maps to the node B. The real
 // `reconcileDecisions` + `applyDecisions` then mint the
-// lsp-corrected 0.70 edge — no production seam needed.
+// lsp-corrected 0.90 edge (or lsp-recall 0.70 if recall path) — no production seam needed.
 //
 // For the default (no-flag) run, `withReconciliationSession` is
 // never reached (the default path has no lsp gate), so the spy
@@ -1633,12 +1635,14 @@ withTestLbugDB('mode-a-j-lsp', (handle) => {
 //   - ac7-controller.ts: `import { callerFn } from './ac7-caller';`
 //                        `export function ac7Handler(): void { callerFn(); }`
 //
-// The corrected graph has callerFn→helperTarget/B at 0.70.
+// The corrected graph has callerFn→helperTarget/B at 0.90 (lsp-corrected) or
+// 0.70 (lsp-recall). Both pass the BFS min_confidence=0.70 floor.
 // After loadGraphToLbug, we add Route R + handler edges to DB.
 // The diff changes ac7-helper.ts line 0 → BFS:
-//   d=1: callerFn (via callerFn→B at 0.70) ← PASSES 0.70 floor
+//   d=1: callerFn (via callerFn→B at 0.90/0.70) ← PASSES 0.70 floor
 //   d=2: ac7Handler (via ac7Handler→callerFn at 1.0)
-//   → Route GET /ac7-route surfaces in LIKELY_AFFECTED
+//   → Route GET /ac7-route surfaces in WILL_BREAK (if lsp-corrected 0.90 ≥ 0.85)
+//                               or LIKELY_AFFECTED (if lsp-recall 0.70 < 0.85)
 //
 // Under the default path, callerFn→A is at 0.50 → filtered
 // by BFS min_confidence=0.70 → no endpoint surfaces.
@@ -1752,7 +1756,7 @@ withTestLbugDB('mode-a-ac7', (handle) => {
     // finds `helperTarget` at line 0 (startLine=0, endLine=0). The
     // engine's P2 gate passes (Method/Function is callable). Action:
     // `correct` → callerFn→computeTarget(A) becomes callerFn→helperTarget(B)
-    // at 0.70 lsp-corrected.
+    // at 0.90 lsp-corrected (or 0.70 lsp-recall if recall path).
     vi.mocked(withReconciliationSession).mockImplementationOnce(
       async (
         repo: ReconciliationRepo,
@@ -1763,11 +1767,11 @@ withTestLbugDB('mode-a-ac7', (handle) => {
         // Inject Location B for EVERY candidate whose calledName is
         // `computeTarget` — whether it came via the correction feed
         // (has `oldTargetId`) or the recall feed (no `oldTargetId`).
-        // Both paths produce a CALLS edge at 0.70 pointing to B:
-        //   - correction candidate: `lsp-corrected` (preferred, proves B1 chain)
-        //   - recall candidate:    `lsp-recall` (acceptable, same downstream effect)
+        // Both paths produce a CALLS edge pointing to B (BFS passes both):
+        //   - correction candidate: `lsp-corrected` at 0.90 (preferred, proves B1 chain)
+        //   - recall candidate:    `lsp-recall` at 0.70 (acceptable, same BFS reachability)
         // The test asserts `source` is `lsp-corrected` OR `lsp-recall`
-        // (either is a 0.70 lsp-* edge, which BFS passes through).
+        // (both ≥ 0.70 BFS floor, so the route surfaces in either case).
         //
         // Location B: `file:///ac7-helper.ts` normalizes to `ac7-helper.ts`
         // via normalizeLocationUri (strips `file://` + leading `/`), which
@@ -1795,8 +1799,8 @@ withTestLbugDB('mode-a-ac7', (handle) => {
 
     // Run the pipeline with lsp:true — the mock intercepts the ONE
     // `withReconciliationSession` call, the real engine corrects
-    // callerFn→A(0.50) to callerFn→B(0.70), and the result graph
-    // has the lsp-corrected edge.
+    // callerFn→A(0.50) to callerFn→B(0.90 lsp-corrected or 0.70 lsp-recall),
+    // and the result graph has the lsp-augmented edge.
     const lspPipelineResult = await runPipelineFromRepo(
       tmpFixtureDir,
       () => {},
@@ -1804,13 +1808,13 @@ withTestLbugDB('mode-a-ac7', (handle) => {
     );
 
     // Verify the LSP correction/recall happened in-graph (AC-1):
-    // there is at least one CALLS edge at 0.70 with source ∈
+    // there is at least one CALLS edge with source ∈
     // {lsp-corrected, lsp-recall}. The exact action depends on
     // whether `computeTarget()` was resolved by the heuristic
-    // (correction path: oldTargetId set → lsp-corrected) or fell
-    // through to null (recall path: no oldTargetId → lsp-recall).
-    // Both produce a 0.70 CALLS edge pointing to B, which is what
-    // the downstream BFS test requires.
+    // (correction path: oldTargetId set → lsp-corrected at 0.90) or fell
+    // through to null (recall path: no oldTargetId → lsp-recall at 0.70).
+    // Both pass the BFS min_confidence=0.70 floor, so the downstream
+    // impacted_endpoints traversal reaches the route in either case.
     const lspAugmentedEdges = [...lspPipelineResult.graph.iterRelationships()].filter(
       (r) => r.type === 'CALLS' &&
              (r.source === 'lsp-corrected' || r.source === 'lsp-recall'),
@@ -1824,9 +1828,11 @@ withTestLbugDB('mode-a-ac7', (handle) => {
       lspAugmentedEdges.length,
       'AC-1: mock must produce at least one lsp-corrected or lsp-recall CALLS edge',
     ).toBeGreaterThan(0);
-    // Each augmented edge must be at 0.70 (not 0.50, not 1.0).
+    // Each augmented edge must carry the correct confidence for its source:
+    // lsp-corrected → LSP_CONFIDENCE (0.90); lsp-recall → LSP_RECALL_CONFIDENCE (0.70).
     for (const e of lspAugmentedEdges) {
-      expect(e.confidence, 'lsp-augmented edge must carry LSP_CONFIDENCE=0.70').toBe(0.7);
+      const expected = e.source === 'lsp-recall' ? 0.7 : 0.9;
+      expect(e.confidence, `lsp-augmented edge (${e.source}) must carry correct confidence`).toBe(expected);
     }
 
     // Persist the lsp-corrected graph to the shared test DB.
@@ -1848,7 +1854,7 @@ withTestLbugDB('mode-a-ac7', (handle) => {
     //   - Function:ac7-controller.ts:ac7Handler (from ac7-controller.ts)
     //   - Function:ac7-caller.ts:callerFn (from ac7-caller.ts)
     //   - CALLS ac7Handler→callerFn at 1.0 (import-resolved)
-    //   - CALLS callerFn→helperTarget at 0.70 (lsp-corrected) ← from the mock
+    //   - CALLS callerFn→helperTarget at 0.90 (lsp-corrected) or 0.70 (lsp-recall) ← from the mock
     //
     // We still need: Route node + Route→handler edge (routes are not
     // parsed from plain TS files without framework annotations; we seed
@@ -1868,9 +1874,9 @@ withTestLbugDB('mode-a-ac7', (handle) => {
     // ── Run impacted_endpoints against the LSP-corrected DB ─────────
     // Diff: change ac7-helper.ts line 0 (helperTarget's file, the B target).
     // BFS upstream:
-    //   d=1: callerFn (via callerFn→helperTarget at 0.70) — PASSES 0.70 floor
+    //   d=1: callerFn (via callerFn→helperTarget at 0.90/0.70) — PASSES 0.70 floor
     //   d=2: ac7Handler (via ac7Handler→callerFn at 1.0)
-    //   → Route GET /ac7-route surfaces in LIKELY_AFFECTED
+    //   → Route GET /ac7-route surfaces in WILL_BREAK (0.90) or LIKELY_AFFECTED (0.70)
     mockGitDiffJ('ac7-helper.ts', [{ newStart: 1, newCount: 1 }]);
     vi.mocked(listRegisteredRepos as any).mockResolvedValue([
       {
@@ -1945,25 +1951,27 @@ withTestLbugDB('mode-a-ac7', (handle) => {
     }
   });
 
-  it('(AC-7) --lsp run: lsp-augmented 0.70 edge causes GET /ac7-route to surface in LIKELY_AFFECTED, not WILL_BREAK', () => {
+  it('(AC-7) --lsp run: lsp-augmented edge causes GET /ac7-route to surface (WILL_BREAK if lsp-corrected 0.90, LIKELY_AFFECTED if lsp-recall 0.70)', () => {
     // This is the load-bearing AC-7 assertion: the full pipeline chain
-    // (runPipelineFromRepo --lsp → lsp-augmented 0.70 edge →
+    // (runPipelineFromRepo --lsp → lsp-augmented edge →
     // loadGraphToLbug → impacted_endpoints) surfaces the route.
     // If the mock failed to inject the Location, or the engine refused
     // the Location (e.g. helperTarget node not found via in-memory adapter),
-    // or the 0.70 edge wasn't written, or loadGraphToLbug dropped the source
+    // or the edge wasn't written, or loadGraphToLbug dropped the source
     // column, then the BFS would NOT find the route and this assertion FAILS.
     expect(lspResult?.error, 'impacted_endpoints must not error under lsp run').toBeUndefined();
-    const laEntry = lspResult?.impacted_endpoints?.LIKELY_AFFECTED?.find(
-      (e: any) => e.path === '/ac7-route' && e.method === 'GET',
-    );
-    expect(laEntry, 'AC-7: GET /ac7-route must surface in LIKELY_AFFECTED under --lsp run').toBeDefined();
-    // The lsp-augmented edge is at 0.70 (< 0.85 WILL_BREAK floor) so
-    // the tier classifier must land it in LIKELY_AFFECTED, not WILL_BREAK.
+    // The route must surface in WILL_BREAK (lsp-corrected conf=0.90 ≥ 0.85)
+    // OR LIKELY_AFFECTED (lsp-recall conf=0.70 < 0.85); either is valid.
     const wbEntry = lspResult?.impacted_endpoints?.WILL_BREAK?.find(
       (e: any) => e.path === '/ac7-route' && e.method === 'GET',
     );
-    expect(wbEntry, 'AC-7: GET /ac7-route must NOT be in WILL_BREAK (conf=0.70 < 0.85)').toBeUndefined();
+    const laEntry = lspResult?.impacted_endpoints?.LIKELY_AFFECTED?.find(
+      (e: any) => e.path === '/ac7-route' && e.method === 'GET',
+    );
+    expect(
+      wbEntry ?? laEntry,
+      'AC-7: GET /ac7-route must surface in WILL_BREAK (conf=0.90) or LIKELY_AFFECTED (conf=0.70) under --lsp run',
+    ).toBeDefined();
   });
 
   it('(AC-7) default run (no --lsp): heuristic 0.50 edge is filtered; GET /ac7-route is ABSENT from LIKELY_AFFECTED and WILL_BREAK', () => {

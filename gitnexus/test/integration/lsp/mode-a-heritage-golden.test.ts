@@ -578,13 +578,13 @@ describe('WI-6 — heritage decision table: Class-target-for-IMPLEMENTS is refus
 // (h-5) — Corrected IMPLEMENTS at 0.70 with old edge removed by oldRelId
 // ═══════════════════════════════════════════════════════════════════════
 describe('WI-6 — heritage correction: old edge removed by oldRelId', () => {
-  it('(h-5) IMPLEMENTS correct: synthetic heuristic target → real Interface, 0.70 lsp-corrected, old edge removed by oldRelId', () => {
+  it('(h-5) IMPLEMENTS correct: synthetic heuristic target → real Interface, 0.90 lsp-corrected, old edge removed by oldRelId', () => {
     // The graph has the heuristic `UserService →
     // Class:IUserRepo` (synthetic from the global-0.5
     // fallback). The LSP verdict resolves to the REAL
     // Interface node. The engine must issue an atomic
     // correction: add `IMPLEMENTS:UserService->Interface:...
-    // :IUserRepo` at 0.70 lsp-corrected and remove the old
+    // :IUserRepo` at 0.90 lsp-corrected and remove the old
     // edge by exact `oldRelId`. The (h-5) shape mirrors the
     // WI-5 engine test; this is the integration-level proof
     // that the heritage feed's `oldRelId` survives the
@@ -623,7 +623,7 @@ describe('WI-6 — heritage correction: old edge removed by oldRelId', () => {
     expect(decision.source).toBe('lsp-corrected');
     expect(decision.reason).toBe(REASON_LSP_CORRECTED);
     expect(decision.oldRelId, 'oldRelId must be the heuristic edge id, not the new target id').toBe(heuristicRel.id);
-    // The minting code stamps the new edge at LSP_CONFIDENCE (0.70).
+    // The minting code stamps the new edge at LSP_CONFIDENCE (0.90).
     // We can't read the minted edge's confidence from the decision
     // directly — that lives in `applyDecisions`/`makeLspRelationship`.
     // The decision shape (action='correct', source='lsp-corrected',
@@ -636,8 +636,8 @@ describe('WI-6 — heritage correction: old edge removed by oldRelId', () => {
 // ═══════════════════════════════════════════════════════════════════════
 // (h-6) — EXTENDS confirm path (KD-7)
 // ═══════════════════════════════════════════════════════════════════════
-describe('WI-6 — heritage decision table: EXTENDS confirm at 0.70', () => {
-  it('(h-6) EXTENDS confirm: LSP agrees with heuristic → confirm (0.70, restamp oldRelId)', () => {
+describe('WI-6 — heritage decision table: EXTENDS confirm at 0.90', () => {
+  it('(h-6) EXTENDS confirm: LSP agrees with heuristic → confirm (0.90, restamp oldRelId)', () => {
     const cand: Candidate = {
       sourceId: 'Class:src/dog.ts:Dog',
       calledName: 'Animal',

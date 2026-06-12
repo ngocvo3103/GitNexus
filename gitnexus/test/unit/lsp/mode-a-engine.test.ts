@@ -35,6 +35,7 @@ import {
   applyDecisions,
   reconcileDecisions,
   LSP_CONFIDENCE,
+  LSP_RECALL_CONFIDENCE,
   HEURISTIC_GLOBAL_CONFIDENCE,
   REASON_LSP_CONFIRMED,
   REASON_LSP_CORRECTED,
@@ -323,7 +324,7 @@ describe('WI-4b — applyDecisions: mutations', () => {
     const rel = graph.relationships[0];
     expect(rel.sourceId).toBe(cand.sourceId);
     expect(rel.targetId).toBe('Function:src/b.ts:bar');
-    expect(rel.confidence).toBe(LSP_CONFIDENCE);
+    expect(rel.confidence).toBe(LSP_RECALL_CONFIDENCE);
     expect(rel.source).toBe('lsp-recall');
     expect(rel.reason).toBe(REASON_LSP_RECALL);
   });
@@ -788,7 +789,7 @@ describe('WI-4b — applyDecisions dryRun: mutates nothing, returns full tuples'
       sourceId,
       targetId,
       type: 'CALLS',
-      confidence: LSP_CONFIDENCE,
+      confidence: LSP_RECALL_CONFIDENCE,
       reason: 'lsp-recall',
       source: 'lsp-recall',
     });
@@ -1167,8 +1168,11 @@ function vi_fn_no_map() {
 // ─── Confidence + reason constants are pinned ─────────────────────────
 
 describe('WI-4b — exported constants', () => {
-  it('LSP_CONFIDENCE is 0.70 (KD-6)', () => {
-    expect(LSP_CONFIDENCE).toBe(0.7);
+  it('LSP_CONFIDENCE is 0.90 (KD-6)', () => {
+    expect(LSP_CONFIDENCE).toBe(0.9);
+  });
+  it('LSP_RECALL_CONFIDENCE is 0.70 (lsp-recall one-legged evidence)', () => {
+    expect(LSP_RECALL_CONFIDENCE).toBe(0.7);
   });
   it('HEURISTIC_GLOBAL_CONFIDENCE is 0.50', () => {
     expect(HEURISTIC_GLOBAL_CONFIDENCE).toBe(0.5);

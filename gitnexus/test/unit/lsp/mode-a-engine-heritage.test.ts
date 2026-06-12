@@ -16,10 +16,10 @@
  * The heritage branches add:
  *   - `correct` for IMPLEMENTS — synthetic heuristic target
  *     → real Interface node (label ∈ gate), old edge
- *     removed by `oldRelId`, new edge stamped 0.70
+ *     removed by `oldRelId`, new edge stamped 0.90
  *     `lsp-corrected`.
  *   - `confirm` for EXTENDS — id preserved, restamped to
- *     0.70.
+ *     0.90.
  *   - `keep` for Class-target-for-IMPLEMENTS (label gate
  *     refuses).
  *   - `keep` for Interface-target-for-EXTENDS (label gate
@@ -191,7 +191,7 @@ describe('WI-5 — candidateLocationKey: CALLS candidates produce byte-identical
 // ─── Compat pins: decideForCandidate CALLS decisions unchanged ─────────
 
 describe('WI-5 — decideForCandidate: CALLS path decisions are byte-identical vs PR #168', () => {
-  it('CALLS confirm: LSP agrees with heuristic → confirm (0.70, restamp oldRelId)', () => {
+  it('CALLS confirm: LSP agrees with heuristic → confirm (0.90, restamp oldRelId)', () => {
     const cand: Candidate = {
       sourceId: 's1',
       calledName: 'foo',
@@ -290,14 +290,14 @@ describe('WI-5 — reconcileDecisions: heritage decision table', () => {
     return candidateLocationKey(c);
   }
 
-  it('IMPLEMENTS correct: synthetic heuristic target → real Interface node, 0.70 lsp-corrected, old edge removed by oldRelId', async () => {
+  it('IMPLEMENTS correct: synthetic heuristic target → real Interface node, 0.90 lsp-corrected, old edge removed by oldRelId', async () => {
     // Setup: the graph has the heuristic `UserService →
     // Interface:IUserRepo` edge (the synthetic target from
     // `heritage-processor.ts:84-90` global-0.5 path). The
     // LSP verdict resolves to the REAL Interface node. The
     // engine should issue an atomic correction: add
     // `IMPLEMENTS:UserService->Interface:src/repo.ts:IUserRepo`
-    // at 0.70 `lsp-corrected` and remove the old edge by
+    // at 0.90 `lsp-corrected` and remove the old edge by
     // `oldRelId`.
     const graph = createKnowledgeGraph();
     graph.addNode({
@@ -356,7 +356,7 @@ describe('WI-5 — reconcileDecisions: heritage decision table', () => {
     // Setup: heuristic `Dog → Class:Animal` edge; LSP verdict
     // also resolves to the same `Class:Animal` target → the
     // engine re-stamps in place: id preserved, source flipped
-    // to `lsp-confirmed`, confidence raised to 0.70.
+    // to `lsp-confirmed`, confidence raised to 0.90.
     const graph = createKnowledgeGraph();
     graph.addNode({ id: 'Class:src/dog.ts:Dog', label: 'Class', properties: { name: 'Dog' } });
     graph.addNode({ id: 'Class:Animal', label: 'Class', properties: { name: 'Animal' } });
@@ -543,7 +543,7 @@ describe('WI-5 — reconcileDecisions: heritage decision table', () => {
 // ─── Typed minting: makeLspRelationship shape ──────────────────────────
 
 describe('WI-5 — applyDecisions: typed minting for heritage', () => {
-  it('correct on IMPLEMENTS: mints IMPLEMENTS:<from>-><to> edge at 0.70 lsp-corrected', () => {
+  it('correct on IMPLEMENTS: mints IMPLEMENTS:<from>-><to> edge at 0.90 lsp-corrected', () => {
     const graph = createKnowledgeGraph();
     graph.addNode({ id: 'Class:src/a.ts:A', label: 'Class', properties: { name: 'A' } });
     const cand = mkImplementsCandidate({
