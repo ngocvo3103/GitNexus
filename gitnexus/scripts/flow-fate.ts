@@ -663,6 +663,13 @@ export const DEFAULT_PROCESS_QUERY = [
   '  p.label       AS label,',
   '  p.entryPointId AS entryPointId,',
   '  p.terminalId  AS terminalId',
+  // I-4 (byte-identical re-runs): Kùzu returns rows in storage
+  // scan order, which is NOT stable across sessions. The rows
+  // feed `classifyFlowFates`, which preserves input order into
+  // `FateReport.rows` — without a deterministic sort the
+  // serialized artifact differs between re-runs on the same
+  // index. `p.id` is the stable primary key.
+  'ORDER BY p.id ASC',
 ].join('\n');
 
 /** Entry-point-candidate derivation query. The production
@@ -689,6 +696,10 @@ export const ENTRY_POINT_CANDIDATE_QUERY = [
   'MATCH (p:Process)',
   'WHERE p.entryPointId IS NOT NULL',
   'RETURN DISTINCT p.entryPointId AS entryPointId',
+  // I-4: deterministic order for the candidate set (the Set
+  // insertion order is observable nowhere today, but a stable
+  // sort costs nothing and keeps every consumer re-run-stable).
+  'ORDER BY entryPointId ASC',
 ].join('\n');
 
 /** Derive the set of entry-point candidate ids for one repo.

@@ -615,7 +615,13 @@ const realVerifySharedCache: Map<
 > = new Map();
 
 function sharedCacheKey(repoPath: string, lspServerPath: string): string {
-  return `${repoPath}::${lspServerPath}`;
+  // JSON-array key: unambiguous for paths containing any
+  // delimiter character (a `${a}::${b}` template collides for
+  // paths that themselves contain `::`). The cache is keyed for
+  // the future parallel-repo case — a silent collision would
+  // share an LspClient between two different (repoPath,
+  // lspServerPath) pairs with no error.
+  return JSON.stringify([repoPath, lspServerPath]);
 }
 
 /** Acquire (or reuse) the real-verify opts for a

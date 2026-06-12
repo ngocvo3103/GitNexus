@@ -317,12 +317,23 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
   let smokeSubprocessAvailable = true;
   let analyzeSucceeded = false;
   let harnessSucceeded = false;
+  // Review fix (silent-green smoke): every degrade site records
+  // WHY the smoke block is unavailable, the reason is logged once
+  // in beforeAll, and the gated tests call `ctx.skip()` instead of
+  // a bare `return` — so Vitest reports them as SKIPPED, never as
+  // passed-while-exercising-nothing (the #166 vacuity pattern).
+  let smokeSkipReason: string | null = null;
+  const degrade = (reason: string) => {
+    smokeSubprocessAvailable = false;
+    smokeSkipReason = reason;
+    console.warn(`[wi-v-smoke] degraded: ${reason}`);
+  };
 
   beforeAll(() => {
     // 1. Resolve paths.
     const fixtureRoot = join(repoRoot, 'test', 'fixtures', 'mini-repo');
     if (!existsSync(fixtureRoot)) {
-      smokeSubprocessAvailable = false;
+      degrade('fixture test/fixtures/mini-repo not found');
       return;
     }
     // tsx loader URL — same pattern as cli-e2e.test.ts.
@@ -331,21 +342,18 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     const tsxImportUrl = pathToFileURL(join(tsxPkgDir, 'dist', 'loader.mjs')).href;
     const cliEntry = join(repoRoot, 'src', 'cli', 'index.ts');
     if (!existsSync(cliEntry)) {
-      smokeSubprocessAvailable = false;
+      degrade('src/cli/index.ts not found');
       return;
     }
 
     // 2. Copy the canonical fixture into a fresh tmpdir.
     smokeTmp = mkdtempSync(join(tmpdir(), 'wi-v-smoke-'));
-    // Strip any pre-existing .gitnexus — we want a clean state.
-    // The fixture's checked-in .gitnexus/repo_manifest.json
-    // is harmless to leave (analyze overwrites meta.json), but
-    // stripping it guarantees a true "fresh analyze" run.
-    rmSync(join(smokeTmp, '.gitnexus'), { recursive: true, force: true });
-    // Use `cp -R`-equivalent for cross-platform support. The
-    // .gitnexus may have been created by a prior test that
-    // forgot to clean up; we deliberately overwrite.
     cpSync(fixtureRoot, smokeTmp, { recursive: true });
+    // Strip the fixture's checked-in `.gitnexus` AFTER the copy —
+    // this is the operative strip (the tmpdir is freshly created
+    // by mkdtempSync, so there is nothing to clean pre-copy). It
+    // guarantees a true "fresh analyze" run on the copy; the
+    // canonical fixture is never touched.
     rmSync(join(smokeTmp, '.gitnexus'), { recursive: true, force: true });
 
     // 3. Init a git repo so analyze's getCurrentCommit works.
@@ -358,7 +366,7 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     };
     const initResult = spawnSync('git', ['init', '-q'], { cwd: smokeTmp, env: gitEnv });
     if (initResult.status !== 0) {
-      smokeSubprocessAvailable = false;
+      degrade(`git init exited ${initResult.status}`);
       return;
     }
     spawnSync('git', ['add', '-A'], { cwd: smokeTmp, env: gitEnv });
@@ -367,7 +375,7 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
       env: gitEnv,
     });
     if (commitResult.status !== 0) {
-      smokeSubprocessAvailable = false;
+      degrade(`git commit exited ${commitResult.status}`);
       return;
     }
 
@@ -389,13 +397,15 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
       },
     );
     if (analyzeResult.status === null) {
-      // CI timeout — degrade gracefully. The static + unit gates
-      // already pass; the smoke block simply no-ops.
-      smokeSubprocessAvailable = false;
+      // CI timeout — degrade gracefully (skip, not pass). The
+      // static + unit gates still run.
+      degrade('analyze subprocess timed out (60s)');
       return;
     }
     if (analyzeResult.status !== 0) {
-      smokeSubprocessAvailable = false;
+      degrade(
+        `analyze exited ${analyzeResult.status}; stderr tail: ${(analyzeResult.stderr || '').slice(-300)}`,
+      );
       return;
     }
     analyzeSucceeded = true;
@@ -449,6 +459,14 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     );
     if (harnessResult.status === 0) {
       harnessSucceeded = true;
+    } else {
+      // Review fix: surface WHY the harness leg is unavailable —
+      // a silent flag flip hid an LSP-discovery exit behind green
+      // tests. The reason reaches the skip note of every gated
+      // test below.
+      smokeSkipReason =
+        `harness exited ${harnessResult.status}; stderr tail: ${(harnessResult.stderr || '').slice(-300)}`;
+      console.warn(`[wi-v-smoke] harness leg unavailable: ${smokeSkipReason}`);
     }
   }, 120_000);
 
@@ -462,12 +480,11 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     }
   });
 
-  it('analyze produced a meta.json on the tmpdir copy (no canonical fixture mutation)', () => {
+  it('analyze produced a meta.json on the tmpdir copy (no canonical fixture mutation)', (ctx) => {
     if (!smokeSubprocessAvailable) {
-      // The beforeAll flagged an early-exit condition (no
-      // fixture, no CLI entry, git init failure, analyze
-      // timeout). Skip the smoke block — the static + unit
-      // gates still pass.
+      // Real skip (not a silent pass): the beforeAll degraded —
+      // reason was logged by `degrade()`.
+      ctx.skip(`smoke unavailable: ${smokeSkipReason ?? 'unknown'}`);
       return;
     }
     expect(analyzeSucceeded, 'analyze subprocess did not exit 0').toBe(true);
@@ -478,13 +495,14 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     expect(smokeMeta!.stats.nodes).toBeGreaterThan(0);
   });
 
-  it('harness produced a schema-valid JSON artifact with overall.n>0, precision∈[0,1], sampledCap≤50', () => {
+  it('harness produced a schema-valid JSON artifact with overall.n>0, precision∈[0,1], sampledCap≤50', (ctx) => {
     if (!smokeSubprocessAvailable || !harnessSucceeded) {
       // The harness is allowed to fail on machines without an
       // LSP server (the discovery gate enforces this; per I-5,
       // LSP absent is an environment constraint, not a harness
-      // bug). The byte-identity + flow-fate assertions below
-      // are also no-ops in that case.
+      // bug) — but the outcome must be a visible SKIP, never a
+      // green pass that exercised nothing.
+      ctx.skip(`smoke/harness unavailable: ${smokeSkipReason ?? 'unknown'}`);
       return;
     }
     const outDir = join(smokeTmp, 'out');
@@ -550,8 +568,9 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     }
   });
 
-  it('identical re-run produces a byte-identical artifact file (AC-5)', () => {
+  it('identical re-run produces a byte-identical artifact file (AC-5)', (ctx) => {
     if (!smokeSubprocessAvailable || !harnessSucceeded) {
+      ctx.skip(`smoke/harness unavailable: ${smokeSkipReason ?? 'unknown'}`);
       return;
     }
     // The previous assertion already produced one artifact
@@ -600,8 +619,9 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     expect(Buffer.compare(Buffer.from(before, 'utf-8'), Buffer.from(after, 'utf-8'))).toBe(0);
   });
 
-  it('flow-fate --before <tmp> --after <tmp> produces all-stable fates (self-compare)', () => {
+  it('flow-fate --before <tmp> --after <tmp> produces all-stable fates (self-compare)', (ctx) => {
     if (!smokeSubprocessAvailable || !analyzeSucceeded || !smokeMeta) {
+      ctx.skip(`smoke/analyze unavailable: ${smokeSkipReason ?? 'unknown'}`);
       return;
     }
     // Self-compare: the same analyzed tmpdir on both sides.
