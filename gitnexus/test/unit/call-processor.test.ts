@@ -2073,3 +2073,266 @@ describe('processNextjsFetchRoutes', () => {
     expect(rels[0].reason).not.toContain('|fetches:');
   });
 });
+
+// ─── B1: Hook-destructuring unnamed-import guard ──────────────────────────────
+//
+// Mechanism: in TS/TSX files, a hook (e.g. useAppState) returns an object of
+// functions. The caller destructures them: `const { runQuery } = useAppState()`.
+// Then calls `runQuery(...)` as a free function.
+//
+// namedImportMap for the caller contains `useAppState` (the explicit named
+// import) but NOT `runQuery` (which is not directly imported — only available
+// via the hook's return value at runtime).
+//
+// The heuristic's Tier 2a sees `runQuery` in `useAppState.tsx` (which is in
+// importMap) → emits import-scoped at confidence 0.9. But LSP resolves to the
+// *destructuring binding site* (the line inside the caller component where
+// `const { runQuery } = useAppState()` appears), which maps to the *enclosing
+// component function* (e.g., ProcessesPanel) — a completely different nodeId.
+// Result: false-confident edges in the campaign.
+//
+// The guard: when callForm='free', the caller file is .ts/.tsx, namedImportMap
+// has an entry for the caller (the file uses named imports), but the called
+// name is NOT among them → the name was only accessible via hook destructuring
+// → downgrade tier to global so the edge falls below MIN_CONFIDENCE thresholds.
+//
+// The guard MUST NOT fire when:
+//   - namedImportMap has no entry for the caller (non-TS/no-named-import files)
+//   - the called name IS a direct named import (legitimate import-scoped edge)
+//   - callForm is 'member' (receiver-type filtering handles those)
+//   - the caller file is not .ts/.tsx (Python/Go whole-module imports)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('hook-destructuring unnamed-import guard (B1)', () => {
+  let graph: ReturnType<typeof createKnowledgeGraph>;
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    graph = createKnowledgeGraph();
+    ctx = createResolutionContext();
+  });
+
+  it('downgrades hook-destructured free call to global when name not in namedImportMap', async () => {
+    // useAppState.tsx exports runQuery (a useCallback-returned function)
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'runQuery',
+      'Function:src/hooks/useAppState.tsx:runQuery', 'Function');
+
+    // ProcessesPanel.tsx imports useAppState (named import), NOT runQuery
+    ctx.importMap.set('src/components/ProcessesPanel.tsx',
+      new Set(['src/hooks/useAppState.tsx']));
+    ctx.namedImportMap.set('src/components/ProcessesPanel.tsx', new Map([
+      ['useAppState', { sourcePath: 'src/hooks/useAppState.tsx', exportedName: 'useAppState' }],
+    ]));
+
+    // The call is free-form: runQuery(cypher) — obtained via destructuring
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/components/ProcessesPanel.tsx',
+      calledName: 'runQuery',
+      sourceId: 'Function:src/components/ProcessesPanel.tsx:ProcessesPanel',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Must be global (not import-resolved) — hook-destructured name was not a direct import
+    expect(rels[0].reason).toBe('global');
+    // Confidence must be TIER_CONFIDENCE['global'] = 0.5, not 0.9
+    expect(rels[0].confidence).toBe(0.5);
+  });
+
+  it('keeps import-resolved for directly named imports (guard must NOT fire)', async () => {
+    // generateId IS a direct named import in src/utils.ts
+    ctx.symbols.add('src/lib/utils.ts', 'generateId',
+      'Function:src/lib/utils.ts:generateId', 'Function');
+
+    ctx.importMap.set('src/core/ingestion/import-processor.ts',
+      new Set(['src/lib/utils.ts']));
+    ctx.namedImportMap.set('src/core/ingestion/import-processor.ts', new Map([
+      ['generateId', { sourcePath: 'src/lib/utils.ts', exportedName: 'generateId' }],
+    ]));
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/core/ingestion/import-processor.ts',
+      calledName: 'generateId',
+      sourceId: 'Function:src/core/ingestion/import-processor.ts:processImports',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Direct named import — stays import-resolved at 0.9
+    expect(rels[0].reason).toBe('import-resolved');
+    expect(rels[0].confidence).toBe(0.9);
+  });
+
+  it('guard does not fire for Python whole-module imports (no namedImportMap entry)', async () => {
+    // Python: `from utils import errors` → log_safe_exception is in errors.py
+    // namedImportMap has NO entry for mcp_bridge.py (Python does not use named-binding tracking)
+    ctx.symbols.add('eval/utils/errors.py', 'log_safe_exception',
+      'Function:eval/utils/errors.py:log_safe_exception', 'Function');
+
+    ctx.importMap.set('eval/bridge/mcp_bridge.py',
+      new Set(['eval/utils/errors.py']));
+    // No namedImportMap entry for mcp_bridge.py
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'eval/bridge/mcp_bridge.py',
+      calledName: 'log_safe_exception',
+      sourceId: 'Function:eval/bridge/mcp_bridge.py:start',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Python has no namedImportMap entry → guard skips → import-resolved stays
+    expect(rels[0].reason).toBe('import-resolved');
+    expect(rels[0].confidence).toBe(0.9);
+  });
+
+  it('guard does not fire for member calls (receiver-type filtering handles those)', async () => {
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'runQuery',
+      'Function:src/hooks/useAppState.tsx:runQuery', 'Function');
+
+    ctx.importMap.set('src/components/ProcessesPanel.tsx',
+      new Set(['src/hooks/useAppState.tsx']));
+    ctx.namedImportMap.set('src/components/ProcessesPanel.tsx', new Map([
+      ['useAppState', { sourcePath: 'src/hooks/useAppState.tsx', exportedName: 'useAppState' }],
+    ]));
+
+    // member call: state.runQuery() — not a free call
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/components/ProcessesPanel.tsx',
+      calledName: 'runQuery',
+      sourceId: 'Function:src/components/ProcessesPanel.tsx:ProcessesPanel',
+      callForm: 'member',
+      receiverName: 'state',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // member call — guard does not apply → stays import-resolved
+    expect(rels[0].reason).toBe('import-resolved');
+    expect(rels[0].confidence).toBe(0.9);
+  });
+
+  it('guard does not fire when namedImportMap entry exists but is empty', async () => {
+    // An empty entry means the import-processor built an entry but found no named bindings
+    // (e.g., a grouped import that was fully resolved to a file). Treat as "no named constraints".
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'runQuery',
+      'Function:src/hooks/useAppState.tsx:runQuery', 'Function');
+
+    ctx.importMap.set('src/components/ProcessesPanel.tsx',
+      new Set(['src/hooks/useAppState.tsx']));
+    // Empty map entry — no named bindings captured
+    ctx.namedImportMap.set('src/components/ProcessesPanel.tsx', new Map());
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/components/ProcessesPanel.tsx',
+      calledName: 'runQuery',
+      sourceId: 'Function:src/components/ProcessesPanel.tsx:ProcessesPanel',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Empty namedImportMap entry → guard does not fire → import-resolved stays
+    expect(rels[0].reason).toBe('import-resolved');
+    expect(rels[0].confidence).toBe(0.9);
+  });
+
+  it('guard fires for .ts caller file (not just .tsx)', async () => {
+    ctx.symbols.add('src/hooks/useStore.ts', 'dispatch',
+      'Function:src/hooks/useStore.ts:dispatch', 'Function');
+
+    // .ts caller that imports useStore but calls dispatch (from destructuring)
+    ctx.importMap.set('src/services/api.ts', new Set(['src/hooks/useStore.ts']));
+    ctx.namedImportMap.set('src/services/api.ts', new Map([
+      ['useStore', { sourcePath: 'src/hooks/useStore.ts', exportedName: 'useStore' }],
+    ]));
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/services/api.ts',
+      calledName: 'dispatch',
+      sourceId: 'Function:src/services/api.ts:handleRequest',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].reason).toBe('global');
+    expect(rels[0].confidence).toBe(0.5);
+  });
+
+  it('guard fires for .jsx caller file', async () => {
+    ctx.symbols.add('src/hooks/useTheme.js', 'toggle',
+      'Function:src/hooks/useTheme.js:toggle', 'Function');
+
+    ctx.importMap.set('src/components/Header.jsx', new Set(['src/hooks/useTheme.js']));
+    ctx.namedImportMap.set('src/components/Header.jsx', new Map([
+      ['useTheme', { sourcePath: 'src/hooks/useTheme.js', exportedName: 'useTheme' }],
+    ]));
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/components/Header.jsx',
+      calledName: 'toggle',
+      sourceId: 'Function:src/components/Header.jsx:Header',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].reason).toBe('global');
+    expect(rels[0].confidence).toBe(0.5);
+  });
+
+  it('multiple hook-destructured calls from same component all downgrade', async () => {
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'runQuery',
+      'Function:src/hooks/useAppState.tsx:runQuery', 'Function');
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'isDatabaseReady',
+      'Function:src/hooks/useAppState.tsx:isDatabaseReady', 'Function');
+
+    ctx.importMap.set('src/components/QueryFAB.tsx',
+      new Set(['src/hooks/useAppState.tsx']));
+    ctx.namedImportMap.set('src/components/QueryFAB.tsx', new Map([
+      ['useAppState', { sourcePath: 'src/hooks/useAppState.tsx', exportedName: 'useAppState' }],
+    ]));
+
+    const calls: ExtractedCall[] = [
+      {
+        filePath: 'src/components/QueryFAB.tsx',
+        calledName: 'isDatabaseReady',
+        sourceId: 'Function:src/components/QueryFAB.tsx:QueryFAB',
+        callForm: 'free',
+      },
+      {
+        filePath: 'src/components/QueryFAB.tsx',
+        calledName: 'runQuery',
+        sourceId: 'Function:src/components/QueryFAB.tsx:QueryFAB',
+        callForm: 'free',
+      },
+    ];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(2);
+    for (const rel of rels) {
+      expect(rel.reason).toBe('global');
+      expect(rel.confidence).toBe(0.5);
+    }
+  });
+});

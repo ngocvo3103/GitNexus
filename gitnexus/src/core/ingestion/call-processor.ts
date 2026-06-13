@@ -1078,6 +1078,50 @@ const resolveCallTarget = (
     return null;
   }
 
+  // B1: Unnamed-import guard — hook-destructuring false-confident fix.
+  //
+  // Pattern: a TS/TSX/JS/JSX component imports a hook (`import { useAppState }
+  // from './hooks/useAppState'`) then destructures its return value:
+  //   `const { runQuery, isDatabaseReady } = useAppState();`
+  // and calls the destructured functions as free calls: `runQuery(cypher)`.
+  //
+  // Tier 2a sees `runQuery` in `useAppState.tsx` (which IS in importMap for the
+  // caller) → emits import-scoped (0.9). But LSP resolves to the *destructuring
+  // binding site* inside the caller — e.g. the line where `runQuery` appears in
+  // the destructure object pattern. The location-mapper maps that site to the
+  // *enclosing React component function* (ProcessesPanel, AppContent, …) — a
+  // completely different nodeId → false-confident.
+  //
+  // Guard conditions (ALL must hold to downgrade):
+  //   1. Tier is import-scoped (guard is irrelevant for other tiers).
+  //   2. Caller file is JS/TS (.js / .jsx / .ts / .tsx) — named-import
+  //      invariants differ in other languages (Python, C#, PHP, Ruby: whole-
+  //      module imports or `using static` bring names in without a named
+  //      binding entry; those files have no namedImportMap entry anyway).
+  //   3. callForm is 'free' — member calls are handled by receiver-type
+  //      filtering (step D above); guard skipping them avoids double-counting.
+  //   4. namedImportMap HAS a NON-EMPTY entry for the caller file (the file
+  //      uses named imports; an empty entry or no entry means the guard is
+  //      inapplicable — the import-processor did not record named bindings).
+  //   5. The called name is NOT in that entry (it was not directly imported;
+  //      it only appeared in an imported file because the hook returns it).
+  //
+  // Action: downgrade to global tier. The edge is still emitted (the heuristic
+  // is often directionally correct — runQuery IS in useAppState.tsx) but at
+  // global confidence (0.5) so it falls below MIN_CONFIDENCE_LARGE and
+  // MIN_TRACE_CONFIDENCE thresholds and does not pollute Leiden clustering or
+  // execution-flow tracing.
+  if (
+    tiered.tier === 'import-scoped' &&
+    call.callForm === 'free' &&
+    /\.[jt]sx?$/.test(currentFile)
+  ) {
+    const namedForCaller = ctx.namedImportMap.get(currentFile);
+    if (namedForCaller !== undefined && namedForCaller.size > 0 && !namedForCaller.has(call.calledName)) {
+      return toResolveResult(filteredCandidates[0], 'global');
+    }
+  }
+
   return toResolveResult(filteredCandidates[0], tiered.tier);
 };
 
