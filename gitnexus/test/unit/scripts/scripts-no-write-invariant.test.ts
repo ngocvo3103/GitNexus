@@ -102,6 +102,7 @@ const repoRoot = resolve(here, '..', '..', '..');
 const scriptsDir = join(repoRoot, 'scripts');
 const measureModeCPath = join(scriptsDir, 'measure-mode-c.ts');
 const flowFatePath = join(scriptsDir, 'flow-fate.ts');
+const auditRecallPath = join(scriptsDir, 'audit-recall-precision.ts');
 const scriptsTsconfigPath = join(repoRoot, 'tsconfig.scripts.json');
 const vitestConfigPath = join(repoRoot, 'vitest.config.ts');
 
@@ -182,6 +183,38 @@ describe('WI-V — scripts no-write invariant (KD-8 / I-2)', () => {
     // Companion: executeQuery (the write-dispatch token) must never
     // appear in flow-fate regardless of the allowLifecycle flag.
     expect(src).not.toMatch(/\bexecuteQuery\s*\(/);
+  });
+
+  it('audit-recall-precision.ts passes assertNoGraphWriteImports (the production helper)', () => {
+    // allowLifecycle:true — the recall-precision audit (#159) calls
+    // initLbug/closeLbug to open the cold pool before reading
+    // lsp-recall CodeRelation rows via executeParameterized (read-only
+    // dispatch). The lifecycle tokens are permitted; all graph-write
+    // dispatch tokens (executeQuery, addNode, …) remain banned — the
+    // companion assertion below enforces the write-dispatch side
+    // independently so neither check can be silently dropped.
+    const src = readScriptSource(auditRecallPath);
+    const { ok, violations } = assertNoGraphWriteImports(src, { allowLifecycle: true });
+    expect(
+      ok,
+      `forbidden write-API symbols in scripts/audit-recall-precision.ts: ${violations.join(', ')}`,
+    ).toBe(true);
+    expect(violations).toEqual([]);
+    // Companion: executeQuery (the write-dispatch token) must never
+    // appear regardless of the allowLifecycle flag.
+    expect(src).not.toMatch(/\bexecuteQuery\s*\(/);
+  });
+
+  it('audit-recall-precision.ts does NOT statically import executeParameterized (dynamic-only)', () => {
+    // Same KD-8 dynamic-only discipline as flow-fate: the audit loads
+    // the lbug-adapter read API via a runtime dynamic import so the
+    // static source-text sweep never sees a static import.
+    const raw = readScriptSource(auditRecallPath);
+    const stripped = raw
+      .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+      .replace(/\/\/[^\n]*/g, (m) => m.replace(/[^\n]/g, ' '));
+    expect(stripped).not.toMatch(/import\b[^\n;]*\bexecuteParameterized\b/);
+    expect(stripped).toMatch(/import\(\s*['"][^'"]*dist[^'"]*lbug-adapter[^'"]*['"]/);
   });
 
   it('measure-mode-c.ts does NOT statically import runModeCVerify (dynamic-only)', () => {
