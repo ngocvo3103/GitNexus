@@ -44,7 +44,8 @@ import {
   type MessageConnection,
 } from 'vscode-languageserver-protocol/node';
 
-import { discoverOne, TYPESCRIPT_LANGUAGE_SERVER_BIN } from './server-discovery.js';
+import { discoverOne } from './server-discovery.js';
+import { type LanguageAdapter, type AdapterReadyCtx, TYPESCRIPT_ADAPTER } from './language-adapter.js';
 
 // ─── Public types ─────────────────────────────────────────────────────
 
@@ -79,6 +80,15 @@ export interface LspClientOptions {
    * resolves to `null` until `stop()`.
    */
   maxRestarts?: number;
+  /**
+   * Per-language adapter. Supplies the server binary name,
+   * spawn arguments, `languageId`, and `initializationOptions`.
+   * Defaults to `TYPESCRIPT_ADAPTER` so all callers that omit
+   * this field get byte-identical TS behaviour (binary discovery
+   * walks `typescript-language-server`, spawn args `['--stdio']`,
+   * languageId `'typescript'`, TS_INITIALIZATION_OPTIONS).
+   */
+  adapter?: LanguageAdapter;
   /**
    * Optional factory hook used by tests to inject a fake
    * subprocess + a fake JSON-RPC connection. Production code
@@ -178,8 +188,11 @@ const sleep = (ms: number): Promise<void> =>
  * shape (preferences: includeCompletionsForModuleExports etc.
  * are *not* set — we want default behavior to keep the byte
  * stability of the analyzer).
+ *
+ * Exported so `language-adapter.ts` can import the single source of
+ * truth instead of maintaining a local copy (WI-4 requirement).
  */
-const TS_INITIALIZATION_OPTIONS: Record<string, unknown> = {
+export const TS_INITIALIZATION_OPTIONS: Record<string, unknown> = {
   hostInfo: 'gitnexus-lsp-client',
   // Disable the install/run-on-save hooks the TS server exposes
   // for ts-execute-command; we never use them.
@@ -232,6 +245,7 @@ export class LspClient {
   private readonly binaryOverride: string | null;
   private readonly maxRestarts: number;
   private readonly inject: LspClientOptions['_inject'];
+  private readonly adapter: LanguageAdapter;
 
   /**
    * Realpath-resolved workspace root, computed once lazily.
@@ -263,6 +277,7 @@ export class LspClient {
     this.binaryOverride = opts.binaryPath ?? null;
     this.maxRestarts = opts.maxRestarts ?? MAX_RESTARTS;
     this.inject = opts._inject;
+    this.adapter = opts.adapter ?? TYPESCRIPT_ADAPTER;
   }
 
   // ─── Public API ─────────────────────────────────────────────────
@@ -402,7 +417,12 @@ export class LspClient {
    * notification on the wire — even if the wire is busy with a
    * prior request.
    */
-  async didOpen(uri: string, content: string, languageId = 'typescript'): Promise<void> {
+  async didOpen(uri: string, content: string, languageId?: string): Promise<void> {
+    // Default the languageId to the adapter's value so callers
+    // that omit it automatically get the correct per-language id.
+    // We cannot use a parameter default that references `this`, so
+    // we resolve the default here at the top of the method body.
+    const resolvedLanguageId = languageId ?? this.adapter.languageId;
     const fileUri = uri.startsWith('file://') ? uri : pathToFileUri(uri);
     // Synchronous dedupe BEFORE the queue chain — this is the
     // idempotency guarantee the spec asks for. If we deferred
@@ -424,7 +444,7 @@ export class LspClient {
         await this.connection.sendNotification('textDocument/didOpen', {
           textDocument: {
             uri: fileUri,
-            languageId,
+            languageId: resolvedLanguageId,
             version: 1,
             text: content,
           },
@@ -577,8 +597,10 @@ export class LspClient {
   private async spawnAndInitialize(): Promise<boolean> {
     // Resolve binary (memoize so a degraded -> start cycle
     // doesn't re-discover if the caller already gave us a
-    // path).
-    if (!this.resolvedBinary) {
+    // path). Binary resolution is skipped entirely when `_inject`
+    // is set — the inject factory replaces both the subprocess
+    // and the connection, so there is no binary to locate.
+    if (!this.resolvedBinary && !this.inject) {
       if (this.binaryOverride) {
         this.resolvedBinary = this.binaryOverride;
       } else {
@@ -590,7 +612,7 @@ export class LspClient {
         // in any parent directory of `process.cwd()`. We pass
         // the client-owned `workspaceRoot` so Source 1 stops
         // at the workspace boundary.
-        const discovered = await discoverOne(TYPESCRIPT_LANGUAGE_SERVER_BIN, {
+        const discovered = await discoverOne(this.adapter.serverBinary, {
           workspaceRoot: this.workspaceRoot,
         });
         if (!discovered) {
@@ -609,10 +631,14 @@ export class LspClient {
       connection = fake.connection;
     } else {
       try {
-        proc = spawn(this.resolvedBinary, ['--stdio'], {
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        });
+        proc = spawn(
+          this.resolvedBinary,
+          this.adapter.spawnArgs({ workspaceRoot: this.workspaceRoot }),
+          {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
+          },
+        );
       } catch {
         return false;
       }
@@ -670,7 +696,7 @@ export class LspClient {
       rootUri,
       capabilities: TS_SERVER_CAPABILITIES,
       workspaceFolders: [{ uri: rootUri, name: 'root' }],
-      initializationOptions: TS_INITIALIZATION_OPTIONS,
+      initializationOptions: this.adapter.initializationOptions as Record<string, unknown>,
     };
 
     let initResult: InitializeResult;
@@ -705,6 +731,30 @@ export class LspClient {
       this.cleanupAfterFailure();
       return false;
     }
+
+    // Post-initialized warm-up gate (KD-1, WI-4b / #172 class).
+    // The adapter decides when the server is actually ready to
+    // serve requests — jdtls needs background indexing to
+    // complete; the TS adapter no-ops to `true` immediately so
+    // the TS path is byte-identical to pre-change.
+    // A throw inside `awaitReady` degrades to `false` (no
+    // leak into the caller), matching the surrounding handshake
+    // discipline above.
+    try {
+      const ctx: AdapterReadyCtx = {
+        connection,
+        workspaceRoot: this.workspaceRoot,
+        // deadlineMs omitted → adapter default (120 000 ms for jdtls)
+      };
+      if (!(await this.adapter.awaitReady(ctx))) {
+        this.cleanupAfterFailure();
+        return false;
+      }
+    } catch {
+      this.cleanupAfterFailure();
+      return false;
+    }
+
     return true;
   }
 
@@ -886,7 +936,7 @@ export class LspClient {
       await this.connection.sendNotification('textDocument/didOpen', {
         textDocument: {
           uri,
-          languageId: 'typescript',
+          languageId: this.adapter.languageId,
           version: 1,
           text: content,
         },

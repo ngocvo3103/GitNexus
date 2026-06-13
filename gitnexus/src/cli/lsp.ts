@@ -49,6 +49,17 @@ export interface LspCommandOptions {
  */
 export interface LspDoctorReport {
   typescript: { path: string; version: string } | null;
+  /**
+   * Java (jdtls) discovery. Additive (#159 Java funnel): `undefined`
+   * preserves the pre-Java report shape for downstream `jq` consumers
+   * that only read `.typescript`/`.workspace`; `null` means jdtls was
+   * looked up and not found; an object means it was located. We report
+   * DISCOVERY only here (path + version) — not a full jdtls workspace
+   * warm-up, which is expensive and is exercised by `verify --lsp`.
+   * `version` may be `'unknown'` for jdtls: it spins a JVM on `--version`
+   * and prints no version token, but the located binary still works.
+   */
+  java?: { path: string; version: string } | null;
   workspace: { ready: boolean; reason?: string };
 }
 
@@ -147,8 +158,17 @@ async function runDoctor(options?: LspCommandOptions): Promise<void> {
     }
   }
 
+  // Java (jdtls) discovery — additive. `servers.java` is `undefined`
+  // when absent (the omitted-key contract from `discoverServers`); we
+  // normalize to `null` so the report distinguishes "looked up, not
+  // found" (null) from "not part of this report" — and only include
+  // the key when something was found, keeping the legacy report shape
+  // byte-identical for TS-only repos.
+  const javaInfo = servers.java ?? null;
+
   const report: LspDoctorReport = {
     typescript: tsInfo ? { path: tsInfo.path, version: tsInfo.version } : null,
+    ...(javaInfo ? { java: { path: javaInfo.path, version: javaInfo.version } } : {}),
     workspace: { ready, ...(reason ? { reason } : {}) },
   };
 
@@ -161,16 +181,32 @@ async function runDoctor(options?: LspCommandOptions): Promise<void> {
   //   - absent  → "NOT FOUND (install to enable --lsp)"
   //   - present + ready    → "found vX.Y · workspace ready ✓"
   //   - present + unready  → "found vX.Y · workspace NOT ready: <reason>"
+  //
+  // The TypeScript line is printed FIRST — it is the primary/default
+  // surface and downstream tooling (and tests) key on the report's
+  // leading line being `typescript-language-server:`. The Java line is
+  // an additive, discovery-only line printed after it.
   if (!tsInfo) {
     writeSync(1, 'typescript-language-server: NOT FOUND (install to enable --lsp)\n');
-    return;
+  } else {
+    const state = ready
+      ? 'ready ✓'
+      : reason
+        ? `NOT ready: ${reason}`
+        : 'unknown';
+    writeSync(1, `typescript-language-server: found v${tsInfo.version} · workspace ${state}\n`);
   }
-  const state = ready
-    ? 'ready ✓'
-    : reason
-      ? `NOT ready: ${reason}`
-      : 'unknown';
-  writeSync(1, `typescript-language-server: found v${tsInfo.version} · workspace ${state}\n`);
+
+  // Java (jdtls) discovery line — additive, discovery-only. Always
+  // surfaces (even on a TS-less repo) so the operator can see whether
+  // `--lsp` is usable on Java repos. jdtls reports `version: 'unknown'`
+  // (slow/silent --version) but is still usable.
+  if (javaInfo) {
+    writeSync(1, `jdtls: found v${javaInfo.version} (java --lsp available)\n`);
+  } else {
+    writeSync(1, 'jdtls: NOT FOUND (install to enable --lsp on Java repos)\n');
+  }
+
   // Informational exit; never 1.
   process.exit(0);
 }

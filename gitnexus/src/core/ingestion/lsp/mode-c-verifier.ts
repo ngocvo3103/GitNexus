@@ -60,9 +60,10 @@
 import type { LspClient } from './lsp-client.js';
 import type { MapperResult } from './location-mapper.js';
 import type { ResolutionTier } from '../resolution-context.js';
+import type { LanguageAdapter } from './language-adapter.js';
 import { executeParameterized } from '../../../mcp/core/lbug-adapter.js';
 import { pathToFileURL } from 'node:url';
-import { isAbsolute as pathIsAbsolute, resolve as pathResolve } from 'node:path';
+import { isAbsolute as pathIsAbsolute, resolve as pathResolve, normalize as pathNormalize } from 'node:path';
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -159,8 +160,18 @@ export interface RunModeCVerifyOpts {
    * (legacy behavior).
    */
   repoPath?: string;
-  /** Maps an LSP Location to a graph nodeId. Default: real `mapLocationToNodeId`. */
-  mapLocationToNodeId: (loc: any, repoId: string) => Promise<MapperResult>;
+  /**
+   * Maps an LSP Location to a graph nodeId. Default: real `mapLocationToNodeId`.
+   *
+   * The optional third argument is a partial `MapperDeps` bag. When
+   * `opts.adapter` is set, `classifyEdge` passes
+   * `{ classifyUri: adapter.classifyUri }` here so the mapper short-circuits
+   * non-workspace URIs (e.g. `jdt://`) before the `file://` normalisation path.
+   * The type is `any` for the deps bag so callers are not forced to import
+   * `MapperDeps` — the production default (`mapLocationToNodeId`) accepts the
+   * real type; injected test doubles that ignore the third arg are unaffected.
+   */
+  mapLocationToNodeId: (loc: any, repoId: string, deps?: any) => Promise<MapperResult>;
   /** Read-only Cypher dispatch. Default: `executeParameterized`. */
   executeParameterized: (
     repoId: string,
@@ -185,6 +196,22 @@ export interface RunModeCVerifyOpts {
   requestTimeoutMs?: number;
   /** Optional sink for diagnostic logs (e.g. the "cap reached" warning). */
   logger?: { warn: (msg: string) => void; info?: (msg: string) => void };
+  /**
+   * The active `LanguageAdapter` selected for this repo (KD-4).
+   *
+   * When present, `classifyEdge` threads `adapter.classifyUri` into
+   * the `mapLocationToNodeId` call so that language-specific URIs
+   * (e.g. `jdt://` for Java decompiled/stdlib defs) are explicitly
+   * refused as external rather than falling through to the generic
+   * NO_NODE path.  This is the Mode-C pass-through (WI-7): no
+   * classification logic of its own — the adapter's `classifyUri`
+   * carries the language-specific verdict.
+   *
+   * When absent (default), the TS path is byte-identical to
+   * pre-WI-7: `classifyUri` is not passed to the mapper and only
+   * `file://` URIs that match repo paths are resolved.
+   */
+  adapter?: LanguageAdapter;
 }
 
 // ─── Defaults ──────────────────────────────────────────────────────────
@@ -643,6 +670,21 @@ async function classifyEdge(
     pathIsAbsolute(edge.sourceFile) || !opts.repoPath
       ? edge.sourceFile
       : pathResolve(opts.repoPath, edge.sourceFile);
+
+  // Defense-in-depth (M9/S5): if `edge.sourceFile` is a DB-poisoned path
+  // (e.g. `../../etc/passwd`) `pathResolve` would produce a path outside the
+  // repo root. Sending that path as a `file://` URI to the LSP server is a
+  // path-traversal risk — the server may read and parse files outside the
+  // workspace. Refuse the edge before constructing the URI.
+  if (opts.repoPath && pathIsAbsolute(absSourceFile)) {
+    const normalizedRepo = pathNormalize(pathResolve(opts.repoPath));
+    const normalizedFile = pathNormalize(absSourceFile);
+    if (!normalizedFile.startsWith(normalizedRepo + '/') && normalizedFile !== normalizedRepo) {
+      // Path escapes the repo root — refuse this edge (never guess).
+      return edge.heuristicTarget === '' ? 'recallMisses' : 'refusals';
+    }
+  }
+
   let uri: string;
   try {
     uri = pathIsAbsolute(absSourceFile)
@@ -702,7 +744,18 @@ async function classifyEdge(
     // target.
     return 'refusals';
   } else {
-    mapperResult = await opts.mapLocationToNodeId(locations[0], opts.repoId);
+    // WI-7 (KD-3): when an adapter is active, thread its `classifyUri`
+    // into the mapper so language-specific URI schemes (e.g. `jdt://` from
+    // jdtls) are explicitly refused as external-refusal rather than falling
+    // through to the generic NO_NODE path. This is the production seam that
+    // makes `opts.adapter` drive actual behaviour — the mapper's KD-3 block
+    // fires on `classifyUri: 'external'` → `{ kind: 'NO_NODE', external: true }`.
+    // TS path (no adapter): third arg is undefined → mapper skips KD-3 block
+    // entirely, byte-identical to pre-WI-7.
+    const mapperDeps = opts.adapter
+      ? { classifyUri: (u: string) => opts.adapter!.classifyUri(u) }
+      : undefined;
+    mapperResult = await opts.mapLocationToNodeId(locations[0], opts.repoId, mapperDeps);
   }
 
   // ── Map the verdict ────────────────────────────────────────────────
