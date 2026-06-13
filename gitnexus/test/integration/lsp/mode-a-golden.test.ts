@@ -96,7 +96,7 @@ import * as fsPromises from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
 import { runPipelineFromRepo, type PipelineResult } from '../../../src/core/ingestion/pipeline.js';
-import { withReconciliationSession, LSP_CONFIDENCE as _LSP_CONFIDENCE } from '../../../src/core/ingestion/mode-a-reconciler.js';
+import { withReconciliationSession, LSP_CONFIDENCE as _LSP_CONFIDENCE, LSP_CONFIDENCE, LSP_RECALL_CONFIDENCE } from '../../../src/core/ingestion/mode-a-reconciler.js';
 import type {
   Candidate,
   Location,
@@ -1769,9 +1769,9 @@ withTestLbugDB('mode-a-ac7', (handle) => {
         // (has `oldTargetId`) or the recall feed (no `oldTargetId`).
         // Both paths produce a CALLS edge pointing to B (BFS passes both):
         //   - correction candidate: `lsp-corrected` at 0.90 (preferred, proves B1 chain)
-        //   - recall candidate:    `lsp-recall` at 0.70 (acceptable, same BFS reachability)
+        //   - recall candidate:    `lsp-recall` at 0.90 (WILL_BREAK, ≥ 0.85, same BFS reachability)
         // The test asserts `source` is `lsp-corrected` OR `lsp-recall`
-        // (both ≥ 0.70 BFS floor, so the route surfaces in either case).
+        // (both ≥ 0.85 WILL_BREAK threshold, so the route surfaces in WILL_BREAK in either case).
         //
         // Location B: `file:///ac7-helper.ts` normalizes to `ac7-helper.ts`
         // via normalizeLocationUri (strips `file://` + leading `/`), which
@@ -1829,9 +1829,9 @@ withTestLbugDB('mode-a-ac7', (handle) => {
       'AC-1: mock must produce at least one lsp-corrected or lsp-recall CALLS edge',
     ).toBeGreaterThan(0);
     // Each augmented edge must carry the correct confidence for its source:
-    // lsp-corrected → LSP_CONFIDENCE (0.90); lsp-recall → LSP_RECALL_CONFIDENCE (0.70).
+    // lsp-corrected → LSP_CONFIDENCE (0.90); lsp-recall → LSP_RECALL_CONFIDENCE (0.90, promoted from 0.70).
     for (const e of lspAugmentedEdges) {
-      const expected = e.source === 'lsp-recall' ? 0.7 : 0.9;
+      const expected = e.source === 'lsp-recall' ? LSP_RECALL_CONFIDENCE : LSP_CONFIDENCE;
       expect(e.confidence, `lsp-augmented edge (${e.source}) must carry correct confidence`).toBe(expected);
     }
 
@@ -1951,7 +1951,7 @@ withTestLbugDB('mode-a-ac7', (handle) => {
     }
   });
 
-  it('(AC-7) --lsp run: lsp-augmented edge causes GET /ac7-route to surface (WILL_BREAK if lsp-corrected 0.90, LIKELY_AFFECTED if lsp-recall 0.70)', () => {
+  it('(AC-7) --lsp run: lsp-augmented edge causes GET /ac7-route to surface (WILL_BREAK — lsp-recall now lands at 0.90)', () => {
     // This is the load-bearing AC-7 assertion: the full pipeline chain
     // (runPipelineFromRepo --lsp → lsp-augmented edge →
     // loadGraphToLbug → impacted_endpoints) surfaces the route.
@@ -1960,8 +1960,8 @@ withTestLbugDB('mode-a-ac7', (handle) => {
     // or the edge wasn't written, or loadGraphToLbug dropped the source
     // column, then the BFS would NOT find the route and this assertion FAILS.
     expect(lspResult?.error, 'impacted_endpoints must not error under lsp run').toBeUndefined();
-    // The route must surface in WILL_BREAK (lsp-corrected conf=0.90 ≥ 0.85)
-    // OR LIKELY_AFFECTED (lsp-recall conf=0.70 < 0.85); either is valid.
+    // The route must surface in WILL_BREAK: lsp-corrected conf=0.90 ≥ 0.85,
+    // and lsp-recall conf=0.90 (promoted from 0.70) ≥ 0.85 — both land in WILL_BREAK.
     const wbEntry = lspResult?.impacted_endpoints?.WILL_BREAK?.find(
       (e: any) => e.path === '/ac7-route' && e.method === 'GET',
     );

@@ -20,6 +20,7 @@ import { extractDependencies } from './dependency-extractor.js';
 // `core/ingestion/mode-a-reconciler.ts` and mutates ONLY the in-memory
 // graph; it imports no direct-DB writer (I-7).
 import { withReconciliationSession, applyDecisions, reconcileDecisions, candidateLocationKey, type Candidate, type Location, type ReconciliationReport } from './mode-a-reconciler.js';
+import { selectAdapter } from './lsp/language-adapter.js';
 import { mapLocationToNodeId } from './lsp/location-mapper.js';
 import { createInMemoryNodeQuery, type InMemoryNode } from './in-memory-node-query.js';
 import { writeManifest } from '../../storage/repo-manifest.js';
@@ -750,6 +751,22 @@ export const runPipelineFromRepo = async (
         dedupedCandidates.push(c);
       }
 
+      // WI-6 (#159 P3): select the language adapter once for this
+      // repo. `selectAdapter` performs an extension census (KD-4)
+      // and returns the dominant adapter or `null` (no supported
+      // language). A `null` result is passed directly into the
+      // session deps — the session short-circuits cleanly and
+      // returns `null` without spawning anything.
+      //
+      // The adapter is threaded through three DI seams:
+      //   1. `adapter` dep → session selects server binary + args.
+      //   2. `probe` override → `buildCanarySamples` uses
+      //      `adapter.canary` strategy so Java repos sample `.java`
+      //      files instead of TypeScript files.
+      //   3. `defaultCreateLspClient` → `LspClient` receives the
+      //      adapter and spawns the correct binary.
+      const lspAdapter = selectAdapter(repoPath);
+
       // The session funnel is the single refuse path. The
       // per-candidate `textDocument/definition` requests are
       // issued inside it; the responses are collected into
@@ -779,12 +796,23 @@ export const runPipelineFromRepo = async (
           return { meta, selectedCount: selected.length, skipped };
         },
         {
+          // WI-6: pass the selected adapter (or null) so the
+          // session can pick the correct discovered server and
+          // spawn the correct binary. null → session short-circuits.
+          adapter: lspAdapter,
           // probe: wire a real canary-based readiness check.
           // The `defaultProbe` in mode-a-reconciler.ts passes
           // empty samples → probe always refuses (structural no-op).
           // We override it here with `buildCanarySamples` so the
-          // session can actually gate on whether the TS server has
+          // session can actually gate on whether the server has
           // resolved the workspace module graph.
+          //
+          // WI-6: pass `{ strategy: lspAdapter.canary }` so the
+          // sampler uses the correct language strategy — Java repos
+          // scan `.java` files; TS repos scan `.ts`/`.tsx`/etc.
+          // `adapter.canary` may be `null` for stub adapters
+          // (pre-WI-2); `buildCanarySamples` falls back to
+          // TS_CANARY_STRATEGY safely in that case.
           //
           // The probe signature wants the full `LspClient`; the
           // session narrows it to `ReconciliationLspClient` for the
@@ -793,12 +821,12 @@ export const runPipelineFromRepo = async (
           // in this codepath) — a structural cast is sound but TS
           // can't prove it without the double-as. Mirrors the
           // casting pattern in defaultProbe (mode-a-reconciler.ts).
-          probe: async (client) => {
+          probe: lspAdapter === null ? undefined : async (client) => {
             const { probeWorkspaceReadiness } = await import('./lsp/workspace-readiness-probe.js');
             const { buildCanarySamples } = await import('./lsp/canary-sampler.js');
             return probeWorkspaceReadiness(
               client as unknown as import('./lsp/lsp-client.js').LspClient,
-              await buildCanarySamples(repoPath),
+              await buildCanarySamples(repoPath, { strategy: lspAdapter.canary }),
               { perRequestTimeoutMs: 3000 },
             );
           },
@@ -838,7 +866,22 @@ export const runPipelineFromRepo = async (
         locations,
         {
           mapLocationToNodeId: (loc, repoId) =>
-            mapLocationToNodeId(loc, repoId, { executeParameterized: inMemoryQuery, repoPath }),
+            mapLocationToNodeId(loc, repoId, {
+              executeParameterized: inMemoryQuery,
+              repoPath,
+              // KD-3: thread the adapter's URI classifier so jdt:// and
+              // classpath:// URIs returned by jdtls are explicitly refused as
+              // external (NO_NODE + external:true) rather than traversing the
+              // full DB-query path and returning a plain NO_NODE. For Java repos
+              // where 30–50% of CALLS target stdlib/Spring types, this avoids
+              // hundreds of avoidable in-memory Cypher queries per run and
+              // correctly flags each such refusal as an external one (not a
+              // recall-miss) in any downstream metric.
+              // Defensive null-guard: lspAdapter is non-null at this code path
+              // (the session gate above short-circuits when lspAdapter is null),
+              // but an optional-chain is cleaner than an assertion.
+              classifyUri: lspAdapter?.classifyUri.bind(lspAdapter),
+            }),
           repoId: ctx.repoId ?? 'default',
           skipped: sessionSkipped,
         },

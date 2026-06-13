@@ -35,6 +35,7 @@ import {
   __test__,
 } from '../../../src/core/ingestion/lsp/mode-c-verifier.js';
 import { mapLocationToNodeId, type MapperResult } from '../../../src/core/ingestion/lsp/location-mapper.js';
+import { JAVA_ADAPTER, TYPESCRIPT_ADAPTER } from '../../../src/core/ingestion/lsp/language-adapter.js';
 import type { LspClient } from '../../../src/core/ingestion/lsp/lsp-client.js';
 import { withTestLbugDB } from '../../helpers/test-indexed-db.js';
 import { LOCAL_BACKEND_SEED_DATA } from '../../fixtures/local-backend-seed.js';
@@ -349,6 +350,171 @@ withTestLbugDB('mode-c-verifier', (handle) => {
       expect(customMapper).not.toHaveBeenCalled();
       // matches + falseConfident = 0 (nothing was classified).
       expect(report.overall.matches + report.overall.falseConfident).toBe(0);
+    });
+  });
+
+  // ─── WI-7: adapter pass-through — jdt:// external-refusal bucketing ──
+  //
+  // These tests exercise the acceptance criteria for WI-7:
+  //   AC: a Java edge whose def resolves to `jdt://` is bucketed as
+  //       external-refusal (refusals), NOT recall-miss.
+  //
+  // Technique: inject a synthetic positioned CALLS row (via a custom
+  // executeParameterized that returns a mock row with sourceLine/sourceCol)
+  // so the edge is sampled. The mock LSP client returns a `jdt://` URI.
+  // The mapper is called with `JAVA_ADAPTER.classifyUri` as `classifyUri`
+  // dep, which returns `'external'` for `jdt://` URIs → mapper returns
+  // `{ kind: 'NO_NODE', external: true }` → `classifyEdge` returns
+  // `'refusals'` (never `'recallMisses'`).
+
+  describe('WI-7 — adapter pass-through: jdt:// external-refusal vs recall-miss', () => {
+    it('jdt:// LSP location → refusals bucket, NOT recall-miss (JAVA_ADAPTER.classifyUri)', async () => {
+      // Synthetic positioned CALLS row: heuristic target is empty (''),
+      // so without classifyUri the fallback branch would be:
+      //   locations===[] → recallMisses (heuristicNull)
+      // But with the jdt:// URI from LSP (non-empty locations array),
+      // the flow is: classifyUri('jdt://...') = 'external' →
+      //   mapper returns { kind:'NO_NODE', external:true } →
+      //   classifyEdge → 'refusals' (Invariant 3: refuse over guess).
+      const jdtUri = 'jdt://contents/java/util/List.class?=project/src%3Cjava.util(List.class';
+
+      // Executor returns one synthetic positioned edge.
+      const syntheticRow = {
+        sourceFile: 'src/Main.java',
+        sourceLine: 10,        // node startLine (non-NaN)
+        sourceName: 'main',
+        sourceId: 'func:main',
+        targetFile: 'src/Service.java',
+        targetStartLine: 5,
+        targetEndLine: 20,
+        targetName: 'process',
+        targetId: '',          // heuristic null — caller couldn't resolve target
+        confidence: 0.7,
+        reason: 'import-resolved',
+        callLine: 15,          // positioned: probed at line 15
+        callCol: 8,
+      };
+      const syntheticExecutor = vi.fn(async () => [syntheticRow]);
+
+      // Mock LSP returns the jdt:// URI (simulates Java stdlib ref).
+      const jdtClient = makeMockClient({
+        defaultImpl: async () => [
+          { uri: jdtUri, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } },
+        ],
+      });
+
+      // Mapper threaded with JAVA_ADAPTER.classifyUri (WI-7 pattern).
+      const javaMapper = vi.fn(async (loc: any, repoId: string): Promise<MapperResult> =>
+        mapLocationToNodeId(loc, repoId, {
+          classifyUri: (uri) => JAVA_ADAPTER.classifyUri(uri),
+        }),
+      );
+
+      const report = await runModeCVerify({
+        repoId: handle.repoId,
+        client: jdtClient,
+        adapter: JAVA_ADAPTER,
+        mapLocationToNodeId: javaMapper,
+        executeParameterized: syntheticExecutor,
+        probe: readyProbe,
+        sampleSize: 200,
+        hardCap: 200,
+        seed: 'wi7-jdt-refusal',
+      });
+
+      // The jdt:// location was classified as external-refusal.
+      // Invariant: it MUST go to refusals, NOT recall-miss.
+      expect(report.overall.n).toBe(1);
+      expect(report.overall.refusals).toBe(1);
+      expect(report.overall.recallMisses).toBe(0);
+      // The mapper was called exactly once (one sampled edge).
+      expect(javaMapper).toHaveBeenCalledTimes(1);
+      // The mapper received the jdt:// location.
+      const calledLoc = javaMapper.mock.calls[0][0];
+      expect(calledLoc?.uri).toBe(jdtUri);
+    });
+
+    it('workspace file:// LSP location → verifies normally (JAVA_ADAPTER pass-through)', async () => {
+      // Synthetic positioned CALLS row: heuristic target is 'func:process'.
+      // LSP returns a workspace file:// URI. The mapper (with JAVA_ADAPTER.classifyUri)
+      // classifies it as 'workspace' and resolves it normally.
+      // Since the mapper can't find the node in the seeded DB by that file path,
+      // it returns NO_NODE — which routes to refusals. What we assert is:
+      //   - recallMisses === 0 (the edge had a heuristic target, so it's refusals
+      //     even if LSP can't find it — heuristicNull is false)
+      //   - the workspace path flows through classifyUri='workspace' correctly
+      const workspaceUri = 'file:///project/src/Service.java';
+
+      const syntheticRow = {
+        sourceFile: 'src/Main.java',
+        sourceLine: 10,
+        sourceName: 'main',
+        sourceId: 'func:main',
+        targetFile: 'src/Service.java',
+        targetStartLine: 5,
+        targetEndLine: 20,
+        targetName: 'process',
+        targetId: 'func:process',  // heuristic has a target
+        confidence: 0.9,
+        reason: 'import-resolved',
+        callLine: 15,
+        callCol: 4,
+      };
+      const syntheticExecutor = vi.fn(async () => [syntheticRow]);
+
+      // LSP returns a workspace file:// location.
+      const workspaceClient = makeMockClient({
+        defaultImpl: async () => [
+          { uri: workspaceUri, range: { start: { line: 5, character: 0 }, end: { line: 5, character: 7 } } },
+        ],
+      });
+
+      // Mapper with JAVA_ADAPTER.classifyUri — workspace URIs pass through.
+      const javaMapper = vi.fn(async (loc: any, repoId: string): Promise<MapperResult> =>
+        mapLocationToNodeId(loc, repoId, {
+          classifyUri: (uri) => JAVA_ADAPTER.classifyUri(uri),
+        }),
+      );
+
+      const report = await runModeCVerify({
+        repoId: handle.repoId,
+        client: workspaceClient,
+        adapter: JAVA_ADAPTER,
+        mapLocationToNodeId: javaMapper,
+        executeParameterized: syntheticExecutor,
+        probe: readyProbe,
+        sampleSize: 200,
+        hardCap: 200,
+        seed: 'wi7-workspace-normal',
+      });
+
+      // Edge was sampled and classified.
+      expect(report.overall.n).toBe(1);
+      // A workspace file:// URI with no matching DB node → NO_NODE → refusals.
+      // NOT recallMisses (because heuristicTarget !== '').
+      // The key invariant: classifyUri('file://...') = 'workspace' → continues
+      // normal mapping → result is refusals/matches/false-confident (never
+      // incorrectly routed by classifyUri to external-refusal).
+      expect(report.overall.recallMisses).toBe(0);
+      // The mapper was called (workspace URI flows through, not short-circuited).
+      expect(javaMapper).toHaveBeenCalledTimes(1);
+    });
+
+    it('TS adapter classifyUri treats jdt:// as unmappable (not external)', async () => {
+      // TYPESCRIPT_ADAPTER.classifyUri('jdt://...') returns 'unmappable'
+      // (not 'external'): the TS adapter never sees jdt:// URIs in
+      // production, but the contract is well-defined — 'unmappable' means
+      // NO_NODE without the external flag. This test pins that contract.
+      expect(TYPESCRIPT_ADAPTER.classifyUri('jdt://contents/java/util/List.class')).toBe('unmappable');
+      expect(TYPESCRIPT_ADAPTER.classifyUri('file:///project/src/foo.ts')).toBe('workspace');
+    });
+
+    it('JAVA_ADAPTER.classifyUri distinguishes jdt:// (external) from file:// (workspace)', () => {
+      // Pin the JAVA_ADAPTER.classifyUri contract: the exact mapping that
+      // drives the external-refusal bucketing in WI-7.
+      expect(JAVA_ADAPTER.classifyUri('jdt://contents/java/lang/Object.class')).toBe('external');
+      expect(JAVA_ADAPTER.classifyUri('file:///project/src/Main.java')).toBe('workspace');
+      expect(JAVA_ADAPTER.classifyUri('classpath://rt.jar!/java/util/List.class')).toBe('unmappable');
     });
   });
 }, {

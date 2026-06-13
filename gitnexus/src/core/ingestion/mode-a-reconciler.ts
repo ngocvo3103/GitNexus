@@ -54,6 +54,8 @@
 import { LspClient } from './lsp/lsp-client.js';
 import type { ProbeResult, Sample } from './lsp/workspace-readiness-probe.js';
 import { type MapperResult, isUnindexablePath } from './lsp/location-mapper.js';
+import { type LanguageAdapter, TYPESCRIPT_ADAPTER } from './lsp/language-adapter.js';
+import type { DiscoveredServers } from './lsp/server-discovery.js';
 import type { GraphRelationship, KnowledgeGraph, EdgeSource } from '../graph/types.js';
 import { CALLABLE_SYMBOL_TYPES } from './call-processor.js';
 import { generateId } from '../../lib/utils.js';
@@ -206,10 +208,28 @@ export type HandToEngineFn = (
  * `vi.fn()`s to bypass subprocess spawning.
  */
 export interface WithReconciliationSessionDeps {
-  /** Override the `discoverServers` call (default: real one). */
-  discoverServers?: () => Promise<{
-    typescript: { path: string; version: string } | null;
-  }>;
+  /**
+   * Language adapter to use for this session (WI-6).
+   *
+   * - `undefined` (not set)  → backward-compatible default: `TYPESCRIPT_ADAPTER`.
+   *   This preserves the pre-WI-6 behaviour for all existing tests that inject
+   *   `discoverServers` / `createLspClient` without specifying a language.
+   * - `null` → caller explicitly signals no supported language; the session
+   *   short-circuits and returns `null` without spawning anything.
+   * - A `LanguageAdapter` → use the supplied adapter (e.g. `JAVA_ADAPTER`).
+   *
+   * Production callers (pipeline.ts) always pass the result of
+   * `selectAdapter(repoPath)` — which may be `null` for repos with no
+   * supported language files — so the null-short-circuit fires correctly.
+   */
+  adapter?: LanguageAdapter | null;
+  /**
+   * Override the `discoverServers` call (default: real one).
+   * Returns a `DiscoveredServers` map with one entry per supported language.
+   * Existing tests that return `{ typescript: … }` are structurally
+   * compatible (the `java` field is optional on `DiscoveredServers`).
+   */
+  discoverServers?: () => Promise<DiscoveredServers>;
   /**
    * Override the `LspClient` factory (default: real one with
    * `repo.repoPath` as the workspaceRoot). Called ONCE per
@@ -271,25 +291,28 @@ const TEXT_DOCUMENT_DEFINITION = 'textDocument/definition';
 // ─── Defaults: real-foundation wiring ─────────────────────────────────
 
 /** Real `discoverServers` indirection. Lazy-imported for cold-start cost. */
-async function defaultDiscoverServers(): Promise<{
-  typescript: { path: string; version: string } | null;
-}> {
+async function defaultDiscoverServers(): Promise<DiscoveredServers> {
   const { discoverServers } = await import('./lsp/server-discovery.js');
   return discoverServers();
 }
 
 /**
- * Real `LspClient` factory. Lazy-imported for the same reason
- * as `defaultDiscoverServers` — keep cold-start cheap and let
- * the test bag short-circuit module loading.
+ * Real `LspClient` factory (adapter-aware, WI-6).
+ *
+ * Passing `adapter` ensures the client spawns the correct binary
+ * (`typescript-language-server` or `jdtls`) with the correct
+ * `spawnArgs`, `languageId`, and `initializationOptions`.
+ * Defaults to `TYPESCRIPT_ADAPTER` when called from the legacy
+ * `undefined`-adapter code path (backward compat).
+ *
+ * No cast needed: the concrete `LspClient` is structurally a
+ * `ReconciliationLspClient` (it has the four required members:
+ * `start`, `stop`, `request`, `getState`). The narrow seam lets
+ * the session accept test fakes that don't inherit the concrete
+ * class.
  */
-function defaultCreateLspClient(repo: ReconciliationRepo): ReconciliationLspClient {
-  // No cast needed: the concrete `LspClient` is structurally a
-  // `ReconciliationLspClient` (it has the four required members:
-  // start, stop, request, getState). The narrow seam lets the
-  // session accept test fakes that don't inherit the concrete
-  // class.
-  return new LspClient({ workspaceRoot: repo.repoPath });
+function defaultCreateLspClient(repo: ReconciliationRepo, adapter: LanguageAdapter): ReconciliationLspClient {
+  return new LspClient({ workspaceRoot: repo.repoPath, adapter });
 }
 
 /**
@@ -356,7 +379,25 @@ export async function withReconciliationSession<T>(
   fn: ReconciliationFn<T>,
   deps: WithReconciliationSessionDeps = {},
 ): Promise<T | null> {
-  // ── 0) Prepare feeds (deterministic-prefix selection, KD-9) ───────
+  // ── 0) Adapter selection (WI-6 / KD-4) ──────────────────────────
+  // Three-way semantics on `deps.adapter`:
+  //   undefined → backward-compatible default: TYPESCRIPT_ADAPTER.
+  //     Preserves pre-WI-6 behaviour for all existing tests that
+  //     inject `discoverServers` / `createLspClient` without naming
+  //     a language. `??` cannot express this because it also coalesces
+  //     `null`, so we use an explicit `!== undefined` check.
+  //   null      → caller explicitly signals no supported language
+  //     (e.g. pipeline.ts called `selectAdapter(repoPath)` and got
+  //     null). Short-circuit: no server, no client, return null.
+  //   LanguageAdapter → use the supplied adapter (TS, Java, …).
+  const adapter: LanguageAdapter | null =
+    deps.adapter !== undefined ? deps.adapter : TYPESCRIPT_ADAPTER;
+  if (adapter === null) {
+    // No supported language detected — skip the funnel cleanly.
+    return null;
+  }
+
+  // ── 0b) Prepare feeds (deterministic-prefix selection, KD-9) ───────
   // Stable-sort the merged feed by (sourceId, calledName, line,
   // character) — the four-tuple identifies a call site
   // uniquely within a repo. JS `Array.prototype.sort` is
@@ -373,18 +414,26 @@ export async function withReconciliationSession<T>(
   // `discoverServers` is a pure async function — never throws,
   // never installs. Absence is the most common case and the
   // funnel treats it as "refuse → null" with zero side effects.
+  // WI-6: pick the discovered entry for this adapter's language
+  // (`adapter.id` is `'typescript'` | `'java'`), not hardcoded
+  // `.typescript`. This is the sole wiring change in the funnel —
+  // the language-agnostic session body (`:353-464`) is untouched.
   const discover = deps.discoverServers ?? defaultDiscoverServers;
   const discovered = await discover();
-  if (!discovered.typescript) {
-    // No server. No client was created → no stop needed.
+  const serverEntry = (discovered as Record<string, { path: string; version: string } | null | undefined>)[adapter.id] ?? null;
+  if (!serverEntry) {
+    // No server for this adapter's language. No client was created → no stop needed.
     return null;
   }
-  const serverVersion = deps.serverVersion ?? discovered.typescript.version;
+  const serverVersion = deps.serverVersion ?? serverEntry.version;
 
   // ── 2) Client construction + start (G2) ───────────────────────────
   // The factory is called AFTER discovery succeeds so a missing
   // binary doesn't waste a client object.
-  const factory = deps.createLspClient ?? defaultCreateLspClient;
+  // WI-6: inline the adapter-aware default so the factory closes
+  // over the selected adapter (TS or Java) — the module-level
+  // `defaultCreateLspClient` now accepts adapter as second arg.
+  const factory = deps.createLspClient ?? ((r: ReconciliationRepo) => defaultCreateLspClient(r, adapter));
   const client = factory(repo);
   try {
     await client.start();

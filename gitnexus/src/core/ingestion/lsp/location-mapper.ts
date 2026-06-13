@@ -15,8 +15,13 @@
  * Contract:
  *   mapLocationToNodeId(loc, repoId, deps?) →
  *     | { kind: 'node', nodeId }
- *     | { kind: 'NO_NODE' }
+ *     | { kind: 'NO_NODE'; external?: boolean }
  *     | { kind: 'AMBIGUOUS' }
+ *
+ * The `external` flag on NO_NODE (WI-5/KD-3) distinguishes an explicit
+ * language-adapter refusal (e.g. a `jdt://` URI from jdtls) from a
+ * genuine recall-miss. Mode-C uses this to bucket external-refusals
+ * separately rather than counting them as recall-misses.
  *
  * Hard rules (mirroring the spec):
  *   - Refuse over guess (#3). A wrong nodeId silently corrupts every
@@ -61,7 +66,7 @@ export type Location = {
 
 export type MapperResult =
   | { kind: 'node'; nodeId: string }
-  | { kind: 'NO_NODE' }
+  | { kind: 'NO_NODE'; external?: boolean }
   | { kind: 'AMBIGUOUS' };
 
 /**
@@ -80,6 +85,23 @@ export interface MapperDeps {
   generateId: (label: string, name: string) => string;
   /** Same shape as `lib/utils.normalizeFilePath`. Default: real fn. */
   normalizeFilePath: (p: string) => string;
+  /**
+   * URI classifier from the active `LanguageAdapter` (KD-3).
+   *
+   * Called with the raw LSP URI *before* any path normalisation.
+   * Must return one of three buckets:
+   *   - `'workspace'`   → normal `file://` URI inside the repo; continue mapping.
+   *   - `'external'`    → `jdt://` / decompiled / stdlib URI; refuse immediately
+   *                       with `{ kind: 'NO_NODE', external: true }`.
+   *   - `'unmappable'`  → URI scheme the adapter cannot handle; refuse with
+   *                       `{ kind: 'NO_NODE' }` (no `external` flag).
+   *
+   * **When absent (TS callers):** the KD-3 block is skipped entirely —
+   * the URI flows directly into the existing `file://` normalisation path,
+   * byte-identical to pre-WI-5 behaviour.  No caller of the default TS
+   * pipeline is affected.
+   */
+  classifyUri?: (uri: string) => 'workspace' | 'external' | 'unmappable';
   /**
    * Absolute path to the repository root. When set, the mapper
    * rebases the LSP URI's absolute filesystem path to a repo-relative
@@ -358,6 +380,30 @@ export async function mapLocationToNodeId(
     normalizeFilePath,
     ...(deps ?? {}),
   };
+
+  // ── 0) KD-3: classify the URI before any path work ───────────────
+  // The active LanguageAdapter supplies `classifyUri` (optional).
+  // When absent (all existing TS callers), this block is skipped
+  // entirely — the TS path is byte-identical to pre-WI-5.
+  //
+  // A `jdt://` URI returned by jdtls for decompiled / stdlib classes
+  // MUST never resolve to a graph node (Invariant I-3, design KD-3).
+  // We refuse explicitly here so the refusal is visible at the mapper
+  // boundary and carries `external:true` for callers (e.g.
+  // mode-c-verifier) that want to distinguish "not in the graph
+  // because it's a stdlib/decompiled symbol" from "not in the graph
+  // because we just haven't indexed this file yet".
+  if (resolvedDeps.classifyUri) {
+    const rawUri = loc?.uri ?? '';
+    const uriClass = resolvedDeps.classifyUri(rawUri);
+    if (uriClass === 'external') {
+      return { kind: 'NO_NODE', external: true };
+    }
+    if (uriClass === 'unmappable') {
+      return { kind: 'NO_NODE' };
+    }
+    // uriClass === 'workspace' → fall through to normal file:// handling.
+  }
 
   // ── 1) Normalize URI → repo-relative POSIX path ───────────────────
   // EdgeCase 3 (node_modules / .d.ts) + EdgeCase 10 (Windows

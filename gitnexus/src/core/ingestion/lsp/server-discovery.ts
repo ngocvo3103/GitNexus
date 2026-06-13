@@ -31,14 +31,20 @@ export interface DiscoveredServer {
   version: string;
 }
 
-/** Result of `discoverServers()`. Each value is null when the
- *  language's server could not be located through any source. */
+/** Result of `discoverServers()`. Each value is null/undefined when the
+ *  language's server could not be located through any source.
+ *  `java` is undefined (omitted) when absent so that callers that only
+ *  destructure `typescript` see no change — a strictly additive widening. */
 export type DiscoveredServers = {
   typescript: DiscoveredServer | null;
+  java?: DiscoveredServer | null;
 };
 
 /** The binary basename we look up for TypeScript. Exported for tests. */
 export const TYPESCRIPT_LANGUAGE_SERVER_BIN = 'typescript-language-server';
+
+/** The binary basename we look up for Java (jdtls). Exported for tests. */
+export const JDTLS_BIN = 'jdtls';
 
 /**
  * Find the nearest ancestor directory that contains a
@@ -190,36 +196,88 @@ export function parseVersion(rawOutput: string): string {
 }
 
 /**
- * Spawn `binaryPath` with `--version` and return its stdout
- * trimmed. Never throws — a missing binary, non-zero exit, or
- * timeout all yield `null`.
+ * Outcome of a `--version` probe. We must distinguish three cases
+ * so `finalize` can honor its documented intent ("the version may
+ * be unknown, but the server is still there") WITHOUT resurrecting
+ * a binary that genuinely is not on disk:
+ *
+ *   - `{ ran: true,  stdout }` — the binary executed (any exit code,
+ *     any stdout, including an empty string or a non-version banner).
+ *     The server EXISTS; the version may parse or fall back to
+ *     `'unknown'`.
+ *   - `{ ran: false }`         — the binary could not be executed at
+ *     all (`ENOENT`/`EACCES` — it is not a runnable file at that
+ *     path). The located path is a phantom; drop it.
+ *
+ * The load-bearing case (#159 jdtls): `jdtls --version` spins a full
+ * JVM that exceeds the 5s cap and is killed with `ETIMEDOUT`, and
+ * even when allowed to finish it prints only a logback/spifly banner
+ * to STDERR (never a version token to stdout). Both of those are
+ * `ran: true` outcomes — the server is on PATH and launchable, it is
+ * simply slow and silent about its version. The pre-fix code mapped
+ * BOTH the timeout-throw and the absent-binary-throw to the same
+ * `null`, so `finalize` dropped the located jdtls and `discoverServers()`
+ * omitted the `java` key — collapsing the whole Java funnel.
  */
-function runVersion(binaryPath: string): string | null {
+type VersionProbe = { ran: true; stdout: string } | { ran: false };
+
+/**
+ * Spawn `binaryPath` with `--version`. Never throws.
+ *
+ * Returns `{ ran: true, stdout }` whenever the process was actually
+ * launched — INCLUDING the timeout case (`ETIMEDOUT`: the binary was
+ * spawned and then killed for being slow) and the non-zero-exit case
+ * (the binary ran and chose to exit non-zero). Only a spawn-level
+ * failure that proves the path is not an executable file
+ * (`ENOENT` / `EACCES` / `ENOTDIR`) maps to `{ ran: false }`.
+ *
+ * Rationale: the caller already proved the file EXISTS via
+ * `fs.statSync` before we get here, so "located + launchable but
+ * slow/silent" must NOT be conflated with "absent". A slow JVM-class
+ * server (jdtls) is a first-class supported case.
+ */
+function runVersion(binaryPath: string): VersionProbe {
   try {
     const stdout = execFileSync(binaryPath, ['--version'], {
       stdio: ['ignore', 'pipe', 'ignore'],
       windowsHide: true,
       timeout: 5_000,
     }).toString();
-    return stdout;
-  } catch {
-    return null;
+    return { ran: true, stdout };
+  } catch (err: unknown) {
+    // Distinguish "could not launch the binary at all" from "launched
+    // but slow / non-zero / silent". `execFileSync` surfaces the OS
+    // spawn error code on `.code`; a process that launched and was then
+    // killed for timeout carries `ETIMEDOUT`, and a process that ran and
+    // exited non-zero carries a numeric `.status` with no spawn-error
+    // `.code`. Only the genuine "not a runnable file" codes drop it.
+    const code = (err as { code?: string } | null)?.code;
+    if (code === 'ENOENT' || code === 'EACCES' || code === 'ENOTDIR') {
+      return { ran: false };
+    }
+    // ETIMEDOUT, non-zero exit, malformed output, or any other runtime
+    // failure: the binary was launchable. Keep it; version is unknown.
+    return { ran: true, stdout: '' };
   }
 }
 
 /**
  * Finalize a candidate path: spawn `--version`, parse, return
- * a `DiscoveredServer` or `null` if the binary refused to
- * cooperate. We accept "I exist and printed anything" as
- * evidence — the version may be `unknown`, but the server is
- * still there.
+ * a `DiscoveredServer` or `null` if the binary could not be
+ * launched at all. We accept "I exist and was launchable" as
+ * evidence — the version may be `unknown` (slow/silent server,
+ * e.g. jdtls), but the server is still there.
  */
 function finalize(candidatePath: string): DiscoveredServer | null {
-  const rawVersion = runVersion(candidatePath);
-  if (rawVersion === null) return null;
+  const probe = runVersion(candidatePath);
+  // Only drop the located path if the binary genuinely could not be
+  // launched (phantom path / not executable). A launchable-but-silent
+  // binary is kept with version 'unknown' — honoring the documented
+  // intent and unblocking JVM-class servers whose --version is slow.
+  if (!probe.ran) return null;
   return {
     path: candidatePath,
-    version: parseVersion(rawVersion),
+    version: parseVersion(probe.stdout),
   };
 }
 
@@ -297,10 +355,14 @@ function tryNpx(binaryName: string): DiscoveredServer | null {
 }
 
 /**
- * Discover the `typescript-language-server` binary. Returns
- * `{ typescript: { path, version } }` on success, or
- * `{ typescript: null }` if the server is not found through
- * any of the three resolution sources.
+ * Discover language-server binaries. Returns a `DiscoveredServers` map
+ * with one entry per supported language. Each value is `null` when the
+ * server is not found through any of the three resolution sources.
+ *
+ * Currently discovered:
+ *   - `typescript`: `typescript-language-server`
+ *   - `java`: `jdtls` (PATH source hits `/opt/homebrew/bin/jdtls`;
+ *              node_modules source is a harmless miss for jdtls)
  *
  * Order (per spec, KD-3):
  *   1. node_modules/.bin walking up from cwd
@@ -308,10 +370,20 @@ function tryNpx(binaryName: string): DiscoveredServer | null {
  *   3. npx fallback
  *
  * Never throws. Never installs.
+ *
+ * NOTE: `java` is omitted (undefined) when jdtls is absent, so callers
+ * that only destructure `typescript` see no change — purely additive.
  */
 export async function discoverServers(): Promise<DiscoveredServers> {
-  const typescript = await discoverOne(TYPESCRIPT_LANGUAGE_SERVER_BIN);
-  return { typescript };
+  const [typescript, java] = await Promise.all([
+    discoverOne(TYPESCRIPT_LANGUAGE_SERVER_BIN),
+    discoverOne(JDTLS_BIN),
+  ]);
+  // `java` is included in the result only when jdtls is actually found.
+  // Absent jdtls yields `undefined` (omitted key) rather than `null` so
+  // that existing callers relying on `toEqual({ typescript: … })` do not
+  // observe a new key. Callers interested in Java use `result.java ?? null`.
+  return { typescript, ...(java !== null ? { java } : {}) };
 }
 
 /**

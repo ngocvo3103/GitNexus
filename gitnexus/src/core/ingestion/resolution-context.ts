@@ -44,7 +44,7 @@ export const TIER_CONFIDENCE: Record<ResolutionTier, number> = {
 // --- Map types ---
 export type ImportMap = Map<string, Set<string>>;
 export type PackageMap = Map<string, Set<string>>;
-export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
+export type NamedImportMap = Map<string, ReadonlyMap<string, NamedImportBinding>>;
 export type ModuleAliasMap = Map<string, Map<string, string>>;
 
 export interface ResolutionContext {

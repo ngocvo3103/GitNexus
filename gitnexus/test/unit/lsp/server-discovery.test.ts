@@ -116,6 +116,7 @@ import {
   discoverOne,
   parseVersion,
   TYPESCRIPT_LANGUAGE_SERVER_BIN,
+  JDTLS_BIN,
 } from '../../../src/core/ingestion/lsp/server-discovery.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -573,6 +574,222 @@ describe('server-discovery', () => {
       expect(result!.version).toBe('5.0.0');
       // npx must NOT have been called.
       expect(npxCalls.length).toBe(0);
+    });
+  });
+
+  // ─── WI-3: jdtls discovery ────────────────────────────────────────────
+  //
+  // Acceptance criteria (EP: jdtls present / absent) + TS-unchanged
+  // equivalence. These tests exercise `discoverServers()` end-to-end
+  // with a mocked PATH so they do not require a real jdtls installation.
+
+  describe('WI-3 — jdtls discovery via discoverServers()', () => {
+    it('exports JDTLS_BIN constant with the correct value', () => {
+      expect(JDTLS_BIN).toBe('jdtls');
+    });
+
+    it('AC: mocked PATH with jdtls → java entry non-null in discoverServers result', async () => {
+      // Stage a fake jdtls binary on PATH and a TS binary on node_modules
+      // so both entries can be exercised in a single discoverServers() call.
+      const jdtlsBin = '/opt/homebrew/bin/jdtls';
+      const tsBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      stageBinary(jdtlsBin);
+      stageBinary(tsBin);
+
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        // which is called for both binaries; route by the requested name.
+        if (args[0] === JDTLS_BIN) return `${jdtlsBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      registerSpawn(tsBin, () => 'typescript-language-server 4.3.3\n');
+      registerSpawn(jdtlsBin, () => 'jdtls 1.26.0\n');
+
+      const result = await discoverServers();
+
+      // java entry is present and non-null
+      expect(result.java).not.toBeNull();
+      expect(result.java).not.toBeUndefined();
+      expect(result.java!.path).toBe(jdtlsBin);
+      expect(result.java!.version).toBe('1.26.0');
+    });
+
+    it('AC: absent jdtls → java entry is absent (undefined) in discoverServers result', async () => {
+      // Stage only a TS binary — no jdtls anywhere.
+      const tsBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      stageBinary(tsBin);
+      registerSpawn(tsBin, () => 'typescript-language-server 4.3.3\n');
+      // No which handler, no jdtls staged → discoverOne(JDTLS_BIN) → null
+
+      const result = await discoverServers();
+
+      // java is omitted (undefined) when jdtls is absent — not `null` —
+      // so that existing callers whose toEqual asserts only { typescript }
+      // continue to pass (toEqual ignores undefined-valued keys).
+      expect(result.java).toBeUndefined();
+      // Confirm result.java is falsy in any case
+      expect(result.java ?? null).toBeNull();
+    });
+
+    it('AC: typescript entry is identical to today when jdtls is also discovered', async () => {
+      // Both binaries present — verify the typescript entry is byte-identical
+      // to what discoverServers() returned before WI-3 (path + version intact).
+      const tsBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      const jdtlsBin = '/opt/homebrew/bin/jdtls';
+      stageBinary(tsBin);
+      stageBinary(jdtlsBin);
+
+      registerSpawn(tsBin, () => 'typescript-language-server 4.3.3\n');
+      registerSpawn(jdtlsBin, () => 'jdtls 1.26.0\n');
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === JDTLS_BIN) return `${jdtlsBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+
+      const result = await discoverServers();
+
+      // The typescript entry must be exactly what it was before WI-3.
+      expect(result.typescript).toEqual({ path: tsBin, version: '4.3.3' });
+    });
+
+    it('AC: typescript entry is null when TS absent even if jdtls is present', async () => {
+      // TS absent, jdtls present — confirm the two are discovered independently.
+      const jdtlsBin = '/opt/homebrew/bin/jdtls';
+      stageBinary(jdtlsBin);
+
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === JDTLS_BIN) return `${jdtlsBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      registerSpawn(jdtlsBin, () => 'jdtls 1.26.0\n');
+
+      const result = await discoverServers();
+
+      expect(result.typescript).toBeNull();
+      expect(result.java).not.toBeNull();
+      expect(result.java!.path).toBe(jdtlsBin);
+    });
+
+    it('discoverOne reused for jdtls — same resolution sources (PATH hit)', async () => {
+      // Verify discoverOne(JDTLS_BIN) follows the standard resolution chain.
+      const jdtlsBin = '/usr/local/bin/jdtls';
+      stageBinary(jdtlsBin);
+      registerSpawn(jdtlsBin, () => 'jdtls 1.26.0\n');
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, () => `${jdtlsBin}\n`);
+
+      const result = await discoverOne(JDTLS_BIN, {
+        cwd: '/nonexistent/empty',
+      });
+
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(jdtlsBin);
+      expect(result!.version).toBe('1.26.0');
+    });
+
+    it('discoverOne reused for jdtls — absent everywhere returns null', async () => {
+      const result = await discoverOne(JDTLS_BIN, {
+        cwd: '/nonexistent/empty',
+      });
+      expect(result).toBeNull();
+    });
+
+    // ── #159 root cause #1 — slow/silent --version must NOT drop the binary ──
+    //
+    // REGRESSION GUARD. jdtls spins a full JVM on `--version`: it exceeds
+    // the 5s probe cap (execFileSync throws ETIMEDOUT) and even when allowed
+    // to finish prints only a logback/spifly banner to STDERR (no version
+    // token on stdout). The pre-fix `finalize()` mapped that ETIMEDOUT throw
+    // to `null` and DROPPED the already-located binary, so `discoverServers()`
+    // omitted the `java` key and the entire Mode-A Java funnel refused every
+    // candidate (`server <unknown>`). A binary a resolution source already
+    // LOCATED must survive a slow/silent `--version` with `version:'unknown'`.
+
+    it('RC#1: a located jdtls whose --version TIMES OUT is kept with version "unknown"', async () => {
+      const jdtlsBin = '/opt/homebrew/bin/jdtls';
+      stageBinary(jdtlsBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === JDTLS_BIN) return `${jdtlsBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      // Simulate the slow-JVM timeout: execFileSync throws ETIMEDOUT when it
+      // runs `jdtls --version` (the binary launched, then was killed for being
+      // slow — NOT an ENOENT "binary missing").
+      registerSpawn(jdtlsBin, () => {
+        throw Object.assign(new Error('spawnSync jdtls ETIMEDOUT'), {
+          code: 'ETIMEDOUT',
+        });
+      });
+
+      const result = await discoverOne(JDTLS_BIN, { cwd: '/nonexistent/empty' });
+
+      // The located binary MUST be kept — dropping it is the #159 bug.
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(jdtlsBin);
+      expect(result!.version).toBe('unknown');
+    });
+
+    it('RC#1: a located jdtls whose --version prints NO version token is kept with version "unknown"', async () => {
+      // Even when --version returns under the cap, jdtls emits only a banner
+      // with no semver token → parseVersion → 'unknown'. The binary is still
+      // present and launchable, so it must be kept.
+      const jdtlsBin = '/opt/homebrew/bin/jdtls';
+      stageBinary(jdtlsBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === JDTLS_BIN) return `${jdtlsBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      registerSpawn(
+        jdtlsBin,
+        () => 'WARNING: Using incubator modules: jdk.incubator.vector\n',
+      );
+
+      const result = await discoverOne(JDTLS_BIN, { cwd: '/nonexistent/empty' });
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(jdtlsBin);
+      expect(result!.version).toBe('unknown');
+    });
+
+    it('RC#1 boundary: a TRULY-absent binary (ENOENT spawn) is still dropped (null)', async () => {
+      // The fix must NOT resurrect a phantom path. If the located path turns
+      // out not to be a runnable file (ENOENT/EACCES on spawn), discovery
+      // still returns null so we never hand back a non-existent server.
+      const phantom = '/opt/homebrew/bin/jdtls';
+      stageBinary(phantom); // statSync says it exists (located)…
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === JDTLS_BIN) return `${phantom}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      // …but spawning it fails ENOENT (e.g. deleted between stat and spawn):
+      registerSpawn(phantom, () => {
+        throw Object.assign(new Error('spawn jdtls ENOENT'), {
+          code: 'ENOENT',
+          status: 127,
+        });
+      });
+
+      const result = await discoverOne(JDTLS_BIN, { cwd: '/nonexistent/empty' });
+      expect(result).toBeNull();
     });
   });
 });

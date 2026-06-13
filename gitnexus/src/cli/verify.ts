@@ -50,6 +50,7 @@ import { buildCanarySamples } from '../core/ingestion/lsp/canary-sampler.js';
 import { discoverServers } from '../core/ingestion/lsp/server-discovery.js';
 import { mapLocationToNodeId } from '../core/ingestion/lsp/location-mapper.js';
 import { LspClient } from '../core/ingestion/lsp/lsp-client.js';
+import { selectAdapter } from '../core/ingestion/lsp/language-adapter.js';
 import { initLbug, isLbugReady, executeParameterized } from '../mcp/core/lbug-adapter.js';
 
 export interface VerifyCommandOptions {
@@ -210,14 +211,33 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
     }
   }
 
-  // ── 5) Discover the LSP server (degrade/strict on absence) ──────
+  // ── 5) Select the language adapter + discover the LSP server ───
+  // KD-4: the adapter is selected once per run by extension census.
+  // `null` means no supported language — degrade identically to
+  // "server absent". The adapter drives discovery (which binary to
+  // look for), LspClient construction, and the mapper's `classifyUri`
+  // (so `jdt://` Java defs are explicitly refused as external-refusal,
+  // not silently returned as NO_NODE — WI-7/KD-3).
+  const repoPath = repoHandle.repoPath;
+  const adapter = selectAdapter(repoPath);
+  if (!adapter) {
+    const msg = 'LSP unavailable: no supported language detected in repository';
+    if (options?.strict) {
+      out(msg);
+      process.exit(1);
+    }
+    out(`${msg} — using heuristic only`);
+    return;
+  }
+
   // Server discovery never throws (per WI-#2 contract). A null
   // result is the "absent" verdict. We treat absent and
   // not-ready symmetrically: both yield a "LSP unavailable"
   // message, with strict controlling the exit code.
   const servers = await discoverServers();
-  if (!servers.typescript) {
-    const msg = 'LSP unavailable: typescript-language-server not found (install to enable --lsp)';
+  const serverEntry = servers[adapter.id as keyof typeof servers];
+  if (!serverEntry) {
+    const msg = `LSP unavailable: ${adapter.serverBinary} not found (install to enable --lsp)`;
     if (options?.strict) {
       out(msg);
       process.exit(1);
@@ -230,20 +250,18 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
   // The client is per-invocation (per the warm-singleton contract
   // of WI-#3). We MUST stop it on every code path, including the
   // error paths — hence the try/finally. The probe uses canary
-  // samples built from real .ts files in the repo root via
-  // `buildCanarySamples`. This replaces the former package.json
-  // canary, which could NEVER produce a non-empty definition
-  // response (typescript-language-server does not serve
-  // definitions for JSON files), making the probe permanently
-  // stuck at ready:false regardless of workspace state.
+  // samples built from real files in the repo root via
+  // `buildCanarySamples`. Adapter carries its canary strategy
+  // (WI-2); null canary falls back to the TS strategy default.
   const client = new LspClient({
-    binaryPath: servers.typescript.path,
-    workspaceRoot: repoHandle.repoPath,
+    binaryPath: serverEntry.path,
+    workspaceRoot: repoPath,
+    adapter,
   });
 
   try {
     await client.start();
-    const samples = await buildCanarySamples(repoHandle.repoPath);
+    const samples = await buildCanarySamples(repoPath, { strategy: adapter.canary });
     const probe = await probeWorkspaceReadiness(client, samples, {
       perRequestTimeoutMs: 3000,
     });
@@ -267,10 +285,16 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
     // Bug B fix (#F4): pass `repoPath` so the mapper can rebase
     // the absolute LSP `file://` URIs to repo-relative paths
     // that match the graph's stored `filePath` values.
-    const repoPath = repoHandle.repoPath;
+    //
+    // WI-7: thread `adapter.classifyUri` into the mapper so that
+    // language-specific URIs (`jdt://` for Java decompiled/stdlib
+    // defs) are explicitly refused as external-refusal (KD-3),
+    // not silently returned as NO_NODE (which would wrongly count
+    // as a recall-miss when the heuristic target was null).
     const report = await runModeCVerify({
       repoId: repoHandle.id,
       client,
+      adapter,
       // Bug F4-forward fix: `classifyEdge` anchors each edge's
       // repo-relative `sourceFile` to this root when building the
       // `textDocument/definition` URI. Without it, `file://src/x.ts`
@@ -278,11 +302,11 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
       // 0% across all tiers.
       repoPath,
       mapLocationToNodeId: (loc, repoId) =>
-        mapLocationToNodeId(loc, repoId, { repoPath }),
+        mapLocationToNodeId(loc, repoId, { repoPath, classifyUri: (uri) => adapter.classifyUri(uri) }),
       executeParameterized,
       probe: async () => probe, // already probed above
       sampleSize,
-      serverVersion: servers.typescript.version,
+      serverVersion: serverEntry.version,
     });
 
     // ── 8) Render the report + exit 0 ───────────────────────────

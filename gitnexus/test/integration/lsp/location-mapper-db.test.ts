@@ -203,6 +203,149 @@ withTestLbugDB('location-mapper', (handle) => {
       expect(a).toEqual({ kind: 'node', nodeId: 'func:login' });
     });
   });
+
+  // ─── WI-5: KD-3 external/jdt:// URI refusal tier ───────────────────────
+  // Equivalence partitions:
+  //   EP-1: jdt:// URI (external, decompiled)  → {kind:'NO_NODE', external:true}
+  //   EP-2: workspace file:// URI              → resolves to a node (unchanged)
+  //   EP-3: out-of-repo file:// URI            → {kind:'NO_NODE'} without external
+  //
+  // Invariants verified:
+  //   I-3 (refuse-over-guess): jdt:// NEVER resolves to a node
+  //   I-1 (TS-path invariance): workspace file:// path unchanged
+  //   3-state shape preserved: no caller churn from additive optional field
+
+  describe('KD-3 URI classification (WI-5)', () => {
+    describe('EP-1: jdt:// URIs → explicit external refusal', () => {
+      it('jdt://contents/java.util.List → {kind:NO_NODE, external:true} (never a node)', async () => {
+        // Acceptance criterion AC-1: jdt:// URIs MUST always return external refusal.
+        // The classifyUri injected here represents what the Java LanguageAdapter provides.
+        const jdtClassify = (uri: string): 'workspace' | 'external' | 'unmappable' =>
+          uri.startsWith('jdt://') ? 'external' : uri.startsWith('file://') ? 'workspace' : 'unmappable';
+
+        const result = await mapLocationToNodeId(
+          loc('jdt://contents/java/util/List.class?=jdt.default/%5C/path%2Fto%2Fjdk/lib/src.zip%3C/java/util/List.java', 0),
+          handle.repoId,
+          { classifyUri: jdtClassify },
+        );
+        expect(result).toEqual({ kind: 'NO_NODE', external: true });
+      });
+
+      it('jdt:// URI at a non-zero line → still external refusal (no DB call attempted)', async () => {
+        const jdtClassify = (uri: string): 'workspace' | 'external' | 'unmappable' =>
+          uri.startsWith('jdt://') ? 'external' : uri.startsWith('file://') ? 'workspace' : 'unmappable';
+
+        const result = await mapLocationToNodeId(
+          loc('jdt://contents/java/lang/Object.class?=jdt.default', 42),
+          handle.repoId,
+          { classifyUri: jdtClassify },
+        );
+        expect(result).toEqual({ kind: 'NO_NODE', external: true });
+        // Confirm no node was returned — I-3 (refuse-over-guess)
+        expect(result.kind).toBe('NO_NODE');
+        if (result.kind === 'NO_NODE') {
+          expect(result.external).toBe(true);
+        }
+      });
+
+      it('external flag is exactly true (not truthy) for jdt:// refusal', async () => {
+        const jdtClassify = (uri: string): 'workspace' | 'external' | 'unmappable' =>
+          uri.startsWith('jdt://') ? 'external' : 'unmappable';
+
+        const result = await mapLocationToNodeId(
+          loc('jdt://contents/com/example/MyClass.class', 10),
+          handle.repoId,
+          { classifyUri: jdtClassify },
+        );
+        // Strict: external must be boolean true, not just truthy
+        expect(result).toStrictEqual({ kind: 'NO_NODE', external: true });
+      });
+    });
+
+    describe('EP-2: workspace file:// URIs → node resolution unchanged (I-1 TS-path invariance)', () => {
+      it('workspace file:// still maps to a node with default classifyUri', async () => {
+        // No classifyUri injection: default TS behaviour (file:// → workspace).
+        // This is AC-2: the TS path must be byte-identical pre/post WI-5.
+        const result = await mapLocationToNodeId(
+          loc('file:///src/auth.ts', 5),
+          handle.repoId,
+          // explicitly omitting classifyUri — default applies
+        );
+        expect(result).toEqual({ kind: 'node', nodeId: 'func:login' });
+      });
+
+      it('workspace file:// still maps to a node with explicit workspace classifyUri', async () => {
+        const jdtClassify = (uri: string): 'workspace' | 'external' | 'unmappable' =>
+          uri.startsWith('jdt://') ? 'external' : uri.startsWith('file://') ? 'workspace' : 'unmappable';
+
+        const result = await mapLocationToNodeId(
+          loc('file:///src/auth.ts', 5),
+          handle.repoId,
+          { classifyUri: jdtClassify },
+        );
+        expect(result).toEqual({ kind: 'node', nodeId: 'func:login' });
+      });
+
+      it('3-state shape preserved: workspace result has no external field', async () => {
+        const result = await mapLocationToNodeId(
+          loc('file:///src/auth.ts', 5),
+          handle.repoId,
+        );
+        expect(result.kind).toBe('node');
+        // The node variant has no external field — shape unchanged for callers
+        expect('external' in result).toBe(false);
+      });
+    });
+
+    describe('EP-3: out-of-repo file:// URIs → NO_NODE without external', () => {
+      it('out-of-repo file:// → NO_NODE without external flag', async () => {
+        // AC-3: a file:// URI that is out-of-repo (resolves to NO_NODE via
+        // the existing isUnindexablePath / outside-repo guard) must NOT
+        // carry external:true — that flag is reserved for jdt:// / decompiled.
+        const result = await mapLocationToNodeId(
+          loc('file:///src/nonexistent-file.ts', 0),
+          handle.repoId,
+        );
+        expect(result).toEqual({ kind: 'NO_NODE' });
+        // Confirm: external must be absent (undefined), not true
+        if (result.kind === 'NO_NODE') {
+          expect(result.external).toBeUndefined();
+        }
+      });
+
+      it('node_modules URI → NO_NODE without external flag (existing behaviour preserved)', async () => {
+        const result = await mapLocationToNodeId(
+          loc('file:///repo/node_modules/lodash/index.d.ts', 0),
+          handle.repoId,
+        );
+        expect(result).toEqual({ kind: 'NO_NODE' });
+        if (result.kind === 'NO_NODE') {
+          expect(result.external).toBeUndefined();
+        }
+      });
+
+      it('unmappable non-file non-jdt URI → NO_NODE without external flag', async () => {
+        // e.g. an http:// URI or some other scheme — classified as unmappable,
+        // which means "we can't handle this" rather than "this is external stdlib".
+        const customClassify = (uri: string): 'workspace' | 'external' | 'unmappable' => {
+          if (uri.startsWith('jdt://')) return 'external';
+          if (uri.startsWith('file://')) return 'workspace';
+          return 'unmappable';
+        };
+
+        const result = await mapLocationToNodeId(
+          loc('http://example.com/SomeClass.java', 0),
+          handle.repoId,
+          { classifyUri: customClassify },
+        );
+        expect(result).toEqual({ kind: 'NO_NODE' });
+        // No external flag — unmappable is not the same as external
+        if (result.kind === 'NO_NODE') {
+          expect(result.external).toBeUndefined();
+        }
+      });
+    });
+  });
 }, {
   seed: LOCAL_BACKEND_SEED_DATA,
   poolAdapter: true,
