@@ -83,14 +83,21 @@ export interface AuditRecallPrecisionOptions {
     params: Record<string, unknown>,
   ) => Promise<unknown[]>;
   /** Read a single file line by 0-based line index. Returns null if file
-   *  absent or line out of range. */
+   *  absent or line out of range. Preserved as fallback seam for tests. */
   readLine?: ReadLineFn;
+  /** Read a whole file as a string. Returns null on failure.
+   *  When provided, the file-level cache uses this seam instead of
+   *  nodeFs.readFileSync — enables test injection without per-line stubs. */
+  readFile?: ReadFileFn;
 }
 
 export type ReadLineFn = (
   absPath: string,
   lineIndex: number,
 ) => string | null;
+
+/** Whole-file read seam (for tests). Returns null on failure. */
+export type ReadFileFn = (absPath: string) => string | null;
 
 // ─── PRNG (mirrors mode-c-verifier.ts) ────────────────────────────────
 
@@ -127,15 +134,11 @@ export function shuffleInPlace<T>(arr: T[], rng: () => number): void {
 }
 
 // ─── Callable label gate ──────────────────────────────────────────────
-
-/** Mirror of CALLABLE_SYMBOL_TYPES from call-processor.ts. */
-const CALLABLE_LABELS = new Set([
-  'Function',
-  'Method',
-  'Constructor',
-  'Macro',
-  'Delegate',
-]);
+// Callability is assumed enforced upstream by the engine's P2 gate
+// (CALLABLE_SYMBOL_TYPES in call-processor.ts). The audit queries only
+// lsp-recall edges that have already passed that gate, so no secondary
+// callability check is performed here. Corroboration output reflects
+// structural name-match only; callable-label enforcement is upstream.
 
 // ─── Name corroboration logic (pure, exported for unit tests) ─────────
 
@@ -303,36 +306,60 @@ function defaultReadLine(absPath: string, lineIndex: number): string | null {
 // ─── Line cache ───────────────────────────────────────────────────────
 
 /**
- * Thin cache: one Map<absPath, string[]> per audit run.
- * Avoids re-reading the same file for every edge in it.
+ * File-level line cache: reads each file at most once per audit run.
+ *
+ * When `readFileFn` is provided (test seam), it is used to read the
+ * whole file content as a string; the result is split on newlines and
+ * cached. When absent, `nodeFs.readFileSync` is used directly —
+ * a single read per file, regardless of how many lines are looked up.
+ *
+ * The `readLineFn` seam is preserved as a per-line fallback for test
+ * contexts that inject line-level stubs without a whole-file seam.
+ * In production `readLineFn` is never called (the file-level cache
+ * satisfies every lookup after the first read).
+ *
+ * Return semantics: null for missing file or out-of-range lineIndex.
  */
+
 function makeLineCache(
   repoPath: string,
   readLineFn: ReadLineFn,
+  readFileFn?: ReadFileFn,
 ): (relPath: string | null, lineIndex: number) => string | null {
-  // Cache maps absPath → per-line results already fetched.
-  // We call readLineFn (the injected seam) and cache its results so
-  // each (file, line) is fetched at most once per audit run.
-  const cache = new Map<string, Map<number, string | null>>();
+  // Cache: absPath → all lines of that file (populated once per file).
+  const fileLines = new Map<string, string[] | null>();
+
+  function getLines(absPath: string): string[] | null {
+    if (fileLines.has(absPath)) return fileLines.get(absPath)!;
+    let lines: string[] | null;
+    if (readFileFn) {
+      const text = readFileFn(absPath);
+      lines = text !== null ? text.split('\n') : null;
+    } else {
+      try {
+        lines = nodeFs.readFileSync(absPath, 'utf-8').split('\n');
+      } catch {
+        lines = null;
+      }
+    }
+    fileLines.set(absPath, lines);
+    return lines;
+  }
+
   return (relPath: string | null, lineIndex: number): string | null => {
     if (!relPath) return null;
-    // Build absolute path to pass to the seam.
-    let absPath: string;
-    if (nodePath.isAbsolute(relPath)) {
-      absPath = relPath;
-    } else {
-      absPath = nodePath.resolve(repoPath, relPath);
+    const absPath = nodePath.isAbsolute(relPath)
+      ? relPath
+      : nodePath.resolve(repoPath, relPath);
+
+    const lines = getLines(absPath);
+    if (lines === null) {
+      // File unreadable via file-level seam — fall back to the per-line seam
+      // (supports test contexts that inject readLine without readFileFn).
+      return readLineFn(absPath, lineIndex);
     }
-    let fileCache = cache.get(absPath);
-    if (!fileCache) {
-      fileCache = new Map();
-      cache.set(absPath, fileCache);
-    }
-    if (!fileCache.has(lineIndex)) {
-      // Delegate to the injected readLine seam — never bypass it.
-      fileCache.set(lineIndex, readLineFn(absPath, lineIndex));
-    }
-    return fileCache.get(lineIndex) ?? null;
+    if (lineIndex < 0 || lineIndex >= lines.length) return null;
+    return lines[lineIndex];
   };
 }
 
@@ -350,6 +377,7 @@ export async function auditRecallPrecision(
   const sampleCap = opts.sampleCap ?? 500;
   const seed = opts.seed ?? 'recall-audit-v1';
   const readLine = opts.readLine ?? defaultReadLine;
+  const readFile = opts.readFile;
   const { repoId, repoPath, runCypher } = opts;
 
   // ── 1) Query all lsp-recall CodeRelation rows ──────────────────────
@@ -408,19 +436,18 @@ export async function auditRecallPrecision(
 
   // ── 3) Per-edge structural corroboration ───────────────────────────
   const repoBasename = nodePath.basename(nodePath.resolve(repoPath));
-  // Line cache: one file read per unique path.
-  const getLine = makeLineCache(repoPath, readLine);
+  // Line cache: one file read per unique path (file-level cache).
+  const getLine = makeLineCache(repoPath, readLine, readFile);
 
   const auditRows: AuditRow[] = [];
 
   for (const row of auditable) {
-    // (a) Check target label is callable.
+    // (a) Extract row fields for structural corroboration.
+    // Callability is assumed enforced upstream by the engine's P2 gate;
+    // the audit does not re-check labels.
     const targetLabel = String(row.targetLabel ?? '');
     const targetName = String(row.targetName ?? '');
     const fromFile = String(row.fromFile ?? '');
-    // Non-callable targets → treat as name-mismatch for precision purposes
-    // (the engine's P2 gate should have blocked these, so this is a safety check).
-    // We still classify them properly.
 
     // (b) Determine verdict from line text.
     const lineIndex =

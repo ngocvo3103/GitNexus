@@ -75,7 +75,7 @@ export interface NamedImportBinding { sourcePath: string; exportedName: string }
 export interface ImportEntry {
   target: string;
 }
-export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
+export type NamedImportMap = Map<string, ReadonlyMap<string, NamedImportBinding>>;
 
 /**
  * Check if a file path is directly inside a package directory identified by its suffix.
@@ -199,8 +199,11 @@ function applyImportResult(
     // of overloaded methods), remove the entry so resolution falls through to Tier 2a
     // import-scoped which sees all candidates and can apply arity narrowing.
     if (namedBindings && namedImportMap) {
-      if (!namedImportMap.has(filePath)) namedImportMap.set(filePath, new Map());
-      const fileBindings = namedImportMap.get(filePath)!;
+      if (!namedImportMap.has(filePath)) namedImportMap.set(filePath, new Map<string, NamedImportBinding>());
+      // Cast to mutable Map for construction: we created this entry above with `new Map()`.
+      // The ReadonlyMap constraint on NamedImportMap prevents callers from mutating
+      // entries they did not construct; here we are the constructor.
+      const fileBindings = namedImportMap.get(filePath)! as Map<string, NamedImportBinding>;
 
       if (files.length === 1) {
         const resolvedFile = files[0];
