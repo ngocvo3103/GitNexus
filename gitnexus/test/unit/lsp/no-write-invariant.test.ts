@@ -91,6 +91,7 @@ const lspDir = path.join(repoRoot, 'src', 'core', 'ingestion', 'lsp');
  */
 const LSP_FILES = [
   'canary-sampler.ts',
+  'language-adapter.ts',
   'lsp-client.ts',
   'server-discovery.ts',
   'location-mapper.ts',

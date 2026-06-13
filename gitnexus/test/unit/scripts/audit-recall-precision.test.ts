@@ -470,4 +470,34 @@ describe('auditRecallPrecision', () => {
     const row = result.reviewRows[0];
     expect(row.displayLine).toBe(1);
   });
+
+  it('file-level cache: each file is read at most once across multiple line lookups', async () => {
+    // Three edges all from the same file, different lines.
+    // The readFile seam must be called exactly once for that file.
+    let readFileCallCount = 0;
+    const fileContent = 'firstLine()\nsecondLine()\nthirdLine()\n';
+
+    const rows: RecallEdgeRow[] = [
+      { fromFile: 'src/shared.ts', fromName: 'c1', sourceLine: 0, sourceCol: 0, targetName: 'firstLine',  targetLabel: 'Function', reason: 'lsp-recall' },
+      { fromFile: 'src/shared.ts', fromName: 'c2', sourceLine: 1, sourceCol: 0, targetName: 'secondLine', targetLabel: 'Function', reason: 'lsp-recall' },
+      { fromFile: 'src/shared.ts', fromName: 'c3', sourceLine: 2, sourceCol: 0, targetName: 'thirdLine',  targetLabel: 'Function', reason: 'lsp-recall' },
+    ];
+
+    await auditRecallPrecision({
+      repoPath: '/fake-repo',
+      repoId: 'fake-repo',
+      sampleCap: 500,
+      seed: 'cache-test',
+      runCypher: makeRunCypher(rows),
+      readFile: (absPath: string) => {
+        if (absPath.endsWith('shared.ts')) {
+          readFileCallCount++;
+          return fileContent;
+        }
+        return null;
+      },
+    });
+
+    expect(readFileCallCount).toBe(1);
+  });
 });
