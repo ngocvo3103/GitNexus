@@ -1,0 +1,1 @@
+- [vitest-unhandled-rejection-guard](feedback_vitest-unhandled-rejection-guard.md) — Dual noise filter needed: ERR_STREAM_DESTROYED + vscode-jsonrpc code:2 "disposed"
