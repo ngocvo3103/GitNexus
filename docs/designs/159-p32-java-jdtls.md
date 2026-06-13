@@ -64,9 +64,10 @@ type MapperResult =
 **Key decisions** (full option tables in the plan's `## Specs`, KD-1..KD-5):
 - **KD-1 (readiness, #172 class):** wait for jdtls `language/status`/`ServiceReady`, canary-probe backstop, hard deadline. Probe stays the authorization gate; `awaitReady` is the warm-up gate. TS = no-op.
 - **KD-2 (spawn/JDK/`-data`):** `jdtls` wrapper with `-data <per-run dir>` under per-fork `GITNEXUS_HOME` (reuse `5b34e6d`/#175). JDK absence degrades through the existing spawn-fail → funnel-null path.
+- **KD-2.1 (DiscoveredServers shape):** `java` field is optional (`java?: DiscoveredServer | null`) rather than required with null value. When absent, the key is omitted entirely (not set to null). This preserves backward compatibility with read-only tests using strict equality checks like `toEqual({ typescript: null })`. Callers needing an explicit null sentinel use `result.java ?? null`.
 - **KD-3 (`jdt://`):** `classifyUri` + one early branch → `{kind:'NO_NODE', external:true}`.
 - **KD-4 (selection):** extension census, dominant language wins, deterministic.
-- **KD-5 (canary):** extract TS logic behind `LanguageCanaryStrategy`; `JavaCanaryStrategy` drops backticks, swaps regexes.
+- **KD-5 (canary):** parameterize `buildCanarySamples(repoPath, opts?: CanaryOptions)` by a per-language `LanguageCanaryStrategy` (where `CanaryOptions = { maxFiles?, strategy? }`). Extract TS logic into `TS_CANARY_STRATEGY`; add `JAVA_CANARY_STRATEGY` dropping backticks and swapping regexes. The opts object is backward-compatible: existing callers with `{ maxFiles: N }` get the default TS strategy; the adapter passes `{ strategy: adapter.canary }` to override.
 
 ## Invariants
 
@@ -115,10 +116,10 @@ sequenceDiagram
 
 ## BlastRadius
 
-- **d1 (will-break / must-update):** `lsp-client.ts` spawn/init site (`:405,612,673,703,889`); `mode-a-reconciler.ts` defaults (`:292,376-381`); `canary-sampler.ts:243` signature; `location-mapper.ts:386` early URI check; `pipeline.ts:798-801`. Every d=1 edit is default-preserving (TS adapter reproduces today's literals).
+- **d1 (will-break / must-update):** `lsp-client.ts` spawn/init site (`:405,612,673,703,889`); `mode-a-reconciler.ts` defaults (`:292,376-381`); `canary-sampler.ts:243` signature; `location-mapper.ts:386` early URI check; `pipeline.ts:798-801`. Every d=1 edit is default-preserving (TS adapter reproduces today's literals). `call-processor.ts` — touched by 6aa2368 (import-scoped unnamed-import guard); additive, default-preserving.
 - **d2 (likely-affected / should-test):** the Mode-A funnel exercised for the first time on Java; `impacted_endpoints` BFS for Java edges (under `--lsp` only).
 - **d3 (may-need-testing):** existing TS golden suites — must stay GREEN, unchanged (I-1 lock).
-- **Confirmed non-impact:** Lane-B files (`call-processor.ts` etc.), heritage processor (Java heritage stays gated off), `detect_changes`/`context`/`rename`, `gitnexus-web/`.
+- **Confirmed non-impact:** Lane-B files (excluding `call-processor.ts`, now listed under d1), heritage processor (Java heritage stays gated off), `detect_changes`/`context`/`rename`, `gitnexus-web/`.
 
 ## Evolution path (Go P4, Python P5)
 
