@@ -798,13 +798,17 @@ export type ModeARelationSource = EdgeSource;
 export const LSP_CONFIDENCE = 0.9;
 
 /**
- * Confidence assigned to `lsp-recall` edges — deliberately NOT
- * promoted with confirm/correct. A recall edge has no heuristic
- * agreement (the heuristics missed the site entirely); the LSP answer
- * is one-legged evidence. Stays at 0.70 pending a dedicated
- * recall-precision check (#159 backlog).
+ * Confidence assigned to `lsp-recall` edges. A recall edge has no
+ * heuristic agreement (the heuristics missed the site entirely); the
+ * LSP `textDocument/definition` answer is the sole evidence. Promoted
+ * 0.70 → 0.90 (#159) after the dedicated recall-precision check:
+ * structural call-site corroboration measured 99.4% (310/312) across
+ * GitNexus + hono + zod with 0 dynamic-dispatch false-positives — the
+ * one-legged LSP answer is as reliable in practice as the two-method
+ * `lsp-confirmed` / `lsp-corrected` edges, so it shares LSP_CONFIDENCE's
+ * tier. Recall edges now clear the 0.85 WILL_BREAK impact floor.
  */
-export const LSP_RECALL_CONFIDENCE = 0.7;
+export const LSP_RECALL_CONFIDENCE = 0.9;
 
 /** Confidence carried by the heuristic `global` tier (WI-2 feed). */
 export const HEURISTIC_GLOBAL_CONFIDENCE = 0.5;

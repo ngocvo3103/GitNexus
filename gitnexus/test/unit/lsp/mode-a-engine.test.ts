@@ -101,7 +101,7 @@ describe('WI-4b — decideForCandidate: correct (LSP disagrees with heuristic)',
 // ─── Decision table — add (KD-5) ──────────────────────────────────────
 
 describe('WI-4b — decideForCandidate: add (heuristic missed, LSP found it)', () => {
-  it('no oldTargetId, callable B → add (lsp-recall, 0.70, no oldRelId)', () => {
+  it('no oldTargetId, callable B → add (lsp-recall, 0.90, no oldRelId)', () => {
     const cand = mkCandidate({ oldTargetId: undefined });
     const decision = decideForCandidate(
       cand,
@@ -306,7 +306,7 @@ describe('WI-4b — self-loop guard: refuse when LSP target == source', () => {
 // ─── applyDecisions — mutations ───────────────────────────────────────
 
 describe('WI-4b — applyDecisions: mutations', () => {
-  it('add: inserts a fresh CALLS edge with confidence 0.70 and source=lsp-recall', () => {
+  it('add: inserts a fresh CALLS edge with confidence 0.90 and source=lsp-recall', () => {
     const graph = createKnowledgeGraph();
     const cand = mkCandidate({ oldTargetId: undefined });
     const decision: Decision = {
@@ -1171,8 +1171,8 @@ describe('WI-4b — exported constants', () => {
   it('LSP_CONFIDENCE is 0.90 (KD-6)', () => {
     expect(LSP_CONFIDENCE).toBe(0.9);
   });
-  it('LSP_RECALL_CONFIDENCE is 0.70 (lsp-recall one-legged evidence)', () => {
-    expect(LSP_RECALL_CONFIDENCE).toBe(0.7);
+  it('LSP_RECALL_CONFIDENCE is 0.90 (promoted #159 — recall-precision check: 99.4% corroboration)', () => {
+    expect(LSP_RECALL_CONFIDENCE).toBe(0.9);
   });
   it('HEURISTIC_GLOBAL_CONFIDENCE is 0.50', () => {
     expect(HEURISTIC_GLOBAL_CONFIDENCE).toBe(0.5);
