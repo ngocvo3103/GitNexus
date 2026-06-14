@@ -42,7 +42,7 @@
  * intact. This matches the `tool.ts` pattern (#324).
  */
 
-import { writeSync } from 'node:fs';
+import { writeSync, realpathSync } from 'node:fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { runModeCVerify } from '../core/ingestion/lsp/mode-c-verifier.js';
 import { probeWorkspaceReadiness } from '../core/ingestion/lsp/workspace-readiness-probe.js';
@@ -219,6 +219,15 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
   // (so `jdt://` Java defs are explicitly refused as external-refusal,
   // not silently returned as NO_NODE — WI-7/KD-3).
   const repoPath = repoHandle.repoPath;
+  // Pre-resolve the repo root once so the mapper's hot path skips
+  // realpathSync(repoPath) on every invocation (10k+ syscalls for a
+  // large Python repo). Mirrors the same pattern in pipeline.ts:776-784.
+  let resolvedRepoPath: string | undefined;
+  try {
+    resolvedRepoPath = realpathSync(repoPath);
+  } catch {
+    resolvedRepoPath = undefined;
+  }
   const adapter = selectAdapter(repoPath);
   if (!adapter) {
     const msg = 'LSP unavailable: no supported language detected in repository';
@@ -301,8 +310,9 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
       // is malformed (host=`src`) and every request returns null →
       // 0% across all tiers.
       repoPath,
+      resolvedRepoPath,
       mapLocationToNodeId: (loc, repoId) =>
-        mapLocationToNodeId(loc, repoId, { repoPath, classifyUri: (uri) => adapter.classifyUri(uri) }),
+        mapLocationToNodeId(loc, repoId, { repoPath, resolvedRepoPath, classifyUri: (uri) => adapter.classifyUri(uri), adapterId: adapter.id }),
       executeParameterized,
       probe: async () => probe, // already probed above
       sampleSize,

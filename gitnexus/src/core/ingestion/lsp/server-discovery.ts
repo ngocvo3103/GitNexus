@@ -38,6 +38,7 @@ export interface DiscoveredServer {
 export type DiscoveredServers = {
   typescript: DiscoveredServer | null;
   java?: DiscoveredServer | null;
+  python?: DiscoveredServer | null;
 };
 
 /** The binary basename we look up for TypeScript. Exported for tests. */
@@ -45,6 +46,9 @@ export const TYPESCRIPT_LANGUAGE_SERVER_BIN = 'typescript-language-server';
 
 /** The binary basename we look up for Java (jdtls). Exported for tests. */
 export const JDTLS_BIN = 'jdtls';
+
+/** The binary basename we look up for Python (pylsp). Exported for tests. */
+export const PYLSP_BIN = 'pylsp';
 
 /**
  * Find the nearest ancestor directory that contains a
@@ -375,15 +379,20 @@ function tryNpx(binaryName: string): DiscoveredServer | null {
  * that only destructure `typescript` see no change — purely additive.
  */
 export async function discoverServers(): Promise<DiscoveredServers> {
-  const [typescript, java] = await Promise.all([
+  const [typescript, java, python] = await Promise.all([
     discoverOne(TYPESCRIPT_LANGUAGE_SERVER_BIN),
     discoverOne(JDTLS_BIN),
+    discoverOne(PYLSP_BIN),
   ]);
-  // `java` is included in the result only when jdtls is actually found.
-  // Absent jdtls yields `undefined` (omitted key) rather than `null` so
+  // `java` and `python` are included in the result only when actually found.
+  // Absent servers yield `undefined` (omitted key) rather than `null` so
   // that existing callers relying on `toEqual({ typescript: … })` do not
-  // observe a new key. Callers interested in Java use `result.java ?? null`.
-  return { typescript, ...(java !== null ? { java } : {}) };
+  // observe new keys. Callers interested in Java use `result.java ?? null`.
+  return {
+    typescript,
+    ...(java !== null ? { java } : {}),
+    ...(python !== null ? { python } : {}),
+  };
 }
 
 /**

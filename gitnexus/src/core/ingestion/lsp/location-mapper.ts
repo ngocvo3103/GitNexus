@@ -46,6 +46,7 @@ import { VALID_NODE_LABELS } from './node-labels.js';
 import { fileURLToPath } from 'node:url';
 import * as nodePath from 'node:path';
 import { realpathSync } from 'node:fs';
+import type { LanguageAdapter } from './language-adapter.js';
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -86,6 +87,20 @@ export interface MapperDeps {
   /** Same shape as `lib/utils.normalizeFilePath`. Default: real fn. */
   normalizeFilePath: (p: string) => string;
   /**
+   * Language adapter id (e.g. `'python'`). When set to `'python'`,
+   * out-of-repo `file://` paths (absolute path outside `repoPath`, or
+   * `path.relative` result starting with `..`) are tagged
+   * `{ kind: 'NO_NODE', external: true }` instead of bare `{ kind: 'NO_NODE' }`.
+   *
+   * This is the sole gate for Python external-refusal (ruling #1 / R2-1):
+   *   - `external:true` fires ONLY when `adapterId === 'python'`.
+   *   - TS/Java callers that omit this field get byte-identical pre-WI-5
+   *     behaviour (bare `NO_NODE` on out-of-repo paths).
+   *   - `external:true` is NEVER set on `fileURLToPath`/`realpathSync`
+   *     failure — those failures give no in/out-of-repo signal (I-9 / R2-2).
+   */
+  adapterId?: LanguageAdapter['id'];
+  /**
    * URI classifier from the active `LanguageAdapter` (KD-3).
    *
    * Called with the raw LSP URI *before* any path normalisation.
@@ -122,6 +137,28 @@ export interface MapperDeps {
    * `repo/src/foo.ts`).
    */
   repoPath?: string;
+  /**
+   * Pre-resolved (realpath'd) absolute path to the repository root.
+   *
+   * Performance: `realpathSync(repoPath)` is called inside
+   * `mapLocationToNodeId` on every invocation when only `repoPath`
+   * is supplied. For a large Python repo (10k+ CALL candidates) this
+   * emits 10k redundant stat(2) syscalls against the same constant
+   * value. Callers that drive many mapper calls in a single session
+   * (e.g. `pipeline.ts`) SHOULD pre-resolve the repo root once and
+   * supply it here so the inner loop avoids the redundant syscalls.
+   *
+   * When set, the mapper uses this value directly instead of calling
+   * `realpathSync(repoPath)` inside the hot path. The value MUST be
+   * the result of `realpathSync(repoPath)` (or equivalent) — passing
+   * an un-resolved path defeats the symlink-safety guarantee of the
+   * containment check.
+   *
+   * When absent, the mapper falls back to calling
+   * `realpathSync(repoPath)` on every invocation (pre-existing
+   * behavior — all existing callers and tests remain unaffected).
+   */
+  resolvedRepoPath?: string;
 }
 
 // ─── Leaf node labels (the query union) ────────────────────────────────
@@ -428,13 +465,35 @@ export async function mapLocationToNodeId(
   //   4. Paths that resolve outside the repo (start with `..` or
   //      are absolute after `path.relative`) are stdlib / external
   //      deps — they yield `NO_NODE`, which is the correct refusal.
+  // WI-5 (#159 P5): Python adapter active flag — used below to gate external:true.
+  // `external:true` fires only when the adapter id is 'python' (ruling #1).
+  const isPythonAdapter = resolvedDeps.adapterId === 'python';
+
+  // WI-5: hoisted so the isOutOfRepo predicate at the end of this block can
+  // see the flag regardless of which `if/else` branch was taken.
+  //
+  // Three states:
+  //   true  → realAbsPath resolved AND path.relative starts with `..`/is absolute
+  //           → definitively outside the repo
+  //   false → realAbsPath resolved AND path is inside the repo (rebased OK)
+  //   null  → realAbsPath was empty (realpathSync threw or fileURLToPath gave '')
+  //           → unknown containment; fall through to scheme-strip
+  let rebasedOutOfRepo: boolean | null = null;
   let relPath: string;
   if (resolvedDeps.repoPath && (loc?.uri ?? '').startsWith('file://')) {
     let absPath: string;
     try {
       absPath = fileURLToPath(loc.uri);
     } catch {
-      // Malformed URI — fall back to scheme-strip path.
+      // Malformed URI — fileURLToPath threw. This gives NO in/out-of-repo
+      // signal, so we MUST NOT tag external:true (I-9 / R2-2).
+      // WI-5: when Python adapter is active, refuse bare {NO_NODE} here
+      // instead of falling through to scheme-strip at the else-branch
+      // below (the "wrong-node door" — ruling R2-4). For TS/Java or no
+      // adapter, fall through to scheme-strip as before.
+      if (isPythonAdapter) {
+        return { kind: 'NO_NODE' };
+      }
       absPath = '';
     }
     // Attempt repo-relative rebase only when the absolute path exists
@@ -450,17 +509,32 @@ export async function mapLocationToNodeId(
       try {
         realAbsPath = realpathSync(absPath);
       } catch {
-        // File does not exist — cannot rebase via realpath. Fall through
-        // to scheme-strip (legacy behavior for synthetic test URIs).
+        // realpathSync threw (broken symlink, FS race, non-existent path).
+        // This gives NO in/out-of-repo signal, so we MUST NOT tag
+        // external:true (I-9 / R2-2).
+        // WI-5: when Python adapter is active, refuse bare {NO_NODE} here
+        // instead of falling through to scheme-strip (ruling R2-4).
+        if (isPythonAdapter) {
+          return { kind: 'NO_NODE' };
+        }
         realAbsPath = '';
       }
       if (realAbsPath) {
         // realpath the repo root for symlink-safe comparison.
+        // Performance: use the pre-resolved root supplied by the caller
+        // (resolvedRepoPath) when available, avoiding a redundant
+        // realpathSync(repoPath) syscall on every mapper invocation.
+        // When absent, fall back to resolving on the fly (pre-existing
+        // behavior — all existing callers and tests are unaffected).
         let realRepoRoot: string;
-        try {
-          realRepoRoot = realpathSync(resolvedDeps.repoPath);
-        } catch {
-          realRepoRoot = resolvedDeps.repoPath;
+        if (resolvedDeps.resolvedRepoPath) {
+          realRepoRoot = resolvedDeps.resolvedRepoPath;
+        } else {
+          try {
+            realRepoRoot = realpathSync(resolvedDeps.repoPath!);
+          } catch {
+            realRepoRoot = resolvedDeps.repoPath!;
+          }
         }
         const rel = nodePath.relative(realRepoRoot, realAbsPath);
         // Only use the rebase result when the path is INSIDE the repo
@@ -469,8 +543,15 @@ export async function mapLocationToNodeId(
         if (!rel.startsWith('..') && !nodePath.isAbsolute(rel)) {
           // Convert Windows backslashes to POSIX separators.
           rebased = rel.replace(/\\/g, '/');
+          rebasedOutOfRepo = false;
+        } else {
+          // Containment check confirmed: file is outside the repo.
+          // WI-5: set the flag so the guard below can tag external:true.
+          rebasedOutOfRepo = true;
         }
       }
+      // rebasedOutOfRepo === null means realAbsPath was empty (e.g. TS
+      // adapter with a non-existent synthetic URI) — no containment info.
     }
     if (rebased !== null) {
       relPath = rebased;
@@ -485,12 +566,45 @@ export async function mapLocationToNodeId(
     relPath = normalizeLocationUri(loc?.uri ?? '', resolvedDeps.normalizeFilePath);
   }
 
+  // WI-5 (ruling R2-1): isUnindexablePath fires before the `..`/isAbsolute
+  // guard. For the Python adapter, an out-of-repo path whose relPath falls
+  // into isUnindexablePath (e.g. /dist/ in an out-of-repo location) ALSO
+  // gets external:true. The pre-existing behaviour (bare NO_NODE) is
+  // preserved for TS/Java/no-adapter callers.
+  //
+  // The out-of-repo predicate is computed from TWO sources (single logical
+  // truth, two physical signals — they cover different cases):
+  //   1. `rebasedOutOfRepo === true` — the realpath+relative check
+  //      conclusively determined the file is outside the repo. This is the
+  //      PRIMARY signal for real filesystem paths (site-packages, stdlib).
+  //   2. `relPath.startsWith('..')` or `nodePath.isAbsolute(relPath)` —
+  //      the fallback for legacy/synthetic URIs where the scheme-strip
+  //      produces an already-relative-outside path (rare in production;
+  //      exercises the old pre-WI-5 code path unchanged).
+  // When repoPath is absent neither source fires → isOutOfRepo is false
+  // and the pre-existing behaviour is preserved byte-for-byte.
+  const isOutOfRepo =
+    rebasedOutOfRepo === true ||
+    (resolvedDeps.repoPath !== undefined &&
+      (relPath.startsWith('..') || nodePath.isAbsolute(relPath)));
+
   if (isUnindexablePath(relPath)) {
+    // R2-1: tag external:true when Python adapter active AND path is
+    // out-of-repo. In-repo unindexable paths (.d.ts, node_modules) keep
+    // the pre-existing bare {NO_NODE} even for Python — they are NOT
+    // stdlib/site-packages (they are vendored in the repo).
+    if (isPythonAdapter && isOutOfRepo) {
+      return { kind: 'NO_NODE', external: true };
+    }
     return { kind: 'NO_NODE' };
   }
 
-  // Outside-repo paths after rebase start with `..` — refuse.
-  if (relPath.startsWith('..') || nodePath.isAbsolute(relPath)) {
+  // Outside-repo paths after rebase start with `..` or are absolute.
+  // WI-5 (ruling #1 / R2-1): tag external:true when Python adapter active.
+  if (isOutOfRepo) {
+    if (isPythonAdapter) {
+      return { kind: 'NO_NODE', external: true };
+    }
     return { kind: 'NO_NODE' };
   }
 
