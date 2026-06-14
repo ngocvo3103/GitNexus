@@ -29,7 +29,7 @@ import { ensureHeap } from './heap-utils.js';
  * Prevents path traversal attacks by ensuring the resolved path
  * stays within allowed directories (cwd, home, /tmp, /var/tmp).
  */
-function validateOutputPath(userPath: string): string {
+export function validateOutputPath(userPath: string): string {
   const resolved = resolve(userPath);
 
   // Check for path traversal sequences
@@ -44,7 +44,10 @@ function validateOutputPath(userPath: string): string {
   const tmpDir = resolve(os.tmpdir());
   const safeRoots = [cwd, home, '/tmp', '/var/tmp', tmpDir].filter(Boolean);
 
-  const isSafe = safeRoots.some(root => resolved.startsWith(resolve(root)));
+  const isSafe = safeRoots.some(root => {
+    const rr = resolve(root as string);
+    return resolved === rr || resolved.startsWith(rr + path.sep);
+  });
 
   if (!isSafe) {
     console.error(`Error: --outputPath must be within current directory, home, or /tmp`);
@@ -380,11 +383,17 @@ async function runBatchMode(options: Parameters<typeof documentEndpointCommand>[
 }
 
 async function runYamlEnrichment(options: Parameters<typeof documentEndpointCommand>[0]): Promise<void> {
+  // Validate the input path BEFORE reading it. An attacker who controls
+  // --input-yaml can otherwise read arbitrary files (e.g. /etc/passwd,
+  // ../../.env) because readFileSync follows the raw string. validateOutputPath
+  // performs the path-traversal and safe-root containment check.
+  const safeYamlPath = validateOutputPath(options.inputYaml!);
+
   let yamlContent: string;
   try {
-    yamlContent = fs.readFileSync(options.inputYaml!, 'utf-8');
+    yamlContent = fs.readFileSync(safeYamlPath, 'utf-8');
   } catch (err) {
-    console.error(`Error: Cannot read file "${options.inputYaml!}": ${(err as NodeJS.ErrnoException).message}`);
+    console.error(`Error: Cannot read file "${safeYamlPath}": ${(err as NodeJS.ErrnoException).message}`);
     process.exit(1);
   }
 
@@ -406,11 +415,11 @@ async function runYamlEnrichment(options: Parameters<typeof documentEndpointComm
 
   try {
     const enriched = await enrichExistingYaml(yamlContent, repoHandle, enrichOptions);
-    const safeInputPath = validateOutputPath(options.inputYaml!);
+    // safeYamlPath is already the validated+resolved input path; reuse it here.
     const outputPath = options.outputPath
       ? validateOutputPath(path.join(options.outputPath,
-          path.basename(safeInputPath).replace(/\.ya?ml$/, '.enriched.openapi.yaml')))
-      : safeInputPath.replace(/\.ya?ml$/, '.enriched.openapi.yaml');
+          path.basename(safeYamlPath).replace(/\.ya?ml$/, '.enriched.openapi.yaml')))
+      : safeYamlPath.replace(/\.ya?ml$/, '.enriched.openapi.yaml');
 
     fs.writeFileSync(outputPath, enriched, 'utf-8');
     console.error(`Enriched YAML written: ${outputPath}`);

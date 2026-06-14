@@ -33,6 +33,53 @@ describe('schema-validator', () => {
     });
   });
 
+  // ─── Security regression: validateSchemaPath path-traversal defence ──
+  //
+  // Fix: loadSchema() now passes user-supplied paths through
+  // validateSchemaPath() before reading. The following cases MUST throw
+  // if the fix is reverted (the old code called readFileSync on the raw
+  // string with no containment check).
+
+  describe('loadSchema — path-traversal defence (security regression)', () => {
+    it('rejects schema path containing ".." sequences', () => {
+      // Prefix-match bypass: "../../etc/passwd" resolves outside any safe root.
+      // Without the fix, readFileSync would be called directly on this string.
+      expect(() => loadSchema('../../etc/passwd')).toThrow();
+    });
+
+    it('rejects absolute path outside cwd / home / tmp', () => {
+      // /etc/passwd exists on POSIX but is outside every safe root
+      // (cwd, $HOME, /tmp, /var/tmp). The fix must reject this
+      // regardless of whether the file exists.
+      // On CI or non-POSIX environments without /etc/passwd the throw
+      // is still expected — the containment check fires first.
+      expect(() => loadSchema('/etc/passwd')).toThrow(/not allowed|cannot contain|not found/i);
+    });
+
+    it('accepts a schema file inside /tmp (safe root)', () => {
+      // Regression guard for the positive case: a legitimate custom
+      // schema inside /tmp must still load. Without this assertion a
+      // future overly-restrictive fix would silently break the feature.
+      const tempDir = join(tmpdir(), 'gnx-sec-schemavalidator-' + Date.now());
+      mkdirSync(tempDir, { recursive: true });
+      const schemaPath = join(tempDir, 'sec-test-schema.json');
+      const minimalSchema = {
+        $schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: { x: { type: 'string' } },
+      };
+      writeFileSync(schemaPath, JSON.stringify(minimalSchema));
+      try {
+        clearCache();
+        const schema = loadSchema(schemaPath);
+        expect(schema).toBeDefined();
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+        clearCache();
+      }
+    });
+  });
+
   describe('loadSchema', () => {
     it('should load bundled schema by default', () => {
       const schema = loadSchema();

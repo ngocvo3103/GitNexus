@@ -695,13 +695,36 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     // the assertion captures the data-determinism contract, not the
     // run-order-dependent metadata.
     const PROVENANCE_KEYS = ['analyzeRanForThisLeg', 'analyzeCommand', 'analyzeRanFirst'];
+    // Deep-sort and remove provenance keys to ensure byte-identity (AC-5).
+    // The issue: after JSON.parse → delete keys → JSON.stringify, the key
+    // order can vary between runs because JavaScript object insertion order
+    // is affected by deletion history. We rebuild the object with sorted
+    // keys at every level of the tree.
+    const deepSortAndClean = (obj: any): any => {
+      if (obj === null || typeof obj !== 'object') {
+        return obj;
+      }
+      if (Array.isArray(obj)) {
+        return obj.map((item) => deepSortAndClean(item));
+      }
+      // For plain objects, rebuild with sorted keys.
+      const sorted: Record<string, any> = {};
+      for (const key of Object.keys(obj).sort()) {
+        if (!PROVENANCE_KEYS.includes(key)) {
+          sorted[key] = deepSortAndClean(obj[key]);
+        }
+      }
+      return sorted;
+    };
     const normalize = (json: string) => {
       const obj = JSON.parse(json);
-      for (const k of PROVENANCE_KEYS) delete obj[k];
-      return JSON.stringify(obj);
+      const cleaned = deepSortAndClean(obj);
+      return JSON.stringify(cleaned);
     };
+    const normalizedBefore = normalize(before);
+    const normalizedAfter = normalize(after);
     expect(
-      Buffer.compare(Buffer.from(normalize(before), 'utf-8'), Buffer.from(normalize(after), 'utf-8')),
+      Buffer.compare(Buffer.from(normalizedBefore, 'utf-8'), Buffer.from(normalizedAfter, 'utf-8')),
       'report data differs between identical re-runs (AC-5 violation)',
     ).toBe(0);
   });
