@@ -31,7 +31,7 @@ import { getGlobalDir } from '../../../storage/repo-manager.js';
 import { TYPESCRIPT_LANGUAGE_SERVER_BIN } from './server-discovery.js';
 // WI-2: import canary strategies. canary-sampler.ts only `import type`s from this
 // file (LanguageCanaryStrategy), so the import is erased at runtime — no cycle.
-import { TS_CANARY_STRATEGY, JAVA_CANARY_STRATEGY, PYTHON_CANARY_STRATEGY, buildCanarySamples } from './canary-sampler.js';
+import { TS_CANARY_STRATEGY, JAVA_CANARY_STRATEGY, PYTHON_CANARY_STRATEGY, GO_CANARY_STRATEGY, buildCanarySamples } from './canary-sampler.js';
 
 // ─── Forward-declared types (filled in by WI-2/WI-4) ─────────────────
 
@@ -94,6 +94,79 @@ export interface AdapterReadyCtx {
    * can serve it (jdtls requires an open file before resolving definitions).
    */
   backstopProbe?: () => Promise<boolean>;
+
+  // ── WI-2a: progress read-seam (Go only) ──────────────────────────────
+  //
+  // The three fields below are OPTIONAL. TS/Java/Python adapters receive an
+  // `AdapterReadyCtx` where all three are `undefined` — their `awaitReady`
+  // implementations must not touch them. Only `GO_ADAPTER.awaitReady` reads
+  // them; `LspClient.spawnAndInitialize` populates them by reference when the
+  // adapter has `clientCapabilities?.window?.workDoneProgress` set.
+  //
+  // Design: threaded by reference (same Map/Set instance as `LspClient`) so
+  // `awaitReady` can observe tokens buffered BEFORE it is called (the
+  // begin-before-awaitReady race). The `onProgressEnd` subscribe seam lets
+  // `awaitReady` be notified when a new `end` arrives after it starts.
+
+  /**
+   * Live reference to `LspClient.progressTokenTitles` (populated by the
+   * pre-`initialize` `$/progress` handler). Keys are progress token ids;
+   * values are the stored `begin.value.title` strings.
+   *
+   * Populated only for Go (Go adapter sets `clientCapabilities?.window?.workDoneProgress`).
+   * `undefined` for TS/Java/Python.
+   */
+  progressTokenTitles?: ReadonlyMap<string | number, string>;
+
+  /**
+   * Live reference to `LspClient.progressEndedTokens` (populated by the
+   * pre-`initialize` `$/progress` handler). Contains every token that has
+   * received its `end` notification.
+   *
+   * Populated only for Go. `undefined` for TS/Java/Python.
+   */
+  progressEndedTokens?: ReadonlySet<string | number>;
+
+  /**
+   * Subscribe to future `$/progress end` events. The callback `cb` is invoked
+   * with the ended token each time the pre-`initialize` `$/progress` handler
+   * processes a new `end` notification. The returned disposable removes `cb`
+   * from the registry.
+   *
+   * Populated only for Go. `undefined` for TS/Java/Python.
+   *
+   * Usage pattern in `GO_ADAPTER.awaitReady`:
+   *   const sub = ctx.onProgressEnd?.((token) => { … });
+   *   // …
+   *   sub?.dispose();
+   */
+  onProgressEnd?: (cb: (token: string | number) => void) => { dispose(): void };
+}
+
+// ─── ClientCapabilities ───────────────────────────────────────────────
+
+/**
+ * Structural type for the LSP `initialize` request's `clientCapabilities`
+ * payload (WI-0 R2-1).
+ *
+ * Non-literal members are intentional: the module-private
+ * `TS_SERVER_CAPABILITIES` const in `lsp-client.ts` has a literal
+ * `window.workDoneProgress: false` field (due to `as const`).  If
+ * `InitializeParams.capabilities` stayed typed as `typeof TS_SERVER_CAPABILITIES`,
+ * any adapter supplying `{window:{workDoneProgress:true}}` would fail `tsc`.
+ * Widening to this structural type (with `boolean`, not `false | true`) makes
+ * both the existing const and the Go override assignable.
+ *
+ * Defined here (not in `lsp-client.ts`) to avoid a circular ESM dependency:
+ * `lsp-client.ts` imports `LanguageAdapter` from this file; importing
+ * `ClientCapabilities` back from `lsp-client.ts` would create a cycle that
+ * leaves one side `undefined` at module init time in Node.js.  `lsp-client.ts`
+ * re-exports this type for callers that need to import from there.
+ */
+export interface ClientCapabilities {
+  textDocument?: Record<string, unknown>;
+  workspace?: Record<string, unknown>;
+  window?: { workDoneProgress?: boolean };
 }
 
 // ─── LanguageAdapter interface ────────────────────────────────────────
@@ -104,7 +177,7 @@ export interface AdapterReadyCtx {
  */
 export interface LanguageAdapter {
   /** Closed union; widened additively — no switch/discriminant over .id in production. */
-  readonly id: 'typescript' | 'java' | 'python';
+  readonly id: 'typescript' | 'java' | 'python' | 'go';
 
   /**
    * Binary basename passed to server discovery.
@@ -117,6 +190,24 @@ export interface LanguageAdapter {
    * `'typescript'` | `'java'`
    */
   readonly languageId: string;
+
+  /**
+   * Per-adapter LSP client capabilities (WI-0 seam, R2-1).
+   *
+   * When present, this value is used verbatim as the `capabilities` field of
+   * the LSP `initialize` request, instead of the default `TS_SERVER_CAPABILITIES`
+   * const from `lsp-client.ts`. Adapters that do NOT set this field (TS, Java,
+   * Python) receive the byte-identical `TS_SERVER_CAPABILITIES` payload —
+   * `lsp-client.ts` uses `adapter.clientCapabilities ?? TS_SERVER_CAPABILITIES`.
+   *
+   * Go adapter: `{ window: { workDoneProgress: true } }` — tells gopls the
+   * client supports progress notifications, enabling the `$/progress` stream
+   * required by the `awaitReady` background-load gate (R2-2 / KD-1).
+   *
+   * MUST NOT be the same object reference as `TS_SERVER_CAPABILITIES` — that
+   * const is module-private and must never be mutated (C0-2 invariant).
+   */
+  readonly clientCapabilities?: ClientCapabilities;
 
   /**
    * Build the subprocess spawn arguments.
@@ -289,7 +380,7 @@ export const JAVA_ADAPTER: LanguageAdapter = {
       function settle(value: boolean): void {
         if (settled) return;
         settled = true;
-        if (timer !== null) clearTimeout(timer);
+        if (timer !== null) { clearTimeout(timer); timer = null; }
         try {
           handler?.dispose();
         } catch {
@@ -402,9 +493,7 @@ export const JAVA_ADAPTER: LanguageAdapter = {
       }, deadline);
 
       // Prevent the timer from keeping the Node.js event loop alive past teardown.
-      if (typeof (timer as unknown) === 'object' && timer !== null && typeof (timer as NodeJS.Timeout).unref === 'function') {
-        (timer as NodeJS.Timeout).unref();
-      }
+      timer.unref?.();
     });
   },
 
@@ -520,13 +609,7 @@ export const PYTHON_ADAPTER: LanguageAdapter = {
       }, deadline);
 
       // Prevent the timer from keeping the Node.js event loop alive past teardown.
-      if (
-        typeof (timer as unknown) === 'object' &&
-        timer !== null &&
-        typeof (timer as NodeJS.Timeout).unref === 'function'
-      ) {
-        (timer as NodeJS.Timeout).unref();
-      }
+      timer.unref?.();
 
       // Run the probe loop asynchronously so we do not block the event loop.
       void (async () => {
@@ -620,6 +703,203 @@ export const PYTHON_ADAPTER: LanguageAdapter = {
   },
 };
 
+// ─── GOPLS_READY_DEADLINE_MS ─────────────────────────────────────────
+
+/**
+ * Hard deadline for `GO_ADAPTER.awaitReady` (milliseconds from call time).
+ *
+ * 30 s is sufficient for gopls cold-load on gin (spike-confirmed: 247–916ms
+ * warm; generous margin for cold JIT start). WI-2 fills in the full
+ * `awaitReady` implementation; this constant is exported here so callers
+ * and tests can reference it without importing the WI-2 module.
+ *
+ * Exported so callers and tests can override via `AdapterReadyCtx.deadlineMs`.
+ */
+export const GOPLS_READY_DEADLINE_MS = 30_000;
+
+// ─── GO_ADAPTER ───────────────────────────────────────────────────────
+
+/**
+ * Go language adapter (WI-1 stub — WI-2 fills in full `awaitReady`).
+ *
+ * `spawnArgs`: `[]` — spike-confirmed: bare `gopls` serves (init resp +87ms).
+ *   WI-7 will assert `['serve']` if the bare form proves insufficient, but
+ *   the spike shows `[]` as the correct invocation for stdio mode.
+ *
+ * `awaitReady`: stub that resolves `true` immediately. WI-2 replaces this
+ *   with the `$/progress` notification-wait pattern (pre-`initialize`
+ *   handler reads the token-correlation buffer populated by WI-0).
+ *
+ * `classifyUri`: `file://` → `'workspace'`; anything else → `'unmappable'`.
+ *   Out-of-repo `file://` containment (Go stdlib / mod-cache) is handled
+ *   by `location-mapper.ts` via `isExternalRefusalAdapter` path-containment
+ *   check — NOT here (same pattern as Python, ruling R2-13 / ADR-001).
+ *
+ * `serverBinary`: `'gopls'` — the canonical gopls binary name.
+ * `languageId`: `'go'` — LSP-spec language identifier for Go source.
+ * `initializationOptions`: `{}` — gopls accepts the LSP default for now.
+ * `canary`: `GO_CANARY_STRATEGY` stub — WI-3 fleshes out the `.go` sampling.
+ */
+export const GO_ADAPTER: LanguageAdapter = {
+  id: 'go',
+  serverBinary: 'gopls',
+  languageId: 'go',
+
+  spawnArgs(_ctx: { workspaceRoot: string }): string[] {
+    // SPIKE-CONFIRMED: bare gopls (no args) serves stdio correctly.
+    // WI-7 will revisit if ['serve'] is needed.
+    return [];
+  },
+
+  initializationOptions: {},
+
+  /**
+   * WI-0 seam: tells gopls the client supports progress notifications,
+   * enabling the `$/progress` stream used by `awaitReady` (R2-1 / R2-2).
+   *
+   * This object is distinct from the module-private `TS_SERVER_CAPABILITIES`
+   * const (C0-2 invariant). `lsp-client.ts` uses
+   * `adapter.clientCapabilities ?? TS_SERVER_CAPABILITIES` so TS/Java/Python
+   * adapters (which omit this field) send the byte-identical TS payload.
+   */
+  clientCapabilities: { window: { workDoneProgress: true } },
+
+  awaitReady(ctx: AdapterReadyCtx): Promise<boolean> {
+    // WI-2a: $/progress notification-wait pattern (spike-confirmed).
+    //
+    // Algorithm:
+    //   1. Scan the pre-buffered `ctx.progressEndedTokens` for any token
+    //      whose stored `ctx.progressTokenTitles` title matches
+    //      "Setting up workspace". If found, resolve true immediately
+    //      (begin+end arrived BEFORE awaitReady — the buffering guarantee).
+    //   2. Otherwise, subscribe via `ctx.onProgressEnd` to be notified when
+    //      future `end` events arrive and apply the same title match.
+    //   3. On hard deadline: fall back to canary backstop
+    //      (backstopProbe if injected, otherwise buildCanarySamples +
+    //      didOpen + textDocument/definition). Never reject.
+    //
+    // The match title ("Setting up workspace") is spike-confirmed against
+    // gopls v0.22.0 on the gin fixture. The `end` notification carries an
+    // EMPTY title — MUST use the stored `begin` title from the map.
+    //
+    // `ctx.progressTokenTitles` / `ctx.progressEndedTokens` / `ctx.onProgressEnd`
+    // are populated by `LspClient.spawnAndInitialize` for Go adapters only.
+    // Non-Go adapters never call this implementation.
+    const GOPLS_WORKSPACE_TITLE = 'Setting up workspace';
+    const capturedCanary = GO_ADAPTER.canary;
+    const capturedWorkspaceRoot = ctx.workspaceRoot;
+    const conn = ctx.connection as MessageConnection;
+
+    return new Promise<boolean>((resolve) => {
+      const deadline = ctx.deadlineMs ?? GOPLS_READY_DEADLINE_MS;
+
+      let settled = false;
+      let progressSub: { dispose(): void } | null = null;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      function settle(value: boolean): void {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        try { progressSub?.dispose(); } catch { /* ignore */ }
+        resolve(value);
+      }
+
+      // Step 1: check buffer for a token that already ended with matching title.
+      // Use settle() — not resolve() directly — so the idempotency guard
+      // (settled flag) is set before returning. If an onProgressEnd callback
+      // fires synchronously on the same microtask tick after this point it
+      // will see settled=true and short-circuit, preventing double-resolution.
+      if (ctx.progressTokenTitles && ctx.progressEndedTokens) {
+        for (const token of ctx.progressEndedTokens) {
+          if (ctx.progressTokenTitles.get(token) === GOPLS_WORKSPACE_TITLE) {
+            settle(true);
+            return; // settled synchronously — no timer, no sub needed
+          }
+        }
+      }
+
+      // Step 2: subscribe to future end events.
+      if (ctx.onProgressEnd) {
+        try {
+          progressSub = ctx.onProgressEnd((token) => {
+            if (settled) return;
+            const title = ctx.progressTokenTitles?.get(token);
+            if (title === GOPLS_WORKSPACE_TITLE) {
+              settle(true);
+            }
+          });
+        } catch {
+          // Subscribe failed — fall through to deadline backstop.
+        }
+      }
+
+      // Step 3: deadline backstop — canary probe (mirrors JAVA_ADAPTER path B).
+      timer = setTimeout(() => {
+        if (settled) return;
+        void (async () => {
+          try {
+            if (ctx.backstopProbe) {
+              const ready = await ctx.backstopProbe();
+              settle(ready);
+              return;
+            }
+            // Inline canary probe: build samples + didOpen + definition.
+            const samples = await buildCanarySamples(capturedWorkspaceRoot, {
+              strategy: capturedCanary,
+              maxFiles: 1,
+            });
+            if (samples.length === 0) { settle(false); return; }
+            const sample = samples[0];
+            try {
+              let fileContent = '';
+              try {
+                fileContent = await fs.promises.readFile(
+                  fileURLToPath(sample.textDocument.uri),
+                  'utf8',
+                );
+              } catch { /* unreadable — send empty content */ }
+              await conn.sendNotification('textDocument/didOpen', {
+                textDocument: {
+                  uri: sample.textDocument.uri,
+                  languageId: GO_ADAPTER.languageId,
+                  version: 1,
+                  text: fileContent,
+                },
+              });
+            } catch { /* best-effort */ }
+            const result = await conn.sendRequest<unknown>(
+              'textDocument/definition',
+              { textDocument: sample.textDocument, position: sample.position },
+            );
+            const ready =
+              result !== null &&
+              result !== undefined &&
+              !(Array.isArray(result) && result.length === 0);
+            settle(ready);
+          } catch {
+            settle(false);
+          }
+        })();
+      }, deadline);
+
+      // Prevent the timer from keeping the Node.js event loop alive past teardown.
+      timer.unref?.();
+    });
+  },
+
+  canary: GO_CANARY_STRATEGY,
+
+  classifyUri(uri: string): 'workspace' | 'external' | 'unmappable' {
+    // Returns 'workspace' for ALL file:// URIs by design — scheme-only signal.
+    // Out-of-repo containment for Go (stdlib / mod-cache) is path-containment
+    // gated on adapterId in location-mapper.ts (isExternalRefusalAdapter),
+    // NOT here. Do NOT add GOROOT or mod-cache special-casing here.
+    if (uri.startsWith('file://')) return 'workspace';
+    return 'unmappable';
+  },
+};
+
 // ─── Extension census for KD-4 adapter selection ─────────────────────
 
 /** Extensions that indicate a TypeScript/JavaScript LSP project. */
@@ -630,6 +910,9 @@ const JAVA_EXTENSIONS = new Set(['.java']);
 
 /** Extensions that indicate a Python LSP project. */
 const PY_EXTENSIONS = new Set(['.py']);
+
+/** Extensions that indicate a Go LSP project. */
+const GO_EXTENSIONS = new Set(['.go']);
 
 /**
  * Directories to skip during the extension census walk. Skipping
@@ -672,10 +955,11 @@ const CENSUS_FILE_LIMIT = 2_000;
  *
  * Returns `{ tsCount, javaCount, pyCount }`.
  */
-function censusExtensions(dir: string): { tsCount: number; javaCount: number; pyCount: number } {
+function censusExtensions(dir: string): { tsCount: number; javaCount: number; pyCount: number; goCount: number } {
   let tsCount = 0;
   let javaCount = 0;
   let pyCount = 0;
+  let goCount = 0;
   let inspected = 0;
 
   function walk(current: string): void {
@@ -686,6 +970,12 @@ function censusExtensions(dir: string): { tsCount: number; javaCount: number; py
     } catch {
       return;
     }
+    // Sort entries lexicographically for determinism — the order of entries
+    // from readdirSync is filesystem-dependent and can vary across runs.
+    // Without sorting, the first CENSUS_FILE_LIMIT files inspected may differ,
+    // leading to different language counts and potentially different adapter
+    // selection (AC-5 determinism contract). Mirrors buildCanarySamples line 332.
+    entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
       if (inspected >= CENSUS_FILE_LIMIT) return;
       if (entry.isDirectory()) {
@@ -706,13 +996,15 @@ function censusExtensions(dir: string): { tsCount: number; javaCount: number; py
           javaCount++;
         } else if (PY_EXTENSIONS.has(ext)) {
           pyCount++;
+        } else if (GO_EXTENSIONS.has(ext)) {
+          goCount++;
         }
       }
     }
   }
 
   walk(dir);
-  return { tsCount, javaCount, pyCount };
+  return { tsCount, javaCount, pyCount, goCount };
 }
 
 /**
@@ -736,18 +1028,29 @@ function censusExtensions(dir: string): { tsCount: number; javaCount: number; py
  *          was detected.
  */
 export function selectAdapter(repoPath: string): LanguageAdapter | null {
-  const { tsCount, javaCount, pyCount } = censusExtensions(repoPath);
+  const { tsCount, javaCount, pyCount, goCount } = censusExtensions(repoPath);
 
-  if (tsCount === 0 && javaCount === 0 && pyCount === 0) {
+  if (tsCount === 0 && javaCount === 0 && pyCount === 0 && goCount === 0) {
     // No supported LSP language detected — funnel not entered.
     return null;
   }
 
-  // Python strict dominance: must beat BOTH TS and Java counts.
-  // Checked BEFORE the TS/Java tie-break — otherwise a pure-Python repo
-  // (tsCount=0, javaCount=0, pyCount=N) short-circuits to TS via 0 >= 0.
-  if (pyCount > tsCount && pyCount > javaCount) {
+  // Python strict dominance: must beat TS, Java, AND Go counts.
+  // Checked BEFORE the Go branch and the TS/Java tie-break — otherwise a
+  // pure-Python repo (tsCount=0, javaCount=0, pyCount=N) short-circuits to TS
+  // via 0 >= 0. The goCount guard ensures Python cannot steal a Go-dominant
+  // repo (e.g. 8 .go / 3 .py / 2 .ts / 2 .java → Go wins, not Python).
+  if (pyCount > tsCount && pyCount > javaCount && pyCount > goCount) {
     return PYTHON_ADAPTER;
+  }
+
+  // Go strict dominance: must beat ALL other counts (TS, Java, Python).
+  // Positioned AFTER Python strict-dominance (so a Python-dominant repo is
+  // never swallowed by this branch) and BEFORE the TS/Java tie-break (so a
+  // pure-Go repo does not short-circuit to TS via the 0 >= 0 guard — I-14).
+  // Ties go to the next branch (TS default), consistent with Python's contract.
+  if (goCount > tsCount && goCount > javaCount && goCount > pyCount) {
+    return GO_ADAPTER;
   }
 
   // Ties (including tsCount === pyCount) go to TS (safe default — TS adapter
