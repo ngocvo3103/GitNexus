@@ -118,6 +118,7 @@ import {
   TYPESCRIPT_LANGUAGE_SERVER_BIN,
   JDTLS_BIN,
   PYLSP_BIN,
+  GOPLS_BIN,
 } from '../../../src/core/ingestion/lsp/server-discovery.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -971,6 +972,151 @@ describe('server-discovery', () => {
       expect(result.python).toBeUndefined();
       // toEqual ignores undefined-valued keys, so this passes:
       expect(result).toEqual({ typescript: null });
+    });
+  });
+
+  // ─── WI-4 (gopls): gopls / Go server discovery ───────────────────────────
+  //
+  // EP (present/absent binary) + BVA (version string format) +
+  // Error Guessing (--version flag rejected → version:'unknown', R2-3).
+  // C4-1..C4-9 as specified in the plan.
+
+  describe('WI-4 (gopls) — gopls discovery via discoverServers()', () => {
+    // C4-7: constant value
+    it('C4-7: GOPLS_BIN constant === "gopls"', () => {
+      expect(GOPLS_BIN).toBe('gopls');
+    });
+
+    // C4-1: parseVersion extracts semver from the gopls version subcommand banner
+    it('C4-1: parseVersion("golang.org/x/tools/gopls v0.22.0") === "0.22.0"', () => {
+      expect(parseVersion('golang.org/x/tools/gopls v0.22.0')).toBe('0.22.0');
+    });
+
+    // C4-2: pre-release suffix stripped
+    it('C4-2: parseVersion("golang.org/x/tools/gopls v0.22.0-pre") === "0.22.0"', () => {
+      expect(parseVersion('golang.org/x/tools/gopls v0.22.0-pre')).toBe('0.22.0');
+    });
+
+    // C4-3: gopls absent from PATH → no 'go' key; other keys unaffected
+    it('C4-3: gopls absent → result has no "go" key; typescript/java/python unaffected', async () => {
+      // Stage only a TS binary; gopls absent everywhere.
+      const tsBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      stageBinary(tsBin);
+      registerSpawn(tsBin, () => 'typescript-language-server 4.3.3\n');
+      // No gopls staged, no which handler for gopls.
+
+      const result = await discoverServers();
+
+      // go key must be absent (undefined) — additive spread-omit invariant.
+      expect(result.go).toBeUndefined();
+      // Other keys must be unaffected.
+      expect(result.typescript).not.toBeNull();
+      expect(result.typescript!.version).toBe('4.3.3');
+    });
+
+    // C4-4: gopls present but --version flag rejected (exit 2, R2-3 production probe path)
+    // Production probe: `gopls --version` exits 2 with "flag provided but not defined: -version"
+    // on stderr, no semver on stdout. runVersion() maps this to { ran: true, stdout: '' }
+    // (non-ENOENT exit code), so finalize() keeps the binary with version 'unknown'.
+    it('C4-4: gopls --version flag rejected (exit 2) → result.go = {path, version:"unknown"} (R2-3)', async () => {
+      const goplsBin = '/Users/NgocVo_1/.local/bin/gopls';
+      stageBinary(goplsBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === GOPLS_BIN) return `${goplsBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      // Simulate `gopls --version` → exit 2 (no ENOENT code — binary DID launch).
+      registerSpawn(goplsBin, () => {
+        const e: any = new Error('flag provided but not defined: -version');
+        e.status = 2;
+        // No `code` property — this is a runtime exit, not a spawn failure.
+        throw e;
+      });
+
+      const result = await discoverServers();
+
+      expect(result.go).not.toBeNull();
+      expect(result.go).not.toBeUndefined();
+      expect(result.go!.path).toBe(goplsBin);
+      expect(result.go!.version).toBe('unknown');
+    });
+
+    // C4-5: gopls present, stdout empty / version unrecognized → version 'unknown'
+    it('C4-5: gopls stdout empty / version unrecognized → result.go.version === "unknown"', async () => {
+      const goplsBin = '/usr/local/bin/gopls';
+      stageBinary(goplsBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === GOPLS_BIN) return `${goplsBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      // Returns stdout with no semver token.
+      registerSpawn(goplsBin, () => 'something completely unrecognized\n');
+
+      const result = await discoverOne(GOPLS_BIN, { cwd: '/nonexistent/empty' });
+
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(goplsBin);
+      expect(result!.version).toBe('unknown');
+    });
+
+    // C4-6: discoverServers() never throws when gopls is absent
+    it('C4-6: discoverServers() never throws when gopls is absent', async () => {
+      // Nothing staged — all discovery paths return null.
+      await expect(discoverServers()).resolves.toBeDefined();
+    });
+
+    // C4-8: gopls present on PATH → result has go key with correct path
+    it('C4-8: gopls staged in PATH → result has go key with correct path', async () => {
+      const goplsBin = '/usr/local/bin/gopls';
+      stageBinary(goplsBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === GOPLS_BIN) return `${goplsBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      // gopls version subcommand banner (production probe uses --version flag which
+      // exits 2; but any stdout with no semver token yields 'unknown').
+      registerSpawn(goplsBin, () => 'gopls 0.22.0\n');
+
+      const result = await discoverOne(GOPLS_BIN, { cwd: '/nonexistent/empty' });
+
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(goplsBin);
+      // Version parsing works when the binary cooperates.
+      expect(result!.version).toBe('0.22.0');
+    });
+
+    // C4-9: existing 'returns documented result shape on success' test unchanged
+    // (additive spread guard — the go key is omitted when gopls is absent,
+    //  so toEqual({ typescript: ... }) continues to pass unmodified)
+    it('C4-9: spread-omit: absent gopls yields go===undefined; existing toEqual assertions unaffected', async () => {
+      // Replicate the exact fixture from the 'returns documented result shape' test
+      // to confirm the additive spread does not inject a new `go` key.
+      const projectNmBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      stageBinary(projectNmBin);
+      registerSpawn(projectNmBin, () => 'typescript-language-server 4.3.3\n');
+      // gopls absent — no which handler, no staged binary.
+
+      const result = await discoverServers();
+
+      // go key must be absent (undefined), not null.
+      expect(result.go).toBeUndefined();
+      // The shape is identical to the pre-gopls baseline — toEqual still passes.
+      expect(result).toEqual({
+        typescript: { path: projectNmBin, version: '4.3.3' },
+      });
     });
   });
 });

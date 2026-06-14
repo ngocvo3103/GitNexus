@@ -1200,3 +1200,215 @@ describe('Python realpath-failure refusal — HARD gate (WI-5)', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// WI-5 (#159 P5): isExternalRefusalAdapter — Go (adapterId='go')
+//
+// Decision table (adapterId × URI-location matrix):
+//   C5-1  go + mod-cache toolchain stdlib URI  → { NO_NODE, external:true }
+//   C5-2  go + GOPATH/pkg/mod third-party dep  → { NO_NODE, external:true }
+//   C5-2b go + system $GOROOT/src stdlib        → { NO_NODE, external:true }
+//   C5-3  go + realpathSync throws              → bare { NO_NODE } (I-9)
+//   C5-4  go + fileURLToPath throws             → bare { NO_NODE } (I-9)
+//   C5-5  go + in-repo .go URI                 → normal node mapping
+//   C5-6  python + mod-cache/pkg/mod-style URI  → NOT external:true (Python gate unchanged)
+//   C5-7  typescript + out-of-repo file://      → bare { NO_NODE } (gate invisible)
+//   C5-8  java + out-of-repo file://            → bare { NO_NODE } (gate invisible)
+//   C5-9  go + non-file:// URI                  → { NO_NODE } (no external:true)
+//   C5-10 symlink inside repo resolving outside → { NO_NODE, external:true }
+//   C5-11 existing Python tests still pass      → verified by non-regression
+//
+// Uses REAL filesystem paths (same pattern as the Python seam tests above):
+//   repoRoot      — same as before (gitnexus package dir)
+//   outOfRepoFile — same as before (process.execPath outside repo)
+//   inRepoFile    — same as before (package.json inside repo)
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
+  // C5-1: mod-cache toolchain stdlib — ~/go/pkg/mod/golang.org/toolchain@.../src/net/http/server.go
+  // We simulate this with the real outOfRepoFile (process.execPath), which realpathSync
+  // resolves to a path outside repoRoot — identical containment semantics to a Go mod-cache path.
+  it('C5-1: go + mod-cache stdlib URI (outside repo) → NO_NODE external:true', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'go-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'go' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-2: $GOPATH/pkg/mod third-party dep — same containment path as C5-1.
+  it('C5-2: go + GOPATH/pkg/mod URI (outside repo) → NO_NODE external:true', async () => {
+    // Any real path outside repoRoot exercises the same predicate.
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'go-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'go' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-2b: system $GOROOT/src stdlib — same containment check (NOT GOROOT-special-cased).
+  // The refusal is path-containment only; Go adapter makes no GOROOT special case.
+  it('C5-2b: go + system GOROOT/src stdlib URI (outside repo, path-containment) → NO_NODE external:true', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'go-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'go' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-3: realpathSync throws → bare {NO_NODE} WITHOUT external:true (I-9)
+  it('C5-3: go + realpathSync throws (non-existent file) → bare NO_NODE (I-9, no external)', async () => {
+    const nonExistentUri = 'file:///tmp/__gitnexus_test_go_nonexistent_c53/main.go';
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(nonExistentUri, 0),
+      'go-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'go' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-4: fileURLToPath throws (malformed URI) → bare {NO_NODE} (I-9)
+  it('C5-4: go + malformed file:// URI (fileURLToPath throws) → bare NO_NODE (I-9, no external)', async () => {
+    const malformedUri = 'file:///path/with/%GG/invalid/percent-encoding.go';
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(malformedUri, 0),
+      'go-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'go' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-5: in-repo .go URI → normal node mapping (DB is queried; returns node)
+  it('C5-5: go + in-repo file:// URI → normal node mapping (DB queried)', async () => {
+    const uri = `file://${inRepoFile}`;
+    const nodeId = 'Function:package.json:main';
+    const { deps, execute } = makeDeps([
+      row({ id: nodeId, name: 'main', startLine: 0, endLine: 0, label: 'Function', filePath: inRepoRelPath }),
+    ]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'go-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'go' },
+    );
+    expect(result.kind).toBe('node');
+    expect(execute).toHaveBeenCalledTimes(1);
+    // relPath must be the repo-relative path sent to the DB.
+    const params = execute.mock.calls[0][2];
+    expect(params.relPath).toBe(inRepoRelPath);
+  });
+
+  // C5-6: Python adapter + mod-cache/pkg/mod-style URI → still external:true
+  // (Python gate unchanged — widening to 'go' must not break Python).
+  it('C5-6: python + out-of-repo URI → still NO_NODE external:true (Python gate unchanged)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-7: typescript + out-of-repo file:// → bare {NO_NODE} (gate invisible — I-1)
+  it('C5-7: typescript (no adapterId) + out-of-repo file:// → bare NO_NODE (gate invisible)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'ts-repo',
+      // No adapterId — TS funnel; external:true gate must NOT fire.
+      { ...deps, repoPath: repoRoot },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-8: java + out-of-repo file:// → bare {NO_NODE} (gate invisible — I-1)
+  it('C5-8: java (adapterId=java) + out-of-repo file:// → bare NO_NODE (gate invisible)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'java-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'java' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-9: go + non-file:// URI → classifyUri returns 'unmappable' → {NO_NODE} (no external:true)
+  // The Go adapter classifies non-file:// schemes as 'unmappable'. The KD-3 block in the mapper
+  // returns bare {NO_NODE} (not external:true) for 'unmappable'. No containment signal → no
+  // external:true from the path-containment gate either.
+  it('C5-9: go + non-file:// URI (gopls://...) with classifyUri=unmappable → NO_NODE without external:true', async () => {
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc('gopls://file/pkg/net/http/server.go', 0),
+      'go-repo',
+      {
+        ...deps,
+        repoPath: repoRoot,
+        adapterId: 'go',
+        // Go adapter classifies non-file:// URIs as unmappable → KD-3 returns bare NO_NODE.
+        classifyUri: (u) => (u.startsWith('file://') ? 'workspace' : 'unmappable'),
+      },
+    );
+    // classifyUri('gopls://...') = 'unmappable' → immediate bare NO_NODE (KD-3 block, no external:true).
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-10: Symlink inside repo resolving outside repoPath → {NO_NODE, external:true}
+  // We simulate with outOfRepoFile directly — realpathSync resolves to a path
+  // outside repoRoot, which is the identical containment logic a resolved symlink exercises.
+  it('C5-10: symlink inside repo whose realpath is outside repoRoot → NO_NODE external:true', async () => {
+    // This case exercises: realpathSync(absPath) → outside repoRoot → rebasedOutOfRepo=true.
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'go-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'go' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // C5-11: Existing Python isPythonAdapter (now isExternalRefusalAdapter) cases
+  // The Python seam tests above remain untouched; this case is a quick smoke test
+  // that adapterId='python' still produces external:true (regression guard).
+  it('C5-11: Python adapter still triggers external:true (isExternalRefusalAdapter regression guard)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+});
