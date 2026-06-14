@@ -85,6 +85,8 @@ export const readFileContents = async (
   relativePaths: string[],
 ): Promise<Map<string, string>> => {
   const contents = new Map<string, string>();
+  let failedCount = 0;
+  let firstFailedPath = '';
 
   for (let start = 0; start < relativePaths.length; start += READ_CONCURRENCY) {
     const batch = relativePaths.slice(start, start + READ_CONCURRENCY);
@@ -99,8 +101,21 @@ export const readFileContents = async (
     for (const result of results) {
       if (result.status === 'fulfilled') {
         contents.set(result.value.path, result.value.content);
+      } else {
+        failedCount++;
+        if (!firstFailedPath && result.reason) {
+          // Extract the relativePath from the failed promise's batch position
+          const failedIdx = results.indexOf(result);
+          if (failedIdx >= 0 && failedIdx < batch.length) {
+            firstFailedPath = batch[failedIdx];
+          }
+        }
       }
     }
+  }
+
+  if (failedCount > 0) {
+    console.warn(`⚠️  ${failedCount}/${relativePaths.length} file reads failed (first: ${firstFailedPath || 'unknown'}). repoPath=${repoPath}`);
   }
 
   return contents;

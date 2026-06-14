@@ -19,7 +19,26 @@ import {
   RELATION_SCHEMA,
   EMBEDDING_SCHEMA,
   CREATE_VECTOR_INDEX_QUERY,
+  SCHEMA_MIGRATIONS,
+  // WI-1: Migration constants for backward compatibility
+  FILE_SCHEMA_MIGRATION,
+  FOLDER_SCHEMA_MIGRATION,
+  FUNCTION_SCHEMA_MIGRATION,
+  FUNCTION_SCHEMA_MIGRATION_2,
+  CLASS_SCHEMA_MIGRATION,
+  INTERFACE_SCHEMA_MIGRATION,
+  METHOD_SCHEMA_MIGRATION,
+  METHOD_SCHEMA_MIGRATION_2,
+  CODE_ELEMENT_SCHEMA_MIGRATION,
+  COMMUNITY_SCHEMA_MIGRATION,
+  PROCESS_SCHEMA_MIGRATION,
+  ROUTE_SCHEMA_MIGRATION,
+  CODEREL_SOURCE_MIGRATION,
+  CODEREL_SOURCELINE_MIGRATION,
+  CODEREL_SOURCECOL_MIGRATION,
 } from '../../src/core/lbug/schema.js';
+import { NodeProperties, RelationshipType } from '../../src/core/graph/types.js';
+import { SupportedLanguages } from '../../src/config/supported-languages.js';
 
 describe('LadybugDB Schema', () => {
   describe('NODE_TABLES', () => {
@@ -39,8 +58,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('has expected total count', () => {
-      // 9 core + 18 multi-language + Route + Tool = 30
-      expect(NODE_TABLES).toHaveLength(30);
+      // 9 core + 1 Route + 18 multi-language = 28
+      expect(NODE_TABLES).toHaveLength(28);
     });
   });
 
@@ -122,11 +141,11 @@ describe('LadybugDB Schema', () => {
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {
       // HAS_METHOD sources: Class, Interface, Struct, Trait, Impl, Record
-      // HAS_METHOD targets: Method, Constructor (Property is now HAS_PROPERTY)
+      // HAS_METHOD targets: Method, Constructor, Property
       const sources = ['Class', 'Interface'];
       const backtickSources = ['Struct', 'Trait', 'Impl', 'Record'];
       const targets = ['Method'];
-      const backtickTargets = ['Constructor'];
+      const backtickTargets = ['Constructor', 'Property'];
 
       // Non-backtick source → non-backtick target
       for (const src of sources) {
@@ -164,7 +183,7 @@ describe('LadybugDB Schema', () => {
 
   describe('schema query ordering', () => {
     it('NODE_SCHEMA_QUERIES has correct count', () => {
-      expect(NODE_SCHEMA_QUERIES).toHaveLength(30);
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(28);
     });
 
     it('REL_SCHEMA_QUERIES has one relation table', () => {
@@ -172,14 +191,268 @@ describe('LadybugDB Schema', () => {
     });
 
     it('SCHEMA_QUERIES includes all node + rel + embedding schemas', () => {
-      // 30 node + 1 rel + 1 embedding = 32
-      expect(SCHEMA_QUERIES).toHaveLength(32);
+      // 28 node + 1 rel + 1 embedding = 30
+      expect(SCHEMA_QUERIES).toHaveLength(30);
     });
 
     it('node schemas come before relation schemas in SCHEMA_QUERIES', () => {
       const relIndex = SCHEMA_QUERIES.indexOf(RELATION_SCHEMA);
       const lastNodeIndex = SCHEMA_QUERIES.indexOf(NODE_SCHEMA_QUERIES[NODE_SCHEMA_QUERIES.length - 1]);
       expect(relIndex).toBeGreaterThan(lastNodeIndex);
+    });
+  });
+
+  // ─── WI-1: Cross-Repo Schema Extensions ─────────────────────────────────────
+
+  describe('NodeProperties type extension (WI-1)', () => {
+    it('accepts repoId as optional string field', () => {
+      // WI-1: NodeProperties must support repoId for cross-repo resolution
+      const nodeWithRepoId: NodeProperties = {
+        name: 'UserService',
+        filePath: '/src/services/UserService.ts',
+        repoId: 'repo-123',
+      };
+      expect(nodeWithRepoId.repoId).toBe('repo-123');
+    });
+
+    it('allows nodes without repoId (backward compatibility)', () => {
+      // WI-1: Nodes without repoId must remain valid for single-repo scenarios
+      const nodeWithoutRepoId: NodeProperties = {
+        name: 'AuthService',
+        filePath: '/src/services/AuthService.ts',
+      };
+      expect(nodeWithoutRepoId.repoId).toBeUndefined();
+    });
+
+    it('repoId is optional in type signature', () => {
+      // Type-level test: TypeScript should accept both forms
+      // This test verifies runtime behavior matches the type
+      const minimalNode: NodeProperties = {
+        name: 'MinimalService',
+        filePath: '/src/MinimalService.ts',
+      };
+      const fullNode: NodeProperties = {
+        name: 'FullService',
+        filePath: '/src/FullService.ts',
+        repoId: 'repo-456',
+        startLine: 1,
+        endLine: 100,
+        language: SupportedLanguages.TypeScript,
+      };
+      expect(minimalNode).toBeDefined();
+      expect(fullNode).toBeDefined();
+    });
+  });
+
+  describe('RelationshipType extension (WI-1)', () => {
+    it('includes CROSS_IMPORTS relationship type', () => {
+      // WI-1: CROSS_IMPORTS is needed for cross-repo dependency tracking
+      const crossImportsRel: RelationshipType = 'CROSS_IMPORTS';
+      expect(crossImportsRel).toBe('CROSS_IMPORTS');
+    });
+
+    it('CROSS_IMPORTS is a valid RelationshipType value', () => {
+      // WI-1: Type-level validation that CROSS_IMPORTS is in the union type
+      // This will fail at compile time if CROSS_IMPORTS is not in the type
+      const allTypes: RelationshipType[] = [
+        'CONTAINS',
+        'CALLS',
+        'INHERITS',
+        'OVERRIDES',
+        'IMPORTS',
+        'USES',
+        'DEFINES',
+        'DECORATES',
+        'IMPLEMENTS',
+        'EXTENDS',
+        'HAS_METHOD',
+        'MEMBER_OF',
+        'STEP_IN_PROCESS',
+        'CROSS_IMPORTS', // WI-1: This must be valid
+      ];
+      expect(allTypes).toContain('CROSS_IMPORTS');
+    });
+  });
+
+  describe('Node schema DDL for cross-repo (WI-1)', () => {
+    // WI-1: All node tables must include repoId column for cross-repo resolution
+
+    it('FILE_SCHEMA includes repoId column', () => {
+      expect(FILE_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('FOLDER_SCHEMA includes repoId column', () => {
+      expect(FOLDER_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('FUNCTION_SCHEMA includes repoId column', () => {
+      expect(FUNCTION_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('CLASS_SCHEMA includes repoId column', () => {
+      expect(CLASS_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('INTERFACE_SCHEMA includes repoId column', () => {
+      expect(INTERFACE_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('METHOD_SCHEMA includes repoId column', () => {
+      expect(METHOD_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('CODE_ELEMENT_SCHEMA includes repoId column', () => {
+      expect(CODE_ELEMENT_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('COMMUNITY_SCHEMA includes repoId column', () => {
+      expect(COMMUNITY_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('PROCESS_SCHEMA includes repoId column', () => {
+      expect(PROCESS_SCHEMA).toContain('repoId STRING');
+    });
+
+    it('uses ADD COLUMN-free ALTER for Kùzu (WI-160 runner is the idempotency guard)', () => {
+      // WI-1 originally asserted the migrations used `IF NOT EXISTS` for
+      // backward compatibility. Kùzu's ALTER TABLE does NOT support that
+      // clause (it throws "Invalid input <ADD COLUMN>: expected rule
+      // iC_AlterOptions" at parse time). WI-160 moves idempotency to the
+      // migration runner in lbug-adapter.doInitLbug, which suppresses the
+      // "already has property" error Kùzu throws on a re-ADD.
+      // This test pins the Kùzu-compatible syntax so a future refactor
+      // doesn't reintroduce `IF NOT EXISTS` (or `ADD COLUMN`) into the
+      // migration strings and brick the DB open.
+      const migrationWithAlter = [
+        FILE_SCHEMA_MIGRATION,
+        FOLDER_SCHEMA_MIGRATION,
+        FUNCTION_SCHEMA_MIGRATION,
+      ].find(migration => migration.includes('ALTER TABLE') && migration.includes('ADD '));
+
+      expect(migrationWithAlter).toBeDefined();
+
+      // None of the migration constants should use the invalid `ADD COLUMN
+      // IF NOT EXISTS` pattern — both clauses are unsupported by Kùzu.
+      for (const migration of [
+        FILE_SCHEMA_MIGRATION,
+        FOLDER_SCHEMA_MIGRATION,
+        FUNCTION_SCHEMA_MIGRATION,
+        FUNCTION_SCHEMA_MIGRATION_2,
+        CLASS_SCHEMA_MIGRATION,
+        INTERFACE_SCHEMA_MIGRATION,
+        METHOD_SCHEMA_MIGRATION,
+        METHOD_SCHEMA_MIGRATION_2,
+        CODE_ELEMENT_SCHEMA_MIGRATION,
+        COMMUNITY_SCHEMA_MIGRATION,
+        PROCESS_SCHEMA_MIGRATION,
+        ROUTE_SCHEMA_MIGRATION,
+      ]) {
+        expect(migration).not.toContain('ADD COLUMN');
+        expect(migration).not.toContain('IF NOT EXISTS');
+      }
+    });
+  });
+
+  describe('REL_TYPES extension (WI-1)', () => {
+    it('includes CROSS_IMPORTS in REL_TYPES array', () => {
+      // WI-1: REL_TYPES must include CROSS_IMPORTS for edge creation
+      expect(REL_TYPES).toContain('CROSS_IMPORTS');
+    });
+  });
+
+  // ─── #159 P3 Mode A (WI-1): source column on CodeRelation ─────────────
+
+  describe('RELATION_SCHEMA: source column (WI-1)', () => {
+    it('declares source STRING after step INT32', () => {
+      // WI-1: the 7th property of CodeRelation is `source STRING`.
+      // Kùzu binds COPY by header name with HEADER=true — the
+      // serializer writes `source` as the 7th CSV column, the COPY
+      // maps it to this column. Default 'heuristic' is applied
+      // serializer-side so every row is non-NULL.
+      expect(RELATION_SCHEMA).toContain('source STRING');
+      // Ordering: `source STRING` must appear AFTER `step INT32` in the
+      // DDL string so the schema declaration matches the CSV column order
+      // and the design contract. This would fail if the two columns were
+      // swapped or if either were absent.
+      expect(RELATION_SCHEMA.indexOf('source STRING')).toBeGreaterThan(
+        RELATION_SCHEMA.indexOf('step INT32'),
+      );
+    });
+
+    it('CODEREL_SOURCE_MIGRATION is a plain ADD source STRING (Kùzu-safe)', () => {
+      // Per feedback-kuzu-alter-table-no-if-not-exists.md: Kùzu's
+      // ALTER does NOT support `IF NOT EXISTS` or `ADD COLUMN`. The
+      // migration runner in lbug-adapter.doInitLbug swallows the
+      // "already has property" error on re-runs against an existing DB.
+      expect(CODEREL_SOURCE_MIGRATION).toContain('ALTER TABLE CodeRelation ADD source STRING');
+      expect(CODEREL_SOURCE_MIGRATION).not.toContain('IF NOT EXISTS');
+      expect(CODEREL_SOURCE_MIGRATION).not.toContain('ADD COLUMN');
+    });
+
+    it('SCHEMA_MIGRATIONS includes CODEREL_SOURCE_MIGRATION', () => {
+      // The runner iterates SCHEMA_MIGRATIONS in order — the new
+      // entry MUST be present, otherwise existing DBs never pick up
+      // the column on re-open.
+      expect(SCHEMA_MIGRATIONS).toContain(CODEREL_SOURCE_MIGRATION);
+    });
+
+    it('NODE/REL/SCHEMA_QUERIES counts unchanged (WI-1 invariant)', () => {
+      // WI-1 hard invariant: adding a column to an existing rel table
+      // does NOT change table counts. 28 node + 1 rel + 1 embedding.
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(28);
+      expect(REL_SCHEMA_QUERIES).toHaveLength(1);
+      expect(SCHEMA_QUERIES).toHaveLength(30);
+      expect(NODE_TABLES).toHaveLength(28);
+      expect(REL_TYPES).toContain('CROSS_IMPORTS');
+    });
+  });
+
+  // ─── #174: call-site position columns on CodeRelation ─────────────────
+
+  describe('RELATION_SCHEMA: sourceLine/sourceCol columns (#174)', () => {
+    it('declares sourceLine INT64 and sourceCol INT64 after source STRING', () => {
+      // #174: the two call-site position columns are INT64 (nullable — NULL
+      // means legacy/synthetic edge). Column order must put them AFTER
+      // `source STRING` so older readers that don't know about them can
+      // still consume the earlier columns via HEADER=true.
+      expect(RELATION_SCHEMA).toContain('sourceLine INT64');
+      expect(RELATION_SCHEMA).toContain('sourceCol INT64');
+      const sourceIdx = RELATION_SCHEMA.indexOf('source STRING');
+      expect(RELATION_SCHEMA.indexOf('sourceLine INT64')).toBeGreaterThan(sourceIdx);
+      expect(RELATION_SCHEMA.indexOf('sourceCol INT64')).toBeGreaterThan(sourceIdx);
+    });
+
+    it('CODEREL_SOURCELINE_MIGRATION is a plain ADD sourceLine INT64 (Kùzu-safe, no IF NOT EXISTS)', () => {
+      expect(CODEREL_SOURCELINE_MIGRATION).toContain('ALTER TABLE CodeRelation ADD sourceLine INT64');
+      expect(CODEREL_SOURCELINE_MIGRATION).not.toContain('IF NOT EXISTS');
+      expect(CODEREL_SOURCELINE_MIGRATION).not.toContain('ADD COLUMN');
+    });
+
+    it('CODEREL_SOURCECOL_MIGRATION is a plain ADD sourceCol INT64 (Kùzu-safe, no IF NOT EXISTS)', () => {
+      expect(CODEREL_SOURCECOL_MIGRATION).toContain('ALTER TABLE CodeRelation ADD sourceCol INT64');
+      expect(CODEREL_SOURCECOL_MIGRATION).not.toContain('IF NOT EXISTS');
+      expect(CODEREL_SOURCECOL_MIGRATION).not.toContain('ADD COLUMN');
+    });
+
+    it('SCHEMA_MIGRATIONS includes both position migrations in order after CODEREL_SOURCE_MIGRATION', () => {
+      expect(SCHEMA_MIGRATIONS).toContain(CODEREL_SOURCELINE_MIGRATION);
+      expect(SCHEMA_MIGRATIONS).toContain(CODEREL_SOURCECOL_MIGRATION);
+      // sourceLine must come after source (the existing column), and sourceCol
+      // must come after sourceLine so the runner applies them in order.
+      const sourceIdx = SCHEMA_MIGRATIONS.indexOf(CODEREL_SOURCE_MIGRATION);
+      const lineIdx   = SCHEMA_MIGRATIONS.indexOf(CODEREL_SOURCELINE_MIGRATION);
+      const colIdx    = SCHEMA_MIGRATIONS.indexOf(CODEREL_SOURCECOL_MIGRATION);
+      expect(lineIdx).toBeGreaterThan(sourceIdx);
+      expect(colIdx).toBeGreaterThan(lineIdx);
+    });
+
+    it('table-count invariant unchanged (#174 only adds columns, not tables)', () => {
+      // Column-adds do NOT bump SCHEMA_VERSION (table-count-derived).
+      // Duplicate of the WI-1 count test — if either test fails, a table
+      // was accidentally added or removed.
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(28);
+      expect(REL_SCHEMA_QUERIES).toHaveLength(1);
+      expect(SCHEMA_QUERIES).toHaveLength(30);
     });
   });
 });

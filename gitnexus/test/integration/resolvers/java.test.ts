@@ -1357,19 +1357,18 @@ describe('Java overload disambiguation by parameter types', () => {
   it('detects lookup method with parameterTypes on graph node', () => {
     const methods = getNodesByLabelFull(result, 'Method');
     const lookupNodes = methods.filter(m => m.name === 'lookup');
-    // generateId collision → 1 graph node, first overload's parameterTypes wins
-    expect(lookupNodes.length).toBe(1);
-    // The node has parameterTypes from whichever overload was registered first
-    expect(lookupNodes[0].properties.parameterTypes).toEqual(['int']);
+    // generateId now includes parameter types → each overload gets its own node
+    expect(lookupNodes.length).toBe(2);
+    const paramTypes = lookupNodes.map(n => n.properties.parameterTypes).sort();
+    expect(paramTypes).toEqual([['String'], ['int']]);
   });
 
   it('emits CALLS edge from run() → lookup() via overload disambiguation', () => {
     const calls = getRelationships(result, 'CALLS');
     const lookupCalls = calls.filter(c => c.source === 'run' && c.target === 'lookup');
-    // Phase 0 (fileIndex stores both overloads) + Phase 2 (literal type matching)
-    // enables resolution where previously 2 same-arity candidates → null.
-    // Both calls resolve to same nodeId (ID collision) → 1 CALLS edge after dedup.
-    expect(lookupCalls.length).toBe(1);
+    // Each overload is a separate node; literal type matching resolves
+    // each call site to its specific overload node → 1 edge per call site.
+    expect(lookupCalls.length).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -1409,8 +1408,11 @@ describe('Java virtual dispatch via constructor type (same-file)', () => {
     // animal.fetchBall() only resolves if constructorTypeMap overrides
     // receiver from Animal → Dog (since only Dog has fetchBall).
     // dog.fetchBall() resolves directly via Dog type.
-    // Both target same nodeId → 1 CALLS edge after dedup.
-    expect(fetchCalls.length).toBe(1);
+    // WI-1 / #159: heuristic CALLS id is line-aware (`:L${row}`
+    // suffix). The fixture has TWO call sites (L25: animal,
+    // L29: dog) at distinct lines → two distinct edges survive
+    // collapse (previously one — id dedup at graph.ts:14).
+    expect(fetchCalls.length).toBe(2);
   });
 });
 

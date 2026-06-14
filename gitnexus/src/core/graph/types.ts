@@ -29,20 +29,25 @@ export type NodeLabel =
   | 'Static'
   | 'Property'
   | 'Record'
+  | 'Route'
+  | 'Tool'
   | 'Delegate'
   | 'Annotation'
   | 'Constructor'
   | 'Template'
-  | 'Section'
-  | 'Route'        // API route endpoint (e.g., /api/grants)
-  | 'Tool';        // MCP tool definition
+  | 'Section';
 
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
 
 export type NodeProperties = {
   name: string,
-  filePath: string,
+  filePath?: string,
+  // Cross-repo resolution — identifies which repo this node belongs to
+  repoId?: string,
+  // #50: marks a phantom File node that stands in for a symbol owned by an
+  // indexed DEPENDENCY repo (created only when a CrossRepoRegistry is provided).
+  isExternal?: boolean,
   startLine?: number,
   endLine?: number,
   language?: SupportedLanguages,
@@ -68,20 +73,42 @@ export type NodeProperties = {
   entryPointReason?: string,
   // Method signature (for MRO disambiguation)
   parameterCount?: number,
-  // Section-specific (markdown heading level, 1-6)
-  level?: number,
+  requiredParameterCount?: number,
+  parameterTypes?: string,  // JSON array of parameter type names
   returnType?: string,
-  // Field/property metadata (populated by FieldExtractor)
-  declaredType?: string,
-  visibility?: string,       // 'public' | 'private' | 'protected' | 'internal' etc.
+  // Property visibility and modifiers
+  visibility?: string,
   isStatic?: boolean,
   isReadonly?: boolean,
+  declaredType?: string,
+  // Route-specific properties (for HTTP endpoints)
+  routeType?: string,
+  httpMethod?: string,
+  routePath?: string,
+  controllerName?: string,
+  // #67: spec-named aliases of the above — also exposed on Route nodes.
+  controllerClass?: string,
+  methodName?: string,
+  handlerMethod?: string,
+  lineNumber?: number,
+  isInherited?: boolean,
+  isControllerClass?: boolean,
+  // @RequestMapping prefix (e.g. /api/v1) — from ExtractedRoute.prefix
+  prefix?: string,
   // Response shape (top-level keys from NextResponse.json({...}) / res.json({...}))
   responseKeys?: string[],
   // Error response shape (top-level keys from .json() calls with status >= 400)
   errorKeys?: string[],
   // Middleware wrapper chain (outermost first): ['withRateLimit', 'withCSRF', 'withAuth']
   middleware?: string[],
+  // Class fields (for DTO/Entity schema resolution)
+  fields?: string,
+  // Annotations (for Java/Kotlin)
+  annotations?: string,
+  // Section level (for markdown)
+  level?: number,
+  // ORM model / entity type name
+  entityType?: string,
 }
 
 export type RelationshipType =
@@ -97,15 +124,25 @@ export type RelationshipType =
   | 'EXTENDS'
   | 'HAS_METHOD'
   | 'HAS_PROPERTY'
-  | 'ACCESSES'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
-  | 'HANDLES_ROUTE'  // Function/File → Route (handler serves this endpoint)
-  | 'FETCHES'        // Function/File → Route (consumer calls this endpoint)
-  | 'HANDLES_TOOL'   // Function/File → Tool (handler implements this tool)
-  | 'ENTRY_POINT_OF'  // Route/Tool → Process (this endpoint starts this execution flow)
-  | 'WRAPS'           // Function → Function (middleware wrapper chain) — Reserved: future middleware graph traversal (not yet emitted)
-  | 'QUERIES'          // File/Function → CodeElement (ORM query to model/table)
+  // Cross-repo dependency tracking
+  | 'CROSS_IMPORTS'
+  // Additional relationship types
+  | 'ACCESSES'
+  | 'FETCHES'
+  | 'QUERIES'
+  | 'HANDLES_ROUTE'
+  | 'HANDLES_TOOL'
+  | 'ENTRY_POINT_OF'
+  | 'WRAPS'
+  // Angular @NgModule metadata edges (#32)
+  | 'DECLARES'
+  | 'IMPORTS_MODULE'
+  | 'PROVIDES'
+  | 'BOOTSTRAPS'
+  // Structural composition: owner has a field/embedding of the target (e.g. Go anonymous field).
+  | 'COMPOSITION'
 
 export interface GraphNode {
   id:  string,
@@ -120,11 +157,48 @@ export interface GraphRelationship {
   type: RelationshipType,
   /** Confidence score 0-1 (1.0 = certain, lower = uncertain resolution) */
   confidence: number,
-  /** Semantics are edge-type-dependent: CALLS uses resolution tier, ACCESSES uses 'read'/'write', OVERRIDES uses MRO reason */
+  /** Resolution reason: 'import-resolved', 'same-file', 'fuzzy-global', or empty for non-CALLS */
   reason: string,
   /** Step number for STEP_IN_PROCESS relationships (1-indexed) */
   step?: number,
+  /**
+   * Edge provenance tag (WI-1 / #159 P3 Mode A).
+   * Optional at the type level so every existing rel constructor stays
+   * valid; the CSV/COPY serializer in `streamAllCSVsToDisk` defaults
+   * missing values to `'heuristic'`. Persisted as the `source` column
+   * on the CodeRelation rel table.
+   *
+   * The union members are the SAME writers that mint edges — there
+   * is no widening to `string` anywhere on the write path.
+   */
+  source?: EdgeSource;
+  /**
+   * 0-based source line of the call/parent identifier (WI-1 / #159; #174).
+   * Serialized to the `sourceLine INT64` column on CodeRelation (#174).
+   * Carried on per-site CALLS edges (heuristic + LSP-minted) and on heritage
+   * edges emitted with a captured position. Absent on synthetic edges
+   * (route/tool) and on legacy emitters that did not capture a call name node.
+   * Used by the Mode A engine (collapse keys + correction lookup) and by
+   * the Mode C verifier (probe at the persisted call-site position, #174).
+   */
+  line?: number;
+  /**
+   * 0-based source column of the call/parent identifier (#174).
+   * Serialized to the `sourceCol INT64` column on CodeRelation (#174).
+   * Mirrors `line` in semantics: absent on synthetic/legacy edges.
+   * Uses tree-sitter / LSP 0-based column convention
+   * (nameNode.startPosition.column).
+   */
+  column?: number;
 }
+
+/**
+ * The four values the `source` column on a `GraphRelationship` can
+ * take. The `GraphRelationship.source` field references this union
+ * directly; the reconciler's writer re-uses the SAME members (no
+ * widening to `string`).
+ */
+export type EdgeSource = 'heuristic' | 'lsp-confirmed' | 'lsp-corrected' | 'lsp-recall';
 
 export interface KnowledgeGraph {
   /** Returns a full array copy — prefer iterNodes() for iteration */
@@ -145,6 +219,6 @@ export interface KnowledgeGraph {
   addNode: (node: GraphNode) => void,
   addRelationship: (relationship: GraphRelationship) => void,
   removeNode: (nodeId: string) => boolean,
-  removeNodesByFile: (filePath: string) => number,
   removeRelationship: (relationshipId: string) => boolean,
+  removeNodesByFile: (filePath: string) => number,
 }

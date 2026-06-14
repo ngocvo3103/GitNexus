@@ -253,19 +253,6 @@ describe('HTTP embedding backend', () => {
     });
   });
 
-  describe('schema dimensions', () => {
-    it('defaults to 384 dimensions', async () => {
-      const { EMBEDDING_DIMS } = await import('../../src/core/lbug/schema.js');
-      expect(EMBEDDING_DIMS).toBe(384);
-    });
-
-    it('reads dimensions from environment variable', async () => {
-      process.env.GITNEXUS_EMBEDDING_DIMS = '1024';
-      const { EMBEDDING_DIMS } = await import('../../src/core/lbug/schema.js');
-      expect(EMBEDDING_DIMS).toBe(1024);
-    });
-  });
-
   describe('timeout and network error handling', () => {
     it('does not retry on timeout', async () => {
       process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';

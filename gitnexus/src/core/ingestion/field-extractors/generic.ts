@@ -48,6 +48,19 @@ export interface FieldExtractionConfig {
   isStatic: (node: SyntaxNode) => boolean;
   /** Check if a field is readonly/final/const */
   isReadonly: (node: SyntaxNode) => boolean;
+  /**
+   * Custom resolver for the type name node from a type declaration node.
+   * Default: `(node) => node.childForFieldName('name')`.
+   * Needed for Go where `type_declaration` wraps `type_spec` which holds the name.
+   */
+  nameResolver?: (node: SyntaxNode) => SyntaxNode | null;
+  /**
+   * Custom resolver for body containers from a type declaration node.
+   * Default: uses `findBodies()` which walks direct children.
+   * Needed for Go where `field_declaration_list` is nested 3 levels deep
+   * under `type_declaration`.
+   */
+  bodyResolver?: (node: SyntaxNode) => SyntaxNode[];
 }
 
 // ---------------------------------------------------------------------------
@@ -76,14 +89,14 @@ export function createFieldExtractor(config: FieldExtractionConfig): FieldExtrac
     extract(node: SyntaxNode, context: FieldExtractorContext): ExtractedFields | null {
       if (!this.isTypeDeclaration(node)) return null;
 
-      const nameNode = node.childForFieldName('name');
+      const nameNode = config.nameResolver?.(node) ?? node.childForFieldName('name');
       if (!nameNode) return null;
 
       const ownerFqn = nameNode.text;
       const fields: FieldInfo[] = [];
 
       // Find body container(s)
-      const bodies = this.findBodies(node);
+      const bodies = config.bodyResolver?.(node) ?? this.findBodies(node);
       for (const body of bodies) {
         this.extractFieldsFromBody(body, context, fields);
       }

@@ -3,6 +3,8 @@
  *
  * Tests: getStoragePath, getStoragePaths, readRegistry, registerRepo, unregisterRepo
  * Covers hardening fixes #29 (API key file permissions) and #30 (case-insensitive paths on Windows)
+ *
+ * Also covers gh #175: GITNEXUS_HOME env override for test-suite isolation.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'path';
@@ -11,6 +13,7 @@ import fs from 'fs/promises';
 import {
   getStoragePath,
   getStoragePaths,
+  getGlobalDir,
   readRegistry,
   saveCLIConfig,
   loadCLIConfig,
@@ -132,5 +135,114 @@ describe('API key file permissions', () => {
     );
     expect(source).toContain('chmod(configPath, 0o600)');
     expect(source).toContain("process.platform !== 'win32'");
+  });
+});
+
+// ─── GITNEXUS_HOME override (gh #175 — test-suite isolation) ─────────
+
+describe('getGlobalDir — GITNEXUS_HOME override', () => {
+  // Save/restore per-test so mutations never leak to sibling tests within
+  // this fork.  Capturing at describe-evaluation time is not safe because
+  // per-fork-setup.ts may run after module evaluation on some vitest
+  // versions — beforeEach guarantees we snapshot the value that was
+  // actually in effect when the test begins.
+  let savedHome: string | undefined;
+
+  beforeEach(() => {
+    savedHome = process.env.GITNEXUS_HOME;
+  });
+
+  afterEach(() => {
+    // Restore whatever was set before this specific test ran.
+    if (savedHome === undefined) {
+      delete process.env.GITNEXUS_HOME;
+    } else {
+      process.env.GITNEXUS_HOME = savedHome;
+    }
+  });
+
+  it('returns GITNEXUS_HOME when set', () => {
+    process.env.GITNEXUS_HOME = '/tmp/custom-gitnexus-home';
+    expect(getGlobalDir()).toBe('/tmp/custom-gitnexus-home');
+  });
+
+  it('returns ~/.gitnexus when GITNEXUS_HOME is unset', () => {
+    delete process.env.GITNEXUS_HOME;
+    const expected = path.join(os.homedir(), '.gitnexus');
+    expect(getGlobalDir()).toBe(expected);
+  });
+
+  it('returns ~/.gitnexus when GITNEXUS_HOME is empty string', () => {
+    process.env.GITNEXUS_HOME = '';
+    const expected = path.join(os.homedir(), '.gitnexus');
+    expect(getGlobalDir()).toBe(expected);
+  });
+
+  it('getGlobalRegistryPath is under GITNEXUS_HOME when set', () => {
+    process.env.GITNEXUS_HOME = '/tmp/custom-gitnexus-home';
+    // getGlobalRegistryPath is derived from getGlobalDir; verify transitively
+    // that the override propagates to all callers.
+    const dir = getGlobalDir();
+    expect(dir).toBe('/tmp/custom-gitnexus-home');
+    // The registry file lives directly inside the home dir
+    expect(dir).not.toContain(os.homedir());
+  });
+});
+
+// ─── Guard: registry path is under GITNEXUS_HOME during the test suite ─
+
+describe('test-suite isolation guard (gh #175)', () => {
+  it('resolved global dir is under GITNEXUS_HOME, not the real home', () => {
+    // This test fails loudly if GITNEXUS_HOME was not set by per-fork-setup.ts.
+    // That would mean the test suite is writing to the real ~/.gitnexus —
+    // the regression described in gh #175.
+    const gitnexusHome = process.env.GITNEXUS_HOME;
+    expect(
+      gitnexusHome,
+      'GITNEXUS_HOME must be set by per-fork-setup.ts before any test runs',
+    ).toBeTruthy();
+
+    const resolvedDir = getGlobalDir();
+    expect(
+      resolvedDir,
+      `getGlobalDir() must return GITNEXUS_HOME (${gitnexusHome}), ` +
+        `got: ${resolvedDir}`,
+    ).toBe(gitnexusHome);
+
+    // Extra safety: the tmpdir must NOT be inside the real home dir.
+    const realHome = os.homedir();
+    expect(
+      resolvedDir.startsWith(realHome),
+      `Registry dir (${resolvedDir}) must not be under the real home (${realHome})`,
+    ).toBe(false);
+  });
+
+  it('per-fork GITNEXUS_HOME is a unique child of GITNEXUS_TEST_HOME_PARENT', () => {
+    // Asserts that the per-fork isolation from per-fork-setup.ts is in effect:
+    // GITNEXUS_HOME must exist AND must be a subdirectory of the run-level
+    // parent (GITNEXUS_TEST_HOME_PARENT) created by global-setup.ts.
+    const gitnexusHome = process.env.GITNEXUS_HOME;
+    const parent = process.env.GITNEXUS_TEST_HOME_PARENT;
+
+    expect(gitnexusHome, 'GITNEXUS_HOME must be set').toBeTruthy();
+
+    if (parent) {
+      // Normal suite run: per-fork dir must be under the parent.
+      expect(
+        gitnexusHome!.startsWith(parent),
+        `Per-fork GITNEXUS_HOME (${gitnexusHome}) must be under ` +
+          `GITNEXUS_TEST_HOME_PARENT (${parent})`,
+      ).toBe(true);
+
+      // The per-fork dir must be different from the parent itself
+      // (i.e. a real child, not the parent reused).
+      expect(
+        gitnexusHome,
+        'Per-fork GITNEXUS_HOME must be a child of the parent, not the parent itself',
+      ).not.toBe(parent);
+    }
+    // If GITNEXUS_TEST_HOME_PARENT is absent (standalone run / fallback path
+    // in per-fork-setup.ts), we only assert that GITNEXUS_HOME is set and
+    // not the real homedir — both already checked above.
   });
 });

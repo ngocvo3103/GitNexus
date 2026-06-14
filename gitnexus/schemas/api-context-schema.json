@@ -1,0 +1,198 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["method", "path", "summary", "specs", "externalDependencies", "logicFlow", "codeDiagram", "cacheStrategy", "retryLogic", "keyDetails"],
+  "properties": {
+    "method": { "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"] },
+    "path": { "type": "string", "pattern": "^/" },
+    "summary": { "type": "string", "minLength": 10 },
+    "handlerClass": { "type": "string", "description": "Controller class name that handles this endpoint" },
+    "handlerMethod": { "type": "string", "description": "Handler method name for this endpoint" },
+    "specs": {
+      "type": "object",
+      "required": ["request", "response"],
+      "properties": {
+        "request": {
+          "type": "object",
+          "required": ["params", "body", "validation"],
+          "properties": {
+            "params": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "type", "required", "description"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "type": { "type": "string" },
+                  "required": { "type": "boolean" },
+                  "description": { "type": "string" }
+                }
+              }
+            },
+            "body": { "description": "JSON body example object, or null if no body" },
+            "validation": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["field", "type", "required", "rules"],
+                "properties": {
+                  "field": { "type": "string" },
+                  "type": { "type": "string" },
+                  "required": { "type": "boolean" },
+                  "rules": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "response": {
+          "type": "object",
+          "required": ["body", "codes"],
+          "properties": {
+            "body": { "description": "JSON response example object" },
+            "codes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["code", "description"],
+                "properties": {
+                  "code": { "type": "integer" },
+                  "description": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "externalDependencies": {
+      "type": "object",
+      "required": ["downstreamApis", "messaging", "persistence"],
+      "properties": {
+        "downstreamApis": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["serviceName", "endpoint", "condition", "purpose"],
+            "properties": {
+              "serviceName": { "type": "string" },
+              "endpoint": { "type": "string" },
+              "condition": { "type": "string" },
+              "purpose": { "type": "string" }
+            }
+          }
+        },
+        "messaging": {
+          "type": "object",
+          "required": ["outbound", "inbound"],
+          "properties": {
+            "outbound": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["topic", "payload", "trigger"],
+                "properties": {
+                  "topic": { "type": "string", "description": "Kafka/RabbitMQ topic or queue name (e.g. 'bond.order.created'). Use 'N/A' or 'Unknown' if not applicable or not yet known." },
+                  "payload": { "oneOf": [{ "type": "string" }, { "type": "object" }], "description": "Message payload type name (string) or resolved schema object" },
+                  "trigger": { "type": "string" }
+                }
+              }
+            },
+            "inbound": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["topic", "payload", "consumptionLogic"],
+                "properties": {
+                  "topic": { "type": "string", "description": "Kafka/RabbitMQ topic or queue name (e.g. 'bond.order.created'). Use 'N/A' or 'Unknown' if not applicable or not yet known." },
+                  "payload": { "oneOf": [{ "type": "string" }, { "type": "object" }], "description": "Message payload type name (string) or resolved schema object" },
+                  "consumptionLogic": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "persistence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["database", "tables", "storedProcedures"],
+            "properties": {
+              "database": { "type": "string" },
+              "tables": { "type": "string" },
+              "storedProcedures": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "logicFlow": { "type": "string", "description": "Mermaid sequenceDiagram content (without ```mermaid fences)" },
+    "codeDiagram": { "type": "string", "description": "Mermaid graph TB content (without ```mermaid fences)" },
+    "cacheStrategy": {
+      "type": "object",
+      "required": ["population", "invalidation", "update", "flow"],
+      "properties": {
+        "population": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["cacheName", "keyPattern", "ttl", "trigger"],
+            "properties": {
+              "cacheName": { "type": "string" },
+              "keyPattern": { "type": "string" },
+              "ttl": { "type": "string" },
+              "trigger": { "type": "string" }
+            }
+          }
+        },
+        "invalidation": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["cacheName", "strategy", "trigger"],
+            "properties": {
+              "cacheName": { "type": "string" },
+              "strategy": { "type": "string" },
+              "trigger": { "type": "string" }
+            }
+          }
+        },
+        "update": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["cacheName", "strategy", "trigger"],
+            "properties": {
+              "cacheName": { "type": "string" },
+              "strategy": { "type": "string" },
+              "trigger": { "type": "string" }
+            }
+          }
+        },
+        "flow": { "type": "string", "description": "Mermaid sequenceDiagram for cache flow (without ```mermaid fences). Use 'N/A' or 'Unknown' if caching is not applicable or not yet known. Use empty string if there is no cache flow." }
+      }
+    },
+    "retryLogic": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["operation", "maxAttempts", "backoff", "recovery"],
+        "properties": {
+          "operation": { "type": "string" },
+          "maxAttempts": { "type": "string" },
+          "backoff": { "type": "string" },
+          "recovery": { "type": "string" }
+        }
+      }
+    },
+    "keyDetails": {
+      "type": "object",
+      "required": ["transactionManagement", "businessRules", "security"],
+      "properties": {
+        "transactionManagement": { "type": "array", "items": { "type": "string" } },
+        "businessRules": { "type": "array", "items": { "type": "string" } },
+        "security": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

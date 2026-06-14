@@ -77,7 +77,7 @@ describe('impact: batching and grouping', () => {
         const cnt = ids.length;
         chunkSizes.push(cnt);
         const idx = chunkCallIndex++;
-        return [{ entryPointId: `ep-${Math.floor(idx)}`, epName: `epName-${idx}`, epType: 'Function', epFilePath: `/path/${idx}`, hits: cnt, minStep: 1 }];
+        return [{ name: `epName-${idx}`, hits: cnt, minStep: 1, stepCount: 10 }];
       }
       // Default target resolution
       return [{ id: 'sym1', name: 'Target', filePath: 'f' }];
@@ -109,11 +109,12 @@ describe('impact: batching and grouping', () => {
       const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
       if (!query.includes('STEP_IN_PROCESS')) return [{ id: 'symA', name: 'TargetA', filePath: 'f' }];
       // For STEP_IN_PROCESS in this test, return grouping rows
+      // Columns: p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
       return [
-        { entryPointId: 'ep-1', epName: 'EP1', epType: 'Function', epFilePath: '/p/1', hits: 2, minStep: 1 },
-        { entryPointId: 'ep-2', epName: 'EP2', epType: 'Function', epFilePath: '/p/2', hits: 2, minStep: 2 },
-        { entryPointId: 'ep-1', epName: 'EP1', epType: 'Function', epFilePath: '/p/1', hits: 1, minStep: 3 },
-        { entryPointId: 'ep-3', epName: 'EP3', epType: 'Function', epFilePath: '/p/3', hits: 1, minStep: 1 },
+        { name: 'EP1', hits: 2, minStep: 1, stepCount: 10 },
+        { name: 'EP2', hits: 2, minStep: 2, stepCount: 10 },
+        { name: 'EP1', hits: 1, minStep: 3, stepCount: 10 },
+        { name: 'EP3', hits: 1, minStep: 1, stepCount: 10 },
       ];
     });
 
@@ -165,6 +166,13 @@ describe('impact: batching and grouping', () => {
         for (let i = 0; i < 500; i++) res.push({ id: `node-${i}`, name: `n${i}`, filePath: `file-${i}.js`, relType: 'CALLS', confidence: null });
         return res;
       }
+      // Handle module enrichment queries (MEMBER_OF)
+      if (query.includes('MEMBER_OF') && query.includes('COUNT(DISTINCT s.id)')) {
+        return [{ name: 'ModuleA', hits: 42 }];
+      }
+      if (query.includes('RETURN DISTINCT c.heuristicLabel')) {
+        return [{ name: 'ModuleA' }];
+      }
       return [];
     });
 
@@ -176,7 +184,7 @@ describe('impact: batching and grouping', () => {
       if (query.includes('STEP_IN_PROCESS')) {
         const ids = Array.isArray(params.ids) ? params.ids : [];
         chunkSizes.push(ids.length);
-        return [{ entryPointId: 'ep-x', epName: 'EPX', epType: 'Function', epFilePath: '/p/x', hits: ids.length, minStep: 1 }];
+        return [{ name: 'EPX', hits: ids.length, minStep: 1, stepCount: 10 }];
       }
 
       if (query.includes('COUNT(DISTINCT s.id)')) {
@@ -204,20 +212,14 @@ describe('impact: batching and grouping', () => {
     // Because we capped enrichment, the result should include partial: true
     expect(res.partial).toBe(true);
 
-    // Module enrichment should have been called in chunks (3 calls, totaling 300 ids)
-    const memberCalls = (executeParameterizedMock.mock.calls || []).filter((c: any[]) => {
+    // Module enrichment should have been called (once, with limited IDs due to MAX_CHUNKS)
+    // The module query now uses processedIds only (300 IDs), not all 500
+    const moduleQueryCalls = (executeQueryMock.mock.calls || []).filter((c: any[]) => {
       const q = typeof c[1] === 'string' ? c[1] : String(c[0] ?? '');
-      // Only count the module-hits query (which returns COUNT(DISTINCT s.id)).
-      // The process-chunk query also uses COUNT(DISTINCT s.id), so require MEMBER_OF
-      // to avoid double-counting process-chunk calls.
-      return q.includes('COUNT(DISTINCT s.id)') && q.includes('MEMBER_OF');
+      return q.includes('MEMBER_OF') && q.includes('COUNT(DISTINCT s.id)');
     });
-    // MAX_CHUNKS = 3 in this test, so expect 3 module-enrichment chunk calls
-    // DEBUG: print memberCalls and their ids lengths
-    expect(memberCalls.length).toBe(3);
-    const totalModuleIds = memberCalls.reduce((sum: number, call: any[]) => sum + ((Array.isArray(call[2]?.ids) ? call[2].ids.length : 0)), 0);
-    // eslint-disable-next-line no-console
-    expect(totalModuleIds).toBe(300);
+    // Single module enrichment call with capped IDs
+    expect(moduleQueryCalls.length).toBe(1);
 
     // Affected modules should include ModuleA
     expect(Array.isArray(res.affected_modules)).toBe(true);

@@ -34,6 +34,7 @@ export const DEFINITION_CAPTURE_KEYS = [
   'definition.annotation',
   'definition.constructor',
   'definition.template',
+  'definition.jsx_element',
 ] as const;
 
 /** Extract the definition node from a tree-sitter query capture map. */
@@ -114,6 +115,8 @@ export const CLASS_CONTAINER_TYPES = new Set([
   // Kotlin
   'object_declaration',
   'companion_object',
+  // Go
+  'type_declaration',
 ]);
 
 export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
@@ -135,6 +138,7 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   module: 'Module',
   object_declaration: 'Class',
   companion_object: 'Class',
+  type_declaration: 'Struct',
 };
 
 /** Check if a Kotlin function_declaration capture is inside a class_body (i.e., a method).
@@ -144,6 +148,22 @@ export function isKotlinClassMethod(captureNode: { parent?: any } | null | undef
   let ancestor = captureNode?.parent;
   while (ancestor) {
     if (ancestor.type === 'class_body') return true;
+    ancestor = ancestor.parent;
+  }
+  return false;
+}
+
+/** Check if a Python function_definition capture is nested in a class_definition (i.e., a method).
+ *  Python's tree-sitter grammar emits `function_definition` for both module-level functions
+ *  and methods inside a class body. Walks up the parent chain looking for a `class_definition`
+ *  ancestor. Returns true when the captured definition node is class-nested.
+ *  Decorators (@staticmethod, @classmethod) don't change class-nesting, so this also covers
+ *  static/classmethod. Nested classes (class A: class B: def foo()) also count — the nearest
+ *  class_definition ancestor makes `foo` a Method of `B`. */
+export function isPythonClassMethod(captureNode: { parent?: any } | null | undefined): boolean {
+  let ancestor = captureNode?.parent;
+  while (ancestor) {
+    if (ancestor.type === 'class_definition') return true;
     ancestor = ancestor.parent;
   }
   return false;
@@ -190,6 +210,14 @@ export function getLabelFromCaptures(
   if (captureMap['definition.annotation']) return 'Annotation';
   if (captureMap['definition.constructor']) return 'Constructor';
   if (captureMap['definition.template']) return 'Template';
+  if (captureMap['definition.jsx_element']) {
+    // Native HTML tags start with a lowercase letter; user-defined React
+    // components start with uppercase. Drop the native tags so they don't
+    // pollute the graph.
+    const tagName = captureMap['name']?.text ?? '';
+    if (!/^[A-Z]/.test(tagName)) return null;
+    return 'CodeElement';
+  }
   return 'CodeElement';
 }
 
@@ -198,6 +226,17 @@ export function getLabelFromCaptures(
 export const findEnclosingClassId = (node: any, filePath: string): string | null => {
   let current = node.parent;
   while (current) {
+    // Go (#77): fields of an anonymous/local struct — `var input struct{...}`,
+    // `x := struct{...}{}`, or an anonymous-struct parameter — belong to that
+    // inline struct literal, NOT to any enclosing method receiver or named type.
+    // A named `type T struct{...}` has its struct_type directly under a type_spec;
+    // every anonymous variant sits under var_spec / composite_literal /
+    // parameter_declaration instead. Stop here so these fields get no (false)
+    // HAS_PROPERTY owner edge to the enclosing struct. Go-only node type → inert
+    // for all other languages.
+    if (current.type === 'struct_type' && current.parent?.type !== 'type_spec') {
+      return null;
+    }
     // Go: method_declaration has a receiver parameter with the struct type
     if (current.type === 'method_declaration') {
       const receiver = current.childForFieldName?.('receiver');
@@ -715,6 +754,28 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
         returnType = child.text;
         break;
       }
+    }
+  }
+
+  // Java: `public Order getOrder()` — tree-sitter-java exposes the return
+  // type via the `type` field on method_declaration, and the actual node
+  // is `type_identifier` (or `generic_type` for `List<Order>`,
+  // `array_type` for `Order[]`, `void_type` for `void`).
+  // The generic `type_annotation`/`return_type` loop above does NOT match
+  // Java's child layout (Java doesn't wrap the return type in either
+  // node). Without this, Java methods silently lose their return type
+  // and downstream consumers (document-endpoint) can't resolve the
+  // response shape — they fall back to `type: string` for an entity
+  // return (#14).
+  //
+  // Note: this block is also reached for C++ `function_definition`
+  // (which shares the `type` field shape) and would clobber the C++
+  // void filter above, so we mirror that filter and skip `void`
+  // return types. (#14)
+  if (!returnType) {
+    const javaReturn = node.childForFieldName?.('type');
+    if (javaReturn && javaReturn.text !== 'void') {
+      returnType = javaReturn.text;
     }
   }
 

@@ -487,4 +487,103 @@ describe('CLI end-to-end', () => {
       });
     }, 35000);
   });
+
+  // ─── document-endpoint --all flag parsing ──────────────────────────────────
+
+  describe('document-endpoint --all flag parsing', () => {
+    it('--help includes --all flag', () => {
+      const result = runCliRaw(['document-endpoint', '--help'], repoRoot);
+      if (result.status === null) return;
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('--all');
+    });
+
+    it('--all --outputPath is accepted (reaches handler even without indexed repo)', () => {
+      // CLI parser must accept --all without "missing required option" error.
+      // tool.ts handles --all separately from single-endpoint mode.
+      // Use a subdirectory inside repoRoot to satisfy validateOutputPath.
+      const outDir = path.join(MINI_REPO, '.test-doc-all-output');
+      try {
+        const result = runCliRaw(
+          ['document-endpoint', '--all', '--outputPath', outDir, '--repo', 'mini-repo'],
+          repoRoot,
+        );
+        const combined = result.stdout + result.stderr;
+        // Must not be rejected by Commander as "missing required option"
+        expect(combined).not.toMatch(/is missing/);
+      } finally {
+        fs.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it('--all with --method is rejected (mutually exclusive)', () => {
+      // Mutual-exclusion validation is implemented in tool.ts.
+      const outDir = path.join(MINI_REPO, '.test-doc-all-m-output');
+      try {
+        const result = runCliRaw(
+          ['document-endpoint', '--all', '--method', 'GET', '--path', '/foo', '--outputPath', outDir, '--repo', 'mini-repo'],
+          repoRoot,
+        );
+        if (result.status === null) return;
+
+        // tool.ts now enforces mutual-exclusion and exits with code 1
+        expect(result.status).toBe(1);
+        const combined = (result.stdout || '') + (result.stderr || '');
+        expect(combined).not.toMatch(/unknown option|--all.*not allowed/i);
+      } finally {
+        fs.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it('--all with --path is rejected (mutually exclusive)', () => {
+      // Mutual-exclusion validation is implemented in tool.ts.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-all-p-'));
+      try {
+        const result = runCliRaw(
+          ['document-endpoint', '--all', '--path', '/foo', '--outputPath', tmpDir, '--repo', 'mini-repo'],
+          repoRoot,
+        );
+        if (result.status === null) return;
+
+        expect(result.status).toBe(1);
+        const combined = (result.stdout || '') + (result.stderr || '');
+        expect(
+          combined.toLowerCase().includes('mutually exclusive') ||
+          combined.toLowerCase().includes('cannot be used with') ||
+          combined.toLowerCase().includes('usage:') ||
+          combined.toLowerCase().includes('--path'),
+        ).toBe(true);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('--all without --outputPath is rejected', () => {
+      const result = runCliRaw(['document-endpoint', '--all'], repoRoot);
+      if (result.status === null) return;
+
+      expect(result.status).toBe(1);
+      const combined = (result.stdout || '') + (result.stderr || '');
+      expect(combined).toMatch(/required|outputPath|missing/i);
+    });
+
+    it('--method --path without --all still works (regression)', () => {
+      // Regression: making --method/--path optional must not break the normal path
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-regress-'));
+      try {
+        const result = runCliRaw(
+          ['document-endpoint', '--method', 'GET', '--path', '/foo', '--outputPath', tmpDir, '--repo', 'mini-repo'],
+          repoRoot,
+        );
+        // Must not produce "Usage" error about --method/--path being required
+        const combined = (result.stdout || '') + (result.stderr || '');
+        expect(combined).not.toMatch(/Usage: gitnexus document-endpoint/);
+        expect(combined).not.toMatch(/--method.*required/i);
+        expect(combined).not.toMatch(/--path.*required/i);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+  });
 });

@@ -17,6 +17,8 @@ import type { SuffixIndex } from './import-resolvers/utils.js';
 import type { ImportResult, ResolveCtx, ImportResolutionContext } from './import-resolvers/types.js';
 import type { NamedBinding } from './named-bindings/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
+import type { CrossRepoRegistry } from './cross-repo-registry.js';
+import { extractPackagePrefix } from './type-extractors/shared.js';
 
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -63,7 +65,17 @@ export type PackageMap = Map<string, Set<string>>;
 // Stores both the resolved source path and the original exported name so that
 // aliased imports (`import { User as U }`) can resolve U → User in the source file.
 export interface NamedImportBinding { sourcePath: string; exportedName: string }
-export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
+
+/**
+ * Represents an import entry with external dependency tracking.
+ * Used to flag imports that reference symbols from external repositories.
+ * 
+ * @property target - The resolved import target (file path or module identifier)
+ */
+export interface ImportEntry {
+  target: string;
+}
+export type NamedImportMap = Map<string, ReadonlyMap<string, NamedImportBinding>>;
 
 /**
  * Check if a file path is directly inside a package directory identified by its suffix.
@@ -122,7 +134,7 @@ function createImportEdgeHelpers(graph: KnowledgeGraph, importMap: ImportMap) {
     const targetId = generateId('File', resolvedPath);
     const relId = generateId('IMPORTS', `${filePath}->${resolvedPath}`);
     totalImportsResolved++;
-    graph.addRelationship({ id: relId, sourceId, targetId, type: 'IMPORTS', confidence: 1.0, reason: '' });
+    graph.addRelationship({ id: relId, sourceId, targetId, type: 'IMPORTS', confidence: 1.0, reason: '', source: 'heuristic' });
   };
 
   const addImportEdge = (filePath: string, resolvedPath: string) => {
@@ -187,8 +199,11 @@ function applyImportResult(
     // of overloaded methods), remove the entry so resolution falls through to Tier 2a
     // import-scoped which sees all candidates and can apply arity narrowing.
     if (namedBindings && namedImportMap) {
-      if (!namedImportMap.has(filePath)) namedImportMap.set(filePath, new Map());
-      const fileBindings = namedImportMap.get(filePath)!;
+      if (!namedImportMap.has(filePath)) namedImportMap.set(filePath, new Map<string, NamedImportBinding>());
+      // Cast to mutable Map for construction: we created this entry above with `new Map()`.
+      // The ReadonlyMap constraint on NamedImportMap prevents callers from mutating
+      // entries they did not construct; here we are the constructor.
+      const fileBindings = namedImportMap.get(filePath)! as Map<string, NamedImportBinding>;
 
       if (files.length === 1) {
         const resolvedFile = files[0];
@@ -231,6 +246,49 @@ function applyImportResult(
 // MAIN IMPORT PROCESSOR
 // ============================================================================
 
+/**
+ * #50: when a local import resolves to nothing but its package maps to an indexed
+ * DEPENDENCY repo, create a phantom external File node + a CROSS_IMPORTS edge.
+ * Fires ONLY when a CrossRepoRegistry is provided (single-repo runs are unaffected).
+ * The external node id is namespaced by repo so it can never collide with a local File.
+ * Returns true iff a cross-repo edge was created.
+ */
+function applyCrossRepoImport(
+  graph: KnowledgeGraph,
+  filePath: string,
+  rawImportPath: string,
+  registry: CrossRepoRegistry,
+): boolean {
+  const prefix = extractPackagePrefix(rawImportPath) ?? rawImportPath;
+  const depRepoId = registry.findDepRepo(prefix);
+  if (!depRepoId) return false;
+
+  const externalPath = `${depRepoId}::${rawImportPath}`;
+  const externalFileId = generateId('File', externalPath);
+  graph.addNode({
+    id: externalFileId,
+    label: 'File',
+    properties: {
+      name: rawImportPath,
+      filePath: externalPath,
+      repoId: depRepoId,
+      isExternal: true,
+    },
+  });
+
+  const sourceId = generateId('File', filePath);
+  graph.addRelationship({
+    id: generateId('CROSS_IMPORTS', `${filePath}->${externalPath}`),
+    sourceId,
+    targetId: externalFileId,
+    type: 'CROSS_IMPORTS',
+    confidence: 1.0,
+    reason: 'cross-repo-import',
+    source: 'heuristic',
+  });
+  return true;
+}
+
 export const processImports = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
@@ -239,6 +297,7 @@ export const processImports = async (
   onProgress?: (current: number, total: number) => void,
   repoRoot?: string,
   allPaths?: string[],
+  crossRepoRegistry?: CrossRepoRegistry,
 ) => {
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
@@ -344,6 +403,10 @@ export const processImports = async (
         const extractor = provider.namedBindingExtractor;
         const bindings = namedImportMap && extractor ? extractor(captureMap['import']) : undefined;
         applyImportResult(result, file.path, importMap, packageMap, addImportEdge, addImportGraphEdge, bindings, namedImportMap, moduleAliasMap);
+        // #50: unresolved local import that maps to an indexed dependency repo.
+        if (!result && crossRepoRegistry) {
+          applyCrossRepoImport(graph, file.path, rawImportPath, crossRepoRegistry);
+        }
       }
 
       // ---- Language-specific call-as-import routing (Ruby require, etc.) ----
@@ -390,6 +453,7 @@ export const processImportsFromExtracted = async (
   onProgress?: (current: number, total: number) => void,
   repoRoot?: string,
   prebuiltCtx?: ImportResolutionContext,
+  crossRepoRegistry?: CrossRepoRegistry,
 ) => {
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
@@ -431,6 +495,10 @@ export const processImportsFromExtracted = async (
       const provider = getProvider(imp.language);
       const result = provider.importResolver(imp.rawImportPath, filePath, resolveCtx);
       applyImportResult(result, filePath, importMap, packageMap, addImportEdge, addImportGraphEdge, imp.namedBindings, namedImportMap, moduleAliasMap);
+      // #50: unresolved local import that maps to an indexed dependency repo.
+      if (!result && crossRepoRegistry) {
+        applyCrossRepoImport(graph, filePath, imp.rawImportPath, crossRepoRegistry);
+      }
     }
   }
 

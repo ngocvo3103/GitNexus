@@ -16,7 +16,12 @@ import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReuse
 // disposeEmbedder intentionally not called — ONNX Runtime segfaults on cleanup (see #38)
 import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, cleanupOldKuzuFiles } from '../storage/repo-manager.js';
 import { getCurrentCommit, getGitRoot, hasGitDir } from '../storage/git.js';
-import { generateAIContextFiles } from './ai-context.js';
+import { SCHEMA_VERSION } from '../core/lbug/schema.js';
+// (#108) generateAIContextFiles is no longer called from analyze. It still
+// runs from `gitnexus setup` (always) and from `gitnexus analyze --skills`
+// (one-shot convenience for the skills-e2e flow). The plain `analyze` path
+// never writes AGENTS.md / CLAUDE.md — see the comment in analyzeCommand below.
+import { scaffoldAIContextForIndexedRepos } from './scaffold.js';
 import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
 
@@ -50,10 +55,56 @@ export interface AnalyzeOptions {
   verbose?: boolean;
   /** Index the folder even when no .git directory is present. */
   skipGit?: boolean;
+  /**
+   * WI-5 (#159 P3 Mode A): when true, run the pipeline with the
+   * LSP reconciler enabled (CALLS-only, TS-only, confidence 0.70).
+   * The default `analyze` (no flag) is byte-identical — no server
+   * is started, no edges are mutated.
+   */
+  lsp?: boolean;
+  /**
+   * WI-5 (#159 P3 Mode A): when true, print every
+   * `{action, from→to, why}` tuple the reconciler would emit and
+   * write nothing. Implies `lsp: true`; the engine sees every
+   * decision but never mutates the graph.
+   */
+  lspDryRun?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
 const EMBEDDING_NODE_LIMIT = 50_000;
+
+/**
+ * (#109) Decide whether existing embeddings should be auto-preserved into
+ * the rebuilt index. Returns true when:
+ *   - an existing index is present
+ *   - that index had at least one embedding
+ *   - the user did NOT pass --force (which is an explicit data-loss signal)
+ *
+ * `options.embeddings` does NOT affect this — auto-preserve runs even when
+ * the user is not requesting a fresh embedding pass. That is the whole
+ * point: silently dropping the slowest, most expensive artifact in the
+ * index on every re-index is the bug we are closing.
+ */
+export function shouldPreserveExistingEmbeddings(
+  existingMeta: { stats?: { embeddings?: number } } | null | undefined,
+  options: { force?: boolean; embeddings?: boolean } | undefined,
+): boolean {
+  const count = existingMeta?.stats?.embeddings ?? 0;
+  return !!(existingMeta && count > 0 && !options?.force);
+}
+
+/**
+ * (#109) Total decision: should the cache loader run? Either the user
+ * explicitly asked for a fresh embedding pass, OR we are auto-preserving
+ * the existing ones.
+ */
+export function shouldCacheEmbeddings(
+  existingMeta: { stats?: { embeddings?: number } } | null | undefined,
+  options: { force?: boolean; embeddings?: boolean } | undefined,
+): boolean {
+  return shouldPreserveExistingEmbeddings(existingMeta, options) || !!options?.embeddings;
+}
 
 const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
@@ -203,7 +254,27 @@ export const analyzeCommand = async (
   let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
 
-  if (options?.embeddings && existingMeta && !options?.force) {
+  // (#109) Auto-preserve existing embeddings unless --force. Without this,
+  // every `gitnexus analyze` (incl. the post-commit hook) silently drops
+  // them when --embeddings is omitted, even though they are the slowest
+  // and most expensive artifact in the index. With this, "off by default"
+  // still means off for *new* embedding generation — we just carry the
+  // existing ones over to the rebuilt index.
+  const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
+  const preserveExistingEmbeddings = shouldPreserveExistingEmbeddings(existingMeta, options);
+  const shouldCache = shouldCacheEmbeddings(existingMeta, options);
+
+  if (options?.force && existingEmbeddingCount > 0) {
+    // Loud warning — user explicitly opted into data loss.
+    bar.stop();
+    console.log(
+      `\n  ⚠️  --force will drop ${existingEmbeddingCount.toLocaleString()} existing embedding${existingEmbeddingCount === 1 ? '' : 's'}. ` +
+        `Pass --embeddings to regenerate, or omit --force to preserve.\n`,
+    );
+    bar.start(100, 0, { phase: 'Initializing...' });
+  }
+
+  if (shouldCache) {
     try {
       updateBar(0, 'Caching embeddings...');
       await initLbug(lbugPath);
@@ -217,10 +288,21 @@ export const analyzeCommand = async (
   }
 
   // ── Phase 1: Full Pipeline (0–60%) ─────────────────────────────────
+  // WI-5 (#159 P3 Mode A): thread `lsp` + `lspDryRun` through to
+  // `PipelineOptions.lsp`. The pipeline runs the reconciler over
+  // the heuristic CALLS feed ONLY when `options.lsp.enabled` is
+  // true; the default `analyze` (no flag) takes the byte-identical
+  // path. The pipeline prints the dry-run report or the summary
+  // line itself (single source of truth).
   const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
     const scaled = Math.round(progress.percent * 0.6);
     updateBar(scaled, phaseLabel);
+  }, {
+    lsp: {
+      enabled: options?.lsp === true || options?.lspDryRun === true,
+      dryRun: options?.lspDryRun === true,
+    },
   });
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────────
@@ -262,10 +344,10 @@ export const analyzeCommand = async (
   if (cachedEmbeddings.length > 0) {
     // Check if cached embedding dimensions match current schema
     const cachedDims = cachedEmbeddings[0].embedding.length;
-    const { EMBEDDING_DIMS } = await import('../core/lbug/schema.js');
-    if (cachedDims !== EMBEDDING_DIMS) {
+    const { getEmbeddingDims } = await import('../core/lbug/schema.js');
+    if (cachedDims !== getEmbeddingDims()) {
       // Dimensions changed (e.g. switched embedding model) — discard cache and re-embed all
-      console.error(`⚠️  Embedding dimensions changed (${cachedDims}d → ${EMBEDDING_DIMS}d), discarding cache`);
+      console.error(`⚠️  Embedding dimensions changed (${cachedDims}d → ${getEmbeddingDims()}d), discarding cache`);
       cachedEmbeddings = [];
       cachedEmbeddingNodeIds = new Set();
     } else {
@@ -288,7 +370,12 @@ export const analyzeCommand = async (
   const stats = await getLbugStats();
   let embeddingTime = '0.0';
   let embeddingSkipped = true;
-  let embeddingSkipReason = 'off (use --embeddings to enable)';
+  // (#109) If existing embeddings were auto-preserved, the "off" framing is
+  // misleading — surface a label that distinguishes "no new generation" from
+  // "no embeddings at all". The cached count is reported by the summary line.
+  let embeddingSkipReason = preserveExistingEmbeddings
+    ? 'off (existing embeddings preserved)'
+    : 'off (use --embeddings to enable)';
 
   if (options?.embeddings) {
     if (stats.nodes > EMBEDDING_NODE_LIMIT) {
@@ -323,6 +410,19 @@ export const analyzeCommand = async (
   // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
   updateBar(98, 'Saving metadata...');
 
+  // Bail before writing the registry if the pipeline produced no files (#48).
+  // Otherwise a --skip-git run on an empty dir creates a 0-node entry that
+  // pollutes `gitnexus list` and triggers "Multiple repositories indexed"
+  // for subsequent calls. Use the same exit-code-via-processExitCode pattern
+  // the early-return path uses, so scripts can detect the failure.
+  if (pipelineResult.totalFileCount === 0) {
+    bar.stop();
+    console.log(`\n  No source files found in ${repoPath}. Aborting — nothing to index.\n`);
+    console.log('  Tip: pass a path with source files, or remove --skip-git to let GitNexus locate the repo root.\n');
+    process.exitCode = 1;
+    return;
+  }
+
   // Count embeddings in the index (cached + newly generated)
   let embeddingCount = 0;
   try {
@@ -334,6 +434,7 @@ export const analyzeCommand = async (
     repoPath,
     lastCommit: currentCommit,
     indexedAt: new Date().toISOString(),
+    schemaVersion: SCHEMA_VERSION,
     stats: {
       files: pipelineResult.totalFileCount,
       nodes: stats.nodes,
@@ -348,36 +449,51 @@ export const analyzeCommand = async (
   // Only attempt to update .gitignore when a .git directory is present.
   // Use hasGitDir (filesystem check) rather than git CLI subprocess
   // so we skip correctly for --skip-git folders even if git CLI is available.
+  // The mutation is idempotent: see addToGitignore in repo-manager.ts (#108).
   if (hasGitDir(repoPath)) {
     await addToGitignore(repoPath);
   }
 
-  const projectName = path.basename(repoPath);
-  let aggregatedClusterCount = 0;
-  if (pipelineResult.communityResult?.communities) {
-    const groups = new Map<string, number>();
-    for (const c of pipelineResult.communityResult.communities) {
-      const label = c.heuristicLabel || c.label || 'Unknown';
-      groups.set(label, (groups.get(label) || 0) + c.symbolCount);
+  // (#108) Do NOT call `generateAIContextFiles` here. Writing CLAUDE.md /
+  // AGENTS.md on every analyze mutates tracked files with volatile stats
+  // (symbol/edge/process counts) on every commit — the PostToolUse hook fires
+  // after every commit, so this would churn `git status` and the
+  // ${stats.nodes} symbols, ${stats.edges} relationships header would be
+  // a moving target. AI-context generation is initial-scaffolding work and
+  // belongs in `gitnexus setup` instead. The current authoritative counts
+  // always live in `.gitnexus/meta.json` (gitignored) — point tools there.
+  // We keep `aiContext.files` as a stub so the downstream summary printer
+  // continues to compile and reports nothing for analyze-driven runs.
+  //
+  // Exception: `--skills` is a one-shot convenience flag (used by the
+  // skills-e2e tests and by users who want analyze to also bootstrap the
+  // AGENTS.md / CLAUDE.md / .claude/skills/generated/ tree in a single
+  // command). It explicitly opts in to the same scaffolding that setup
+  // runs, so the volatile counts land in the meta.json we just wrote.
+  const aiContext = { files: [] as string[] };
+  if (options?.skills) {
+    const projectName = path.basename(repoPath);
+    let generatedSkills: GeneratedSkillInfo[] = [];
+    if (pipelineResult.communityResult) {
+      updateBar(99, 'Generating skill files...');
+      try {
+        const skillResult = await generateSkillFiles(repoPath, projectName, pipelineResult);
+        generatedSkills = skillResult.skills;
+      } catch (err: any) {
+        console.log(`  Note: --skills generation failed: ${err.message}`);
+      }
     }
-    aggregatedClusterCount = Array.from(groups.values()).filter(count => count >= 5).length;
+    const skillsByRepo = new Map<string, GeneratedSkillInfo[]>();
+    skillsByRepo.set(repoPath, generatedSkills);
+    const summary = await scaffoldAIContextForIndexedRepos(repoPath, skillsByRepo);
+    for (const name of summary.configured) {
+      aiContext.files.push(`AI context (${name} → AGENTS.md, CLAUDE.md)`);
+    }
+    if (summary.errors.length > 0) {
+      console.log(`  Note: --skills scaffolding reported ${summary.errors.length} error(s):`);
+      for (const err of summary.errors) console.log(`    ! ${err}`);
+    }
   }
-
-  let generatedSkills: GeneratedSkillInfo[] = [];
-  if (options?.skills && pipelineResult.communityResult) {
-    updateBar(99, 'Generating skill files...');
-    const skillResult = await generateSkillFiles(repoPath, projectName, pipelineResult);
-    generatedSkills = skillResult.skills;
-  }
-
-  const aiContext = await generateAIContextFiles(repoPath, storagePath, projectName, {
-    files: pipelineResult.totalFileCount,
-    nodes: stats.nodes,
-    edges: stats.edges,
-    communities: pipelineResult.communityResult?.stats.totalCommunities,
-    clusters: aggregatedClusterCount,
-    processes: pipelineResult.processResult?.stats.totalProcesses,
-  }, generatedSkills);
 
   await closeLbug();
   // Note: we intentionally do NOT call disposeEmbedder() here.
@@ -397,8 +513,13 @@ export const analyzeCommand = async (
   bar.stop();
 
   // ── Summary ───────────────────────────────────────────────────────
+  // (#109) Distinguish "auto-preserved from a prior index" from "carried
+  // through a --embeddings rebuild" in the user-visible summary.
   const embeddingsCached = cachedEmbeddings.length > 0;
-  console.log(`\n  Repository indexed successfully (${totalTime}s)${embeddingsCached ? ` [${cachedEmbeddings.length} embeddings cached]` : ''}\n`);
+  const cachedLabel = preserveExistingEmbeddings && !options?.embeddings
+    ? 'preserved'
+    : 'cached';
+  console.log(`\n  Repository indexed successfully (${totalTime}s)${embeddingsCached ? ` [${cachedEmbeddings.length} embeddings ${cachedLabel}]` : ''}\n`);
   console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
   console.log(`  LadybugDB ${lbugTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
   console.log(`  ${repoPath}`);

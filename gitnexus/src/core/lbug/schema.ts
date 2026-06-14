@@ -13,12 +13,11 @@
 // NODE TABLE NAMES
 // ============================================================================
 export const NODE_TABLES = [
-  'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process', 'Section',
+  'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process',
+  'Route',
   // Multi-language support
   'Struct', 'Enum', 'Macro', 'Typedef', 'Union', 'Namespace', 'Trait', 'Impl',
-  'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
-  'Route',
-  'Tool'
+  'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module'
 ] as const;
 export type NodeTableName = typeof NODE_TABLES[number];
 
@@ -28,8 +27,15 @@ export type NodeTableName = typeof NODE_TABLES[number];
 export const REL_TABLE_NAME = 'CodeRelation';
 
 // Valid relation types
-// Note: WRAPS is reserved for future middleware graph traversal (not yet emitted)
-export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'ACCESSES', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS', 'HANDLES_ROUTE', 'FETCHES', 'HANDLES_TOOL', 'ENTRY_POINT_OF', 'WRAPS', 'QUERIES'] as const;
+export const REL_TYPES = [
+  'CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS',
+  'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES',
+  'MEMBER_OF', 'STEP_IN_PROCESS', 'CROSS_IMPORTS',
+  // Angular metadata edges (#32):
+  'DECLARES', 'IMPORTS_MODULE', 'PROVIDES', 'BOOTSTRAPS',
+  // Structural composition (Go anonymous embedding, #26):
+  'COMPOSITION',
+] as const;
 export type RelType = typeof REL_TYPES[number];
 
 // ============================================================================
@@ -37,26 +43,41 @@ export type RelType = typeof REL_TYPES[number];
 // ============================================================================
 export const EMBEDDING_TABLE_NAME = 'CodeEmbedding';
 
+// Default embedding dimensions (snowflake-arctic-embed-xs)
+export function getEmbeddingDims(): number {
+  return parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
+}
+
 // ============================================================================
 // NODE TABLE SCHEMAS
 // ============================================================================
 
+// Cross-repo support - repoId column for multi-repo resolution
+// Migration (for existing databases): ALTER TABLE File ADD repoId STRING
 export const FILE_SCHEMA = `
 CREATE NODE TABLE File (
   id STRING,
   name STRING,
   filePath STRING,
   content STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration statement for backward compatibility with existing databases
+export const FILE_SCHEMA_MIGRATION = `
+ALTER TABLE File ADD repoId STRING`;
 
 export const FOLDER_SCHEMA = `
 CREATE NODE TABLE Folder (
   id STRING,
   name STRING,
   filePath STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const FOLDER_SCHEMA_MIGRATION = `
+ALTER TABLE Folder ADD repoId STRING`;
 
 export const FUNCTION_SCHEMA = `
 CREATE NODE TABLE Function (
@@ -68,8 +89,21 @@ CREATE NODE TABLE Function (
   isExported BOOLEAN,
   content STRING,
   description STRING,
+  parameterCount INT32,
+  returnType STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const FUNCTION_SCHEMA_MIGRATION = `
+ALTER TABLE Function ADD repoId STRING`;
+// #86: Migration for parameterCount/returnType so existing DBs pick up the
+// new columns without a re-create. Mirrors METHOD_SCHEMA_MIGRATION_2's
+// additive pattern; the runner's error-suppression in lbug-adapter
+// catches the "already has property" thrown on re-runs against an existing DB.
+export const FUNCTION_SCHEMA_MIGRATION_2 = `
+ALTER TABLE Function ADD parameterCount INT32;
+ALTER TABLE Function ADD returnType STRING`;
 
 export const CLASS_SCHEMA = `
 CREATE NODE TABLE Class (
@@ -81,8 +115,14 @@ CREATE NODE TABLE Class (
   isExported BOOLEAN,
   content STRING,
   description STRING,
+  fields STRING,
+  annotations STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const CLASS_SCHEMA_MIGRATION = `
+ALTER TABLE Class ADD repoId STRING`;
 
 export const INTERFACE_SCHEMA = `
 CREATE NODE TABLE Interface (
@@ -94,8 +134,12 @@ CREATE NODE TABLE Interface (
   isExported BOOLEAN,
   content STRING,
   description STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const INTERFACE_SCHEMA_MIGRATION = `
+ALTER TABLE Interface ADD repoId STRING`;
 
 export const METHOD_SCHEMA = `
 CREATE NODE TABLE Method (
@@ -109,8 +153,18 @@ CREATE NODE TABLE Method (
   description STRING,
   parameterCount INT32,
   returnType STRING,
+  parameters STRING,
+  annotations STRING,
+  parameterAnnotations STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const METHOD_SCHEMA_MIGRATION = `
+ALTER TABLE Method ADD repoId STRING`;
+// Migration for parameter annotations
+export const METHOD_SCHEMA_MIGRATION_2 = `
+ALTER TABLE Method ADD parameterAnnotations STRING`;
 
 export const CODE_ELEMENT_SCHEMA = `
 CREATE NODE TABLE CodeElement (
@@ -122,8 +176,12 @@ CREATE NODE TABLE CodeElement (
   isExported BOOLEAN,
   content STRING,
   description STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const CODE_ELEMENT_SCHEMA_MIGRATION = `
+ALTER TABLE CodeElement ADD repoId STRING`;
 
 // ============================================================================
 // COMMUNITY NODE TABLE (for Leiden algorithm clusters)
@@ -139,8 +197,12 @@ CREATE NODE TABLE Community (
   enrichedBy STRING,
   cohesion DOUBLE,
   symbolCount INT32,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const COMMUNITY_SCHEMA_MIGRATION = `
+ALTER TABLE Community ADD repoId STRING`;
 
 // ============================================================================
 // PROCESS NODE TABLE (for execution flow detection)
@@ -156,14 +218,58 @@ CREATE NODE TABLE Process (
   communities STRING[],
   entryPointId STRING,
   terminalId STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration for cross-repo support
+export const PROCESS_SCHEMA_MIGRATION = `
+ALTER TABLE Process ADD repoId STRING`;
+
+// ============================================================================
+// ROUTE NODE TABLE SCHEMA (Spring, Laravel, etc. HTTP endpoints)
+// ============================================================================
+
+export const ROUTE_SCHEMA = `
+CREATE NODE TABLE Route (
+  id STRING,
+  name STRING,
+  httpMethod STRING,
+  routePath STRING,
+  controllerName STRING,
+  methodName STRING,
+  filePath STRING,
+  startLine INT64,
+  lineNumber INT64,
+  isInherited BOOLEAN,
+  repoId STRING,
+  responseKeys STRING[],
+  errorKeys STRING[],
+  middleware STRING[],
+  controllerClass STRING,
+  handlerMethod STRING,
+  isControllerClass BOOLEAN,
+  prefix STRING,
+  PRIMARY KEY (id)
+)`;
+// Migration for cross-repo support + (#67) Route property aliases.
+// 8 statements, split on `;` at the runner. Kùzu rejects `IF NOT EXISTS`
+// in ALTER — the runner's "already has property" suppression keeps this
+// idempotent on re-runs against an existing DB.
+export const ROUTE_SCHEMA_MIGRATION = `
+ALTER TABLE Route ADD repoId STRING;
+ALTER TABLE Route ADD responseKeys STRING[];
+ALTER TABLE Route ADD errorKeys STRING[];
+ALTER TABLE Route ADD middleware STRING[];
+ALTER TABLE Route ADD controllerClass STRING;
+ALTER TABLE Route ADD handlerMethod STRING;
+ALTER TABLE Route ADD isControllerClass BOOLEAN;
+ALTER TABLE Route ADD prefix STRING`;
 
 // ============================================================================
 // MULTI-LANGUAGE NODE TABLE SCHEMAS
 // ============================================================================
 
-// Generic code element with startLine/endLine for C, C++, Rust, Go, Java, C#
+// Generic code element with startLine/endLine and repoId for cross-repo support
 // description: optional metadata (e.g. Eloquent $fillable fields, relationship targets)
 const CODE_ELEMENT_BASE = (name: string) => `
 CREATE NODE TABLE \`${name}\` (
@@ -174,8 +280,16 @@ CREATE NODE TABLE \`${name}\` (
   endLine INT64,
   content STRING,
   description STRING,
+  repoId STRING,
   PRIMARY KEY (id)
 )`;
+// Migration helper for cross-repo support.
+// Kùzu's ALTER TABLE does NOT support `IF NOT EXISTS` — it must be a plain
+// `ALTER TABLE \`X\` ADD col TYPE` statement. The runner's error-suppression
+// loop in lbug-adapter.doInitLbug catches the "already has property" error
+// thrown on re-runs against an existing DB, keeping the migrations idempotent.
+const CODE_ELEMENT_MIGRATION = (name: string) => `
+ALTER TABLE \`${name}\` ADD repoId STRING`;
 
 export const STRUCT_SCHEMA = CODE_ELEMENT_BASE('Struct');
 export const ENUM_SCHEMA = CODE_ELEMENT_BASE('Enum');
@@ -195,41 +309,26 @@ export const ANNOTATION_SCHEMA = CODE_ELEMENT_BASE('Annotation');
 export const CONSTRUCTOR_SCHEMA = CODE_ELEMENT_BASE('Constructor');
 export const TEMPLATE_SCHEMA = CODE_ELEMENT_BASE('Template');
 export const MODULE_SCHEMA = CODE_ELEMENT_BASE('Module');
-// API route endpoints (Next.js, Express, etc.)
-export const ROUTE_SCHEMA = `
-CREATE NODE TABLE Route (
-  id STRING,
-  name STRING,
-  filePath STRING,
-  responseKeys STRING[],
-  errorKeys STRING[],
-  middleware STRING[],
-  PRIMARY KEY (id)
-)`;
 
-// MCP tool definitions
-export const TOOL_SCHEMA = `
-CREATE NODE TABLE Tool (
-  id STRING,
-  name STRING,
-  filePath STRING,
-  description STRING,
-  PRIMARY KEY (id)
-)`;
-
-// Markdown heading sections
-export const SECTION_SCHEMA = `
-CREATE NODE TABLE Section (
-  id STRING,
-  name STRING,
-  filePath STRING,
-  startLine INT64,
-  endLine INT64,
-  level INT64,
-  content STRING,
-  description STRING,
-  PRIMARY KEY (id)
-)`;
+// Migration exports for multi-language schemas
+export const STRUCT_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Struct');
+export const ENUM_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Enum');
+export const MACRO_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Macro');
+export const TYPEDEF_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Typedef');
+export const UNION_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Union');
+export const NAMESPACE_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Namespace');
+export const TRAIT_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Trait');
+export const IMPL_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Impl');
+export const TYPE_ALIAS_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('TypeAlias');
+export const CONST_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Const');
+export const STATIC_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Static');
+export const PROPERTY_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Property');
+export const RECORD_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Record');
+export const DELEGATE_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Delegate');
+export const ANNOTATION_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Annotation');
+export const CONSTRUCTOR_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Constructor');
+export const TEMPLATE_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Template');
+export const MODULE_SCHEMA_MIGRATION = CODE_ELEMENT_MIGRATION('Module');
 
 // ============================================================================
 // RELATION TABLE SCHEMA
@@ -263,7 +362,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM File TO \`Constructor\`,
   FROM File TO \`Template\`,
   FROM File TO \`Module\`,
-  FROM File TO Section,
+  FROM File TO Route,
   FROM Folder TO Folder,
   FROM Folder TO File,
   FROM Function TO Function,
@@ -284,7 +383,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Function TO \`Typedef\`,
   FROM Function TO \`Union\`,
   FROM Function TO \`Property\`,
-  FROM Function TO CodeElement,
+  FROM Function TO Route,
   FROM Class TO Method,
   FROM Class TO Function,
   FROM Class TO Class,
@@ -318,7 +417,6 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Method TO Interface,
   FROM Method TO \`Constructor\`,
   FROM Method TO \`Property\`,
-  FROM Method TO CodeElement,
   FROM \`Template\` TO \`Template\`,
   FROM \`Template\` TO Function,
   FROM \`Template\` TO Method,
@@ -330,14 +428,6 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Template\` TO Interface,
   FROM \`Template\` TO \`Constructor\`,
   FROM \`Module\` TO \`Module\`,
-  FROM Section TO Section,
-  FROM Section TO File,
-  FROM File TO Route,
-  FROM Function TO Route,
-  FROM Method TO Route,
-  FROM File TO Tool,
-  FROM Function TO Tool,
-  FROM Method TO Tool,
   FROM CodeElement TO Community,
   FROM Interface TO Community,
   FROM Interface TO Function,
@@ -436,32 +526,53 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Annotation\` TO Process,
   FROM \`Template\` TO Process,
   FROM CodeElement TO Process,
+  FROM Route TO Method,
+  FROM Route TO Function,
+  FROM Route TO Community,
   FROM Route TO Process,
-  FROM Tool TO Process,
   type STRING,
   confidence DOUBLE,
   reason STRING,
-  step INT32
+  step INT32,
+  source STRING,
+  sourceLine INT64,
+  sourceCol INT64
 )`;
+
+// #159 P3 Mode A (WI-1): additive migration for the new `source` STRING
+// column on CodeRelation. Plain `ALTER TABLE ... ADD col TYPE` — Kùzu does
+// NOT support `IF NOT EXISTS` or `ADD COLUMN` here. The migration runner
+// in lbug-adapter.doInitLbug suppresses the "already has property" error
+// thrown on re-runs against an existing DB, keeping it idempotent.
+export const CODEREL_SOURCE_MIGRATION = `
+ALTER TABLE CodeRelation ADD source STRING`;
+
+// #174: additive migrations for call-site position columns on CodeRelation.
+// Column names `sourceLine` / `sourceCol` match the GraphRelationship fields
+// emitted by call-processor.ts and serialised by csv-generator.ts (#174).
+//
+// Design: same pattern as CODEREL_SOURCE_MIGRATION — plain ALTER TABLE ADD
+// without IF NOT EXISTS (Kùzu does not support that clause). The runner in
+// lbug-adapter.doInitLbug suppresses "already has property" on re-runs
+// (idempotent). Column-adds do NOT bump SCHEMA_VERSION (table-count-derived).
+//
+// 0-based LSP/tree-sitter convention: nameNode.startPosition.{row,column}.
+// NULL means the edge was emitted before #174 or was a synthetic edge that
+// carries no call-site position (route/tool/heritage).
+export const CODEREL_SOURCELINE_MIGRATION = `
+ALTER TABLE CodeRelation ADD sourceLine INT64`;
+export const CODEREL_SOURCECOL_MIGRATION = `
+ALTER TABLE CodeRelation ADD sourceCol INT64`;
 
 // ============================================================================
 // EMBEDDING TABLE SCHEMA
 // Separate table for vector storage to avoid copy-on-write overhead
 // ============================================================================
 
-/** Embedding vector dimensions. Default 384 (snowflake-arctic-embed-xs). */
-const _rawDims = parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
-if (Number.isNaN(_rawDims) || _rawDims <= 0) {
-  throw new Error(
-    `GITNEXUS_EMBEDDING_DIMS must be a positive integer, got "${process.env.GITNEXUS_EMBEDDING_DIMS}"`,
-  );
-}
-export const EMBEDDING_DIMS = _rawDims;
-
 export const EMBEDDING_SCHEMA = `
 CREATE NODE TABLE ${EMBEDDING_TABLE_NAME} (
   nodeId STRING,
-  embedding FLOAT[${EMBEDDING_DIMS}],
+  embedding FLOAT[384],
   PRIMARY KEY (nodeId)
 )`;
 
@@ -488,6 +599,7 @@ export const NODE_SCHEMA_QUERIES = [
   CODE_ELEMENT_SCHEMA,
   COMMUNITY_SCHEMA,
   PROCESS_SCHEMA,
+  ROUTE_SCHEMA,
   // Multi-language support
   STRUCT_SCHEMA,
   ENUM_SCHEMA,
@@ -507,12 +619,6 @@ export const NODE_SCHEMA_QUERIES = [
   CONSTRUCTOR_SCHEMA,
   TEMPLATE_SCHEMA,
   MODULE_SCHEMA,
-  // Markdown support
-  SECTION_SCHEMA,
-  // API routes
-  ROUTE_SCHEMA,
-  // MCP tools
-  TOOL_SCHEMA,
 ];
 
 export const REL_SCHEMA_QUERIES = [
@@ -524,3 +630,66 @@ export const SCHEMA_QUERIES = [
   ...REL_SCHEMA_QUERIES,
   EMBEDDING_SCHEMA,
 ];
+
+/**
+ * Ordered list of all `*_MIGRATION[_N]` constants.
+ *
+ * The migration runner in `lbug-adapter.doInitLbug` iterates this array after
+ * `SCHEMA_QUERIES` and executes each entry. Every `*_MIGRATION[_N]` constant
+ * in this file MUST be listed here exactly once.
+ *
+ * How to add a new migration:
+ * 1. Define a new `*_MIGRATION_N` constant (use `ALTER TABLE ... ADD col TYPE`).
+ *    Kùzu's ALTER does not support `IF NOT EXISTS` — the runner suppresses
+ *    the "already has property" error on re-runs.
+ * 2. Append it to this array on a new line.
+ *
+ * Multi-statement migrations (currently `FUNCTION_SCHEMA_MIGRATION_2` and
+ * `ROUTE_SCHEMA_MIGRATION`) are split on `;` at the runner — the constants
+ * stay readable as a single block in the schema file.
+ */
+export const SCHEMA_MIGRATIONS = [
+  FILE_SCHEMA_MIGRATION,
+  FOLDER_SCHEMA_MIGRATION,
+  FUNCTION_SCHEMA_MIGRATION,
+  FUNCTION_SCHEMA_MIGRATION_2,         // multi-statement (2 stmts)
+  CLASS_SCHEMA_MIGRATION,
+  INTERFACE_SCHEMA_MIGRATION,
+  METHOD_SCHEMA_MIGRATION,
+  METHOD_SCHEMA_MIGRATION_2,
+  CODE_ELEMENT_SCHEMA_MIGRATION,
+  COMMUNITY_SCHEMA_MIGRATION,
+  PROCESS_SCHEMA_MIGRATION,
+  ROUTE_SCHEMA_MIGRATION,              // multi-statement (8 stmts)
+  STRUCT_SCHEMA_MIGRATION,
+  ENUM_SCHEMA_MIGRATION,
+  MACRO_SCHEMA_MIGRATION,
+  TYPEDEF_SCHEMA_MIGRATION,
+  UNION_SCHEMA_MIGRATION,
+  NAMESPACE_SCHEMA_MIGRATION,
+  TRAIT_SCHEMA_MIGRATION,
+  IMPL_SCHEMA_MIGRATION,
+  TYPE_ALIAS_SCHEMA_MIGRATION,
+  CONST_SCHEMA_MIGRATION,
+  STATIC_SCHEMA_MIGRATION,
+  PROPERTY_SCHEMA_MIGRATION,
+  RECORD_SCHEMA_MIGRATION,
+  DELEGATE_SCHEMA_MIGRATION,
+  ANNOTATION_SCHEMA_MIGRATION,
+  CONSTRUCTOR_SCHEMA_MIGRATION,
+  TEMPLATE_SCHEMA_MIGRATION,
+  MODULE_SCHEMA_MIGRATION,
+  // #159 P3 Mode A (WI-1): additive `source` column on CodeRelation.
+  // Default 'heuristic' is applied serializer-side so the fresh-DB DDL and
+  // the ALTER path both produce the same shape; runner suppresses
+  // "already has property" on re-runs against an existing DB.
+  CODEREL_SOURCE_MIGRATION,
+  // #174: call-site position columns (0-based row/col, tree-sitter convention).
+  // The runner suppresses "already has property" on re-runs (idempotent).
+  // NULL in legacy rows is handled by mode-c-verifier's `unpositioned` counter.
+  CODEREL_SOURCELINE_MIGRATION,
+  CODEREL_SOURCECOL_MIGRATION,
+];
+
+/** Schema version derived from table count — increments when tables are added/removed. */
+export const SCHEMA_VERSION = NODE_SCHEMA_QUERIES.length + REL_SCHEMA_QUERIES.length;

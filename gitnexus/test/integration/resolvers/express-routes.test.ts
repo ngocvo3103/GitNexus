@@ -40,11 +40,13 @@ describe('Express/Hono route detection', () => {
     expect(itemsRoute!.sourceFilePath).toContain('app.js');
   });
 
-  it('detects multiple HTTP methods on same path as single route', () => {
+  it('detects multiple HTTP methods on same path as multi route', () => {
     // /api/users has GET and POST but route registry deduplicates by path
     const routes = getNodesByLabel(result, 'Route');
+    console.log('ROUTE NODES:', routes.map(r => ({ name: r.name, properties: r.properties })));
+
     const usersRoutes = routes.filter(r => r === '/api/users');
-    expect(usersRoutes).toHaveLength(1);
+    expect(usersRoutes).toHaveLength(2);
   });
 
   it('detects router.get() routes (not just app.get())', () => {

@@ -3,6 +3,7 @@
  */
 
 import { SupportedLanguages } from '../../../config/supported-languages.js';
+import { isConfigFile } from '../config-indexer.js';
 
 /** Ruby extensionless filenames recognised as Ruby source */
 const RUBY_EXTENSIONLESS_FILES = new Set(['Rakefile', 'Gemfile', 'Guardfile', 'Vagrantfile', 'Brewfile']);
@@ -57,3 +58,48 @@ export const getLanguageFromFilename = (filename: string): SupportedLanguages | 
   if (filename.endsWith('.dart')) return SupportedLanguages.Dart;
   return null;
 };
+/**
+ * Classify a file path into a broad type category.
+ *
+ * Priority: code > documentation > config > data > other.
+ * Code classification delegates to getLanguageFromFilename.
+ */
+export function getFileType(filePath: string): 'code' | 'documentation' | 'config' | 'data' | 'other' {
+  // Code — any file recognized by language detection
+  if (getLanguageFromFilename(filePath) !== null) {
+    return 'code';
+  }
+
+  const filename = filePath.split('/').pop() || '';
+
+  // Documentation
+  if (filename.endsWith('.md') || filename.endsWith('.mdx') ||
+      filename.endsWith('.rst') || filename.endsWith('.adoc') ||
+      filename.endsWith('.txt')) {
+    return 'documentation';
+  }
+
+  // Config — by extension or by config filename pattern
+  if (filename.endsWith('.xml') || filename.endsWith('.toml') ||
+      filename.endsWith('.yaml') || filename.endsWith('.yml') ||
+      filename.endsWith('.properties') || filename.endsWith('.ini') ||
+      filename.endsWith('.cfg')) {
+    return 'config';
+  }
+  if (isConfigFile(filePath)) {
+    return 'config';
+  }
+
+  // Data — JSON (excluding lock files) and CSV
+  if (filename.endsWith('.json')) {
+    if (filename.endsWith('-lock.json') || filename === 'package-lock.json') {
+      return 'other';
+    }
+    return 'data';
+  }
+  if (filename.endsWith('.csv')) {
+    return 'data';
+  }
+
+  return 'other';
+}

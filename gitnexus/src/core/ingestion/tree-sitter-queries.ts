@@ -22,6 +22,33 @@ export const TYPESCRIPT_QUERIES = `
 (function_signature
   name: (identifier) @name) @definition.function
 
+; React hook bindings (Issue #107): const handleClick = useCallback(...)
+; The variable is a closure - capture it as a Function so the call graph
+; shows MyComponent -> handleClick and handleClick -> useCallback instead
+; of the value falling into the void. Restricted to React Hooks (functions
+; whose name starts with 'use' followed by an uppercase letter) to avoid
+; capturing every 'const X = someCall()' binding.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: [
+        (identifier) @_hook_fn (#match? @_hook_fn "^use[A-Z]")
+        (member_expression
+          property: (property_identifier) @_hook_fn (#match? @_hook_fn "^use[A-Z]"))
+      ]))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: [
+          (identifier) @_hook_fn (#match? @_hook_fn "^use[A-Z]")
+          (member_expression
+            property: (property_identifier) @_hook_fn (#match? @_hook_fn "^use[A-Z]"))
+        ])))) @definition.function
+
 (method_definition
   name: (property_identifier) @name) @definition.method
 
@@ -121,6 +148,14 @@ export const TYPESCRIPT_QUERIES = `
   arguments: (arguments
     (string (string_fragment) @http_client.url))) @http_client
 
+; Expo Router navigation: router.push('/path'), router.replace('/path'), router.navigate('/path')
+(call_expression
+  function: (member_expression
+    object: (identifier) @_router_obj (#eq? @_router_obj "router")
+    property: (property_identifier) @expo_nav.method)
+  arguments: (arguments
+    (string (string_fragment) @expo_nav.url))) @expo_nav
+
 ; Decorators: @Controller, @Get, @Post, etc.
 (decorator
   (call_expression
@@ -133,6 +168,32 @@ export const TYPESCRIPT_QUERIES = `
     property: (property_identifier) @express_route.method)
   arguments: (arguments
     (string (string_fragment) @express_route.path))) @express_route
+
+; ---- TypeScript-specific gaps (Issue #107) ----
+
+; type X = ... (TypeAlias node). The tree-sitter-typescript grammar exposes
+; these as type_alias_declaration (not the legacy type_alias used by other
+; languages). Without this capture, type aliases are invisible in the graph.
+(type_alias_declaration
+  name: (type_identifier) @name) @definition.type
+`;
+
+// TSX-specific queries (tree-sitter-tsx). The JSX node types only exist in
+// the .tsx grammar; the base .ts grammar rejects them with a query error.
+export const TSX_QUERIES = TYPESCRIPT_QUERIES + `
+
+; React JSX self-closing element: <Button />
+; We capture the tag name so the JSX reference is queryable in the graph.
+; Note: the closing tag of a non-self-closing <Foo></Foo> pair shares the same
+; identifier - we only need one capture per element to avoid duplication.
+(jsx_self_closing_element
+  (identifier) @name) @definition.jsx_element
+
+; React JSX opening element of a non-self-closing pair: <Button>...</Button>.
+; Capture the tag from the OPENING element so we don't double-count.
+(jsx_element
+  (jsx_opening_element
+    (identifier) @name)) @definition.jsx_element
 `;
 
 // JavaScript queries - works with tree-sitter-javascript
@@ -225,6 +286,14 @@ export const JAVASCRIPT_QUERIES = `
   arguments: (arguments
     (string (string_fragment) @http_client.url))) @http_client
 
+; Expo Router navigation: router.push('/path'), router.replace('/path'), router.navigate('/path')
+(call_expression
+  function: (member_expression
+    object: (identifier) @_router_obj (#eq? @_router_obj "router")
+    property: (property_identifier) @expo_nav.method)
+  arguments: (arguments
+    (string (string_fragment) @expo_nav.url))) @expo_nav
+
 ; Express/Hono route registration
 (call_expression
   function: (member_expression
@@ -306,6 +375,16 @@ export const PYTHON_QUERIES = `
       attribute: (identifier) @decorator.name)
     arguments: (argument_list
       (string (string_content) @decorator.arg)?))) @decorator
+
+; MCP tool decorators: @mcp.tool() - capture the decorated_definition which contains both decorator and function
+(decorated_definition
+  (decorator
+    (call
+      function: (attribute
+        object: (identifier) @_mcp_obj
+        attribute: (identifier) @_tool_method)))
+  definition: (function_definition
+    name: (identifier) @mcp_tool.name)) @mcp_tool
 `;
 
 // Java queries - works with tree-sitter-java
@@ -335,13 +414,20 @@ export const JAVA_QUERIES = `
 ; Constructor calls: new Foo()
 (object_creation_expression type: (type_identifier) @call.name) @call
 
-; Heritage - extends class
+; Heritage - extends class (plain and generic)
 (class_declaration name: (identifier) @heritage.class
-  (superclass (type_identifier) @heritage.extends)) @heritage
+  (superclass [(type_identifier) @heritage.extends
+               (generic_type (type_identifier) @heritage.extends)])) @heritage
 
-; Heritage - implements interfaces
+; Heritage - implements interfaces (plain and generic)
 (class_declaration name: (identifier) @heritage.class
-  (super_interfaces (type_list (type_identifier) @heritage.implements))) @heritage.impl
+  (super_interfaces (type_list [(type_identifier) @heritage.implements
+                                 (generic_type (type_identifier) @heritage.implements)]))) @heritage.impl
+
+; Heritage - interface extends (plain and generic)
+(interface_declaration name: (identifier) @heritage.class
+  (extends_interfaces (type_list [(type_identifier) @heritage.extends
+                                   (generic_type (type_identifier) @heritage.extends)]))) @heritage
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -387,6 +473,12 @@ export const GO_QUERIES = `
 ; Functions & Methods
 (function_declaration name: (identifier) @name) @definition.function
 (method_declaration name: (field_identifier) @name) @definition.method
+; WI-H88 / Issue #88: Go interface body methods (e.g. \`type Namer interface { GetName() string }\`)
+; parse as \`method_elem\` — a different node type from \`method_declaration\`.
+; The name is a \`field_identifier\` (per the Go grammar). Without this, interface
+; methods are never captured as \`definition.method\` and never become Method nodes
+; or HAS_METHOD edges in the graph.
+(method_elem name: (field_identifier) @name) @definition.method
 
 ; Types
 (type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @definition.struct
@@ -1149,8 +1241,11 @@ export const DART_QUERIES = `
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
 
-export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
+export const LANGUAGE_QUERIES: Record<string, string> = {
   [SupportedLanguages.TypeScript]: TYPESCRIPT_QUERIES,
+  // TSX files use a separate grammar (tree-sitter-tsx). We extend
+  // TYPESCRIPT_QUERIES with JSX-specific patterns.
+  [`${SupportedLanguages.TypeScript}:tsx`]: TSX_QUERIES,
   [SupportedLanguages.JavaScript]: JAVASCRIPT_QUERIES,
   [SupportedLanguages.Python]: PYTHON_QUERIES,
   [SupportedLanguages.Java]: JAVA_QUERIES,
@@ -1164,5 +1259,5 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Ruby]: RUBY_QUERIES,
   [SupportedLanguages.Swift]: SWIFT_QUERIES,
   [SupportedLanguages.Dart]: DART_QUERIES,
-  [SupportedLanguages.Cobol]: '', // Standalone regex processor — no tree-sitter queries
+  [SupportedLanguages.Cobol]: '', // Standalone regex processor - no tree-sitter queries
 };

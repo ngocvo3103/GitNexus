@@ -42,7 +42,8 @@ export function nextjsFileToRouteURL(filePath: string): string | null {
 export function normalizeFetchURL(rawURL: string): string | null {
   let url = rawURL.split('?')[0];
   url = url.replace(/\$\{[^}]+\}/g, '[param]');
-  url = url.replace(/^`|`$/g, '');
+  // Strip ALL backticks (tree-sitter may include them in template string captures)
+  url = url.replace(/`/g, '');
   // Strip file extensions from URLs (PHP projects use /api/upload.php but routes are /api/upload)
   url = url.replace(/\.(php|asp|aspx|jsp|cgi)$/, '');
 

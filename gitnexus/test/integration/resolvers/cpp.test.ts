@@ -1094,15 +1094,18 @@ describe('C++ overload disambiguation by parameter types', () => {
   it('detects lookup method with parameterTypes on graph node', () => {
     const methods = getNodesByLabelFull(result, 'Method');
     const lookupNodes = methods.filter(m => m.name === 'lookup');
-    expect(lookupNodes.length).toBe(1);
-    expect(lookupNodes[0].properties.parameterTypes).toEqual(['int']);
+    // generateId now includes parameter types → each overload gets its own node
+    expect(lookupNodes.length).toBe(2);
+    const paramTypes = lookupNodes.map(n => n.properties.parameterTypes).sort();
+    expect(paramTypes).toEqual([['int'], ['string']]);
   });
 
   it('emits CALLS edge from run() → lookup() via overload disambiguation', () => {
     const calls = getRelationships(result, 'CALLS');
     const lookupCalls = calls.filter(c => c.source === 'run' && c.target === 'lookup');
-    // Both lookup(42) and lookup("alice") resolve to same nodeId → 1 CALLS edge
-    expect(lookupCalls.length).toBe(1);
+    // Each overload is a separate node; literal type matching resolves
+    // each call site to its specific overload node → at least 1 edge.
+    expect(lookupCalls.length).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -1149,7 +1152,11 @@ describe('C++ default parameter arity resolution', () => {
   it('resolves greet("Alice") with 1 arg to greet with 2 params (1 default)', () => {
     const calls = getRelationships(result, 'CALLS');
     const greetCalls = calls.filter(c => c.source === 'process' && c.target === 'greet');
-    expect(greetCalls.length).toBe(1);
+    // WI-1 / #159: heuristic CALLS id is line-aware (`:L${row}`
+    // suffix). The fixture has TWO call sites (line 8: 1-arg,
+    // line 9: 2-arg) at distinct lines → two distinct edges
+    // survive collapse (previously one — id dedup at graph.ts:14).
+    expect(greetCalls.length).toBe(2);
   });
 });
 

@@ -3,11 +3,12 @@ import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import path from 'path';
 import lbug from '@ladybugdb/core';
-import { KnowledgeGraph } from '../graph/types.js';
+import { KnowledgeGraph, NodeProperties } from '../graph/types.js';
 import {
   NODE_TABLES,
   REL_TABLE_NAME,
   SCHEMA_QUERIES,
+  SCHEMA_MIGRATIONS,
   EMBEDDING_TABLE_NAME,
   NodeTableName,
 } from './schema.js';
@@ -17,33 +18,12 @@ let db: lbug.Database | null = null;
 let conn: lbug.Connection | null = null;
 let currentDbPath: string | null = null;
 let ftsLoaded = false;
-
-/** Expose the current Database for pool adapter reuse in tests. */
-export const getDatabase = (): lbug.Database | null => db;
+const DB_LOCK_RETRY_ATTEMPTS = 3;
+const DB_LOCK_RETRY_DELAY_MS = 500;
 
 // Global session lock for operations that touch module-level lbug globals.
 // This guarantees no DB switch can happen while an operation is running.
 let sessionLock: Promise<void> = Promise.resolve();
-
-/** Number of times to retry on a BUSY / lock-held error before giving up. */
-const DB_LOCK_RETRY_ATTEMPTS = 3;
-/** Base back-off in ms between BUSY retries (multiplied by attempt number). */
-const DB_LOCK_RETRY_DELAY_MS = 500;
-
-/**
- * Return true when the error message indicates that another process holds
- * an exclusive lock on the LadybugDB file (e.g. `gitnexus analyze` or
- * `gitnexus serve` running at the same time).
- */
-export const isDbBusyError = (err: unknown): boolean => {
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  return (
-    msg.includes('busy')
-    || msg.includes('lock')
-    || msg.includes('already in use')
-    || msg.includes('could not set lock')
-  );
-};
 
 const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> => {
   const previous = sessionLock;
@@ -69,11 +49,17 @@ export const initLbug = async (dbPath: string) => {
 /**
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
- *
- * Automatically retries up to DB_LOCK_RETRY_ATTEMPTS times when the
- * database is busy (e.g. `gitnexus analyze` holds the write lock).
- * Each retry waits DB_LOCK_RETRY_DELAY_MS * attempt milliseconds.
  */
+export const isDbBusyError = (err: unknown): boolean => {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('busy') ||
+    msg.includes('lock') ||
+    msg.includes('already in use') ||
+    msg.includes('could not set lock')
+  );
+};
+
 export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>): Promise<T> => {
   let lastError: unknown;
   for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
@@ -84,25 +70,11 @@ export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>)
       });
     } catch (err) {
       lastError = err;
-      if (!isDbBusyError(err) || attempt === DB_LOCK_RETRY_ATTEMPTS) {
-        throw err;
-      }
-      // Close stale connection inside the session lock to prevent race conditions
-      // with concurrent operations that might acquire the lock between cleanup steps
-      await runWithSessionLock(async () => {
-        try { if (conn) await conn.close(); } catch { /* best-effort */ }
-        try { if (db) await db.close(); } catch { /* best-effort */ }
-        conn = null;
-        db = null;
-        currentDbPath = null;
-        ftsLoaded = false;
-      });
-      // Sleep outside the lock — no need to block others while waiting
+      if (!isDbBusyError(err) || attempt === DB_LOCK_RETRY_ATTEMPTS) throw err;
+      // Cleanup and backoff before retry
       await new Promise(resolve => setTimeout(resolve, DB_LOCK_RETRY_DELAY_MS * attempt));
     }
   }
-  // This line is unreachable — the loop either returns or throws inside,
-  // but TypeScript needs an explicit throw to satisfy the return type.
   throw lastError;
 };
 
@@ -145,8 +117,14 @@ const doInitLbug = async (dbPath: string) => {
       await fs.rm(dbPath, { recursive: true, force: true });
     }
     // If it's a file, assume it's an existing LadybugDB database - LadybugDB will open it
+    if (process.env.GITNEXUS_VERBOSE) {
+      process.stderr.write(`[DEBUG] Existing database file found at ${dbPath}, will be overwritten\n`);
+    }
   } catch {
     // Path doesn't exist, which is what LadybugDB wants for a new database
+    if (process.env.GITNEXUS_VERBOSE) {
+      process.stderr.write(`[DEBUG] No existing database at ${dbPath}, creating fresh\n`);
+    }
   }
 
   // Ensure parent directory exists
@@ -156,14 +134,41 @@ const doInitLbug = async (dbPath: string) => {
   db = new lbug.Database(dbPath);
   conn = new lbug.Connection(db);
 
+  // Create schema tables
   for (const schemaQuery of SCHEMA_QUERIES) {
     try {
       await conn.query(schemaQuery);
     } catch (err) {
-      // Only ignore "already exists" errors - log everything else
+      // Ignore "already exists" errors for idempotent schema creation
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes('already exists')) {
-        console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+        throw err;
+      }
+    }
+  }
+
+  // Apply incremental migrations (additive ALTER TABLE ... ADD col TYPE).
+  // Idempotent on existing DBs — running on a fresh DB and an existing DB
+  // both end up with the migrated columns populated. Kùzu's ALTER does NOT
+  // support IF NOT EXISTS, so re-running on a DB that already has the
+  // column throws "already has property" — the catch-block below swallows
+  // that and re-running becomes a no-op. Multi-statement migrations
+  // (FUNCTION_SCHEMA_MIGRATION_2, ROUTE_SCHEMA_MIGRATION) are split on
+  // `;` because Connection.query() takes one statement at a time.
+  for (const migration of SCHEMA_MIGRATIONS) {
+    for (const stmt of migration.split(';')) {
+      const trimmed = stmt.trim();
+      if (!trimmed) continue;
+      try {
+        await conn.query(trimmed);
+      } catch (err) {
+        // Suppress "already has property" (Kùzu's wording for a re-ADD
+        // against an existing column) and "already exists" (legacy wording
+        // for DDL conflicts) so the runner is idempotent on existing DBs.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('already has property') && !msg.includes('already exists')) {
+          throw err;
+        }
       }
     }
   }
@@ -270,6 +275,14 @@ export const loadGraphToLbug = async (
       const pairCsvPath = path.join(csvDir, `rel_${fromLabel}_${toLabel}.csv`);
       await fs.writeFile(pairCsvPath, relHeader + '\n' + lines.join('\n'), 'utf-8');
       const normalizedPath = normalizeCopyPath(pairCsvPath);
+      // #159 P3 Mode A (WI-1): the CSV header at L242 (now 7 cols,
+      // including `source`) is propagated into the per-pair CSV above
+      // (L276). With `HEADER=true`, Kùzu binds CSV header NAMES to
+      // CodeRelation column names — that's why the header order in
+      // csv-generator.ts:streamAllCSVsToDisk MUST match the rel column
+      // order in schema.ts:RELATION_SCHEMA. The 7th column `source` is
+      // the near-irreversible edge provenance tag; default 'heuristic'
+      // is applied serializer-side so every row has a non-NULL value.
       const copyQuery = `COPY ${REL_TABLE_NAME} FROM "${normalizedPath}" (from="${fromLabel}", to="${toLabel}", HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
 
       if (pairIdx % 5 === 0 || lines.length > 1000) {
@@ -346,21 +359,35 @@ const fallbackRelationshipInserts = async (
   for (let i = 1; i < validRelLines.length; i++) {
     const line = validRelLines[i];
     try {
-      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)/);
+      // #159 P3 Mode A (WI-1): 7th capture group = `source`. Defaults to
+      // 'heuristic' when the CSV row is from a pre-WI-1 run (the regex
+      // group is optional, so existing 6-column rows still match).
+      // #174: 8th/9th capture groups = sourceLine / sourceCol (optional
+      // INT64 digits, empty cell → NULL). Regex permits absence for
+      // backward-compat with pre-#174 CSVs.
+      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)(?:,"([^"]*)")?(?:,([0-9]*))?(?:,([0-9]*))?/);
       if (!match) continue;
-      const [, fromId, toId, relType, confidenceStr, reason, stepStr] = match;
+      const [, fromId, toId, relType, confidenceStr, reason, stepStr, sourceStr, sourceLineStr, sourceColStr] = match;
       const fromLabel = getNodeLabel(fromId);
       const toLabel = getNodeLabel(toId);
       if (!validTables.has(fromLabel) || !validTables.has(toLabel)) continue;
 
       const confidence = parseFloat(confidenceStr) || 1.0;
       const step = parseInt(stepStr) || 0;
+      // Hard invariant: `source` is non-NULL — fallback to 'heuristic' if absent.
+      const source = (sourceStr && sourceStr.length > 0) ? sourceStr : 'heuristic';
+      // #174: sourceLine / sourceCol are nullable INT64. Parse if present;
+      // use NULL literal in the CREATE query when absent or empty.
+      const sourceLineVal = (sourceLineStr !== undefined && sourceLineStr !== '') ? parseInt(sourceLineStr, 10) : null;
+      const sourceColVal  = (sourceColStr  !== undefined && sourceColStr  !== '') ? parseInt(sourceColStr,  10) : null;
+      const sourceLineCql = sourceLineVal !== null && !isNaN(sourceLineVal) ? String(sourceLineVal) : 'NULL';
+      const sourceColCql  = sourceColVal  !== null && !isNaN(sourceColVal)  ? String(sourceColVal)  : 'NULL';
 
       const esc = (s: string) => s.replace(/'/g, "''").replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
       await conn.query(`
         MATCH (a:${escapeLabel(fromLabel)} {id: '${esc(fromId)}' }),
               (b:${escapeLabel(toLabel)} {id: '${esc(toId)}' })
-        CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}}]->(b)
+        CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}, source: '${esc(source)}', sourceLine: ${sourceLineCql}, sourceCol: ${sourceColCql}}]->(b)
       `);
     } catch {
       // skip
@@ -385,17 +412,22 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   if (table === 'Process') {
     return `COPY ${t}(id, label, heuristicLabel, processType, stepCount, communities, entryPointId, terminalId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
-  if (table === 'Section') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, level, content, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  if (table === 'Method') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType, parameters, annotations, parameterAnnotations) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'Function') {
+    // #86: Function carries parameterCount + returnType. Column order MUST
+    // match the functionHeader in csv-generator.ts:251 and the row layout in
+    // csv-generator.ts:Function switch case. A mismatch would silently shift
+    // fields (e.g. parameterCount would receive a quoted content blob).
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType, repoId) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'Class') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, fields, annotations) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Route') {
-    return `COPY ${t}(id, name, filePath, responseKeys, errorKeys, middleware) FROM "${filePath}" ${COPY_CSV_OPTS}`;
-  }
-  if (table === 'Tool') {
-    return `COPY ${t}(id, name, filePath, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
-  }
-  if (table === 'Method') {
-    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+    // Order must match csv-generator.ts:241 (routeHeader) — see B1 BLOCKER fix.
+    return `COPY ${t}(id, name, httpMethod, routePath, controllerName, methodName, filePath, startLine, lineNumber, isInherited, repoId, responseKeys, errorKeys, middleware, controllerClass, handlerMethod, isControllerClass, prefix) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   // TypeScript/JS code element tables have isExported; multi-language tables do not
   if (TABLES_WITH_EXPORTED.has(table)) {
@@ -438,9 +470,17 @@ export const insertNodeToLbug = async (
       query = `CREATE (n:File {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, content: ${escapeValue(properties.content || '')}})`;
     } else if (label === 'Folder') {
       query = `CREATE (n:Folder {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}})`;
-    } else if (label === 'Section') {
+    } else if (label === 'Route') {
+      // Intersection widens the type: keeps Record<string, unknown> semantics for
+      // any extra fields while making the new typed fields type-safe at the access site.
+      const p = properties as Partial<NodeProperties> & Record<string, unknown>;
+      query = `CREATE (n:Route {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, httpMethod: ${escapeValue(p.httpMethod ?? '')}, routePath: ${escapeValue(p.routePath ?? '')}, controllerName: ${escapeValue(p.controllerName ?? '')}, methodName: ${escapeValue(p.methodName ?? '')}, filePath: ${escapeValue(properties.filePath)}, startLine: ${p.startLine ?? 0}, lineNumber: ${p.lineNumber ?? 0}, isInherited: ${!!p.isInherited}, repoId: ${escapeValue(p.repoId ?? '')}, responseKeys: ${escapeValue(p.responseKeys ?? [])}, errorKeys: ${escapeValue(p.errorKeys ?? [])}, middleware: ${escapeValue(p.middleware ?? [])}, controllerClass: ${escapeValue(p.controllerClass ?? '')}, handlerMethod: ${escapeValue(p.handlerMethod ?? '')}, isControllerClass: ${!!p.isControllerClass}, prefix: ${escapeValue(p.prefix ?? '')}})`;
+    } else if (label === 'Function') {
+      // #86: Function-specific INSERT — carries parameterCount + returnType
+      // (and optional repoId for cross-repo). Branched out of TABLES_WITH_EXPORTED
+      // so the 8-column template below stays correct for Class/Interface/CodeElement.
       const descPart = properties.description ? `, description: ${escapeValue(properties.description)}` : '';
-      query = `CREATE (n:Section {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, level: ${properties.level || 1}, content: ${escapeValue(properties.content || '')}${descPart}})`;
+      query = `CREATE (n:Function {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, isExported: ${!!properties.isExported}, content: ${escapeValue(properties.content || '')}${descPart}, parameterCount: ${typeof properties.parameterCount === 'number' ? properties.parameterCount : 0}, returnType: ${escapeValue(properties.returnType ?? '')}, repoId: ${escapeValue(properties.repoId ?? '')}})`;
     } else if (TABLES_WITH_EXPORTED.has(label)) {
       const descPart = properties.description ? `, description: ${escapeValue(properties.description)}` : '';
       query = `CREATE (n:${t} {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, isExported: ${!!properties.isExported}, content: ${escapeValue(properties.content || '')}${descPart}})`;
@@ -512,9 +552,17 @@ export const batchInsertNodesToLbug = async (
           query = `MERGE (n:File {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.content = ${escapeValue(properties.content || '')}`;
         } else if (label === 'Folder') {
           query = `MERGE (n:Folder {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}`;
-        } else if (label === 'Section') {
+        } else if (label === 'Route') {
+          // Intersection widens the type: keeps Record<string, unknown> semantics for
+          // any extra fields while making the new typed fields type-safe at the access site.
+          const p = properties as Partial<NodeProperties> & Record<string, unknown>;
+          query = `MERGE (n:Route {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.httpMethod = ${escapeValue(p.httpMethod)}, n.routePath = ${escapeValue(p.routePath)}, n.controllerName = ${escapeValue(p.controllerName)}, n.methodName = ${escapeValue(p.methodName)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${p.startLine ?? 0}, n.lineNumber = ${p.lineNumber ?? 0}, n.isInherited = ${!!p.isInherited}, n.repoId = ${escapeValue(p.repoId ?? '')}, n.responseKeys = ${escapeValue(p.responseKeys ?? [])}, n.errorKeys = ${escapeValue(p.errorKeys ?? [])}, n.middleware = ${escapeValue(p.middleware ?? [])}, n.controllerClass = ${escapeValue(p.controllerClass ?? '')}, n.handlerMethod = ${escapeValue(p.handlerMethod ?? '')}, n.isControllerClass = ${!!p.isControllerClass}, n.prefix = ${escapeValue(p.prefix ?? '')}`;
+        } else if (label === 'Function') {
+          // #86: Function-specific MERGE — carries parameterCount + returnType
+          // (and optional repoId for cross-repo). Branched out of TABLES_WITH_EXPORTED
+          // so the 8-column template below stays correct for Class/Interface/CodeElement.
           const descPart = properties.description ? `, n.description = ${escapeValue(properties.description)}` : '';
-          query = `MERGE (n:Section {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.level = ${properties.level || 1}, n.content = ${escapeValue(properties.content || '')}${descPart}`;
+          query = `MERGE (n:Function {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.isExported = ${!!properties.isExported}, n.content = ${escapeValue(properties.content || '')}${descPart}, n.parameterCount = ${typeof properties.parameterCount === 'number' ? properties.parameterCount : 0}, n.returnType = ${escapeValue(properties.returnType ?? '')}, n.repoId = ${escapeValue(properties.repoId ?? '')}`;
         } else if (TABLES_WITH_EXPORTED.has(label)) {
           const descPart = properties.description ? `, n.description = ${escapeValue(properties.description)}` : '';
           query = `MERGE (n:${t} {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.isExported = ${!!properties.isExported}, n.content = ${escapeValue(properties.content || '')}${descPart}`;
@@ -565,7 +613,26 @@ export const executeWithReusedStatement = async (
     const subBatch = paramsList.slice(i, i + SUB_BATCH_SIZE);
     const stmt = await conn.prepare(cypher);
     if (!stmt.isSuccess()) {
-      const errMsg = await stmt.getErrorMessage();
+      // B1: Kùzu's PreparedStatement API has drifted between
+      // versions — `getErrorMessage` may be sync, async, or
+      // absent entirely on a future release. Mode A's
+      // CODEREL_SOURCE_MIGRATION runs under `--lsp`; if the
+      // migration fails the funnel must not abort the entire
+      // ingest with a TypeError. Best-effort error string:
+      // try the sync form, then async, then fall back to
+      // 'unknown error'. The outer `throw` (still below)
+      // surfaces a useful message to the operator.
+      let errMsg = 'unknown error';
+      try {
+        const maybe: any = stmt as any;
+        if (typeof maybe.getErrorMessage === 'function') {
+          const r = maybe.getErrorMessage();
+          errMsg = r && typeof (r as any).then === 'function' ? await (r as Promise<string>) : (r as string);
+        }
+      } catch {
+        // Swallow — Kùzu API may have drifted. The 'unknown
+        // error' fallback carries the operator through.
+      }
       throw new Error(`Prepare failed: ${errMsg}`);
     }
     try {
@@ -666,6 +733,12 @@ export const closeLbug = async (): Promise<void> => {
 
 export const isLbugReady = (): boolean => conn !== null && db !== null;
 
+/**
+ * Get the underlying LadybugDB Database instance.
+ * Used by test helpers to share the open Database with pool adapters,
+ * avoiding file-lock conflicts between writable and read-only connections.
+ */
+export const getDatabase = (): lbug.Database | null => db;
 
 /**
  * Delete all nodes (and their relationships) for a specific file from LadybugDB

@@ -1,0 +1,523 @@
+/**
+ * Integration Tests: mode-c-verifier (LSP read-only foundation, WI-#6)
+ *
+ * Drives `runModeCVerify` against a REAL seeded LadybugDB. The
+ * `withTestLbugDB` helper opens the pool adapter, the verifier's
+ * default `executeParameterized` dep hits that pool, and the
+ * seed data is the `LOCAL_BACKEND_SEED_DATA` used by other
+ * integration tests in the suite — Functions, Classes, Methods
+ * and CALLS edges at known filePath/line ranges.
+ *
+ * The single Invariant-1 contract from the WI is the merge gate:
+ *
+ *   > IT: real seeded CALLS edges + read-only Cypher + mock
+ *   > LspClient + mock mapper → produces a deterministic
+ *   > VerifyReport whose per-tier sums equal its overall
+ *   > counters (Invariant 7) and whose `executeParameterized`
+ *   > is the only DB surface touched.
+ *
+ * Note on tier derivation: the schema stores `reason` (a STRING
+ * column on the CodeRelation row), NOT a `tier` column. The
+ * verifier derives tier from reason via `reasonToTier`. The
+ * LOCAL_BACKEND_SEED_DATA writes CALLS edges with two reasons:
+ * `'direct'` (not a known tier reason — bucketed to 'global')
+ * and `'import-resolved'` (bucketed to 'import-scoped'). The
+ * seed thus exercises both the default-defensive path and the
+ * named-reason path of `reasonToTier`.
+ */
+
+import { describe, it, expect, vi } from 'vitest';
+
+import {
+  runModeCVerify,
+  type RunModeCVerifyOpts,
+  type VerifyReport,
+  __test__,
+} from '../../../src/core/ingestion/lsp/mode-c-verifier.js';
+import { mapLocationToNodeId, type MapperResult } from '../../../src/core/ingestion/lsp/location-mapper.js';
+import { JAVA_ADAPTER, TYPESCRIPT_ADAPTER } from '../../../src/core/ingestion/lsp/language-adapter.js';
+import type { LspClient } from '../../../src/core/ingestion/lsp/lsp-client.js';
+import { withTestLbugDB } from '../../helpers/test-indexed-db.js';
+import { LOCAL_BACKEND_SEED_DATA } from '../../fixtures/local-backend-seed.js';
+
+// ─── Mock LspClient + probe factories ─────────────────────────────────
+
+/**
+ * Build a vi.fn()-driven mock `LspClient`. The verifier only
+ * uses `client.request(method, params, timeoutMs)`. We never
+ * call `start()` or `getState()` in the integration test — the
+ * probe is also injected.
+ *
+ * `byUri` lets the test pin the LSP response per-URI. The
+ * default is a "successful cross-file resolve" (one Location
+ * pointing at the request's own URI).
+ */
+function makeMockClient(opts: {
+  byUri?: Map<string, any[]>;
+  defaultImpl?: (method: string, params: any, timeoutMs: number) => Promise<any>;
+} = {}) {
+  const request = vi.fn(async (method: string, params: any, _timeoutMs: number) => {
+    if (opts.defaultImpl) return opts.defaultImpl(method, params, _timeoutMs);
+    const uri = params?.textDocument?.uri ?? '';
+    if (opts.byUri?.has(uri)) {
+      return opts.byUri.get(uri);
+    }
+    // Default: one Location, with the same URI as the request.
+    return [
+      {
+        uri,
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+      },
+    ];
+  });
+  return { request } as unknown as LspClient & { request: ReturnType<typeof vi.fn> };
+}
+
+const readyProbe = async () => ({ ready: true });
+
+/**
+ * The default mapper: the production `mapLocationToNodeId` is
+ * real-DB-backed and works against the seeded data. Tests can
+ * override this to inject specific verdicts.
+ */
+const realMapper = mapLocationToNodeId;
+
+// ─── Helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Compute the sum of a single counter across the four tiers.
+ * Used to assert "per-tier sums == overall" (Invariant 7
+ * bookkeeping).
+ */
+function sumAcross(report: VerifyReport, key: keyof (typeof report.overall)): number {
+  return (__test__.ALL_TIERS).reduce(
+    (s, t) => s + (report.perTier[t][key] as number),
+    0,
+  );
+}
+
+// ─── Real-seeded tests ────────────────────────────────────────────────
+
+withTestLbugDB('mode-c-verifier', (handle) => {
+  describe('real seeded DB — happy path', () => {
+    it('reads the seeded CALLS edges and produces a per-tier report', async () => {
+      // The default LSP mock returns the same URI as the
+      // request, so the production mapper will look up the
+      // source file itself and (in the absence of a Function
+      // at the call-site line) return NO_NODE.
+      //
+      // This test pins the read-only flow: the verifier MUST
+      // only call `executeParameterized` once (the bulk CALLS
+      // read) plus the mapper's own per-Location queries. The
+      // mapper does additional reads internally, so we only
+      // assert the verifier's own bulk call happened once.
+      const client = makeMockClient();
+      const executor = vi.fn().mockImplementation(
+        // Use the real adapter for the verifier's bulk CALLS read.
+        async (repoId: string, cypher: string, params: Record<string, any>) => {
+          const realAdapter = await import('../../../src/mcp/core/lbug-adapter.js');
+          return realAdapter.executeParameterized(repoId, cypher, params);
+        },
+      );
+      const opts: RunModeCVerifyOpts = {
+        repoId: handle.repoId,
+        client,
+        mapLocationToNodeId: realMapper,
+        executeParameterized: executor as any,
+        probe: readyProbe,
+        sampleSize: 10,
+        seed: 'integration-seed',
+      };
+      const report = await runModeCVerify(opts);
+
+      // #174: The seed wrote exactly 2 CALLS edges, but they carry
+      // NO sourceLine (synthetic Cypher CREATE without position data).
+      // After #174, edges without sourceLine are `unpositioned` — they
+      // are counted but NOT sampled (probing char:0 of the declaration
+      // line was the pre-#174 bug). So n=0 and unpositioned=2.
+      expect(report.overall.n).toBe(0);
+      expect(report.overall.unpositioned).toBe(2);
+      // The sum across tiers equals the overall n (Invariant 7
+      // bookkeeping) — holds even at n=0.
+      expect(sumAcross(report, 'n')).toBe(report.overall.n);
+      // The verifier's own executor was called at least once
+      // (the bulk CALLS read).
+      expect(executor).toHaveBeenCalled();
+    });
+  });
+
+  describe('real seeded DB — metric invariants', () => {
+    it('per-tier counters always sum to overall counters (Inv 7)', async () => {
+      // This is the structural integrity property: the report
+      // is a sum, not a separate set of numbers. The check
+      // runs across all the counters the verifier maintains.
+      const client = makeMockClient();
+      const realAdapter = await import('../../../src/mcp/core/lbug-adapter.js');
+      const report = await runModeCVerify({
+        repoId: handle.repoId,
+        client,
+        mapLocationToNodeId: realMapper,
+        executeParameterized: (repoId, cypher, params) =>
+          realAdapter.executeParameterized(repoId, cypher, params),
+        probe: readyProbe,
+        sampleSize: 5,
+        seed: 'integrity-1',
+      });
+      expect(sumAcross(report, 'matches')).toBe(report.overall.matches);
+      expect(sumAcross(report, 'falseConfident')).toBe(report.overall.falseConfident);
+      expect(sumAcross(report, 'recallMisses')).toBe(report.overall.recallMisses);
+      expect(sumAcross(report, 'refusals')).toBe(report.overall.refusals);
+      expect(sumAcross(report, 'recallGains')).toBe(report.overall.recallGains);
+      expect(sumAcross(report, 'n')).toBe(report.overall.n);
+    });
+
+    it('all derived metrics are well-formed (no NaN, no negative numbers)', async () => {
+      const client = makeMockClient();
+      const realAdapter = await import('../../../src/mcp/core/lbug-adapter.js');
+      const report = await runModeCVerify({
+        repoId: handle.repoId,
+        client,
+        mapLocationToNodeId: realMapper,
+        executeParameterized: (repoId, cypher, params) =>
+          realAdapter.executeParameterized(repoId, cypher, params),
+        probe: readyProbe,
+        sampleSize: 5,
+        seed: 'wellformed-1',
+      });
+      // Numbers are not NaN and not negative.
+      for (const k of ['precision', 'recall', 'falseConfidentRate'] as const) {
+        expect(Number.isFinite(report.overall[k]), `overall.${k} not finite`).toBe(true);
+        expect(report.overall[k]).toBeGreaterThanOrEqual(0);
+        expect(report.overall[k]).toBeLessThanOrEqual(1);
+      }
+      for (const t of __test__.ALL_TIERS) {
+        for (const k of ['precision', 'recall', 'falseConfidentRate'] as const) {
+          expect(Number.isFinite(report.perTier[t][k]), `perTier[${t}].${k} not finite`).toBe(true);
+          expect(report.perTier[t][k]).toBeGreaterThanOrEqual(0);
+          expect(report.perTier[t][k]).toBeLessThanOrEqual(1);
+        }
+      }
+    });
+  });
+
+  describe('real seeded DB — read-only invariant (Inv 1)', () => {
+    it('the verifier only issues read Cypher (no write verbs)', async () => {
+      // Hook into `executeParameterized` and record every
+      // Cypher string the verifier sends. The bulk CALLS read
+      // is a single MATCH…RETURN with no write verb. The
+      // mapper's internal queries are also read-only (the
+      // location-mapper is already vetted for this). The
+      // invariant under test is: the verifier itself never
+      // issues a CREATE, MERGE, SET, or DELETE.
+      const observedCypher: string[] = [];
+      const client = makeMockClient();
+      const realAdapter = await import('../../../src/mcp/core/lbug-adapter.js');
+      const wrappedExecutor = vi.fn(async (repoId: string, cypher: string, params: Record<string, any>) => {
+        observedCypher.push(cypher);
+        return realAdapter.executeParameterized(repoId, cypher, params);
+      });
+      await runModeCVerify({
+        repoId: handle.repoId,
+        client,
+        mapLocationToNodeId: realMapper,
+        executeParameterized: wrappedExecutor as any,
+        probe: readyProbe,
+        sampleSize: 5,
+        seed: 'read-only-1',
+      });
+      // No CREATE / MERGE / SET / DELETE in any verifier-issued
+      // Cypher. (The mapper may issue reads too; the assertion
+      // is on the verifier's own Cypher, not the mapper's.
+      // The mapper is already verified read-only by
+      // WI-#4's tests.)
+      const writeVerbs = /\b(CREATE|MERGE|SET|DELETE|DETACH\s+DELETE)\b/i;
+      for (const q of observedCypher) {
+        expect(writeVerbs.test(q), `verifier issued write cypher: ${q}`).toBe(false);
+      }
+      // The verifier's own Cypher is the bulk CALLS read —
+      // MATCH…RETURN. We expect at least one such query.
+      expect(observedCypher.some((q) => /MATCH.*:CodeRelation.*RETURN/is.test(q))).toBe(true);
+    });
+  });
+
+  describe('real seeded DB — determinism (Inv 7)', () => {
+    it('same seed + same DB → byte-identical report (Inv 7 property)', async () => {
+      // Two runs of runModeCVerify with the same seed and the
+      // same DB must produce identical JSON. This is the
+      // "deterministic report" contract the fitness function
+      // relies on.
+      const client = makeMockClient();
+      const realAdapter = await import('../../../src/mcp/core/lbug-adapter.js');
+      const opts: RunModeCVerifyOpts = {
+        repoId: handle.repoId,
+        client,
+        mapLocationToNodeId: realMapper,
+        executeParameterized: (repoId, cypher, params) =>
+          realAdapter.executeParameterized(repoId, cypher, params),
+        probe: readyProbe,
+        sampleSize: 5,
+        seed: 'deterministic-seed-42',
+      };
+      const r1 = await runModeCVerify(opts);
+      const r2 = await runModeCVerify(opts);
+      expect(JSON.stringify(r1)).toBe(JSON.stringify(r2));
+    });
+  });
+
+  describe('real seeded DB — tier derivation from `reason`', () => {
+    it("buckets 'import-resolved' as 'import-scoped' (the named-reason path)", async () => {
+      // The seed has a CALLS edge func:login→func:hash with
+      // reason='import-resolved'. That edge MUST land in the
+      // import-scoped bucket (not the global defensive default).
+      // We assert this by counting >0 in the import-scoped
+      // tier whenever the import-resolved edge is included in
+      // the sample.
+      const client = makeMockClient();
+      const realAdapter = await import('../../../src/mcp/core/lbug-adapter.js');
+      const report = await runModeCVerify({
+        repoId: handle.repoId,
+        client,
+        mapLocationToNodeId: realMapper,
+        executeParameterized: (repoId, cypher, params) =>
+          realAdapter.executeParameterized(repoId, cypher, params),
+        probe: readyProbe,
+        // Push sampleSize above 30 so every edge in the
+        // population is sampled.
+        sampleSize: 200,
+        hardCap: 200,
+        seed: 'tier-import',
+      });
+      // #174: The seed CALLS edges have no sourceLine → all unpositioned.
+      // The import-resolved edge IS in the seed and IS in the
+      // import-scoped tier, but it is unpositioned → goes to
+      // `unpositioned` counter, NOT sampled. So n=0, unpositioned>0.
+      expect(report.perTier['import-scoped'].n).toBe(0);
+      expect(report.perTier['import-scoped'].unpositioned).toBeGreaterThan(0);
+    });
+
+    it("unknown reasons (e.g. 'direct') fall through to the 'global' defensive default", () => {
+      // Pure unit check: the `reasonToTier` helper is what the
+      // verifier calls to bucket the seeded edge with
+      // reason='direct'. We pin the bucket here so a future
+      // refactor that adds 'direct' as a tier doesn't
+      // accidentally change the report shape.
+      expect(__test__.reasonToTier('direct')).toBe('global');
+      expect(__test__.reasonToTier('')).toBe('global');
+      expect(__test__.reasonToTier('unknown-reason')).toBe('global');
+      // The three canonical reasons are pinned to the expected
+      // tiers — this is the "tier encoding" the analyzer uses
+      // (call-processor.ts:733).
+      expect(__test__.reasonToTier(__test__.REASON_SAME_FILE)).toBe('same-file');
+      expect(__test__.reasonToTier(__test__.REASON_IMPORT_RESOLVED)).toBe('import-scoped');
+      expect(__test__.reasonToTier(__test__.REASON_FUZZY_GLOBAL)).toBe('global');
+    });
+  });
+
+  describe('real seeded DB — custom mapper verdicts', () => {
+    it('mapper returning the heuristic target → counts as match (real DB path)', async () => {
+      // The CALLS edges in the seed have targetId='func:validate'
+      // and 'func:hash'. A mapper that always returns
+      // { kind: 'node', nodeId: 'func:validate' } matches the
+      // first edge and false-confidents the second.
+      //
+      // The intent here is to exercise the production
+      // executor + a custom mapper together — confirming that
+      // the read-Cypher reaches the real DB and the per-edge
+      // verdict flow runs end-to-end.
+      const target = 'func:validate';
+      const customMapper = vi.fn(async (_loc: any, _repoId: string): Promise<MapperResult> => {
+        return { kind: 'node', nodeId: target };
+      });
+      const client = makeMockClient();
+      const realAdapter = await import('../../../src/mcp/core/lbug-adapter.js');
+      const report = await runModeCVerify({
+        repoId: handle.repoId,
+        client,
+        mapLocationToNodeId: customMapper,
+        executeParameterized: (repoId, cypher, params) =>
+          realAdapter.executeParameterized(repoId, cypher, params),
+        probe: readyProbe,
+        sampleSize: 200,
+        hardCap: 200,
+        seed: 'custom-mapper',
+      });
+      // #174: Seed edges have no sourceLine → all unpositioned → n=0.
+      // The custom mapper is never called because no edges are sampled.
+      // We assert the structural invariants hold even for an empty sample.
+      expect(report.overall.n).toBe(0);
+      expect(report.overall.unpositioned).toBe(2);
+      // No edges were sampled, so no mapper calls were made.
+      expect(customMapper).not.toHaveBeenCalled();
+      // matches + falseConfident = 0 (nothing was classified).
+      expect(report.overall.matches + report.overall.falseConfident).toBe(0);
+    });
+  });
+
+  // ─── WI-7: adapter pass-through — jdt:// external-refusal bucketing ──
+  //
+  // These tests exercise the acceptance criteria for WI-7:
+  //   AC: a Java edge whose def resolves to `jdt://` is bucketed as
+  //       external-refusal (refusals), NOT recall-miss.
+  //
+  // Technique: inject a synthetic positioned CALLS row (via a custom
+  // executeParameterized that returns a mock row with sourceLine/sourceCol)
+  // so the edge is sampled. The mock LSP client returns a `jdt://` URI.
+  // The mapper is called with `JAVA_ADAPTER.classifyUri` as `classifyUri`
+  // dep, which returns `'external'` for `jdt://` URIs → mapper returns
+  // `{ kind: 'NO_NODE', external: true }` → `classifyEdge` returns
+  // `'refusals'` (never `'recallMisses'`).
+
+  describe('WI-7 — adapter pass-through: jdt:// external-refusal vs recall-miss', () => {
+    it('jdt:// LSP location → refusals bucket, NOT recall-miss (JAVA_ADAPTER.classifyUri)', async () => {
+      // Synthetic positioned CALLS row: heuristic target is empty (''),
+      // so without classifyUri the fallback branch would be:
+      //   locations===[] → recallMisses (heuristicNull)
+      // But with the jdt:// URI from LSP (non-empty locations array),
+      // the flow is: classifyUri('jdt://...') = 'external' →
+      //   mapper returns { kind:'NO_NODE', external:true } →
+      //   classifyEdge → 'refusals' (Invariant 3: refuse over guess).
+      const jdtUri = 'jdt://contents/java/util/List.class?=project/src%3Cjava.util(List.class';
+
+      // Executor returns one synthetic positioned edge.
+      const syntheticRow = {
+        sourceFile: 'src/Main.java',
+        sourceLine: 10,        // node startLine (non-NaN)
+        sourceName: 'main',
+        sourceId: 'func:main',
+        targetFile: 'src/Service.java',
+        targetStartLine: 5,
+        targetEndLine: 20,
+        targetName: 'process',
+        targetId: '',          // heuristic null — caller couldn't resolve target
+        confidence: 0.7,
+        reason: 'import-resolved',
+        callLine: 15,          // positioned: probed at line 15
+        callCol: 8,
+      };
+      const syntheticExecutor = vi.fn(async () => [syntheticRow]);
+
+      // Mock LSP returns the jdt:// URI (simulates Java stdlib ref).
+      const jdtClient = makeMockClient({
+        defaultImpl: async () => [
+          { uri: jdtUri, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } },
+        ],
+      });
+
+      // Mapper threaded with JAVA_ADAPTER.classifyUri (WI-7 pattern).
+      const javaMapper = vi.fn(async (loc: any, repoId: string): Promise<MapperResult> =>
+        mapLocationToNodeId(loc, repoId, {
+          classifyUri: (uri) => JAVA_ADAPTER.classifyUri(uri),
+        }),
+      );
+
+      const report = await runModeCVerify({
+        repoId: handle.repoId,
+        client: jdtClient,
+        adapter: JAVA_ADAPTER,
+        mapLocationToNodeId: javaMapper,
+        executeParameterized: syntheticExecutor,
+        probe: readyProbe,
+        sampleSize: 200,
+        hardCap: 200,
+        seed: 'wi7-jdt-refusal',
+      });
+
+      // The jdt:// location was classified as external-refusal.
+      // Invariant: it MUST go to refusals, NOT recall-miss.
+      expect(report.overall.n).toBe(1);
+      expect(report.overall.refusals).toBe(1);
+      expect(report.overall.recallMisses).toBe(0);
+      // The mapper was called exactly once (one sampled edge).
+      expect(javaMapper).toHaveBeenCalledTimes(1);
+      // The mapper received the jdt:// location.
+      const calledLoc = javaMapper.mock.calls[0][0];
+      expect(calledLoc?.uri).toBe(jdtUri);
+    });
+
+    it('workspace file:// LSP location → verifies normally (JAVA_ADAPTER pass-through)', async () => {
+      // Synthetic positioned CALLS row: heuristic target is 'func:process'.
+      // LSP returns a workspace file:// URI. The mapper (with JAVA_ADAPTER.classifyUri)
+      // classifies it as 'workspace' and resolves it normally.
+      // Since the mapper can't find the node in the seeded DB by that file path,
+      // it returns NO_NODE — which routes to refusals. What we assert is:
+      //   - recallMisses === 0 (the edge had a heuristic target, so it's refusals
+      //     even if LSP can't find it — heuristicNull is false)
+      //   - the workspace path flows through classifyUri='workspace' correctly
+      const workspaceUri = 'file:///project/src/Service.java';
+
+      const syntheticRow = {
+        sourceFile: 'src/Main.java',
+        sourceLine: 10,
+        sourceName: 'main',
+        sourceId: 'func:main',
+        targetFile: 'src/Service.java',
+        targetStartLine: 5,
+        targetEndLine: 20,
+        targetName: 'process',
+        targetId: 'func:process',  // heuristic has a target
+        confidence: 0.9,
+        reason: 'import-resolved',
+        callLine: 15,
+        callCol: 4,
+      };
+      const syntheticExecutor = vi.fn(async () => [syntheticRow]);
+
+      // LSP returns a workspace file:// location.
+      const workspaceClient = makeMockClient({
+        defaultImpl: async () => [
+          { uri: workspaceUri, range: { start: { line: 5, character: 0 }, end: { line: 5, character: 7 } } },
+        ],
+      });
+
+      // Mapper with JAVA_ADAPTER.classifyUri — workspace URIs pass through.
+      const javaMapper = vi.fn(async (loc: any, repoId: string): Promise<MapperResult> =>
+        mapLocationToNodeId(loc, repoId, {
+          classifyUri: (uri) => JAVA_ADAPTER.classifyUri(uri),
+        }),
+      );
+
+      const report = await runModeCVerify({
+        repoId: handle.repoId,
+        client: workspaceClient,
+        adapter: JAVA_ADAPTER,
+        mapLocationToNodeId: javaMapper,
+        executeParameterized: syntheticExecutor,
+        probe: readyProbe,
+        sampleSize: 200,
+        hardCap: 200,
+        seed: 'wi7-workspace-normal',
+      });
+
+      // Edge was sampled and classified.
+      expect(report.overall.n).toBe(1);
+      // A workspace file:// URI with no matching DB node → NO_NODE → refusals.
+      // NOT recallMisses (because heuristicTarget !== '').
+      // The key invariant: classifyUri('file://...') = 'workspace' → continues
+      // normal mapping → result is refusals/matches/false-confident (never
+      // incorrectly routed by classifyUri to external-refusal).
+      expect(report.overall.recallMisses).toBe(0);
+      // The mapper was called (workspace URI flows through, not short-circuited).
+      expect(javaMapper).toHaveBeenCalledTimes(1);
+    });
+
+    it('TS adapter classifyUri treats jdt:// as unmappable (not external)', async () => {
+      // TYPESCRIPT_ADAPTER.classifyUri('jdt://...') returns 'unmappable'
+      // (not 'external'): the TS adapter never sees jdt:// URIs in
+      // production, but the contract is well-defined — 'unmappable' means
+      // NO_NODE without the external flag. This test pins that contract.
+      expect(TYPESCRIPT_ADAPTER.classifyUri('jdt://contents/java/util/List.class')).toBe('unmappable');
+      expect(TYPESCRIPT_ADAPTER.classifyUri('file:///project/src/foo.ts')).toBe('workspace');
+    });
+
+    it('JAVA_ADAPTER.classifyUri distinguishes jdt:// (external) from file:// (workspace)', () => {
+      // Pin the JAVA_ADAPTER.classifyUri contract: the exact mapping that
+      // drives the external-refusal bucketing in WI-7.
+      expect(JAVA_ADAPTER.classifyUri('jdt://contents/java/lang/Object.class')).toBe('external');
+      expect(JAVA_ADAPTER.classifyUri('file:///project/src/Main.java')).toBe('workspace');
+      expect(JAVA_ADAPTER.classifyUri('classpath://rt.jar!/java/util/List.class')).toBe('unmappable');
+    });
+  });
+}, {
+  seed: LOCAL_BACKEND_SEED_DATA,
+  poolAdapter: true,
+});

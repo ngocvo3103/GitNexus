@@ -1,9 +1,35 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { processCallsFromExtracted, seedCrossFileReceiverTypes, extractConsumerAccessedKeys, processNextjsFetchRoutes } from '../../src/core/ingestion/call-processor.js';
+import {
+  processCalls,
+  processCallsFromExtracted,
+  seedCrossFileReceiverTypes,
+  extractConsumerAccessedKeys,
+  processNextjsFetchRoutes,
+  type CorrectionFeedItem,
+  type RecallFeedItem,
+} from '../../src/core/ingestion/call-processor.js';
 import { extractReturnTypeName } from '../../src/core/ingestion/type-extractors/shared.js';
 import { createResolutionContext, type ResolutionContext } from '../../src/core/ingestion/resolution-context.js';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
+import { createASTCache } from '../../src/core/ingestion/ast-cache.js';
 import type { ExtractedCall, ExtractedFetchCall, FileConstructorBindings } from '../../src/core/ingestion/workers/parse-worker.js';
+
+// ────────────────────────────────────────────────────────────────────────
+// WI-1 / #159 — SANCTIONED TEST-PIN UPDATES (tripwires).
+//
+// The `toEqual` pins that include `oldRelId: 'CALLS:...:L${row}'` (see
+// "lsp:true — global-0.50 edges populate the correction feed" and the
+// exact-shape pin at :835 in this file, plus its sibling in
+// `gitnexus/test/integration/lsp/mode-a-golden.test.ts`) are
+// LOAD-BEARING. They pin the WI-1 line-aware id mint — the `:L${row}`
+// suffix is the one and only deliberate default-baseline change for
+// slice A. If a future diff ever breaks the pin, the EXPECTED string
+// is correct — the regression is in the production mint at
+// `call-processor.ts:668` and `call-processor.ts:1554-1557` (the
+// `relId` reorder at :1553-1557 is what makes the feed push at
+// :1565-1575 carry the right `oldRelId`). Do NOT weaken the pin; do
+// NOT add a `?? 'L0'` fallback. The pin's brittleness is the point.
+// ────────────────────────────────────────────────────────────────────────
 
 describe('processCallsFromExtracted', () => {
   let graph: ReturnType<typeof createKnowledgeGraph>;
@@ -634,6 +660,806 @@ describe('processCallsFromExtracted', () => {
     expect(rels[0].sourceId).toBe('Function:src/index.ts:processUser');
     expect(rels[1].sourceId).toBe('Function:src/index.ts:processRepo');
   });
+
+  // ---- D5: Interface implementation lookup ----
+
+  function makeMockGraph(relationships: Array<{ sourceId: string; targetId: string; type: string }>) {
+    const rels = [...relationships];
+    return {
+      addRelationship: (rel: { id: string; sourceId: string; targetId: string; type: string; confidence: number; reason: string }) => {
+        rels.push(rel);
+        return rel.id;
+      },
+      forEachRelationship: (fn: (rel: { id?: string; sourceId: string; targetId: string; type: string; confidence?: number; reason?: string }) => void) => {
+        rels.forEach(fn);
+      },
+      relationships: rels,
+    } as unknown as import('../../src/core/graph/graph.js').KnowledgeGraph;
+  }
+
+  it('D5: resolves method call to implementing class when receiver type is an Interface', async () => {
+    // Receiver type 'Repository' is an Interface with one implementer 'UserRepo'
+    // D4 ownerId fallback fails (no match), D5 finds 'UserRepo' as the implementer
+    // and filters the method pool to methods owned by UserRepo
+    ctx.symbols.add('src/types.ts', 'Repository', 'Interface:src/types.ts:Repository', 'Interface');
+    ctx.symbols.add('src/models.ts', 'UserRepo', 'Class:src/models.ts:UserRepo', 'Class');
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:UserRepo' });
+    ctx.importMap.set('src/index.ts', new Set(['src/types.ts', 'src/models.ts']));
+
+    const graph = makeMockGraph([
+      { sourceId: 'Class:src/models.ts:UserRepo', targetId: 'Interface:src/types.ts:Repository', type: 'IMPLEMENTS' },
+    ]);
+    ctx.graph = graph;
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/index.ts:main',
+      receiverTypeName: 'Repository',
+      callForm: 'member',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].targetId).toBe('Method:src/models.ts:save');
+    expect(rels[0].reason).toBe('import-resolved'); // D5 tier (Interface found via import resolution)
+  });
+
+  it('D5: returns null when D4 fails and interface has no implementers', async () => {
+    // D4 ownerId fallback fails; D5 finds no implementing classes -> returns null
+    // Must have multiple candidates to reach D5 (single candidate returns early)
+    ctx.symbols.add('src/types.ts', 'Repository', 'Interface:src/types.ts:Repository', 'Interface');
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:UserRepo' });
+    // Add another save candidate to force D1-D5 resolution path
+    ctx.symbols.add('src/other.ts', 'save', 'Method:src/other.ts:save', 'Method', { ownerId: 'Class:src/other.ts:OtherRepo' });
+    ctx.importMap.set('src/index.ts', new Set(['src/types.ts']));
+
+    const graph = makeMockGraph([]); // No IMPLEMENTS edges
+    ctx.graph = graph;
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/index.ts:main',
+      receiverTypeName: 'Repository',
+      callForm: 'member',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(0);
+  });
+
+  it('D5: no D5 activation for class types (D4 behavior preserved)', async () => {
+    // When receiver type is a Class (not Interface), D5 should not activate.
+    // D4 ownerId matching handles it.
+    ctx.symbols.add('src/models.ts', 'User', 'Class:src/models.ts:User', 'Class');
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:User' });
+    ctx.importMap.set('src/index.ts', new Set(['src/models.ts']));
+
+    const graph = makeMockGraph([
+      // Even if there is an IMPLEMENTS edge, D5 should not fire for Class types
+      { sourceId: 'Class:src/models.ts:User', targetId: 'Interface:src/types.ts:Repository', type: 'IMPLEMENTS' },
+    ]);
+    ctx.graph = graph;
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/index.ts:main',
+      receiverTypeName: 'User',
+      callForm: 'member',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].targetId).toBe('Method:src/models.ts:save');
+  });
+
+  it('D5: multiple implementers — ambiguous, returns null without overload hints', async () => {
+    // Two classes implement 'Repository': UserRepo and AdminRepo.
+    // Both have 'save' methods. Without overload disambiguation, this is ambiguous.
+    ctx.symbols.add('src/types.ts', 'Repository', 'Interface:src/types.ts:Repository', 'Interface');
+    ctx.symbols.add('src/models.ts', 'UserRepo', 'Class:src/models.ts:UserRepo', 'Class');
+    ctx.symbols.add('src/models.ts', 'AdminRepo', 'Class:src/models.ts:AdminRepo', 'Class');
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:UserRepo' });
+    ctx.symbols.add('src/models.ts', 'save', 'Method:src/models.ts:save', 'Method', { ownerId: 'Class:src/models.ts:AdminRepo' });
+    ctx.importMap.set('src/index.ts', new Set(['src/types.ts', 'src/models.ts']));
+
+    const graph = makeMockGraph([
+      { sourceId: 'Class:src/models.ts:UserRepo', targetId: 'Interface:src/types.ts:Repository', type: 'IMPLEMENTS' },
+      { sourceId: 'Class:src/models.ts:AdminRepo', targetId: 'Interface:src/types.ts:Repository', type: 'IMPLEMENTS' },
+    ]);
+    ctx.graph = graph;
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/index.ts:main',
+      receiverTypeName: 'Repository',
+      callForm: 'member',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    // Multiple implementers, no overload hints -> ambiguous
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(0);
+  });
+
+  // ---- WI-2 — Mode A candidate feed (correction + recall) ----
+
+  it('default path: feeds stay empty and CALLS counts are identical', async () => {
+    ctx.symbols.add('src/other.ts', 'uniqueFunc', 'Function:src/other.ts:uniqueFunc', 'Function');
+
+    // Mix of resolvable (global), unresolvable (no candidate), and same-file so
+    // the assertion isn't a single-edge happy path.
+    const calls: ExtractedCall[] = [
+      { filePath: 'src/index.ts', calledName: 'uniqueFunc', sourceId: 'Function:src/index.ts:main', line: 10, character: 4 },
+      { filePath: 'src/index.ts', calledName: 'doesNotExist', sourceId: 'Function:src/index.ts:main', line: 20, character: 4 },
+    ];
+
+    const correctionFeed: import('../../src/core/ingestion/call-processor.js').CorrectionFeedItem[] = [];
+    const recallFeed: import('../../src/core/ingestion/call-processor.js').RecallFeedItem[] = [];
+    const opts = { lsp: false, correctionFeed, recallFeed };
+
+    await processCallsFromExtracted(graph, calls, ctx, undefined, undefined, undefined, opts);
+
+    const callsCount = graph.relationships.filter(r => r.type === 'CALLS').length;
+    expect(callsCount).toBe(1);
+    // Feeds must not be touched when opts.lsp is false.
+    expect(correctionFeed).toEqual([]);
+    expect(recallFeed).toEqual([]);
+  });
+
+  it('lsp:true — global-0.50 edges populate the correction feed', async () => {
+    // ──────────────────────────────────────────────────────────────────
+    // WI-1 (PR #159, slice A) — SANCTIONED TRIPWIRE UPDATE.
+    //
+    // The `toEqual` pin below (and the exact-shape pin at :835)
+    // gained the `oldRelId` field as part of WI-1. This update is
+    // deliberate and load-bearing: `oldRelId` carries the exact
+    // heuristic CALLS edge id (`CALLS:${sourceId}:${calledName}
+    // ->${targetId}:L${row}`) through the feed into
+    // `Candidate.oldRelId` (`mode-a-reconciler.ts:72-85`), so the
+    // engine's `correct`/`confirm` actions can target the exact
+    // row even when multiple per-site edges share the same
+    // (sourceId, targetId) pair (WI-1 / #159).
+    //
+    // The :L42 suffix is the WI-1 line-aware id mint — it MUST
+    // match `call-processor.ts:1556` byte-for-byte. If this pin
+    // ever fails, do not change the expected string; instead
+    // verify the call-site row at
+    // `call-processor.ts:1553-1557` and the feed push at
+    // `call-processor.ts:1565-1575` are still line-aware. This
+    // pin is the tripwire that catches a missing WI-1 mint.
+    // ──────────────────────────────────────────────────────────────────
+    ctx.symbols.add('src/other.ts', 'uniqueFunc', 'Function:src/other.ts:uniqueFunc', 'Function');
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'uniqueFunc',
+      sourceId: 'Function:src/index.ts:main',
+      line: 42,
+      character: 7,
+    }];
+
+    const correctionFeed: import('../../src/core/ingestion/call-processor.js').CorrectionFeedItem[] = [];
+    const recallFeed: import('../../src/core/ingestion/call-processor.js').RecallFeedItem[] = [];
+
+    await processCallsFromExtracted(
+      graph, calls, ctx, undefined, undefined, undefined,
+      { lsp: true, correctionFeed, recallFeed },
+    );
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].reason).toBe('global');
+    expect(rels[0].confidence).toBe(0.5);
+
+    expect(correctionFeed).toEqual([{
+      sourceId: 'Function:src/index.ts:main',
+      calledName: 'uniqueFunc',
+      oldTargetId: 'Function:src/other.ts:uniqueFunc',
+      oldRelId: 'CALLS:Function:src/index.ts:main:uniqueFunc->Function:src/other.ts:uniqueFunc:L42',
+      file: 'src/index.ts',
+      line: 42,
+      character: 7,
+    }]);
+    expect(recallFeed).toEqual([]);
+  });
+
+  it('lsp:true — unresolved/ambiguous sites populate the recall feed', async () => {
+    // Two symbols named the same → ambiguous → recall feed.
+    ctx.symbols.add('src/a.ts', 'render', 'Function:src/a.ts:render', 'Function');
+    ctx.symbols.add('src/b.ts', 'render', 'Function:src/b.ts:render', 'Function');
+    // No candidate at all → recall feed.
+    const calls: ExtractedCall[] = [
+      { filePath: 'src/index.ts', calledName: 'render', sourceId: 'Function:src/index.ts:main', line: 5, character: 3 },
+      { filePath: 'src/index.ts', calledName: 'ghost', sourceId: 'Function:src/index.ts:main', line: 8, character: 3 },
+    ];
+
+    const correctionFeed: import('../../src/core/ingestion/call-processor.js').CorrectionFeedItem[] = [];
+    const recallFeed: import('../../src/core/ingestion/call-processor.js').RecallFeedItem[] = [];
+
+    await processCallsFromExtracted(
+      graph, calls, ctx, undefined, undefined, undefined,
+      { lsp: true, correctionFeed, recallFeed },
+    );
+
+    expect(graph.relationships.filter(r => r.type === 'CALLS')).toHaveLength(0);
+    expect(correctionFeed).toEqual([]);
+    expect(recallFeed).toEqual([
+      { sourceId: 'Function:src/index.ts:main', calledName: 'render', file: 'src/index.ts', line: 5, character: 3 },
+      { sourceId: 'Function:src/index.ts:main', calledName: 'ghost',  file: 'src/index.ts', line: 8, character: 3 },
+    ]);
+  });
+
+  it('member-call a.b.c() records the `c` position, not the `a` position', async () => {
+    // We can\'t drive real tree-sitter here; instead assert that whatever
+    // line/character ExtractedCall carries is what the feed records.
+    // The worker (parse-worker.ts:2682) emits `callNameNode.startPosition`, which
+    // is the `c` identifier for `a.b.c()`. This test pins the contract.
+    ctx.symbols.add('src/other.ts', 'c', 'Function:src/other.ts:c', 'Function');
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'c',
+      callForm: 'member',
+      receiverName: 'a',
+      sourceId: 'Function:src/index.ts:main',
+      // Empirically the column of `c` in `a.b.c()` is the column of `c` itself,
+      // not of `a`. Worker passes callNameNode.startPosition through unchanged.
+      line: 100,
+      character: 8,
+    }];
+
+    const correctionFeed: import('../../src/core/ingestion/call-processor.js').CorrectionFeedItem[] = [];
+    const recallFeed: import('../../src/core/ingestion/call-processor.js').RecallFeedItem[] = [];
+
+    await processCallsFromExtracted(
+      graph, calls, ctx, undefined, undefined, undefined,
+      { lsp: true, correctionFeed, recallFeed },
+    );
+
+    expect(correctionFeed).toEqual([{
+      sourceId: 'Function:src/index.ts:main',
+      calledName: 'c',
+      oldTargetId: 'Function:src/other.ts:c',
+      oldRelId: 'CALLS:Function:src/index.ts:main:c->Function:src/other.ts:c:L100',
+      file: 'src/index.ts',
+      line: 100,
+      character: 8,
+    }]);
+  });
+
+  it('#174 P1: ExtractedCall without line/character persists undefined on GraphRelationship (not fabricated 0)', async () => {
+    // The pre-#174 bug: `line: callRow` where `callRow = effectiveCall.line ?? 0`
+    // persisted 0 for any call with no position, polluting the sourceLine column
+    // with a fabricated value. Mode C would then probe at (0, 0) — the first
+    // character of the file — for every legacy/synthetic edge, causing a
+    // structurally-guaranteed false-confident result. The fix persists
+    // `line: effectiveCall.line` (undefined when absent) → NULL in the DB.
+    ctx.symbols.add('src/other.ts', 'nopos', 'Function:src/other.ts:nopos', 'Function');
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'nopos',
+      sourceId: 'Function:src/index.ts:main',
+      // No `line` or `character` fields — simulates an emitter that couldn't
+      // determine the call-site position (e.g. Angular DI, JS dynamic dispatch).
+    }];
+
+    await processCallsFromExtracted(
+      graph, calls, ctx, undefined, undefined, undefined,
+      undefined,
+    );
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Critical: must be undefined (→ NULL in DB), NOT 0 (fabricated position).
+    expect(rels[0].line, '#174 P1: line must be undefined for positionless call').toBeUndefined();
+    expect(rels[0].column, '#174 P1: column must be undefined for positionless call').toBeUndefined();
+    // The :L suffix must still be deterministic (uses callRow ?? 0).
+    expect(rels[0].id).toMatch(/:L0$/);
+  });
+
+  it('#174 P1: ExtractedCall WITH line/character persists those values unchanged', async () => {
+    // Positive case: when position is available it must survive to the
+    // persisted GraphRelationship (not truncated, not shifted).
+    ctx.symbols.add('src/other.ts', 'withpos', 'Function:src/other.ts:withpos', 'Function');
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'withpos',
+      sourceId: 'Function:src/index.ts:main',
+      line: 37,
+      character: 12,
+    }];
+
+    await processCallsFromExtracted(
+      graph, calls, ctx, undefined, undefined, undefined,
+      undefined,
+    );
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].line).toBe(37);
+    expect(rels[0].column).toBe(12);
+    // The :L suffix must use the integer position.
+    expect(rels[0].id).toMatch(/:L37$/);
+  });
+});
+
+describe('processCalls — Mode A candidate feeds (WI-1 / #166)', () => {
+  let graph: ReturnType<typeof createKnowledgeGraph>;
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    graph = createKnowledgeGraph();
+    ctx = createResolutionContext();
+  });
+
+  // AC-5: default analyze (opts undefined) is byte-identical; feeds stay empty.
+  // Drives the active sequential resolver on a real TypeScript file with a single
+  // call site and asserts (a) the CALLS edge exists and (b) the default path
+  // (no opts arg) does not error. Since the default path has no feed handles,
+  // the byte-identity invariant is that the call signature accepts a missing
+  // 10th arg without complaint — the gated `opts?.lsp && opts.<feed>` predicates
+  // short-circuit to falsy and no push ever runs.
+  it('default path (opts undefined) — identical CALLS counts, no error, signature accepts missing 10th arg', async () => {
+    ctx.symbols.add('src/utils.ts', 'format', 'Function:src/utils.ts:format', 'Function');
+    ctx.importMap.set('src/index.ts', new Set(['src/utils.ts']));
+
+    const files = [
+      {
+        path: 'src/index.ts',
+        content: 'import { format } from "./utils";\nexport function main() { format("hi"); }\n',
+      },
+    ];
+
+    // No opts arg → all gated push predicates (`opts?.lsp && opts.<feed>`) are falsy.
+    const heritage = await processCalls(graph, files, createASTCache(files.length), ctx);
+    expect(heritage).toEqual([]);
+
+    const callsEdges = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(callsEdges).toHaveLength(1);
+    // Graph-level default stamp is 'heuristic' (B1 integration contract);
+    // KD-7 serializer-side default only kicks in on the DB write path.
+    expect(callsEdges[0].source).toBe('heuristic');
+  });
+
+  // AC-1: a `global`-0.50 site populates `correctionFeed` with the callee
+  // identifier position when opts.lsp is true.
+  it('lsp:true — global-0.50 site populates the correction feed with callee-identifier position', async () => {
+    ctx.symbols.add('src/other.ts', 'uniqueFunc', 'Function:src/other.ts:uniqueFunc', 'Function');
+
+    const files = [
+      { path: 'src/caller.ts', content: 'export function main() { uniqueFunc(); }\n' },
+    ];
+    const cf: CorrectionFeedItem[] = [];
+    const rf: RecallFeedItem[] = [];
+
+    await processCalls(
+      graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined,
+      { lsp: true, correctionFeed: cf, recallFeed: rf },
+    );
+
+    const callsEdges = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(callsEdges).toHaveLength(1);
+    expect(callsEdges[0].reason).toBe('global');
+    expect(callsEdges[0].confidence).toBe(0.5);
+
+    expect(rf).toEqual([]);
+    expect(cf).toHaveLength(1);
+    const item = cf[0];
+    expect(item.sourceId).toBe('Function:src/caller.ts:main');
+    expect(item.calledName).toBe('uniqueFunc');
+    expect(item.oldTargetId).toBe('Function:src/other.ts:uniqueFunc');
+    expect(item.file).toBe('src/caller.ts');
+    // The `uniqueFunc` identifier starts on line 0 (zero-indexed), at the column
+    // immediately after `main() { ` — pins the callee-identifier position contract.
+    expect(item.line).toBe(0);
+    expect(typeof item.character).toBe('number');
+    expect(item.character).toBeGreaterThanOrEqual(0);
+  });
+
+  // AC-1 / I-2: an unresolved site populates `recallFeed` (no `oldTargetId`).
+  it('lsp:true — unresolved site populates the recall feed (no oldTargetId)', async () => {
+    const files = [
+      { path: 'src/caller.ts', content: 'export function main() { ghostCall(); }\n' },
+    ];
+    const cf: CorrectionFeedItem[] = [];
+    const rf: RecallFeedItem[] = [];
+
+    await processCalls(
+      graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined,
+      { lsp: true, correctionFeed: cf, recallFeed: rf },
+    );
+
+    expect(graph.relationships.filter(r => r.type === 'CALLS')).toHaveLength(0);
+    expect(cf).toEqual([]);
+    expect(rf).toHaveLength(1);
+    expect(rf[0].sourceId).toBe('Function:src/caller.ts:main');
+    expect(rf[0].calledName).toBe('ghostCall');
+    expect(rf[0].file).toBe('src/caller.ts');
+    // 'oldTargetId' is intentionally absent on recall items.
+    expect((rf[0] as any).oldTargetId).toBeUndefined();
+  });
+
+  // AC-2: a member call `a.b.c()` records the `.c` callee-identifier position.
+  // The capture parse-worker uses for the call.name is the `c` identifier
+  // (call-processor.ts:460-462), not the receiver `a`. The resolver falls
+  // through to a global lookup for `c` and finds it (we seeded it), so this
+  // site lands in the *correction* feed (reason: 'global', confidence: 0.5).
+  it('lsp:true — member call a.b.c() records the .c callee-identifier position, not the receiver', async () => {
+    ctx.symbols.add('src/other.ts', 'c', 'Function:src/other.ts:c', 'Function');
+
+    // Line 1 has the call: `  a.b.c();`
+    //   0123456789
+    //     a.b.c();
+    // So `c` is at column 6 of line 1 (NOT the column of `a` at col 2).
+    const files = [
+      {
+        path: 'src/caller.ts',
+        content: 'export function main() {\n  a.b.c();\n}\n',
+      },
+    ];
+    const cf: CorrectionFeedItem[] = [];
+    const rf: RecallFeedItem[] = [];
+
+    await processCalls(
+      graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined,
+      { lsp: true, correctionFeed: cf, recallFeed: rf },
+    );
+
+    // The call resolves globally → correction feed (AC-1 path).
+    expect(rf).toEqual([]);
+    expect(cf).toHaveLength(1);
+    expect(cf[0].calledName).toBe('c');
+    // Line 1 (the body line), not line 0 (the function signature).
+    expect(cf[0].line).toBe(1);
+    // The exact column of `c` in `  a.b.c();` — not the column of `a` (col 2).
+    expect(cf[0].character).toBe(6);
+  });
+
+  // AC-3: a router/builtin-dropped site emits no recall candidate.
+  // The TypeScript router classifies `console` as a built-in; `console.log`
+  // is therefore routed-and-dropped by `isBuiltInName` at :522 (the
+  // forEach early-return). No recall entry should be recorded.
+  it('lsp:true — router/builtin-dropped site emits no recall candidate', async () => {
+    const files = [
+      { path: 'src/caller.ts', content: 'export function main() { console.log("x"); }\n' },
+    ];
+    const cf: CorrectionFeedItem[] = [];
+    const rf: RecallFeedItem[] = [];
+
+    await processCalls(
+      graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined,
+      { lsp: true, correctionFeed: cf, recallFeed: rf },
+    );
+
+    expect(graph.relationships.filter(r => r.type === 'CALLS')).toHaveLength(0);
+    // Built-in name pre-filter must not push any feed entries.
+    expect(cf).toEqual([]);
+    expect(rf).toEqual([]);
+  });
+
+  // AC-5 / I-1: opts.lsp=false (or opts without lsp:true) must be a no-op
+  // on the feeds while preserving the CALLS count exactly.
+  it('lsp:false (or truthy opts without lsp) — feeds stay empty, CALLS count unchanged', async () => {
+    ctx.symbols.add('src/other.ts', 'uniqueFunc', 'Function:src/other.ts:uniqueFunc', 'Function');
+
+    const files = [
+      { path: 'src/caller.ts', content: 'export function main() { uniqueFunc(); }\n' },
+    ];
+    const cf: CorrectionFeedItem[] = [];
+    const rf: RecallFeedItem[] = [];
+
+    // Pass `lsp:false` explicitly. The push predicates short-circuit on
+    // `opts?.lsp === false`, so the function still emits the CALLS edge
+    // (the default behavior) but never touches the feed arrays.
+    await processCalls(
+      graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined,
+      { lsp: false, correctionFeed: cf, recallFeed: rf },
+    );
+
+    expect(graph.relationships.filter(r => r.type === 'CALLS')).toHaveLength(1);
+    expect(cf).toEqual([]);
+    expect(rf).toEqual([]);
+  });
+});
+
+describe('candidateLocationKey dedup (WI-1 / #166)', () => {
+  // AC-4: a call site reachable by both producers (`processCalls` + Angular
+  // post-pass) yields exactly one candidate after dedup.
+  // The dedup happens in `pipeline.ts` between the merge site and
+  // `withReconciliationSession`. We assert the *function* of the dedup
+  // (Map-keyed uniqueness by `candidateLocationKey`) by replaying the
+  // shape directly: two candidates with identical (sourceId, calledName,
+  // file, line, character) must collapse to one.
+  it('two producers reaching the same site collapse to one candidate', async () => {
+    const { candidateLocationKey } = await import(
+      '../../src/core/ingestion/mode-a-reconciler.js'
+    );
+    type Candidate = {
+      sourceId: string;
+      calledName: string;
+      oldTargetId?: string;
+      file: string;
+      line: number;
+      character: number;
+    };
+
+    const shared = {
+      sourceId: 'Function:src/a.ts:main',
+      calledName: 'foo',
+      file: 'src/a.ts',
+      line: 10,
+      character: 4,
+    };
+
+    const correction: Candidate = { ...shared, oldTargetId: 'Function:src/b.ts:foo' };
+    const recall: Candidate = { ...shared }; // no oldTargetId
+
+    // Simulate the pipeline merge order: correction first, then recall.
+    const candidates: Candidate[] = [correction, recall];
+
+    const deduped: Candidate[] = [];
+    const seen = new Set<string>();
+    for (const c of candidates) {
+      const k = candidateLocationKey(c);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      deduped.push(c);
+    }
+
+    expect(deduped).toHaveLength(1);
+    // First-writer wins: the correction shape (with oldTargetId) is kept,
+    // not the recall shape. This matters because the engine keys its
+    // confirmation pass on `oldTargetId`.
+    expect(deduped[0].oldTargetId).toBe('Function:src/b.ts:foo');
+  });
+
+  it('distinct sites are not collapsed by dedup', async () => {
+    const { candidateLocationKey } = await import(
+      '../../src/core/ingestion/mode-a-reconciler.js'
+    );
+    type Candidate = {
+      sourceId: string;
+      calledName: string;
+      oldTargetId?: string;
+      file: string;
+      line: number;
+      character: number;
+    };
+
+    const a: Candidate = {
+      sourceId: 'Function:src/a.ts:main',
+      calledName: 'foo',
+      file: 'src/a.ts',
+      line: 10, character: 4,
+    };
+    const b: Candidate = {
+      sourceId: 'Function:src/a.ts:main',
+      calledName: 'bar', // different calledName
+      file: 'src/a.ts',
+      line: 10, character: 4,
+    };
+    const c: Candidate = {
+      sourceId: 'Function:src/a.ts:main',
+      calledName: 'foo',
+      file: 'src/a.ts',
+      line: 11, character: 0, // different line
+    };
+    const d: Candidate = {
+      sourceId: 'Function:src/a.ts:main',
+      calledName: 'foo',
+      file: 'src/a.ts',
+      line: 10, character: 5, // different character
+    };
+
+    const all: Candidate[] = [a, b, c, d];
+    const deduped: Candidate[] = [];
+    const seen = new Set<string>();
+    for (const x of all) {
+      const k = candidateLocationKey(x);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      deduped.push(x);
+    }
+
+    expect(deduped).toHaveLength(4);
+  });
+});
+
+describe('WI-1 / #159 — line-aware CALLS ids (duplicate call sites)', () => {
+  let graph: ReturnType<typeof createKnowledgeGraph>;
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    graph = createKnowledgeGraph();
+    ctx = createResolutionContext();
+  });
+
+  // AC-1: `function f(){ a(); b(); a(); }` (extracted fast path)
+  // mints exactly 2 distinct CALLS edges to `a`, ids differing
+  // only in `:L${line}`, both `source:'heuristic'`. Previously
+  // the second `a()` call collided with the first on id and was
+  // silently dropped by `graph.ts:14` dedup — the whole point
+  // of WI-1 is to make that loss visible + recoverable.
+  it('two same-name call sites to the same target mint two distinct edges with :L suffixes', async () => {
+    ctx.symbols.add('src/other.ts', 'a', 'Function:src/other.ts:a', 'Function');
+    ctx.symbols.add('src/other.ts', 'b', 'Function:src/other.ts:b', 'Function');
+
+    const calls: ExtractedCall[] = [
+      // First a() at line 10
+      { filePath: 'src/index.ts', calledName: 'a', sourceId: 'Function:src/index.ts:main', line: 10, character: 2 },
+      // b() at line 11 (different target — sanity check that the
+      // multiplicity isn't a single-edge happy path).
+      { filePath: 'src/index.ts', calledName: 'b', sourceId: 'Function:src/index.ts:main', line: 11, character: 2 },
+      // Second a() at line 12 — same name + same target as the
+      // first, distinct line. Without `:L${line}` in the id this
+      // collides with the first `a()` and gets dropped.
+      { filePath: 'src/index.ts', calledName: 'a', sourceId: 'Function:src/index.ts:main', line: 12, character: 2 },
+    ];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const aEdges = graph.relationships.filter(r => r.type === 'CALLS' && r.targetId === 'Function:src/other.ts:a');
+    expect(aEdges).toHaveLength(2);
+    // The two edges differ only in `:L${line}`.
+    const ids = aEdges.map(e => e.id).sort();
+    expect(ids).toEqual([
+      'CALLS:Function:src/index.ts:main:a->Function:src/other.ts:a:L10',
+      'CALLS:Function:src/index.ts:main:a->Function:src/other.ts:a:L12',
+    ]);
+    // Every default-path edge stamps `source: 'heuristic'` (B1 contract).
+    for (const edge of aEdges) {
+      expect(edge.source).toBe('heuristic');
+      expect(edge.confidence).toBe(0.5);
+      expect(edge.reason).toBe('global');
+    }
+    // `line` rides on the in-memory rel (call-processor.ts:1545).
+    expect(aEdges.map(e => e.line).sort()).toEqual([10, 12]);
+    // The b() call is still its own edge (no false-merge with a()).
+    const bEdges = graph.relationships.filter(r => r.type === 'CALLS' && r.targetId === 'Function:src/other.ts:b');
+    expect(bEdges).toHaveLength(1);
+  });
+
+  // AC-1 / I-2: when lsp:true is on, the correction feed carries
+  // the exact heuristic `oldRelId` for each duplicate site (BOTH
+  // a() calls feed). This is the contract that lets WI-2's
+  // reconciler target the exact per-site row.
+  it('duplicate call sites each feed their own oldRelId with distinct :L suffixes', async () => {
+    ctx.symbols.add('src/other.ts', 'a', 'Function:src/other.ts:a', 'Function');
+
+    const calls: ExtractedCall[] = [
+      { filePath: 'src/index.ts', calledName: 'a', sourceId: 'Function:src/index.ts:main', line: 10, character: 2 },
+      { filePath: 'src/index.ts', calledName: 'a', sourceId: 'Function:src/index.ts:main', line: 12, character: 2 },
+    ];
+
+    const correctionFeed: CorrectionFeedItem[] = [];
+    const recallFeed: RecallFeedItem[] = [];
+    await processCallsFromExtracted(
+      graph, calls, ctx, undefined, undefined, undefined,
+      { lsp: true, correctionFeed, recallFeed },
+    );
+
+    expect(correctionFeed).toHaveLength(2);
+    // `oldRelId` mirrors the heuristic id exactly.
+    const oldRelIds = correctionFeed.map(f => f.oldRelId).sort();
+    expect(oldRelIds).toEqual([
+      'CALLS:Function:src/index.ts:main:a->Function:src/other.ts:a:L10',
+      'CALLS:Function:src/index.ts:main:a->Function:src/other.ts:a:L12',
+    ]);
+    // And the in-memory edge ids match the feed `oldRelId` values.
+    const edgeIds = graph.relationships.filter(r => r.type === 'CALLS').map(r => r.id).sort();
+    expect(edgeIds).toEqual(oldRelIds);
+  });
+
+  // AC-1 mirror on the AST path (`processCalls`). The
+  // `processCallsFromExtracted` block above proves the
+  // extracted fast path (the worker pipeline). This test
+  // proves the AST fallback path (the sequential pipeline
+  // at `pipeline.ts:515`) mints the SAME two distinct
+  // :L-suffixed edges. Without this, the spec's "two
+  // per-site heuristic emit sites" promise is only
+  // proven for the worker path — and a regression that
+  // broke `:L` on the AST path would slip through CI.
+  it('AST path: two same-name call sites in the same function mint two distinct edges with :L suffixes', async () => {
+    // The heuristic target is a globally-unique symbol (no
+    // import), so each `a()` call resolves via the global
+    // tier (0.5) — the same path that carries `:L${row}`
+    // into the id (call-processor.ts:668-678).
+    ctx.symbols.add('src/other.ts', 'a', 'Function:src/other.ts:a', 'Function');
+
+    // The function body holds TWO `a()` calls on distinct
+    // lines. With the line-aware id, these mint two
+    // distinct edges; without it, the second collides on
+    // id and is silently dropped by `graph.ts:14` dedup.
+    const files = [
+      {
+        path: 'src/index.ts',
+        content: [
+          'export function main() {',
+          '  a();',   // line 1
+          '  a();',   // line 2 — the duplicate
+          '}',
+          '',
+        ].join('\n'),
+      },
+    ];
+
+    await processCalls(graph, files, createASTCache(files.length), ctx);
+
+    const aEdges = graph.relationships.filter(r => r.type === 'CALLS' && r.targetId === 'Function:src/other.ts:a');
+    expect(aEdges).toHaveLength(2);
+    // The two edges differ only in `:L${line}` — the
+    // WI-1 contract.
+    const ids = aEdges.map(e => e.id).sort();
+    expect(ids).toEqual([
+      'CALLS:Function:src/index.ts:main:a->Function:src/other.ts:a:L1',
+      'CALLS:Function:src/index.ts:main:a->Function:src/other.ts:a:L2',
+    ]);
+    for (const edge of aEdges) {
+      expect(edge.source).toBe('heuristic');
+      expect(edge.confidence).toBe(0.5);
+      expect(edge.reason).toBe('global');
+    }
+    // `line` rides on the in-memory rel (call-processor.ts:709).
+    expect(aEdges.map(e => e.line).sort()).toEqual([1, 2]);
+  });
+
+  // AC-1 mirror on the AST path with lsp:true: BOTH
+  // duplicate sites feed the correction feed with their
+  // exact `:L` suffixed oldRelId. Mirrors the
+  // processCallsFromExtracted version byte-for-byte
+  // (additive push, gated on opts.lsp).
+  it('AST path: duplicate call sites each feed their own oldRelId with distinct :L suffixes', async () => {
+    ctx.symbols.add('src/other.ts', 'a', 'Function:src/other.ts:a', 'Function');
+
+    const files = [
+      {
+        path: 'src/index.ts',
+        content: [
+          'export function main() {',
+          '  a();',
+          '  a();',
+          '}',
+          '',
+        ].join('\n'),
+      },
+    ];
+    const correctionFeed: CorrectionFeedItem[] = [];
+    const recallFeed: RecallFeedItem[] = [];
+
+    await processCalls(
+      graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined,
+      { lsp: true, correctionFeed, recallFeed },
+    );
+
+    expect(correctionFeed).toHaveLength(2);
+    const oldRelIds = correctionFeed.map(f => f.oldRelId).sort();
+    expect(oldRelIds).toEqual([
+      'CALLS:Function:src/index.ts:main:a->Function:src/other.ts:a:L1',
+      'CALLS:Function:src/index.ts:main:a->Function:src/other.ts:a:L2',
+    ]);
+    // In-memory edge ids match the feed `oldRelId` values.
+    const edgeIds = graph.relationships.filter(r => r.type === 'CALLS').map(r => r.id).sort();
+    expect(edgeIds).toEqual(oldRelIds);
+  });
 });
 
 describe('extractReturnTypeName', () => {
@@ -1245,5 +2071,268 @@ describe('processNextjsFetchRoutes', () => {
     const rels = graph.relationships.filter(r => r.type === 'FETCHES');
     expect(rels).toHaveLength(1);
     expect(rels[0].reason).not.toContain('|fetches:');
+  });
+});
+
+// ─── B1: Hook-destructuring unnamed-import guard ──────────────────────────────
+//
+// Mechanism: in TS/TSX files, a hook (e.g. useAppState) returns an object of
+// functions. The caller destructures them: `const { runQuery } = useAppState()`.
+// Then calls `runQuery(...)` as a free function.
+//
+// namedImportMap for the caller contains `useAppState` (the explicit named
+// import) but NOT `runQuery` (which is not directly imported — only available
+// via the hook's return value at runtime).
+//
+// The heuristic's Tier 2a sees `runQuery` in `useAppState.tsx` (which is in
+// importMap) → emits import-scoped at confidence 0.9. But LSP resolves to the
+// *destructuring binding site* (the line inside the caller component where
+// `const { runQuery } = useAppState()` appears), which maps to the *enclosing
+// component function* (e.g., ProcessesPanel) — a completely different nodeId.
+// Result: false-confident edges in the campaign.
+//
+// The guard: when callForm='free', the caller file is .ts/.tsx, namedImportMap
+// has an entry for the caller (the file uses named imports), but the called
+// name is NOT among them → the name was only accessible via hook destructuring
+// → downgrade tier to global so the edge falls below MIN_CONFIDENCE thresholds.
+//
+// The guard MUST NOT fire when:
+//   - namedImportMap has no entry for the caller (non-TS/no-named-import files)
+//   - the called name IS a direct named import (legitimate import-scoped edge)
+//   - callForm is 'member' (receiver-type filtering handles those)
+//   - the caller file is not .ts/.tsx (Python/Go whole-module imports)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('hook-destructuring unnamed-import guard (B1)', () => {
+  let graph: ReturnType<typeof createKnowledgeGraph>;
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    graph = createKnowledgeGraph();
+    ctx = createResolutionContext();
+  });
+
+  it('downgrades hook-destructured free call to global when name not in namedImportMap', async () => {
+    // useAppState.tsx exports runQuery (a useCallback-returned function)
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'runQuery',
+      'Function:src/hooks/useAppState.tsx:runQuery', 'Function');
+
+    // ProcessesPanel.tsx imports useAppState (named import), NOT runQuery
+    ctx.importMap.set('src/components/ProcessesPanel.tsx',
+      new Set(['src/hooks/useAppState.tsx']));
+    ctx.namedImportMap.set('src/components/ProcessesPanel.tsx', new Map([
+      ['useAppState', { sourcePath: 'src/hooks/useAppState.tsx', exportedName: 'useAppState' }],
+    ]));
+
+    // The call is free-form: runQuery(cypher) — obtained via destructuring
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/components/ProcessesPanel.tsx',
+      calledName: 'runQuery',
+      sourceId: 'Function:src/components/ProcessesPanel.tsx:ProcessesPanel',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Must be global (not import-resolved) — hook-destructured name was not a direct import
+    expect(rels[0].reason).toBe('global');
+    // Confidence must be TIER_CONFIDENCE['global'] = 0.5, not 0.9
+    expect(rels[0].confidence).toBe(0.5);
+  });
+
+  it('keeps import-resolved for directly named imports (guard must NOT fire)', async () => {
+    // generateId IS a direct named import in src/utils.ts
+    ctx.symbols.add('src/lib/utils.ts', 'generateId',
+      'Function:src/lib/utils.ts:generateId', 'Function');
+
+    ctx.importMap.set('src/core/ingestion/import-processor.ts',
+      new Set(['src/lib/utils.ts']));
+    ctx.namedImportMap.set('src/core/ingestion/import-processor.ts', new Map([
+      ['generateId', { sourcePath: 'src/lib/utils.ts', exportedName: 'generateId' }],
+    ]));
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/core/ingestion/import-processor.ts',
+      calledName: 'generateId',
+      sourceId: 'Function:src/core/ingestion/import-processor.ts:processImports',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Direct named import — stays import-resolved at 0.9
+    expect(rels[0].reason).toBe('import-resolved');
+    expect(rels[0].confidence).toBe(0.9);
+  });
+
+  it('guard does not fire for Python whole-module imports (no namedImportMap entry)', async () => {
+    // Python: `from utils import errors` → log_safe_exception is in errors.py
+    // namedImportMap has NO entry for mcp_bridge.py (Python does not use named-binding tracking)
+    ctx.symbols.add('eval/utils/errors.py', 'log_safe_exception',
+      'Function:eval/utils/errors.py:log_safe_exception', 'Function');
+
+    ctx.importMap.set('eval/bridge/mcp_bridge.py',
+      new Set(['eval/utils/errors.py']));
+    // No namedImportMap entry for mcp_bridge.py
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'eval/bridge/mcp_bridge.py',
+      calledName: 'log_safe_exception',
+      sourceId: 'Function:eval/bridge/mcp_bridge.py:start',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Python has no namedImportMap entry → guard skips → import-resolved stays
+    expect(rels[0].reason).toBe('import-resolved');
+    expect(rels[0].confidence).toBe(0.9);
+  });
+
+  it('guard does not fire for member calls (receiver-type filtering handles those)', async () => {
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'runQuery',
+      'Function:src/hooks/useAppState.tsx:runQuery', 'Function');
+
+    ctx.importMap.set('src/components/ProcessesPanel.tsx',
+      new Set(['src/hooks/useAppState.tsx']));
+    ctx.namedImportMap.set('src/components/ProcessesPanel.tsx', new Map([
+      ['useAppState', { sourcePath: 'src/hooks/useAppState.tsx', exportedName: 'useAppState' }],
+    ]));
+
+    // member call: state.runQuery() — not a free call
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/components/ProcessesPanel.tsx',
+      calledName: 'runQuery',
+      sourceId: 'Function:src/components/ProcessesPanel.tsx:ProcessesPanel',
+      callForm: 'member',
+      receiverName: 'state',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // member call — guard does not apply → stays import-resolved
+    expect(rels[0].reason).toBe('import-resolved');
+    expect(rels[0].confidence).toBe(0.9);
+  });
+
+  it('guard does not fire when namedImportMap entry exists but is empty', async () => {
+    // An empty entry means the import-processor built an entry but found no named bindings
+    // (e.g., a grouped import that was fully resolved to a file). Treat as "no named constraints".
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'runQuery',
+      'Function:src/hooks/useAppState.tsx:runQuery', 'Function');
+
+    ctx.importMap.set('src/components/ProcessesPanel.tsx',
+      new Set(['src/hooks/useAppState.tsx']));
+    // Empty map entry — no named bindings captured
+    ctx.namedImportMap.set('src/components/ProcessesPanel.tsx', new Map());
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/components/ProcessesPanel.tsx',
+      calledName: 'runQuery',
+      sourceId: 'Function:src/components/ProcessesPanel.tsx:ProcessesPanel',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    // Empty namedImportMap entry → guard does not fire → import-resolved stays
+    expect(rels[0].reason).toBe('import-resolved');
+    expect(rels[0].confidence).toBe(0.9);
+  });
+
+  it('guard fires for .ts caller file (not just .tsx)', async () => {
+    ctx.symbols.add('src/hooks/useStore.ts', 'dispatch',
+      'Function:src/hooks/useStore.ts:dispatch', 'Function');
+
+    // .ts caller that imports useStore but calls dispatch (from destructuring)
+    ctx.importMap.set('src/services/api.ts', new Set(['src/hooks/useStore.ts']));
+    ctx.namedImportMap.set('src/services/api.ts', new Map([
+      ['useStore', { sourcePath: 'src/hooks/useStore.ts', exportedName: 'useStore' }],
+    ]));
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/services/api.ts',
+      calledName: 'dispatch',
+      sourceId: 'Function:src/services/api.ts:handleRequest',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].reason).toBe('global');
+    expect(rels[0].confidence).toBe(0.5);
+  });
+
+  it('guard fires for .jsx caller file', async () => {
+    ctx.symbols.add('src/hooks/useTheme.js', 'toggle',
+      'Function:src/hooks/useTheme.js:toggle', 'Function');
+
+    ctx.importMap.set('src/components/Header.jsx', new Set(['src/hooks/useTheme.js']));
+    ctx.namedImportMap.set('src/components/Header.jsx', new Map([
+      ['useTheme', { sourcePath: 'src/hooks/useTheme.js', exportedName: 'useTheme' }],
+    ]));
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/components/Header.jsx',
+      calledName: 'toggle',
+      sourceId: 'Function:src/components/Header.jsx:Header',
+      callForm: 'free',
+    }];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].reason).toBe('global');
+    expect(rels[0].confidence).toBe(0.5);
+  });
+
+  it('multiple hook-destructured calls from same component all downgrade', async () => {
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'runQuery',
+      'Function:src/hooks/useAppState.tsx:runQuery', 'Function');
+    ctx.symbols.add('src/hooks/useAppState.tsx', 'isDatabaseReady',
+      'Function:src/hooks/useAppState.tsx:isDatabaseReady', 'Function');
+
+    ctx.importMap.set('src/components/QueryFAB.tsx',
+      new Set(['src/hooks/useAppState.tsx']));
+    ctx.namedImportMap.set('src/components/QueryFAB.tsx', new Map([
+      ['useAppState', { sourcePath: 'src/hooks/useAppState.tsx', exportedName: 'useAppState' }],
+    ]));
+
+    const calls: ExtractedCall[] = [
+      {
+        filePath: 'src/components/QueryFAB.tsx',
+        calledName: 'isDatabaseReady',
+        sourceId: 'Function:src/components/QueryFAB.tsx:QueryFAB',
+        callForm: 'free',
+      },
+      {
+        filePath: 'src/components/QueryFAB.tsx',
+        calledName: 'runQuery',
+        sourceId: 'Function:src/components/QueryFAB.tsx:QueryFAB',
+        callForm: 'free',
+      },
+    ];
+
+    await processCallsFromExtracted(graph, calls, ctx);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(2);
+    for (const rel of rels) {
+      expect(rel.reason).toBe('global');
+      expect(rel.confidence).toBe(0.5);
+    }
   });
 });

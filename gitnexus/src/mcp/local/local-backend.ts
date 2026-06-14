@@ -8,8 +8,20 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady, isWriteQuery } from '../core/lbug-adapter.js';
-export { isWriteQuery };
+import { realpathSync } from 'fs';
+import { pathToFileURL } from 'node:url';
+import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady } from '../core/lbug-adapter.js';
+// WI-4 (issue #159 P2): opt-in `precision:'lsp'` branch for `rename`.
+// We re-use the read-only LSP funnel (`withReferenceProvider`) and the
+// WI-3 adapter + precise applier. No graph writes (Inv-1); the
+// adapter's node_modules/.d.ts/multi-line refusals (KD-7) are
+// preserved unchanged.
+import {
+  withReferenceProvider,
+  workspaceEditToApplierChanges,
+  workspaceEditToChanges,
+  applyPreciseEdits,
+} from '../../core/ingestion/lsp/reference-provider.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
 // git utilities available if needed
@@ -17,10 +29,26 @@ export { isWriteQuery };
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
+  loadMeta,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
+import { SCHEMA_VERSION } from '../../core/lbug/schema.js';
+import { readManifest, type RepoManifest } from '../../storage/repo-manifest.js';
+import { CrossRepoRegistry } from '../../core/ingestion/cross-repo-registry.js';
+import { documentEndpoint, type DocumentEndpointOptions, type DocumentEndpointResult, type OpenApiModeResult } from './document-endpoint.js';
+import type { CrossRepoContext } from './cross-repo-context.js';
+import { CrossRepoResolver, type ChangedSymbol, type RepoHandle as ResolverRepoHandle } from './cross-repo-resolver.js';
+import { queryEndpoints, type EndpointInfo } from './endpoint-query.js';
+import { parseMethodLevelMapping, parseClassLevelPrefix, combinePaths } from './route-annotation-parser.js';
+import { parseDiffOutputWithLines, type FileDiffWithLines, type LineRange } from './parse-diff-lines.js';
+import { normalizeFilePath } from '../../lib/utils.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
+// (#159 P2) WI-5: opt-in LSP provenance + union-seeding for impact.
+// `mapLocationToNodeId` resolves an LSP `Location` to a graph nodeId
+// (or NO_NODE / AMBIGUOUS — both skipped). See design doc
+// `## Contracts` (impact) + KD-5.
+import { mapLocationToNodeId, type MapperResult } from '../../core/ingestion/lsp/location-mapper.js';
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -39,62 +67,183 @@ export function isTestFilePath(filePath: string): boolean {
   );
 }
 
+// Source of truth lives in core/ingestion/lsp/node-labels.ts to avoid a
+// circular ESM import (location-mapper.ts → local-backend.ts → TDZ crash).
+import { VALID_NODE_LABELS } from '../../core/ingestion/lsp/node-labels.js';
 /** Valid LadybugDB node labels for safe Cypher query construction */
-export const VALID_NODE_LABELS = new Set([
-  'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement',
-  'Community', 'Process', 'Struct', 'Enum', 'Macro', 'Typedef', 'Union',
-  'Namespace', 'Trait', 'Impl', 'TypeAlias', 'Const', 'Static', 'Property',
-  'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
-  'Route',
-  'Tool',
-]);
+export { VALID_NODE_LABELS };
 
 /** Valid relation types for impact analysis filtering */
-export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES', 'HANDLES_ROUTE', 'FETCHES', 'HANDLES_TOOL', 'ENTRY_POINT_OF', 'WRAPS']);
+export const VALID_RELATION_TYPES = new Set([
+  'CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY',
+  'OVERRIDES', 'ACCESSES', 'HANDLES_ROUTE', 'FETCHES', 'HANDLES_TOOL',
+  'ENTRY_POINT_OF', 'WRAPS', 'CONTAINS', 'COMPOSITION'
+]);
 
 /**
- * Per-relation-type confidence floor for impact analysis.
- *
- * When the graph stores a relation with a confidence value, that stored
- * value is used as-is (it reflects resolution-tier accuracy from analysis
- * time).  This map provides the floor for each edge type when no stored
- * confidence is available, and is also used for display / tooltip hints.
- *
- * Rationale:
- *   CALLS / IMPORTS  – direct, strongly-typed references → 0.9
- *   EXTENDS          – class hierarchy, statically verifiable → 0.85
- *   IMPLEMENTS       – interface contract, statically verifiable → 0.85
- *   OVERRIDES        – method override, statically verifiable → 0.85
- *   HAS_METHOD       – structural containment → 0.95
- *   HAS_PROPERTY     – structural containment → 0.95
- *   ACCESSES         – field read/write, may be indirect → 0.8
- *   CONTAINS         – folder/file containment → 0.95
- *   (unknown type)   – conservative fallback → 0.5
+ * Confidence floors per relation type for impact analysis.
+ * Used when no stored graph confidence is available.
+ * Higher = more trustworthy relationship (structural containment).
+ * Lower = potentially indirect/observational relationship.
  */
-export const IMPACT_RELATION_CONFIDENCE: Readonly<Record<string, number>> = {
-  CALLS: 0.9,
-  IMPORTS: 0.9,
-  EXTENDS: 0.85,
-  IMPLEMENTS: 0.85,
-  OVERRIDES: 0.85,
-  HAS_METHOD: 0.95,
-  HAS_PROPERTY: 0.95,
-  ACCESSES: 0.8,
-  CONTAINS: 0.95,
+export const IMPACT_RELATION_CONFIDENCE: Record<string, number> = {
+  CALLS: 0.9,          // direct function reference
+  IMPORTS: 0.9,        // direct module import
+  EXTENDS: 0.85,       // statically verifiable inheritance
+  IMPLEMENTS: 0.85,    // statically verifiable contract
+  OVERRIDES: 0.85,     // statically verifiable override
+  HAS_METHOD: 0.95,    // structural containment (method in class)
+  HAS_PROPERTY: 0.95,  // structural containment (field in class)
+  ACCESSES: 0.8,       // may be indirect read/write
+  CONTAINS: 0.95,      // folder/file structural containment
+  COMPOSITION: 0.9,    // structural ownership (e.g. Go embedding)
 };
 
-/**
- * Return the confidence floor for a given relation type.
- * Falls back to 0.5 for unknown types so they are not silently elevated.
- */
-const confidenceForRelType = (relType: string | undefined): number =>
-  IMPACT_RELATION_CONFIDENCE[relType ?? ''] ?? 0.5;
+/** Regex to detect write operations in user-supplied Cypher queries */
+export const CYPHER_WRITE_RE = /(?<!:)\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
 
+/** Check if a Cypher query contains write operations */
+export function isWriteQuery(query: string): boolean {
+  return CYPHER_WRITE_RE.test(query);
+}
 
 /** Structured error logging for query failures — replaces empty catch blocks */
 function logQueryError(context: string, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
   console.error(`GitNexus [${context}]: ${msg}`);
+}
+
+/**
+ * Guard: ensure a file path resolves within the repo root
+ * (prevents path traversal AND symlink-bridged escapes).
+ *
+ * - Read operations (`mode: 'read'`) tolerate ENOENT — a
+ *   missing file falls through to the lexical path so the
+ *   caller's `readFile` produces the conventional ENOENT
+ *   error.
+ * - Write operations (`mode: 'write'`) REFUSE a missing
+ *   target — a write to a non-existent file under a
+ *   symlink that resolves outside the repo is a classic
+ *   directory-traversal vector; we refuse over guess.
+ *
+ * The defense is layered:
+ *   1. Lexical `startsWith` (case-folded on darwin/win32)
+ *      as a fast reject.
+ *   2. Lexical `path.relative` to catch cross-platform
+ *      case-bytes that fool `startsWith`.
+ *   3. `realpathSync` to dereference symlinks — this is
+ *      the missing piece. A symlink inside the repo that
+ *      points outside passes the lexical guards but
+ *      dereferences to an out-of-repo file; the second
+ *      `path.relative(realRoot, realResolved)` catches
+ *      that TOCTOU class. Mirrors the hardening in
+ *      `lsp/lsp-client.ts:maybeDidOpenForDefinition`.
+ */
+export function assertSafePathForRepo(
+  repoPath: string,
+  filePath: string,
+  mode: 'read' | 'write' = 'read',
+): string {
+  // Step 1: resolve to an absolute, normalized form.
+  // `path.resolve` collapses `..` and `./` but does NOT
+  // normalize case — on case-insensitive volumes the
+  // fast-reject below is case-folded defensively.
+  const full = path.resolve(repoPath, filePath);
+  const isCaseInsensitiveFs = process.platform === 'darwin' || process.platform === 'win32';
+  const repoRoot = isCaseInsensitiveFs ? repoPath.toLowerCase() : repoPath;
+  const fullKey = isCaseInsensitiveFs ? full.toLowerCase() : full;
+  if (!fullKey.startsWith(repoRoot + path.sep) && fullKey !== repoRoot) {
+    // First check (legacy shape, kept as a fast reject).
+    throw new Error(`Path traversal blocked: ${filePath}`);
+  }
+  // Step 2: lexical `path.relative` rejects an escape even
+  // if `startsWith` passed accidentally (sibling dir sharing
+  // a case-folded prefix with the repo root, etc).
+  const rel = path.relative(repoPath, full);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`Path traversal blocked: ${filePath}`);
+  }
+  // Step 3: symlink dereference for BOTH the candidate and
+  // the repo root. `realpathSync(repoPath)` is the
+  // `repoPath` in its dereferenced form (e.g. on macOS
+  // `/tmp` → `/private/tmp`); comparing a still-lexical
+  // `repoPath` against an already-dereferenced
+  // `realResolved` would falsely claim an escape.
+  // For reads, ENOENT on the repo root is treated as
+  // soft — the lexical repoPath is used for containment
+  // and the candidate ENOENT is handled in step 4.
+  let realRepoPath: string;
+  try {
+    realRepoPath = realpathSync.native(repoPath);
+  } catch {
+    realRepoPath = repoPath;
+  }
+  const realRoot = isCaseInsensitiveFs ? realRepoPath.toLowerCase() : realRepoPath;
+  let realResolved: string;
+  try {
+    realResolved = realpathSync.native(full);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') {
+      if (mode === 'write') {
+        // Writes must target an existing on-disk path
+        // that we have dereferenced. Refuse — the caller
+        // should not be creating new files via this
+        // guard (the rename tool only edits existing
+        // files; if the target is missing, that is a bug
+        // or an attack).
+        throw new Error(`Path traversal blocked: ${filePath}`);
+      }
+      // Read mode: fall back to the lexical `full`. The
+      // lexical guards above already verified it lives
+      // inside the repo; the caller's readFile will
+      // surface the conventional ENOENT.
+      return full;
+    }
+    // Any other error (EACCES, ELOOP, ENOTDIR, etc.) is
+    // a refusal — we cannot vouch for the path.
+    throw new Error(`Path traversal blocked: ${filePath}`);
+  }
+  // Step 4: re-check containment against the
+  // dereferenced path. A symlink inside the repo that
+  // points outside passes the lexical guards but the
+  // `path.relative(realRoot, realResolved)` check
+  // catches the escape. `realRoot` is the
+  // `realpathSync`-ed repoPath; on macOS this matters
+  // for `/tmp` → `/private/tmp` style mounts.
+  const realKey = isCaseInsensitiveFs ? realResolved.toLowerCase() : realResolved;
+  // Empty `rel` means `realResolved === realRepoPath`
+  // — the repo root itself is refused (the LSP server's
+  // job, not the rename tool's).
+  const realRel = path.relative(realRepoPath, realResolved);
+  if (
+    realKey === realRoot ||
+    realRel === '' ||
+    realRel.startsWith('..') ||
+    path.isAbsolute(realRel)
+  ) {
+    throw new Error(`Path traversal blocked: ${filePath}`);
+  }
+  return realResolved;
+}
+
+/**
+ * Shape of a single incoming reference entry — the unified form used
+ * by `categorize()` (real graph rows) and the synthetic Class/Interface
+ * self-reference (added in `rename` for #72). The same shape is also
+ * what the rename loop iterates over in `allIncoming`. Keeping the
+ * fields uniform means the loop's per-entry logic is identical for
+ * graph-sourced and synthetic entries; only the `__synthetic` flag
+ * distinguished them historically, but that flag was never read and
+ * has been dropped to reduce dead weight.
+ */
+export interface IncomingRef {
+  filePath: string;
+  name: string;
+  uid: string;
+  kind: string;
+  /** Method on the target that the caller invokes (populated for method-level CALLS entries from the IMPLEMENTS walk and the #56 method-incoming path). */
+  targetMethod?: string;
 }
 
 export interface CodebaseContext {
@@ -107,7 +256,7 @@ export interface CodebaseContext {
   };
 }
 
-interface RepoHandle {
+export interface RepoHandle {
   id: string;          // unique key = repo name (basename)
   name: string;
   repoPath: string;
@@ -118,12 +267,27 @@ interface RepoHandle {
   stats?: RegistryEntry['stats'];
 }
 
+/** Summary shape for impacted_endpoints — always uses Record<string, number> for per-repo counts. */
+interface ImpactedEndpointsSummary {
+  changed_files: Record<string, number>;
+  changed_symbols: Record<string, number>;
+  impacted_endpoints: Record<string, number>;
+  risk_level: string;
+}
+
+/** Asserts that a value is a non-null object (Record<string, number>), not a bare number. */
+function assertObjectType(value: unknown, fieldName: string): asserts value is Record<string, number> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`Unexpected ${fieldName} type: ${typeof value}. Expected Record<string, number>.`);
+  }
+}
+
 export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
-  private reinitPromises: Map<string, Promise<void>> = new Map();
-  private lastStalenessCheck: Map<string, number> = new Map();
+  private crossRepoRegistry: CrossRepoRegistry | null = null;
+  private crossRepoInitPromise: Promise<void> | null = null;
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -276,56 +440,44 @@ export class LocalBackend {
       return this.repos.values().next().value!;
     }
 
-    return null; // Multiple repos, no param — ambiguous
+    // Multiple repos, no param — try to resolve from cwd
+    const cwd = process.cwd();
+    const cwdMatch = this.resolveRepoFromCwd(cwd);
+    if (cwdMatch) {
+      console.error(`GitNexus: auto-resolved repo "${cwdMatch.name}" from working directory`);
+      return cwdMatch;
+    }
+
+    return null; // Ambiguous — resolveRepo will throw
+  }
+
+  /**
+   * Returns the indexed repo whose repoPath contains cwd (longest-prefix wins).
+   * Guards with path.sep so /foo does NOT match /foo-bar.
+   */
+  private resolveRepoFromCwd(cwd: string): RepoHandle | null {
+    let best: RepoHandle | null = null;
+    let bestLen = -1;
+    for (const handle of this.repos.values()) {
+      const root = handle.repoPath;
+      if (cwd === root || cwd.startsWith(root + path.sep)) {
+        if (root.length > bestLen) {
+          best = handle;
+          bestLen = root.length;
+        }
+      }
+    }
+    return best;
   }
 
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
-    // If a reinit is already in progress for this repo, wait for it
-    const pending = this.reinitPromises.get(repoId);
-    if (pending) return pending;
+    // Always check the actual pool — the idle timer may have evicted the connection
+    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) return;
 
     const handle = this.repos.get(repoId);
     if (!handle) throw new Error(`Unknown repo: ${repoId}`);
-
-    // Check if the index was rebuilt since we opened the connection (#297).
-    // Throttle staleness checks to at most once per 5 seconds per repo to
-    // avoid an fs.readFile round-trip on every tool invocation.
-    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
-      const now = Date.now();
-      const lastCheck = this.lastStalenessCheck.get(repoId) ?? 0;
-      if (now - lastCheck < 5000) return; // Checked recently — skip
-
-      this.lastStalenessCheck.set(repoId, now);
-      try {
-        const metaPath = path.join(handle.storagePath, 'meta.json');
-        const metaRaw = await fs.readFile(metaPath, 'utf-8');
-        const meta = JSON.parse(metaRaw);
-        if (meta.indexedAt && meta.indexedAt !== handle.indexedAt) {
-          // Index was rebuilt — close stale connection and re-init.
-          // Wrap in reinitPromises to prevent TOCTOU race where concurrent
-          // callers both detect staleness and double-close the pool.
-          const reinit = (async () => {
-            try {
-              await closeLbug(repoId);
-              this.initializedRepos.delete(repoId);
-              handle.indexedAt = meta.indexedAt;
-              await initLbug(repoId, handle.lbugPath);
-              this.initializedRepos.add(repoId);
-            } finally {
-              this.reinitPromises.delete(repoId);
-            }
-          })();
-          this.reinitPromises.set(repoId, reinit);
-          return reinit;
-        } else {
-          return; // Pool is current
-        }
-      } catch {
-        return; // Can't read meta — assume pool is fine
-      }
-    }
 
     try {
       await initLbug(repoId, handle.lbugPath);
@@ -370,47 +522,487 @@ export class LocalBackend {
 
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
-  async callTool(method: string, params: any): Promise<any> {
+  async callTool<T = unknown>(method: string, params: any): Promise<T> {
     if (method === 'list_repos') {
-      return this.listRepos();
+      return this.listRepos() as T;
     }
 
+    // Cross-repo routing: if repos[] is provided, use multi-repo handler
+    if (params?.repos && Array.isArray(params.repos) && params.repos.length > 0) {
+      return this.callToolMultiRepo(method, params) as T;
+    }
+
+    // Auto-expand impacted_endpoints to include consumer repos (WI-4)
+    // When called without explicit repos, discover dependents via CrossRepoRegistry
+    // and route to multi-repo handler. Falls back to single-repo if no consumers found.
+    if (method === 'impacted_endpoints') {
+      // (#21) Respect explicit `repo` parameter as a hard scope. Without
+      // this guard, `expandToConsumers` would silently fan out to consumer
+      // repos and the response would include changes from those other
+      // repos — making the `repo` parameter appear to be ignored. Only
+      // auto-expand when the caller did NOT pin a specific repo.
+      const repo = await this.resolveRepo(params?.repo);
+      const explicitScope = !!params?.repo;
+      if (explicitScope) {
+        // Single-repo path — strict scope, no auto-expansion.
+        const result = await this._impactedEndpointsImpl(repo, params);
+        if (!result.error) {
+          assertObjectType(result.summary?.changed_files, 'changed_files');
+        }
+        return result as T;
+      }
+      // No explicit repo: try to expand to consumer repos. Falls back to
+      // single-repo if no consumers found or registry not available.
+      const expanded = await this.expandToConsumers(repo.id);
+      if (expanded) {
+        return this.callToolMultiRepo(method, { ...params, repos: expanded }) as T;
+      }
+      // No consumers found or registry not available — single-repo fallback
+      const result = await this._impactedEndpointsImpl(repo, params);
+      if (!result.error) {
+        assertObjectType(result.summary?.changed_files, 'changed_files');
+      }
+      return result as T;
+    }
+
+    // Single-repo routing (backward compatible)
     // Resolve repo from optional param (re-reads registry on miss)
     const repo = await this.resolveRepo(params?.repo);
 
     switch (method) {
       case 'query':
-        return this.query(repo, params);
+        return this.query(repo, params) as T;
       case 'cypher': {
         const raw = await this.cypher(repo, params);
-        return this.formatCypherAsMarkdown(raw);
+        return this.formatCypherAsMarkdown(raw) as T;
       }
       case 'context':
-        return this.context(repo, params);
+        return this.context(repo, params) as T;
       case 'impact':
-        return this.impact(repo, params);
+        return this.impact(repo, params) as T;
       case 'detect_changes':
-        return this.detectChanges(repo, params);
+        return this.detectChanges(repo, params) as T;
       case 'rename':
-        return this.rename(repo, params);
+        return this.rename(repo, params) as T;
+      case 'endpoints':
+        return this.endpoints(repo, params) as T;
+      case 'document-endpoint':
+        return this.documentEndpoint(repo, params) as T;
+      case 'api_impact':
+        return this.apiImpact(repo, params) as T;
+      case 'route_map':
+        return this.routeMap(repo, params) as T;
+      case 'shape_check':
+        return this.shapeCheck(repo, params) as T;
       // Legacy aliases for backwards compatibility
       case 'search':
-        return this.query(repo, params);
+        return this.query(repo, params) as T;
       case 'explore':
-        return this.context(repo, { name: params?.name, ...params });
+        return this.context(repo, { name: params?.name, ...params }) as T;
       case 'overview':
-        return this.overview(repo, params);
-      case 'route_map':
-        return this.routeMap(repo, params);
-      case 'shape_check':
-        return this.shapeCheck(repo, params);
-      case 'tool_map':
-        return this.toolMap(repo, params);
-      case 'api_impact':
-        return this.apiImpact(repo, params);
+        return this.overview(repo, params) as T;
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
+  }
+
+  /**
+   * Multi-repo tool dispatch.
+   * Executes queries across multiple repos in parallel and aggregates results.
+   * Each result includes _repoId attribution.
+   */
+  private async callToolMultiRepo(method: string, params: any): Promise<any> {
+    const repoIds: string[] = params.repos;
+
+    switch (method) {
+      case 'query': {
+        // Query each repo in parallel and aggregate results
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              const result = await this.query(handle, params);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        // Aggregate results with _repoId attribution
+        const aggregated = {
+          processes: [] as any[],
+          process_symbols: [] as any[],
+          definitions: [] as any[],
+          errors: [] as { repoId: string; error: string }[],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result) {
+            // Add _repoId to each item
+            if (result.processes) {
+              aggregated.processes.push(...result.processes.map((p: any) => ({ ...p, _repoId: repoId })));
+            }
+            if (result.process_symbols) {
+              aggregated.process_symbols.push(...result.process_symbols.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.definitions) {
+              aggregated.definitions.push(...result.definitions.map((d: any) => ({ ...d, _repoId: repoId })));
+            }
+          }
+        }
+
+        return aggregated;
+      }
+
+      case 'cypher': {
+        // Execute cypher on multiple repos in parallel
+        const cypherQuery = params.query;
+        const raw = await this.queryMultipleRepos(repoIds, cypherQuery);
+        // Aggregate results with _repoId and format as markdown
+        return this.formatMultiRepoCypherResult(raw);
+      }
+
+      case 'context': {
+        // Query context from multiple repos
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              const result = await this.context(handle, params);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        // Aggregate candidates from all repos
+        const aggregated: any = {
+          status: 'found',
+          candidates: [] as any[],
+          errors: [] as { repoId: string; error: string }[],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result) {
+            if (result.status === 'ambiguous' && result.candidates) {
+              // Add _repoId to each candidate
+              aggregated.candidates.push(...result.candidates.map((c: any) => ({ ...c, _repoId: repoId })));
+            } else if (result.status === 'found' && result.symbol) {
+              // First-repo wins: skip if already found in an earlier repo
+              if (!aggregated.symbol) {
+                aggregated.symbol = { ...result.symbol, _repoId: repoId };
+                aggregated.repoId = repoId;
+                // Preserve relationship data with _repoId attribution
+                if (result.incoming) {
+                  aggregated.incoming = Object.fromEntries(
+                    Object.entries(result.incoming).map(([cat, entries]) => [
+                      cat,
+                      (entries as any[]).map((e: any) => ({ ...e, _repoId: repoId })),
+                    ]),
+                  );
+                }
+                if (result.outgoing) {
+                  aggregated.outgoing = Object.fromEntries(
+                    Object.entries(result.outgoing).map(([cat, entries]) => [
+                      cat,
+                      (entries as any[]).map((e: any) => ({ ...e, _repoId: repoId })),
+                    ]),
+                  );
+                }
+                if (result.processes) {
+                  aggregated.processes = result.processes.map((p: any) => ({ ...p, _repoId: repoId }));
+                }
+              }
+            }
+          }
+        }
+
+        // If we found an exact match, return it with relationships
+        if (aggregated.symbol) {
+          const found: any = {
+            status: 'found',
+            symbol: aggregated.symbol,
+            incoming: aggregated.incoming || {},
+            outgoing: aggregated.outgoing || {},
+            processes: aggregated.processes || [],
+            _repoId: aggregated.repoId,
+          };
+          if (aggregated.errors.length > 0) {
+            found.errors = aggregated.errors;
+          }
+          return found;
+        }
+
+        // Otherwise return aggregated candidates
+        if (aggregated.candidates.length > 0) {
+          aggregated.status = 'ambiguous';
+        } else {
+          aggregated.status = 'not_found';
+        }
+
+        return aggregated;
+      }
+
+      case 'endpoints': {
+        // (#12) Query Route nodes for HTTP endpoints across multiple repos.
+        // Mirrors the single-repo `endpoints` contract: each repo contributes
+        // its EndpointInfo[]; results are tagged with `_repoId`. Failed repos
+        // surface in `errors[]` rather than aborting the whole call.
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              const result = await this.endpoints(handle, params);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        const aggregated: any = {
+          endpoints: [] as any[],
+          errors: [] as { repoId: string; error: string }[],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result?.endpoints) {
+            aggregated.endpoints.push(
+              ...result.endpoints.map((e: any) => ({ ...e, _repoId: repoId })),
+            );
+          }
+        }
+
+        return aggregated;
+      }
+
+      case 'impact': {
+        // Run impact analysis on multiple repos
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              const result = await this.impact(handle, params);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        // Aggregate impact results
+        const aggregated: any = {
+          target: params.target,
+          direction: params.direction,
+          byDepth: { d1: [], d2: [], d3: [] },
+          affected_processes: [],
+          affected_modules: [],
+          errors: [],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result) {
+            // Aggregate byDepth with _repoId
+            if (result.byDepth?.d1) {
+              aggregated.byDepth.d1.push(...result.byDepth.d1.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.byDepth?.d2) {
+              aggregated.byDepth.d2.push(...result.byDepth.d2.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.byDepth?.d3) {
+              aggregated.byDepth.d3.push(...result.byDepth.d3.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.affected_processes) {
+              aggregated.affected_processes.push(...result.affected_processes.map((p: any) => ({ ...p, _repoId: repoId })));
+            }
+            if (result.affected_modules) {
+              aggregated.affected_modules.push(...result.affected_modules.map((m: any) => ({ ...m, _repoId: repoId })));
+            }
+          }
+        }
+
+        // Calculate aggregate risk
+        aggregated.risk = this.calculateAggregateRisk(results.map((r) => r.result));
+
+        return aggregated;
+      }
+
+      case 'impacted_endpoints': {
+        // Lazy-initialize cross-repo registry for multi-repo queries
+        if (!this.crossRepoRegistry) {
+          if (!this.crossRepoInitPromise) {
+            this.crossRepoInitPromise = this.initCrossRepoRegistry();
+          }
+          await this.crossRepoInitPromise;
+        }
+
+        const results = await Promise.all(
+          repoIds.map(async (repoId) => {
+            try {
+              const handle = await this.resolveRepo(repoId);
+              // Create cross-repo context for this repo
+              let crossRepo: CrossRepoContext | undefined;
+              if (this.crossRepoRegistry && repoIds.length > 1) {
+                crossRepo = {
+                  findDepRepo: (prefix: string) => this.findDepRepo(prefix),
+                  queryMultipleRepos: (ids: string[], query: string, p: Record<string, unknown>) =>
+                    this.queryMultipleRepos(ids, query, p),
+                  listDepRepos: async () => {
+                    const repos = this.crossRepoRegistry!.listRepos();
+                    return repos.map(r => r.repoId).filter(id => id !== repoId);
+                  },
+                };
+              }
+              const result = await this._impactedEndpointsImpl(handle, params, crossRepo);
+              return { repoId, result, error: null };
+            } catch (err: any) {
+              return { repoId, result: null, error: err.message };
+            }
+          })
+        );
+
+        const aggregated: any = {
+          // (#28, #49) Every count field is a per-repo Record so the
+          // single-repo and multi-repo shapes are identical. `changed_symbols`
+          // was previously omitted from the multi-repo summary entirely
+          // (issue #49) and `changed_files` could be a number in the
+          // single-repo path (issue #28). Now both are uniformly
+          // Record<string, number>.
+          summary: {
+            changed_files: {} as Record<string, number>,
+            changed_symbols: {} as Record<string, number>,
+            impacted_endpoints: {} as Record<string, number>,
+          },
+          impacted_endpoints: { WILL_BREAK: [] as any[], LIKELY_AFFECTED: [] as any[], MAY_NEED_TESTING: [] as any[] },
+          changed_symbols: [] as any[],
+          affected_processes: [] as any[],
+          affected_modules: [] as any[],
+          errors: [] as { repoId: string; error: string }[],
+        };
+
+        for (const { repoId, result, error } of results) {
+          if (error) {
+            aggregated.errors.push({ repoId, error });
+          } else if (result) {
+            // Merge changed_files: Record format or coerce bare number (backward compat)
+            const cf = result.summary?.changed_files;
+            if (typeof cf === 'object' && cf !== null) {
+              Object.assign(aggregated.summary.changed_files, cf);
+            } else if (typeof cf === 'number') {
+              aggregated.summary.changed_files[repoId] = cf;
+            }
+            // (#49) Aggregate changed_symbols into the per-repo summary
+            // Record. Tolerate both the new Record shape and the legacy
+            // bare number for backward compatibility with single-repo
+            // callers that may still return the old shape.
+            const cs = result.summary?.changed_symbols;
+            if (typeof cs === 'object' && cs !== null && !Array.isArray(cs)) {
+              Object.assign(aggregated.summary.changed_symbols, cs);
+            } else if (typeof cs === 'number') {
+              aggregated.summary.changed_symbols[repoId] = cs;
+            }
+            // Merge impacted_endpoints: Record format or coerce bare number (backward compat)
+            const ie = result.summary?.impacted_endpoints;
+            if (typeof ie === 'object' && ie !== null) {
+              Object.assign(aggregated.summary.impacted_endpoints, ie);
+            } else if (typeof ie === 'number') {
+              aggregated.summary.impacted_endpoints[repoId] = ie;
+            }
+            if (result.changed_symbols) {
+              aggregated.changed_symbols.push(...result.changed_symbols.map((s: any) => ({ ...s, _repoId: repoId })));
+            }
+            if (result.impacted_endpoints) {
+              for (const tier of ['WILL_BREAK', 'LIKELY_AFFECTED', 'MAY_NEED_TESTING'] as const) {
+                if (result.impacted_endpoints[tier]) {
+                  aggregated.impacted_endpoints[tier].push(...result.impacted_endpoints[tier].map((e: any) => ({ ...e, _repoId: repoId })));
+                }
+              }
+            }
+            if (result.affected_processes) {
+              aggregated.affected_processes.push(...result.affected_processes.map((p: any) => ({ ...p, _repoId: repoId })));
+            }
+            if (result.affected_modules) {
+              aggregated.affected_modules.push(...result.affected_modules.map((m: any) => ({ ...m, _repoId: repoId })));
+            }
+          }
+        }
+
+        // Filter null results before risk calculation; impacted_endpoints uses summary.risk_level
+        const nonNullResults = results.map(r => r.result).filter((r): r is NonNullable<typeof r> => r != null);
+        const riskLevels = nonNullResults.map(r => r.summary?.risk_level ?? r.risk).filter(Boolean);
+        aggregated.summary.risk_level = this.calculateAggregateRisk(
+          riskLevels.map(r => ({ risk: r }))
+        );
+        // Aggregate _meta: mark partial if any individual result is partial
+        const anyPartial = nonNullResults.some(r => r._meta?.partial === true);
+        aggregated._meta = {
+          version: '1.0',
+          generated_at: new Date().toISOString(),
+          ...(anyPartial && { partial: true }),
+        };
+        return aggregated;
+      }
+
+      default:
+        throw new Error(`Tool '${method}' does not support multi-repo queries. Use single 'repo' parameter instead.`);
+    }
+  }
+
+  /**
+   * Format multi-repo cypher results as markdown.
+   */
+  private formatMultiRepoCypherResult(results: Array<{ repoId: string; results: unknown[] }>): any {
+    // Check if any repo had errors
+    const allRows: any[] = [];
+    const errors: { repoId: string; error: string }[] = [];
+
+    for (const { repoId, results: rows } of results) {
+      if (Array.isArray(rows)) {
+        for (const row of rows) {
+          if (row && typeof row === 'object' && 'error' in row) {
+            errors.push({ repoId, error: (row as any).error });
+          } else {
+            allRows.push({ ...(row as object), _repoId: repoId });
+          }
+        }
+      }
+    }
+
+    if (allRows.length === 0 && errors.length > 0) {
+      return { error: errors.map((e) => `${e.repoId}: ${e.error}`).join('; ') };
+    }
+
+    if (allRows.length === 0) {
+      return [];
+    }
+
+    // Format as markdown table
+    return this.formatCypherAsMarkdown(allRows);
+  }
+
+  /**
+   * Calculate aggregate risk from multi-repo impact results.
+   */
+  private calculateAggregateRisk(results: any[]): string {
+    const risks = results
+      .filter((r) => r && r.risk)
+      .map((r) => r.risk);
+
+    if (risks.includes('CRITICAL')) return 'CRITICAL';
+    if (risks.includes('HIGH')) return 'HIGH';
+    if (risks.includes('MEDIUM')) return 'MEDIUM';
+    if (risks.includes('LOW')) return 'LOW';
+    return 'NONE';
   }
 
   // ─── Tool Implementations ────────────────────────────────────────
@@ -425,8 +1017,6 @@ export class LocalBackend {
    */
   private async query(repo: RepoHandle, params: {
     query: string;
-    task_context?: string;
-    goal?: string;
     limit?: number;
     max_symbols?: number;
     include_content?: boolean;
@@ -441,24 +1031,32 @@ export class LocalBackend {
     const maxSymbolsPerProcess = params.max_symbols || 10;
     const includeContent = params.include_content ?? false;
     const searchQuery = params.query.trim();
-    
+
     // Step 1: Run hybrid search to get matching symbols
-    const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25SearchResult, semanticResults] = await Promise.all([
+    // (#58) Decouple search quality from `max_symbols`. The previous formula
+    // `processLimit * maxSymbolsPerProcess` made `max_symbols=1` shrink the
+    // raw result set to 2*1=2 per channel — missing entire processes. Use a
+    // fixed floor so results are stable regardless of output density settings.
+    const searchLimit = Math.max(100, processLimit * 20);
+    const [bm25Results, semanticResults] = await Promise.all([
       this.bm25Search(repo, searchQuery, searchLimit),
       this.semanticSearch(repo, searchQuery, searchLimit),
     ]);
-
-    const bm25Results = bm25SearchResult.results;
-    const ftsUsed = bm25SearchResult.ftsUsed;
     
     // Merge via reciprocal rank fusion
+    // (#57) Apply test-file demotion: multiply RRF scores from test/fixture
+    // files by TEST_FILE_DEMOTION so production code naturally ranks higher.
+    // This mirrors how `impacted_endpoints` already uses `isTestFilePath`.
+    const TEST_FILE_DEMOTION = 0.5;
     const scoreMap = new Map<string, { score: number; data: any }>();
-    
+
     for (let i = 0; i < bm25Results.length; i++) {
       const result = bm25Results[i];
       const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
+      let rrfScore = 1 / (60 + i);
+      if (result.filePath && isTestFilePath(result.filePath)) {
+        rrfScore *= TEST_FILE_DEMOTION;
+      }
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -466,11 +1064,14 @@ export class LocalBackend {
         scoreMap.set(key, { score: rrfScore, data: result });
       }
     }
-    
+
     for (let i = 0; i < semanticResults.length; i++) {
       const result = semanticResults[i];
       const key = result.nodeId || result.filePath;
-      const rrfScore = 1 / (60 + i);
+      let rrfScore = 1 / (60 + i);
+      if (result.filePath && isTestFilePath(result.filePath)) {
+        rrfScore *= TEST_FILE_DEMOTION;
+      }
       const existing = scoreMap.get(key);
       if (existing) {
         existing.score += rrfScore;
@@ -620,28 +1221,59 @@ export class LocalBackend {
       return true;
     });
     
+    // Filter out non-code File nodes from definitions
+    if (definitions.length > 0) {
+      const filePaths = definitions
+        .filter(d => d.type === 'File')
+        .map(d => d.filePath);
+      
+      if (filePaths.length > 0) {
+        try {
+          // Batch lookup fileType for all File definitions
+          const fileTypeRows = await executeParameterized(repo.id, `
+            MATCH (n:File)
+            WHERE n.filePath IN $filePaths
+            RETURN n.filePath AS filePath, n.fileType AS fileType
+          `, { filePaths });
+          
+          const nonCodePaths = new Set(
+            fileTypeRows
+              .filter(r => {
+                const ft = r.fileType || r[1];
+                return ft && ft !== 'code';
+              })
+              .map(r => r.filePath || r[0])
+          );
+          
+          // Remove non-code File definitions (backward compat: keep if fileType is null/undefined)
+          for (let i = definitions.length - 1; i >= 0; i--) {
+            if (definitions[i].type === 'File' && nonCodePaths.has(definitions[i].filePath)) {
+              definitions.splice(i, 1);
+            }
+          }
+        } catch (e) { logQueryError('query:fileType-filter', e); }
+      }
+    }
+    
     return {
       processes,
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
-      ...(!ftsUsed && { warning: 'FTS extension unavailable - keyword search degraded. Run: gitnexus analyze --force to rebuild indexes.' }),
     };
   }
 
   /**
    * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
    */
-  private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<{ results: any[]; ftsUsed: boolean }> {
+  private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
     let bm25Results;
     try {
       bm25Results = await searchFTSFromLbug(query, limit, repo.id);
     } catch (err: any) {
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
-      return { results: [], ftsUsed: false };
+      return [];
     }
-
-    const ftsUsed = bm25Results.length === 0 || (bm25Results[0]?.ftsUsed !== false);
     
     const results: any[] = [];
     
@@ -651,12 +1283,26 @@ export class LocalBackend {
         const symbols = await executeParameterized(repo.id, `
           MATCH (n)
           WHERE n.filePath = $filePath
-          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
+          RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.fileType AS fileType
           LIMIT 3
         `, { filePath: fullPath });
         
         if (symbols.length > 0) {
-          for (const sym of symbols) {
+          // Check if all symbols are File nodes — if any are non-code, skip the entire result
+          const codeSymbols = symbols.filter(sym => {
+            const type = sym.type || sym[2];
+            const fileType = sym.fileType || sym[6];
+            // Keep non-File symbols, and File symbols with fileType='code' or no fileType
+            if (type !== 'File') return true;
+            return !fileType || fileType === 'code';
+          });
+          
+          if (codeSymbols.length === 0) {
+            // All symbols are non-code File nodes — skip this bm25Result
+            continue;
+          }
+          
+          for (const sym of codeSymbols) {
             results.push({
               nodeId: sym.id || sym[0],
               name: sym.name || sym[1],
@@ -687,7 +1333,7 @@ export class LocalBackend {
       }
     }
     
-    return { results, ftsUsed };
+    return results;
   }
 
   /**
@@ -751,6 +1397,36 @@ export class LocalBackend {
         } catch {}
       }
       
+      // Batch filter: remove non-code File nodes (avoids N+1 per-node query)
+      const fileNodeIds = results
+        .filter(r => r.type === 'File' && r.nodeId)
+        .map(r => r.nodeId);
+
+      if (fileNodeIds.length > 0) {
+        try {
+          const fileTypeRows = await executeParameterized(repo.id, `
+            MATCH (n:File)
+            WHERE n.id IN $nodeIds
+            RETURN n.id AS nodeId, n.fileType AS fileType
+          `, { nodeIds: fileNodeIds });
+
+          const nonCodeNodeIds = new Set(
+            fileTypeRows
+              .filter(r => {
+                const ft = r.fileType || r[1];
+                return ft && ft !== 'code';
+              })
+              .map(r => r.nodeId || r[0])
+          );
+
+          for (let i = results.length - 1; i >= 0; i--) {
+            if (results[i].type === 'File' && nonCodeNodeIds.has(results[i].nodeId)) {
+              results.splice(i, 1);
+            }
+          }
+        } catch (e) { logQueryError('semanticSearch:fileType-batch-filter', e); }
+      }
+      
       return results;
     } catch {
       // Expected when embeddings are disabled — silently fall back to BM25-only
@@ -771,7 +1447,7 @@ export class LocalBackend {
     }
 
     // Block write operations (defense-in-depth — DB is already read-only)
-    if (isWriteQuery(params.query)) {
+    if (CYPHER_WRITE_RE.test(params.query)) {
       return { error: 'Write operations (CREATE, DELETE, SET, MERGE, REMOVE, DROP, ALTER, COPY, DETACH) are not allowed. The knowledge graph is read-only.' };
     }
 
@@ -935,7 +1611,7 @@ export class LocalBackend {
     if (uid) {
       symbols = await executeParameterized(repo.id, `
         MATCH (n {id: $uid})
-        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
+        RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
         LIMIT 1
       `, { uid });
     } else {
@@ -956,7 +1632,7 @@ export class LocalBackend {
 
       symbols = await executeParameterized(repo.id, `
         MATCH (n) ${whereClause}
-        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
+        RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
         LIMIT 10
       `, queryParams);
     }
@@ -965,9 +1641,6 @@ export class LocalBackend {
       return { error: `Symbol '${name || uid}' not found` };
     }
     
-    // Step 2: Disambiguation
-    // When multiple nodes share the same name (e.g. a Java Class and its
-    // Constructor both named 'SessionTracker'), prefer the Class node so
     // context() returns the semantically meaningful result rather than
     // triggering ambiguous disambiguation (#480).
     // labels(n)[0] returns empty string in LadybugDB, so we resolve the
@@ -1004,31 +1677,24 @@ export class LocalBackend {
       }
     }
 
-    if (symbols.length > 1 && !uid) {
+    // If still multiple symbols after disambiguation, return ambiguous status
+    if (symbols.length > 1) {
       return {
         status: 'ambiguous',
-        message: `Found ${symbols.length} symbols matching '${name}'. Use uid or file_path to disambiguate.`,
         candidates: symbols.map((s: any) => ({
           uid: s.id || s[0],
           name: s.name || s[1],
           kind: s.type || s[2],
           filePath: s.filePath || s[3],
-          line: s.startLine || s[4],
+          startLine: s.startLine || s[4],
+          endLine: s.endLine || s[5],
         })),
       };
     }
-    
+
     // Step 3: Build full context
     const sym = symbols[0];
     const symId = sym.id || sym[0];
-
-    // Categorized incoming refs
-    let incomingRows = await executeParameterized(repo.id, `
-      MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
-      RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-      LIMIT 30
-    `, { symId });
 
     // Fix #480: Class/Interface nodes have no direct CALLS/IMPORTS edges —
     // those point to Constructor and File nodes respectively. Fetch those
@@ -1054,10 +1720,50 @@ export class LocalBackend {
       isClassLike = symRawType === 'Class' || symRawType === 'Interface';
     }
 
+    // Categorized incoming refs
+    const incomingRows = await executeParameterized(repo.id, `
+      MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+      RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+      LIMIT 30
+    `, { symId });
+
+    // Expand incoming refs for Class/Interface nodes: callers via Constructor/File/Method.
+    //
+    // (#13) ALSO expand for any non-class target (Method/Function/etc.) — the
+    // base incoming query above may return file-level IMPORTS edges (File A
+    // imports File B which contains `target`), but the user wants the calling
+    // METHOD inside File A, not the file itself. The drill-down below walks
+    // the file's methods and surfaces any method-level CALLS edges to the
+    // target. This makes `context(name="someMethod")` return the caller
+    // method's name+filePath instead of just the file.
+    // The 4th IMPLEMENTS walk is only meaningful for Class targets
+    // (impl classes whose interface methods are called via interface-typed
+    // receivers — D5 resolution in call-processor.ts:951 makes the CALLS
+    // edge point at the interface Method, not the impl Method). For
+    // Interface targets the existing methodIncoming path already covers
+    // incoming CALLS, so we skip the extra query there. (#23, #34)
+    const isClassTarget = isClassLike && (
+      resolvedLabel === 'Class' || symId.startsWith('class:')
+    );
+
     if (isClassLike) {
       try {
-        // Run both incoming-ref queries in parallel — they are independent.
-        const [ctorIncoming, fileIncoming] = await Promise.all([
+        // Run all incoming-ref queries in parallel — they are
+        // independent. The third query (#56) covers callers of the
+        // class's METHODS — without it, a query like
+        // `context(name="CashServiceV2Impl")` returns no incoming
+        // refs even though 8 controllers call its methods at the
+        // method level. The fourth query (WI-K23/K34) follows
+        // `Class-[:IMPLEMENTS]->Interface-[:HAS_METHOD]->Method<-[:CALLS]`
+        // so that callers of an interface method (e.g.
+        // `userService.getUsers()`) are visible when the user queries
+        // the impl class `UserServiceImpl`. We aggregate those
+        // method-level CALLS edges into the class context, similar to
+        // how outgoing `has_method` already shows method-level outgoing
+        // edges. The seenKeys dedup ensures callers found via both
+        // methodIncoming and implIncoming appear ONCE.
+        const queries: Array<Promise<any[]>> = [
           executeParameterized(repo.id, `
             MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
@@ -1074,20 +1780,101 @@ export class LocalBackend {
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             LIMIT 30
           `, { symId }),
-        ]);
+          executeParameterized(repo.id, `
+            // (#56) Find callers of the class's methods. This walks
+            // HAS_METHOD from the class to its Method nodes, then
+            // finds CALLS edges from any caller to those methods. The
+            // relation type is reported as CALLS so it sorts into
+            // the same incoming.calls bucket as direct method-level
+            // context queries. The caller.uid, name, filePath come
+            // from the caller (the source of the CALLS edge), and
+            // targetMethod identifies which method on the class was
+            // called — useful for the consumer to show a backtrace.
+            MATCH (n)-[hm:CodeRelation {type: 'HAS_METHOD'}]->(target:Method)
+            WHERE n.id = $symId
+            MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(target)
+            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind, target.name AS targetMethod
+            LIMIT 30
+          `, { symId }),
+        ];
+
+        // (WI-K23/K34) Follow IMPLEMENTS outgoing from the impl class
+        // to its interfaces, then down HAS_METHOD to the interface's
+        // Method nodes, then up CALLS to find the callers. This
+        // surfaces method-level CALLS that the D5 tier in
+        // call-processor.ts:951 routes to the interface method —
+        // callers of an interface method are otherwise invisible when
+        // querying the impl class. Only runs for Class targets (the
+        // METHOD-typed-impl's outgoing IMPLEMENTS); Interface targets
+        // are covered by methodIncoming above. Single hop only
+        // (invariant 3 in k-hgo-impl-calls-traversal.md).
+        if (isClassTarget) {
+          queries.push(executeParameterized(repo.id, `
+            MATCH (n)-[impl:CodeRelation {type: 'IMPLEMENTS'}]->(iface:Interface)
+            WHERE n.id = $symId
+            MATCH (iface)-[hm:CodeRelation {type: 'HAS_METHOD'}]->(target:Method)
+            MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(target)
+            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind, target.name AS targetMethod
+            LIMIT 30
+          `, { symId }));
+        }
+
+        const [ctorIncoming, fileIncoming, methodIncoming, implIncoming] = await Promise.all(queries);
 
         // Deduplicate by (relType, uid) — a caller can have multiple relation
         // types to the same target (e.g. both IMPORTS and CALLS), and each
-        // must be preserved so every category appears in the output.
+        // must be preserved so every category appears in the output. The
+        // implIncoming entries are appended only when the Class target
+        // implements at least one interface; otherwise the array is empty.
         const seenKeys = new Set(
           incomingRows.map((r: any) => `${r.relType || r[0]}:${r.uid || r[1]}`),
         );
-        for (const r of [...ctorIncoming, ...fileIncoming]) {
+        for (const r of [...ctorIncoming, ...fileIncoming, ...methodIncoming, ...(implIncoming ?? [])]) {
           const key = `${r.relType || r[0]}:${r.uid || r[1]}`;
           if (!seenKeys.has(key)) { seenKeys.add(key); incomingRows.push(r); }
         }
       } catch (e) {
         logQueryError('context:class-incoming-expansion', e);
+      }
+    } else {
+      // (#13) Non-class target (Method/Function/etc.) — the base incoming
+      // query may have surfaced file-level IMPORTS callers only. Drill into
+      // the target's owning file to find methods that have direct CALLS
+      // edges to the target. This makes `context(name="someMethod")` return
+      // the calling method (not just the caller file).
+      //
+      // The WHERE clause filters the target to Method/Function/Constructor
+      // by checking the label-prefix in the uid (LadybugDB label() functions
+      // are unreliable inside OPTIONAL MATCH; uid prefix is the convention
+      // the rest of the codebase uses for these node types).
+      try {
+        const methodIncoming = await executeParameterized(repo.id, `
+          // Walk method-level CALLS edges pointing at the target. We do not
+          // need the target's owning file — the CALLS edge source already
+          // carries filePath via the caller node. This is the "calling
+          // METHOD (not just the calling file)" path requested by #13.
+          MATCH (callerMethod)-[calls:CodeRelation {type: 'CALLS'}]->(target {id: $symId})
+          WHERE callerMethod.id <> $symId
+            AND (callerMethod.id STARTS WITH 'method:'
+                 OR callerMethod.id STARTS WITH 'function:'
+                 OR callerMethod.id STARTS WITH 'ctor:')
+          RETURN 'CALLS' AS relType, callerMethod.id AS uid, callerMethod.name AS name,
+                 callerMethod.filePath AS filePath, labels(callerMethod)[0] AS kind,
+                 target.name AS targetMethod
+          LIMIT 30
+        `, { symId });
+
+        if (methodIncoming.length > 0) {
+          const seenKeys = new Set(
+            incomingRows.map((r: any) => `${r.relType || r[0]}:${r.uid || r[1]}`),
+          );
+          for (const r of methodIncoming) {
+            const key = `${r.relType || r[0]}:${r.uid || r[1]}`;
+            if (!seenKeys.has(key)) { seenKeys.add(key); incomingRows.push(r); }
+          }
+        }
+      } catch (e) {
+        logQueryError('context:method-incoming-drilldown', e);
       }
     }
 
@@ -1109,16 +1896,20 @@ export class LocalBackend {
     } catch (e) { logQueryError('context:process-participation', e); }
     
     // Helper to categorize refs
-    const categorize = (rows: any[]) => {
-      const cats: Record<string, any[]> = {};
+    const categorize = (rows: any[]): Record<string, IncomingRef[]> => {
+      const cats: Record<string, IncomingRef[]> = {};
       for (const row of rows) {
         const relType = (row.relType || row[0] || '').toLowerCase();
-        const entry = {
+        const entry: IncomingRef = {
           uid: row.uid || row[1],
           name: row.name || row[2],
           filePath: row.filePath || row[3],
           kind: row.kind || row[4],
         };
+        // Preserve targetMethod when present (set by method-level CALLS queries —
+        // the #56 path and the WI-K23/K34 IMPLEMENTS walk). Optional because
+        // file-level IMPORTS/EXTENDS rows do not carry a target method.
+        if (row.targetMethod) entry.targetMethod = row.targetMethod;
         if (!cats[relType]) cats[relType] = [];
         cats[relType].push(entry);
       }
@@ -1130,7 +1921,22 @@ export class LocalBackend {
       symbol: {
         uid: sym.id || sym[0],
         name: sym.name || sym[1],
-        kind: isClassLike ? (resolvedLabel || 'Class') : (sym.type || sym[2]),
+        // (#30) When isClassLike is true but sym.type is empty
+        // (LadybugDB limitation on `labels(n)[0]` for some Cypher
+        // projections) and the disambiguation path did not set
+        // resolvedLabel, the kind defaulted to 'Class' even for
+        // nodes whose uid prefix is `Interface:`. The disambiguation
+        // query at line 1517 also only checks one label at a time
+        // and prefers Class, so a node with both a Class and
+        // Interface label in the graph (e.g. a Spring @Repository
+        // interface that Spring auto-generates a class for) would
+        // resolve as Class even when the user is asking about the
+        // interface. We now derive kind from the uid prefix when
+        // resolvedLabel is empty and sym.type is empty, so the
+        // kind always matches the uid.
+        kind: isClassLike
+          ? (resolvedLabel || (symId.startsWith('Interface:') ? 'Interface' : 'Class'))
+          : (sym.type || sym[2]),
         filePath: sym.filePath || sym[3],
         startLine: sym.startLine || sym[4],
         endLine: sym.endLine || sym[5],
@@ -1182,7 +1988,7 @@ export class LocalBackend {
       const members = await executeParameterized(repo.id, `
         MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
         WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
-        RETURN DISTINCT n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+        RETURN DISTINCT n.name AS name, labels(n) AS type, n.filePath AS filePath
         LIMIT 30
       `, { clusterName: name });
       
@@ -1214,7 +2020,7 @@ export class LocalBackend {
       const procId = proc.id || proc[0];
       const steps = await executeParameterized(repo.id, `
         MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
-        RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
+        RETURN n.name AS name, labels(n) AS type, n.filePath AS filePath, r.step AS step
         ORDER BY r.step
       `, { procId });
       
@@ -1236,16 +2042,13 @@ export class LocalBackend {
    * Detect changes — git-diff based impact analysis.
    * Maps changed lines to indexed symbols, then finds affected processes.
    */
-  private async detectChanges(repo: RepoHandle, params: {
-    scope?: string;
-    base_ref?: string;
-  }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-    
-    const scope = params.scope || 'unstaged';
+  private async execGitDiff(
+    scope: string,
+    baseRef: string | undefined,
+    cwd: string
+  ): Promise<string[] | { error: string }> {
     const { execFileSync } = await import('child_process');
 
-    // Build git diff args based on scope (using execFileSync to avoid shell injection)
     let diffArgs: string[];
     switch (scope) {
       case 'staged':
@@ -1255,8 +2058,8 @@ export class LocalBackend {
         diffArgs = ['diff', 'HEAD', '--name-only'];
         break;
       case 'compare':
-        if (!params.base_ref) return { error: 'base_ref is required for "compare" scope' };
-        diffArgs = ['diff', params.base_ref, '--name-only'];
+        if (!baseRef) return { error: 'base_ref is required for "compare" scope' };
+        diffArgs = ['diff', baseRef, '--name-only'];
         break;
       case 'unstaged':
       default:
@@ -1264,13 +2067,61 @@ export class LocalBackend {
         break;
     }
 
-    let changedFiles: string[];
     try {
-      const output = execFileSync('git', diffArgs, { cwd: repo.repoPath, encoding: 'utf-8' });
-      changedFiles = output.trim().split('\n').filter(f => f.length > 0);
+      const output = execFileSync('git', diffArgs, { cwd, encoding: 'utf-8' });
+      return output.trim().split('\n').filter(f => f.length > 0);
     } catch (err: any) {
       return { error: `Git diff failed: ${err.message}` };
     }
+  }
+
+  private async execGitDiffWithLines(
+    scope: string,
+    baseRef: string | undefined,
+    cwd: string
+  ): Promise<FileDiffWithLines[] | { error: string }> {
+    const { execFileSync } = await import('child_process');
+
+    let diffArgs: string[];
+    switch (scope) {
+      case 'staged':
+        diffArgs = ['diff', '--staged', '--unified=0'];
+        break;
+      case 'all':
+        diffArgs = ['diff', 'HEAD', '--unified=0'];
+        break;
+      case 'compare':
+        if (!baseRef) return { error: 'base_ref is required for "compare" scope' };
+        diffArgs = ['diff', baseRef, '--unified=0'];
+        break;
+      case 'unstaged':
+      default:
+        diffArgs = ['diff', '--unified=0'];
+        break;
+    }
+
+    try {
+      const output = execFileSync('git', diffArgs, { cwd, encoding: 'utf-8' });
+      return parseDiffOutputWithLines(output);
+    } catch (err: any) {
+      return { error: `Git diff failed: ${err.message}` };
+    }
+  }
+
+  private async detectChanges(repo: RepoHandle, params: {
+    scope?: string;
+    base_ref?: string;
+  }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+    
+    const scope = params.scope || 'unstaged';
+    const diffResult = await this.execGitDiff(scope, params.base_ref, repo.repoPath);
+    
+    if ('error' in diffResult) {
+      return { error: diffResult.error };
+    }
+    
+    const changedFiles = diffResult;
     
     if (changedFiles.length === 0) {
       return {
@@ -1287,14 +2138,19 @@ export class LocalBackend {
       try {
         const symbols = await executeParameterized(repo.id, `
           MATCH (n) WHERE n.filePath CONTAINS $filePath
-          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+          RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath, n.fileType AS fileType
           LIMIT 20
         `, { filePath: normalizedFile });
         for (const sym of symbols) {
+          const type = sym.type || sym[2];
+          const fileType = sym.fileType || sym[4];
+          // Skip non-code File nodes (backward compat: include if fileType is null)
+          if (type === 'File' && fileType && fileType !== 'code') continue;
+          
           changedSymbols.push({
             id: sym.id || sym[0],
             name: sym.name || sym[1],
-            type: sym.type || sym[2],
+            type: type,
             filePath: sym.filePath || sym[3],
             change_type: 'Modified',
           });
@@ -1345,6 +2201,1238 @@ export class LocalBackend {
   }
 
   /**
+   * impacted_endpoints tool — find API routes affected by code changes.
+   *
+   * 1. execGitDiff → changed files
+   * 2. Map files → indexed symbols
+   * 3. BFS upstream traversal (CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD)
+   * 4. Route discovery: reverse-CALLS, DEFINES/HANDLES_ROUTE, FETCHES
+   * 5. Dedup + tier classification (WILL_BREAK / LIKELY_AFFECTED / MAY_NEED_TESTING)
+   * 6. Enrichment: processes, modules, risk
+   */
+  private async _impactedEndpointsImpl(
+    repo: RepoHandle,
+    params: {
+      scope?: string;
+      base_ref?: string;
+      max_depth?: number;
+      min_confidence?: number;
+    },
+    crossRepo?: CrossRepoContext
+  ): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    // (#64) Use `??` (nullish coalescing) instead of `||` so that a user-
+    // supplied `max_depth=0` is honored as "no upstream traversal" rather
+    // than coerced to the default 3. The `||` operator treats 0 as falsy,
+    // which silently turned `max_depth=0` into `max_depth=3` and made all
+    // four documented values (0/1/5/10) return identical results.
+    const maxDepth = params.max_depth ?? 3;
+    const minConfidence = params.min_confidence ?? 0.7;
+
+    // ── 1. Git diff → changed files with line ranges ─────────────────
+    const lineDiffResult = await this.execGitDiffWithLines(
+      params.scope || 'unstaged',
+      params.base_ref,
+      repo.repoPath
+    );
+
+    let changedFiles: string[];
+    let fileLineRanges: Map<string, LineRange[]>;
+
+    if ('error' in lineDiffResult) {
+      // Fallback: try original file-level diff
+      const fallbackResult = await this.execGitDiff(
+        params.scope || 'unstaged',
+        params.base_ref,
+        repo.repoPath
+      );
+      if ('error' in fallbackResult) {
+        return { error: fallbackResult.error };
+      }
+      changedFiles = fallbackResult;
+      fileLineRanges = new Map(); // empty = whole-file resolution
+    } else if (lineDiffResult.length === 0) {
+      return {
+        // (#28, #49) summary fields use per-repo Record<string, number>
+        // consistently — both in the single-repo and multi-repo aggregator
+        // paths, so consumers can rely on a uniform shape.
+        summary: { changed_files: { [repo.id]: 0 }, changed_symbols: { [repo.id]: 0 }, impacted_endpoints: { [repo.id]: 0 }, risk_level: 'none' },
+        impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
+        changed_symbols: [], affected_processes: [], affected_modules: [],
+        _meta: { version: '1.0', generated_at: new Date().toISOString() },
+      };
+    } else {
+      changedFiles = lineDiffResult.map(f => f.filePath.replace(/\\/g, '/'));
+      fileLineRanges = new Map(
+        lineDiffResult.map(f => [f.filePath.replace(/\\/g, '/'), f.changedLineRanges])
+      );
+    }
+
+    if (changedFiles.length === 0) {
+      return {
+        // (#28, #49) see comment on the lineDiffResult.length === 0 branch
+        summary: { changed_files: { [repo.id]: 0 }, changed_symbols: { [repo.id]: 0 }, impacted_endpoints: { [repo.id]: 0 }, risk_level: 'none' },
+        impacted_endpoints: { WILL_BREAK: [], LIKELY_AFFECTED: [], MAY_NEED_TESTING: [] },
+        changed_symbols: [], affected_processes: [], affected_modules: [],
+        _meta: { version: '1.0', generated_at: new Date().toISOString() },
+      };
+    }
+
+    // ── 2. Map files → symbols with line-range filtering ──────────────
+    const changedSymbols: any[] = [];
+    for (const file of changedFiles) {
+      const normalizedFile = file.replace(/\\/g, '/');
+      const ranges = fileLineRanges.get(normalizedFile) ?? [];
+      const isWholeFile = ranges.length === 0;
+
+      try {
+        const symbols = await executeParameterized(repo.id, `
+          MATCH (n) WHERE n.filePath CONTAINS $filePath
+          RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath,
+                 n.startLine AS startLine, n.endLine AS endLine
+          LIMIT 50
+        `, { filePath: normalizedFile });
+
+        for (const sym of symbols) {
+          const symStart = sym.startLine ?? null;
+          const symEnd = sym.endLine ?? null;
+
+          // File nodes (no line range) always included — they carry DEFINES edges to Route nodes
+          // Also include symbols with no line info (fallback to whole-file behavior for that symbol)
+          if (isWholeFile || symStart === null || symEnd === null) {
+            changedSymbols.push({
+              id: sym.id || sym[0],
+              name: sym.name || sym[1],
+              type: sym.type || sym[2],
+              filePath: sym.filePath || sym[3],
+              change_type: 'Modified',
+            });
+            continue;
+          }
+
+          // Check if ANY changed line range overlaps with this symbol's range
+          const overlaps = ranges.some(
+            r => symStart <= r.endLine && symEnd >= r.startLine
+          );
+          if (overlaps) {
+            changedSymbols.push({
+              id: sym.id || sym[0],
+              name: sym.name || sym[1],
+              type: sym.type || sym[2],
+              filePath: sym.filePath || sym[3],
+              change_type: 'Modified',
+            });
+          }
+        }
+      } catch (e) { logQueryError('impacted-endpoints:file-symbols', e); }
+    }
+
+    if (changedSymbols.length === 0) {
+      return {
+        // (#28, #49) see comment on the lineDiffResult.length === 0 branch
+        summary: {
+          changed_files: { [repo.id]: changedFiles.length },
+          changed_symbols: { [repo.id]: 0 },
+          impacted_endpoints: { [repo.id]: 0 },
+          risk_level: 'none',
+        },
+        impacted_endpoints: {
+          WILL_BREAK: [],
+          LIKELY_AFFECTED: [],
+          MAY_NEED_TESTING: [],
+        },
+        changed_symbols: [],
+        affected_processes: [],
+        affected_modules: [],
+        _meta: { version: '1.0', generated_at: new Date().toISOString() },
+      };
+    }
+
+    // ── 2b. Index health check (non-blocking diagnostics) ──────────
+    interface IndexDiagnostics {
+      index_health: 'stale' | 'healthy';
+      missing_tables?: string[];
+      schema_version?: { current: number; indexed: number | null };
+      commit_drift?: { indexed: string; current: string };
+      low_node_count?: boolean;
+      recommendation: string;
+    }
+
+    let _diagnostics: IndexDiagnostics | undefined;
+
+    try {
+      const diagnostics: IndexDiagnostics = { index_health: 'healthy', recommendation: '' };
+      let isStale = false;
+
+      // Check 1: Route table exists
+      try {
+        await executeParameterized(repo.id, 'MATCH (r:Route) RETURN count(r) AS cnt LIMIT 1', {});
+      } catch (routeErr: any) {
+        const msg = routeErr?.message || String(routeErr);
+        if (msg.includes('does not exist')) {
+          diagnostics.missing_tables = ['Route'];
+          diagnostics.index_health = 'stale';
+          isStale = true;
+        }
+      }
+
+      // Check 2: Schema version match
+      try {
+        const meta = await loadMeta(repo.storagePath);
+        const indexedVersion = meta?.schemaVersion ?? null;
+        if (indexedVersion !== SCHEMA_VERSION) {
+          diagnostics.schema_version = { current: SCHEMA_VERSION, indexed: indexedVersion };
+          diagnostics.index_health = 'stale';
+          isStale = true;
+        }
+        // Check 2b: Commit drift (indexed commit vs registry's last-known commit).
+        // The registry's `repo.lastCommit` is updated by every analyze run; if meta.json
+        // disagrees with the registry, the index is at a different commit than the
+        // registry thinks — i.e. a stale write or a manual `analyze` on a different branch.
+        // We deliberately avoid `git rev-parse HEAD` here: the index's freshness story
+        // is about *what was indexed*, not *what the working tree currently looks like*,
+        // and the registry is the source of truth for the former.
+        if (meta?.lastCommit && repo.lastCommit && meta.lastCommit !== repo.lastCommit) {
+          diagnostics.commit_drift = { indexed: meta.lastCommit, current: repo.lastCommit };
+          diagnostics.index_health = 'stale';
+          isStale = true;
+        }
+      } catch { /* meta.json read failure is non-blocking */ }
+
+      // Check 3: Low node count
+      const nodeCount = repo.stats?.nodes ?? 0;
+      const fileCount = repo.stats?.files ?? 0;
+      if (nodeCount > 0 && nodeCount < 100 && fileCount > 50) {
+        diagnostics.low_node_count = true;
+        diagnostics.index_health = 'stale';
+        isStale = true;
+      }
+
+      if (isStale) {
+        const parts: string[] = [];
+        if (diagnostics.missing_tables?.length) {
+          parts.push(`Missing tables: ${diagnostics.missing_tables.join(', ')}`);
+        }
+        if (diagnostics.schema_version) {
+          parts.push(`Schema version mismatch: indexed=${diagnostics.schema_version.indexed}, current=${diagnostics.schema_version.current}`);
+        }
+        if (diagnostics.commit_drift) {
+          parts.push(`Index is at commit ${diagnostics.commit_drift.indexed.slice(0, 7)} but HEAD is ${diagnostics.commit_drift.current.slice(0, 7)}`);
+        }
+        if (diagnostics.low_node_count) {
+          parts.push(`Low node count (${nodeCount}) for ${fileCount} files — index may be incomplete`);
+        }
+        diagnostics.recommendation = `Index may be stale. ${parts.join('; ')}. Consider re-running \`gitnexus analyze\`.`;
+      }
+
+      if (diagnostics.index_health === 'stale') {
+        _diagnostics = diagnostics;
+      }
+    } catch { /* Health check failures are non-blocking */ }
+
+    // ── 3. BFS upstream traversal ───────────────────────────────────
+    const changedIds = changedSymbols.map(s => s.id);
+    const visited = new Set<string>(changedIds);
+    let frontier = [...changedIds];
+    const expandedMeta = new Map<string, { depth: number; confidence: number; relationType: string }>();
+    // changed symbols are depth 0
+    for (const id of changedIds) {
+      expandedMeta.set(id, { depth: 0, confidence: 1.0, relationType: 'DIRECT_CHANGE' });
+    }
+
+    // Track which dep-repo symbols triggered cross-repo discoveries.
+    // Maps expanded symbol ID → array of "repoId:symbolName" triggers.
+    const triggeredByMap = new Map<string, string[]>();
+
+    const relTypes = ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES'];
+    const relTypeFilter = relTypes.map(t => `'${t}'`).join(', ');
+    const MAX_EXPANDED_NODES = 10000;
+    let traversalComplete = true;
+
+    for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
+      if (visited.size >= MAX_EXPANDED_NODES) {
+        traversalComplete = false;
+        break;
+      }
+
+      const nextFrontier: string[] = [];
+      // Safety filter: exclude IDs with characters that could break Cypher syntax
+      const safeFrontier = frontier.filter(id => !/[}{]/.test(id));
+      const idList = safeFrontier.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+
+      const confidenceFilter = minConfidence > 0
+        ? ` AND r.confidence >= ${minConfidence}`
+        : '';
+
+      const query = `MATCH (caller)-[r:CodeRelation]->(n) ` +
+        `WHERE n.id IN [${idList}] ` +
+        `AND r.type IN [${relTypeFilter}]${confidenceFilter} ` +
+        `RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, ` +
+        `labels(caller)[0] AS type, caller.filePath AS filePath, ` +
+        `r.type AS relType, r.confidence AS confidence`;
+
+      try {
+        const related = await executeQuery(repo.id, query);
+
+        for (const rel of related) {
+          const relId = rel.id || rel[1];
+          const filePath = rel.filePath || rel[4] || '';
+          const relConfidence = rel.confidence || rel[6] || 0;
+          const relType = rel.relType || rel[5] || '';
+
+          // Skip test files
+          if (isTestFilePath(filePath)) continue;
+
+          // Apply confidence floor when stored confidence is missing/0
+          const effectiveConfidence = relConfidence > 0
+            ? relConfidence
+            : (IMPACT_RELATION_CONFIDENCE[relType] ?? 0.7);
+
+          if (effectiveConfidence < minConfidence) continue;
+
+          if (!visited.has(relId)) {
+            visited.add(relId);
+            nextFrontier.push(relId);
+            expandedMeta.set(relId, {
+              depth,
+              confidence: effectiveConfidence,
+              relationType: relType,
+            });
+          }
+        }
+      } catch (e) {
+        logQueryError('impacted-endpoints:depth-traversal', e);
+        traversalComplete = false;
+        break;
+      }
+
+      if (visited.size >= MAX_EXPANDED_NODES) {
+        traversalComplete = false;
+        break;
+      }
+
+      // ── 3b. Interface resolution ───────────────────────────────────
+      // After BFS expansion, check if any frontier nodes implement interfaces.
+      // Add those interfaces to nextFrontier so BFS can find callers of the
+      // interface methods in subsequent depths. This bridges the gap where
+      // controllers call CashService.method() but the graph only has an edge
+      // from the controller to the interface, not to the implementation.
+      const safeFrontierForImplements = frontier.filter(id => !/[}{]/.test(id) && (expandedMeta.get(id)?.depth ?? 0) <= 2);
+      if (safeFrontierForImplements.length > 0) {
+        const implIdList = safeFrontierForImplements.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+        const implementsQuery = `MATCH (impl)-[r:CodeRelation {type: 'IMPLEMENTS'}]->(iface) ` +
+          `WHERE impl.id IN [${implIdList}] ` +
+          `RETURN iface.id AS id, iface.name AS name, labels(iface)[0] AS type, iface.filePath AS filePath, ` +
+          `r.type AS relType, r.confidence AS confidence, impl.id AS implId`;
+        try {
+          const interfaceResults = await executeQuery(repo.id, implementsQuery);
+          for (const iface of interfaceResults) {
+            const ifaceId = iface.id || iface[0];
+            const ifaceFilePath = iface.filePath || iface[3] || '';
+            if (isTestFilePath(ifaceFilePath)) continue;
+            if (!visited.has(ifaceId)) {
+              visited.add(ifaceId);
+              nextFrontier.push(ifaceId);
+              expandedMeta.set(ifaceId, {
+                depth: expandedMeta.get(iface.implId || iface[6])?.depth ?? maxDepth,
+                confidence: iface.confidence || iface[5] || 0.85,
+                relationType: 'IMPLEMENTS',
+              });
+            }
+          }
+        } catch (e) {
+          logQueryError('impacted-endpoints:implements-resolution', e);
+          // Non-fatal — continue without interface resolution
+        }
+      }
+
+      frontier = nextFrontier;
+    }
+
+    // ── 3c. Cross-repo BFS bridging via CrossRepoResolver ──────────────
+    // If CrossRepoContext is provided, use CrossRepoResolver to find consumer-repo
+    // symbols that depend on changed dep-repo symbols. The resolver uses a 3-stage
+    // strategy (file-path IMPORTS, class-name, package-path) instead of the old
+    // direct ID-matching approach which failed because IMPORTS edges are File→File.
+    if (crossRepo && changedSymbols.length > 0) {
+      try {
+        const depRepoIds = await crossRepo.listDepRepos();
+        if (depRepoIds.length > 0) {
+          const resolver = new CrossRepoResolver();
+
+          // Build ChangedSymbol array for resolver
+          const changedSymbolsForResolver: ChangedSymbol[] = changedSymbols.map(s => ({
+            id: s.id,
+            name: s.name,
+            filePath: s.filePath,
+          }));
+
+          // Map from dep symbol ID → name for _triggered_by format "repoId:symbolName"
+          const changedSymIdToName = new Map<string, string>(
+            changedSymbols.map(s => [s.id, s.name] as [string, string]),
+          );
+
+          // For each dep repo, resolve which consumer-repo symbols depend on changed dep symbols
+          const consumerRepo: ResolverRepoHandle = {
+            repoId: repo.id,
+            query: async (query: string, params: Record<string, unknown>) =>
+              executeParameterized(repo.id, query, params),
+          };
+
+          for (const depRepoId of depRepoIds) {
+            const depRepo: ResolverRepoHandle = {
+              repoId: depRepoId,
+              query: async (query: string, params: Record<string, unknown>) => {
+                const results = await crossRepo.queryMultipleRepos(
+                  [depRepoId], query, params
+                );
+                // Extract results for this repo
+                const match = results.find(r => r.repoId === depRepoId);
+                return match?.results ?? [];
+              },
+            };
+
+            const resolvedConsumers = await resolver.resolveDepConsumers(
+              consumerRepo, depRepo, changedSymbolsForResolver
+            );
+
+            // Add resolved consumers to BFS frontier
+            for (const consumer of resolvedConsumers) {
+              // Build trigger key: "repoId:symbolName" for cross-repo attribution
+              const depSymbolName = changedSymIdToName.get(consumer.matchedDepSymbol) ?? consumer.matchedDepSymbol;
+              const triggerKey = `${depRepoId}:${depSymbolName}`;
+
+              // Find all Method/Class symbols in the importing file
+              try {
+                const fileSymbols = await executeParameterized(repo.id,
+                  `MATCH (s) WHERE s.filePath = $filePath
+                   RETURN s.id AS id, s.name AS name, s.filePath AS filePath, labels(s)[0] AS type`,
+                  { filePath: consumer.filePath }
+                );
+
+                for (const sym of fileSymbols) {
+                  const symId = sym.id || sym[0];
+                  const symType = sym.type || sym[3] || '';
+                  const symFilePath = sym.filePath || sym[2] || '';
+                  // Only include Method and Class symbols (skip File, Route, etc.)
+                  if (symType !== 'Method' && symType !== 'Class') continue;
+                  if (isTestFilePath(symFilePath)) continue;
+                  if (!visited.has(symId)) {
+                    visited.add(symId);
+                    expandedMeta.set(symId, {
+                      depth: 1,
+                      confidence: consumer.confidence,
+                      relationType: `CROSS_REPO_${consumer.matchMethod.toUpperCase()}`,
+                    });
+                    // Track which dep symbol triggered this cross-repo discovery
+                    const existing = triggeredByMap.get(symId) ?? [];
+                    if (!existing.includes(triggerKey)) {
+                      existing.push(triggerKey);
+                    }
+                    triggeredByMap.set(symId, existing);
+                  }
+                }
+              } catch (e) {
+                logQueryError('impacted-endpoints:cross-repo-file-symbols', e);
+                // Non-fatal — add the consumer itself as fallback
+                if (!visited.has(consumer.id)) {
+                  visited.add(consumer.id);
+                  expandedMeta.set(consumer.id, {
+                    depth: 1,
+                    confidence: consumer.confidence,
+                    relationType: `CROSS_REPO_${consumer.matchMethod.toUpperCase()}`,
+                  });
+                  // Track trigger for fallback consumer too
+                  const existing = triggeredByMap.get(consumer.id) ?? [];
+                  if (!existing.includes(triggerKey)) {
+                    existing.push(triggerKey);
+                  }
+                  triggeredByMap.set(consumer.id, existing);
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        logQueryError('impacted-endpoints:cross-repo-bridging', e);
+        // Non-fatal — continue without cross-repo results
+      }
+    }
+
+    // ── 4. Route Discovery (4 parallel queries) ────────────────────
+    const expandedIds = Array.from(visited);
+    const changedIdSet = new Set(changedIds);
+
+    // Helper: for each Route, track which original changed symbols led to it
+    // We build a mapping from expanded symbol → original changed ancestors via BFS metadata
+    // Simplified: any expanded symbol that is a changed symbol (depth 0) is the root cause
+
+    const [handlerRows, ownershipRows, fetchesRows, annotationRows] = await Promise.all([
+      // Query 1: reverse-CALLS (handler methods)
+      executeParameterized(repo.id, `
+        MATCH (m:Method|Function)-[c:CodeRelation {type: 'CALLS'}]->(s)
+        WHERE s.id IN $expandedIds AND c.confidence >= $minConfidence
+        MATCH (r:Route)-[rc:CodeRelation {type: 'CALLS'}]->(m)
+        RETURN r.routePath AS path, r.httpMethod AS method,
+               r.filePath AS file_path, r.lineNumber AS line,
+               r.controllerName AS controller, r.methodName AS handler,
+               s.name AS affected_name, s.id AS affected_id,
+               c.type AS relation, 'reverse-CALLS' AS discovery_path
+      `, { expandedIds, minConfidence }).catch((e) => {
+        logQueryError('impacted-endpoints:reverse-calls', e);
+        return [];
+      }),
+
+      // Query 2: DEFINES/HANDLES_ROUTE (direct ownership)
+      executeParameterized(repo.id, `
+        MATCH (s)-[d:CodeRelation]->(r:Route)
+        WHERE s.id IN $expandedIds
+          AND d.type IN ['DEFINES', 'HANDLES_ROUTE']
+          AND d.confidence >= $minConfidence
+        RETURN r.routePath AS path, r.httpMethod AS method,
+               r.filePath AS file_path, r.lineNumber AS line,
+               r.controllerName AS controller, r.methodName AS handler,
+               s.name AS affected_name, s.id AS affected_id,
+               d.type AS relation, 'DEFINES/HANDLES_ROUTE' AS discovery_path
+      `, { expandedIds, minConfidence }).catch((e) => {
+        logQueryError('impacted-endpoints:defines-handles', e);
+        return [];
+      }),
+
+      // Query 3: FETCHES (API consumers)
+      executeParameterized(repo.id, `
+        MATCH (s)-[f:CodeRelation {type: 'FETCHES'}]->(r:Route)
+        WHERE s.id IN $expandedIds AND f.confidence >= $minConfidence
+        RETURN r.routePath AS path, r.httpMethod AS method,
+               r.filePath AS file_path, r.lineNumber AS line,
+               r.controllerName AS controller, r.methodName AS handler,
+               s.name AS affected_name, s.id AS affected_id,
+               f.type AS relation, 'FETCHES' AS discovery_path
+      `, { expandedIds, minConfidence }).catch((e) => {
+        logQueryError('impacted-endpoints:fetches', e);
+        return [];
+      }),
+
+      // Query 4: Annotation-based route fallback
+      // Find expanded Method nodes in Controller files that contain mapping annotations
+      executeParameterized(repo.id, `
+        MATCH (m:Method)
+        WHERE m.id IN $expandedIds
+          AND m.filePath CONTAINS 'Controller'
+        RETURN m.id AS id, m.name AS handler, m.filePath AS filePath,
+               m.content AS content, m.startLine AS line
+      `, { expandedIds }).catch((e) => {
+        logQueryError('impacted-endpoints:annotation-fallback', e);
+        return [];
+      }),
+    ]);
+
+    const allRouteRows = [...handlerRows, ...ownershipRows, ...fetchesRows];
+
+    // ── 4b. Annotation-based route fallback processing ──────────────
+    // For each Method node returned by Query 4, parse @XxxMapping annotations
+    // to discover routes when Route nodes don't exist in the graph.
+    const annotationFallbackRows: any[] = [];
+    if (annotationRows && annotationRows.length > 0) {
+      // Batch-query class-level @RequestMapping prefixes (one query per unique controller filePath)
+      const controllerFiles = [...new Set(annotationRows.map((r: any) => r.filePath || r[2] || '').filter(Boolean))];
+      const classPrefixCache = new Map<string, string | undefined>();
+
+      for (const filePath of controllerFiles) {
+        try {
+          const classRows = await executeParameterized(repo.id, `
+            MATCH (c:Class)
+            WHERE c.filePath = $filePath
+            RETURN c.content AS classContent
+            LIMIT 1
+          `, { filePath });
+          if (classRows && classRows.length > 0) {
+            const classContent = classRows[0].classContent ?? classRows[0][0] ?? '';
+            const prefix = parseClassLevelPrefix(classContent);
+            classPrefixCache.set(filePath, prefix ?? undefined);
+          }
+        } catch (e) {
+          logQueryError('impacted-endpoints:class-prefix', e);
+          // Non-fatal — continue without class prefix
+        }
+      }
+
+      // Process each annotation method
+      for (const row of annotationRows) {
+        const methodId = row.id || row[0] || '';
+        const handler = row.handler || row[1] || '';
+        const filePath = row.filePath || row[2] || '';
+        const content = row.content || row[3] || '';
+        const line = row.line || row[4] || 0;
+
+        if (!content) continue; // Skip methods without content
+
+        const parsed = parseMethodLevelMapping(content);
+        if (!parsed) continue; // No mapping annotation found
+
+        const { httpMethod, routePath } = parsed;
+
+        // Combine class prefix with method path
+        const classPrefix = classPrefixCache.get(filePath);
+        const fullPath = combinePaths(classPrefix, routePath);
+
+        // Derive controller name from filePath
+        const fileName = filePath.split('/').pop() ?? 'Unknown';
+        const controller = fileName.replace(/\.[^.]+$/, '');
+
+        annotationFallbackRows.push({
+          method: httpMethod === '*' ? 'GET' : httpMethod.toUpperCase(), // Default '*' to GET for tier classification
+          path: fullPath,
+          file_path: filePath,
+          line,
+          controller,
+          handler,
+          affected_name: handler,
+          affected_id: methodId,
+          relation: 'CALLS',
+          discovery_path: 'annotation-fallback',
+        });
+      }
+    }
+
+    // Dedup annotation-fallback rows against route-node rows
+    // Route-node entries take precedence (higher confidence)
+    const routeNodeKeys = new Set(allRouteRows.map((r: any) => {
+      const m = (r.method || r[1] || '').toUpperCase();
+      const p = r.path || r[0] || '';
+      return `${m} ${p}`;
+    }));
+
+    for (const fallbackRow of annotationFallbackRows) {
+      const key = `${fallbackRow.method} ${fallbackRow.path}`;
+      if (!routeNodeKeys.has(key)) {
+        allRouteRows.push(fallbackRow);
+      }
+    }
+
+    // ── 5. Dedup + Tier Classification ──────────────────────────────
+    // Dedup by (method, path); keep shallowest depth; worst-tier wins
+    const routeMap = new Map<string, {
+      method: string; path: string; file_path: string; line: number;
+      controller: string; handler: string;
+      depth: number; confidence: number;
+      affected_by: Set<string>;
+      discovery_paths: Set<string>;
+      affected_id: string;
+    }>();
+
+    for (const row of allRouteRows) {
+      const method = (row.method || row[1] || '').toUpperCase();
+      const path = row.path || row[0] || '';
+      const key = `${method} ${path}`;
+      if (!method || !path) continue;
+
+      const affectedId = row.affected_id || row[6] || '';
+      const discoveryPath = row.discovery_path || row[9] || '';
+
+      // Determine depth: if the affected_id is a changed symbol, depth=0;
+      // otherwise look up BFS metadata
+      const depth = changedIdSet.has(affectedId)
+        ? 0
+        : (expandedMeta.get(affectedId)?.depth ?? maxDepth + 1);
+
+      // Confidence along the path: minimum of the edge to the affected symbol
+      // Annotation-fallback confidence is capped at 0.8 (lower than Route-node confidence)
+      const baseConfidence = changedIdSet.has(affectedId)
+        ? 1.0
+        : (expandedMeta.get(affectedId)?.confidence ?? 0.5);
+      const confidence = discoveryPath === 'annotation-fallback'
+        ? Math.min(baseConfidence, 0.8)
+        : baseConfidence;
+
+      if (!routeMap.has(key) || depth < routeMap.get(key)!.depth) {
+        // Preserve existing affected_by when overwriting with shallower depth
+        const existingAffectedBy = routeMap.has(key)
+          ? routeMap.get(key)!.affected_by
+          : new Set<string>();
+        if (changedIdSet.has(affectedId)) existingAffectedBy.add(affectedId);
+        routeMap.set(key, {
+          method, path,
+          file_path: row.file_path || row[2] || '',
+          line: row.line || row[3] || 0,
+          controller: row.controller || row[4] || '',
+          handler: row.handler || row[5] || '',
+          depth,
+          confidence,
+          affected_by: existingAffectedBy,
+          discovery_paths: routeMap.has(key)
+            ? routeMap.get(key)!.discovery_paths
+            : new Set([discoveryPath]),
+          affected_id: affectedId,
+        });
+      } else {
+        const existing = routeMap.get(key)!;
+        // Merge affected_by from additional paths
+        if (changedIdSet.has(affectedId)) {
+          existing.affected_by.add(affectedId);
+        }
+        existing.discovery_paths.add(discoveryPath);
+        // Keep shallowest depth (worst tier wins)
+        if (depth < existing.depth) {
+          existing.depth = depth;
+          existing.confidence = Math.min(existing.confidence, confidence);
+        }
+      }
+    }
+
+    // Track which changed symbols lead to each expanded symbol (for affected_by tracing)
+    // For efficiency, build a simple parent map from BFS traversal metadata
+    // We trace back: for each non-changed expanded symbol, find changed symbols at depth 0
+    // that are reachable. Simplification: use changedIds as the root set.
+    // For Routes whose affected_id is NOT a changed symbol, trace via the expanded set.
+    // We'll do a separate query to find which changed symbols are upstream of each
+    // intermediate symbol. For now, use a simpler approach: mark the affected_id directly.
+
+    // Assign tiers
+    const WILL_BREAK: any[] = [];
+    const LIKELY_AFFECTED: any[] = [];
+    const MAY_NEED_TESTING: any[] = [];
+
+    for (const [key, route] of routeMap) {
+      // Collect _triggered_by entries from all affected symbols in this route.
+      // A route may be discovered via multiple expanded symbols; merge triggers from all.
+      const triggeredByEntries = new Set<string>();
+      for (const affId of route.affected_by) {
+        const triggers = triggeredByMap.get(affId);
+        if (triggers) {
+          for (const t of triggers) triggeredByEntries.add(t);
+        }
+      }
+      // Also check the primary affected_id for cross-repo triggers
+      if (route.affected_id && triggeredByMap.has(route.affected_id)) {
+        for (const t of triggeredByMap.get(route.affected_id)!) triggeredByEntries.add(t);
+      }
+
+      const entry: Record<string, unknown> = {
+        method: route.method,
+        path: route.path,
+        file_path: route.file_path,
+        line: route.line,
+        controller: route.controller,
+        handler: route.handler,
+        confidence: route.confidence,
+        affected_by: Array.from(route.affected_by),
+        discovery_paths: Array.from(route.discovery_paths),
+      };
+
+      // Only add _triggered_by for cross-repo discoveries
+      if (triggeredByEntries.size > 0) {
+        entry._triggered_by = Array.from(triggeredByEntries);
+      }
+
+      if (route.depth <= 1 && route.confidence >= 0.85) {
+        WILL_BREAK.push(entry);
+      } else if (route.depth <= 3 && route.confidence >= 0.7) {
+        LIKELY_AFFECTED.push(entry);
+      } else {
+        MAY_NEED_TESTING.push(entry);
+      }
+    }
+
+    // ── 6. Enrichment: affected processes and modules ───────────────
+    const expandedSymbols = Array.from(expandedMeta.entries())
+      .filter(([id]) => !changedIdSet.has(id))
+      .map(([id, meta]) => ({
+        id,
+        depth: meta.depth,
+        confidence: meta.confidence,
+        relationType: meta.relationType,
+      }));
+
+    let affectedProcesses: any[] = [];
+    let affectedModules: any[] = [];
+
+    const allImpactedIds = Array.from(visited);
+    const d1Ids = Array.from(expandedMeta.entries())
+      .filter(([, m]) => m.depth === 1)
+      .map(([id]) => id);
+
+    const CHUNK_SIZE = 100;
+    const chunkIds = (ids: string[]): string[][] => {
+      const chunks: string[][] = [];
+      for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+        chunks.push(ids.slice(i, i + CHUNK_SIZE));
+      }
+      return chunks;
+    };
+
+    // Affected processes
+    const maxChunks = parseInt(process.env.IMPACT_MAX_CHUNKS || '999999', 10);
+    const processChunks = chunkIds(allImpactedIds);
+    const processRows: any[] = [];
+    const processedIds: string[] = [];
+    let chunksProcessed = 0;
+    for (const chunk of processChunks) {
+      if (chunksProcessed >= maxChunks) {
+        traversalComplete = false;
+        break;
+      }
+      processedIds.push(...chunk);
+      const result = await executeParameterized(repo.id, `
+        MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+        WHERE s.id IN $ids
+        RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits,
+               MIN(r.step) AS minStep, p.stepCount AS stepCount
+        ORDER BY hits DESC
+        LIMIT 20
+      `, { ids: chunk }).catch(() => []);
+      processRows.push(...result);
+      chunksProcessed++;
+    }
+
+    // Re-aggregate across chunks
+    const aggregatedProcesses = new Map<string, any>();
+    for (const row of processRows) {
+      const procName = row.name || row[0];
+      if (aggregatedProcesses.has(procName)) {
+        const existing = aggregatedProcesses.get(procName);
+        existing.hits += row.hits || row[1] || 0;
+        if ((row.minStep ?? row[2]) < existing.minStep) {
+          existing.minStep = row.minStep ?? row[2];
+        }
+      } else {
+        aggregatedProcesses.set(procName, {
+          name: procName,
+          hits: row.hits || row[1] || 0,
+          minStep: row.minStep ?? row[2],
+          stepCount: row.stepCount ?? row[3],
+        });
+      }
+    }
+    affectedProcesses = Array.from(aggregatedProcesses.values())
+      .sort((a, b) => b.hits - a.hits)
+      .slice(0, 20)
+      .map(r => ({
+        name: r.name,
+        total_hits: r.hits,
+        broken_at_step: r.minStep,
+        step_count: r.stepCount,
+      }));
+
+    // Affected modules — chunked + parameterized (same pattern as process enrichment)
+    if (processedIds.length > 0) {
+      const moduleChunks = chunkIds(processedIds);
+      const d1FilteredIds = d1Ids.filter(id => processedIds.includes(id));
+      const d1Chunks = chunkIds(d1FilteredIds);
+      let moduleRows: any[] = [];
+      let directModuleRows: any[] = [];
+      let moduleChunksProcessed = 0;
+
+      for (const chunk of moduleChunks) {
+        if (moduleChunksProcessed >= maxChunks) {
+          traversalComplete = false;
+          break;
+        }
+        const result = await executeParameterized(repo.id, `
+          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE s.id IN $ids
+          RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
+          ORDER BY hits DESC
+          LIMIT 20
+        `, { ids: chunk }).catch(() => []);
+        moduleRows.push(...result);
+        moduleChunksProcessed++;
+      }
+
+      // Aggregate module hits across chunks
+      const aggregatedModules = new Map<string, number>();
+      for (const row of moduleRows) {
+        const name = row.name || row[0];
+        const hits = row.hits || row[1] || 0;
+        aggregatedModules.set(name, (aggregatedModules.get(name) ?? 0) + hits);
+      }
+      // Re-sort and limit to 20 after aggregation
+      moduleRows = Array.from(aggregatedModules.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 20)
+        .map(([name, hits]) => ({ name, hits }));
+
+      for (const chunk of d1Chunks) {
+        const result = await executeParameterized(repo.id, `
+          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE s.id IN $ids
+          RETURN DISTINCT c.heuristicLabel AS name
+        `, { ids: chunk }).catch(() => []);
+        directModuleRows.push(...result);
+      }
+
+      const directModuleSet = new Set(directModuleRows.map((r: any) => r.name || r[0]));
+      affectedModules = moduleRows.map((r: any) => {
+        const name = r.name || r[0];
+        return {
+          name,
+          hits: r.hits || r[1],
+          impact: directModuleSet.has(name) ? 'direct' : 'indirect',
+        };
+      });
+    }
+
+    // ── 7. Risk scoring ────────────────────────────────────────────
+    const endpointCount = WILL_BREAK.length + LIKELY_AFFECTED.length + MAY_NEED_TESTING.length;
+    const processCount = affectedProcesses.length;
+    const moduleCount = affectedModules.length;
+    let risk = 'LOW';
+    if (endpointCount >= 30 || processCount >= 5 || moduleCount >= 5 || expandedSymbols.length >= 200) {
+      risk = 'CRITICAL';
+    } else if (endpointCount >= 15 || processCount >= 3 || moduleCount >= 3 || expandedSymbols.length >= 100) {
+      risk = 'HIGH';
+    } else if (endpointCount >= 5 || expandedSymbols.length >= 30) {
+      risk = 'MEDIUM';
+    }
+
+    // ── 8. Return shape ─────────────────────────────────────────────
+    return {
+      // (#28, #49) per-repo Record<string, number> for ALL count fields,
+      // matching the multi-repo aggregator shape. Consumers no longer need
+      // to type-check whether `changed_files` is a number or an object —
+      // it is always an object keyed by repoId.
+      summary: {
+        changed_files: { [repo.id]: changedFiles.length },
+        changed_symbols: { [repo.id]: changedSymbols.length },
+        impacted_endpoints: { [repo.id]: endpointCount },
+        risk_level: risk,
+      },
+      impacted_endpoints: {
+        WILL_BREAK,
+        LIKELY_AFFECTED,
+        MAY_NEED_TESTING,
+      },
+      changed_symbols: changedSymbols,
+      affected_processes: affectedProcesses,
+      affected_modules: affectedModules,
+      _meta: {
+        version: '1.0',
+        generated_at: new Date().toISOString(),
+        ...(!traversalComplete && { partial: true }),
+      },
+      ...(_diagnostics && { _diagnostics }),
+    };
+  }
+
+  /**
+   * API Impact tool — analyze an HTTP route's response shape, consumers, and mismatches.
+   *
+   * Queries Route nodes and their FETCHES consumer edges to determine:
+   * - Which consumers (fetch() callers) depend on this route
+   * - Whether consumer code accesses fields not present in the handler's response shape
+   * - Risk level based on consumer count and mismatch severity
+   */
+  private async apiImpact(repo: RepoHandle, params: {
+    route?: string;
+    file?: string;
+  }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    if (!params.route && !params.file) {
+      return { error: 'Either "route" or "file" parameter is required.' };
+    }
+
+    // Build the route lookup query
+    let routeWhere = '';
+    const routeParams: Record<string, any> = {};
+
+    if (params.route) {
+      routeWhere = 'WHERE r.name = $route';
+      routeParams.route = params.route;
+    } else if (params.file) {
+      routeWhere = 'WHERE r.filePath = $file';
+      routeParams.file = params.file;
+    }
+
+    // Find the route(s) — may return multiple if same file has multiple methods
+    const routeRows = await executeParameterized(repo.id, `
+      MATCH (r:Route)
+      ${routeWhere}
+      RETURN r.id AS routeId, r.name AS route, r.filePath AS handlerFile,
+             r.responseKeys AS responseKeys, r.errorKeys AS errorKeys,
+             r.middleware AS middleware
+    `, routeParams);
+
+    if (!routeRows || routeRows.length === 0) {
+      return { error: 'No routes found matching the given route or file.' };
+    }
+
+    // Build results — one entry per matched route
+    const routes: any[] = [];
+    let allMismatches: any[] = [];
+    let totalConsumers = 0;
+
+    for (const row of routeRows) {
+      const routeId = row.routeId || row[0];
+      const routeName = row.route || row[1];
+      const handlerFile = row.handlerFile || row[2];
+      const responseKeys: string[] = row.responseKeys || row[3] || [];
+      const errorKeys: string[] = row.errorKeys || row[4] || [];
+      const middleware: string[] = row.middleware || row[5] || [];
+
+      // Find consumers: functions that FETCHES this route (via CodeRelation edges)
+      const consumerRows = await executeParameterized(repo.id, `
+        MATCH (c:Function)-[r:CodeRelation {type: 'FETCHES'}]->(rout:Route)
+        WHERE rout.id = $routeId
+        RETURN c.id AS consumerId, c.name AS consumerName,
+               c.filePath AS consumerFile, r.reason AS fetchReason
+      `, { routeId });
+
+      const consumers: any[] = [];
+      const routeConsumerSet = new Set<string>();
+
+      for (const cres of consumerRows) {
+        const consumerId = cres.consumerId || cres[0];
+        const consumerName = cres.consumerName || cres[1];
+        const consumerFile = cres.consumerFile || cres[2];
+        const fetchReason: string = cres.fetchReason || cres[3] || '';
+
+        // Skip duplicate consumers from same file (multiple methods in same file)
+        if (routeConsumerSet.has(consumerFile)) continue;
+        routeConsumerSet.add(consumerFile);
+
+        // Determine if this is a multi-fetch consumer (fetches multiple routes)
+        const multiMatch = fetchReason.match(/fetches:(\d+)/);
+        const attributionNote = multiMatch && parseInt(multiMatch[1]) > 1
+          ? `fetches ${multiMatch[1]} routes`
+          : undefined;
+
+        // Determine confidence based on multi-fetch
+        const confidence = multiMatch && parseInt(multiMatch[1]) > 1 ? 'low' : 'high';
+
+        consumers.push({
+          name: consumerName,
+          file: consumerFile,
+          attributionNote,
+          confidence,
+        });
+
+        // Check for mismatches: consumer accesses fields not in response shape
+        const keyMatch = fetchReason.match(/keys:([^|]+)/);
+        if (keyMatch) {
+          const accessedKeys = keyMatch[1].split(',').map((k: string) => k.trim());
+          const successSet = new Set(responseKeys);
+          const errorSet = new Set(errorKeys);
+
+          for (const key of accessedKeys) {
+            // Skip if key is a nested property access (e.g., "data.items")
+            const topLevelKey = key.split('.')[0];
+            const isSuccess = successSet.has(topLevelKey);
+            const isError = errorSet.has(topLevelKey);
+
+            if (!isSuccess && !isError) {
+              allMismatches.push({
+                consumer: consumerFile,
+                field: topLevelKey,
+                reason: `${topLevelKey} not in response shape`,
+                confidence,
+              });
+            }
+          }
+        }
+      }
+
+      totalConsumers += consumers.length;
+
+      routes.push({
+        route: routeName,
+        handler: handlerFile,
+        responseShape: {
+          success: responseKeys,
+          error: errorKeys,
+        },
+        middleware,
+        consumers,
+      });
+    }
+
+    // Calculate impact summary
+    const directConsumers = totalConsumers;
+    let riskLevel = 'LOW';
+    if (allMismatches.length > 0) {
+      // Mismatches always bump risk to at least MEDIUM
+      riskLevel = directConsumers >= 10 ? 'HIGH' : 'MEDIUM';
+    } else if (directConsumers >= 10) {
+      riskLevel = 'HIGH';
+    } else if (directConsumers >= 3) {
+      riskLevel = 'MEDIUM';
+    }
+
+    const impactSummary = {
+      directConsumers,
+      riskLevel,
+    };
+
+    // If multiple routes matched, return array format
+    if (routes.length > 1) {
+      return {
+        routes,
+        total: routes.length,
+        mismatches: allMismatches,
+        impactSummary,
+      };
+    }
+
+    // Single route — return flat structure
+    const single = routes[0];
+    return {
+      route: single.route,
+      handler: single.handler,
+      responseShape: single.responseShape,
+      middleware: single.middleware,
+      consumers: single.consumers,
+      mismatches: allMismatches,
+      impactSummary,
+    };
+  }
+
+  /**
+   * route_map tool — list routes with their consumers and middleware.
+   * Simpler than api_impact: just returns route metadata without mismatch analysis.
+   */
+  private async routeMap(repo: RepoHandle, params: { route?: string; file?: string }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    if (!params.route && !params.file) {
+      return { error: 'Either "route" or "file" parameter is required.' };
+    }
+
+    const routeWhere = params.route
+      ? 'WHERE r.name = $route'
+      : 'WHERE r.filePath = $file';
+    const routeParams = { route: params.route, file: params.file };
+    const queryParam = params.route ? 'route' : 'file';
+
+    const routeRows = await executeParameterized(repo.id, `
+      MATCH (r:Route)
+      ${routeWhere}
+      RETURN r.id AS routeId, r.name AS route, r.filePath AS handlerFile,
+             r.responseKeys AS responseKeys, r.errorKeys AS errorKeys,
+             r.middleware AS middleware
+    `, { [queryParam]: params.route ?? params.file });
+
+    if (!routeRows || routeRows.length === 0) {
+      return { error: 'No routes found matching the given route or file.' };
+    }
+
+    const routes: any[] = [];
+
+    for (const row of routeRows) {
+      const routeId = row.routeId || row[0];
+      const routeName = row.route || row[1];
+      const handlerFile = row.handlerFile || row[2];
+      const middleware: string[] = row.middleware || row[5] || [];
+
+      const consumerRows = await executeParameterized(repo.id, `
+        MATCH (c:Function)-[r:CodeRelation {type: 'FETCHES'}]->(rout:Route)
+        WHERE rout.id = $routeId
+        RETURN c.filePath AS consumerFile
+      `, { routeId });
+
+      const consumers = [...new Set(consumerRows.map((r: any) => r.consumerFile || r[0]))];
+
+      routes.push({
+        route: routeName,
+        handler: handlerFile,
+        middleware,
+        consumers: consumers.map(f => ({ file: f })),
+      });
+    }
+
+    return { routes };
+  }
+
+  /**
+   * shape_check tool — list routes with their response shapes.
+   * Analyzes consumer key access and identifies mismatches between
+   * consumer-accessed keys and route response/error keys.
+   */
+  private async shapeCheck(repo: RepoHandle, params: { route?: string; file?: string }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    if (!params.route && !params.file) {
+      return { error: 'Either "route" or "file" parameter is required.' };
+    }
+
+    const routeWhere = params.route
+      ? 'WHERE r.name = $route'
+      : 'WHERE r.filePath = $file';
+    const queryParam = params.route ? 'route' : 'file';
+
+    const routeRows = await executeParameterized(repo.id, `
+      MATCH (r:Route)
+      ${routeWhere}
+      RETURN r.id AS routeId, r.name AS route, r.filePath AS handlerFile,
+             r.responseKeys AS responseKeys, r.errorKeys AS errorKeys
+    `, { [queryParam]: params.route ?? params.file });
+
+    if (!routeRows || routeRows.length === 0) {
+      return { error: 'No routes found matching the given route or file.' };
+    }
+
+    const routes: any[] = [];
+
+    for (const row of routeRows) {
+      const routeId = row.routeId || row[0];
+      const routeName = row.route || row[1];
+      const handlerFile = row.handlerFile || row[2];
+      const responseKeys: string[] = row.responseKeys || row[3] || [];
+      const errorKeys: string[] = row.errorKeys || row[4] || [];
+
+      // Query FETCHES edges with reason field to extract accessed keys
+      const consumerRows = await executeParameterized(repo.id, `
+        MATCH (c:Function)-[rel:CodeRelation {type: 'FETCHES'}]->(r:Route)
+        WHERE r.id = $routeId
+        RETURN c.filePath AS consumerFile, rel.reason AS reason
+      `, { routeId });
+
+      // Build consumer info with key analysis
+      const consumers: any[] = [];
+      for (const consumerRow of consumerRows) {
+        const filePath = consumerRow.consumerFile || consumerRow[0];
+        const reason = consumerRow.reason || consumerRow[1] || '';
+
+        // Parse accessed keys from reason field (format: "fetch-url-match|keys:key1,key2,...")
+        const keysMatch = reason.match(/keys:([^|]+)/);
+        const accessedKeys: string[] = keysMatch
+          ? keysMatch[1].split(',').map(k => k.trim()).filter(k => k.length > 0)
+          : [];
+
+        // Classify keys: errorPathKeys (in errorKeys), mismatched (not in responseKeys or errorKeys)
+        const responseKeySet = new Set(responseKeys);
+        const errorKeySet = new Set(errorKeys);
+
+        const errorPathKeys: string[] = accessedKeys.filter(k => errorKeySet.has(k));
+        const mismatched: string[] = accessedKeys.filter(
+          k => !responseKeySet.has(k) && !errorKeySet.has(k)
+        );
+
+        consumers.push({
+          filePath,
+          accessedKeys,
+          ...(errorPathKeys.length > 0 && { errorPathKeys }),
+          ...(mismatched.length > 0 && { mismatched }),
+        });
+      }
+
+      // Determine route status: MISMATCH if any consumer has mismatched keys
+      const hasMismatches = consumers.some(c => c.mismatched && c.mismatched.length > 0);
+
+      routes.push({
+        route: routeName,
+        handler: handlerFile,
+        responseKeys,
+        errorKeys,
+        consumers,
+        ...(hasMismatches && { status: 'MISMATCH' }),
+      });
+    }
+
+    return { routes };
+  }
+
+  /**
    * Rename tool — multi-file coordinated rename using graph + text search.
    * Graph refs are tagged "graph" (high confidence).
    * Additional refs found via text search are tagged "text_search" (lower confidence).
@@ -1355,6 +3443,11 @@ export class LocalBackend {
     new_name: string;
     file_path?: string;
     dry_run?: boolean;
+    // WI-4 (issue #159 P2): additive opt-in for LSP-backed rename.
+    // When `'lsp'`, the tool prefers the LSP `textDocument/rename`
+    // path; any refuse → heuristic fallback with `source:'heuristic'`
+    // + `lsp_status` notice (byte-identical edits, AC-2/AC-3).
+    precision?: 'lsp';
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
     
@@ -1365,15 +3458,17 @@ export class LocalBackend {
       return { error: 'Either symbol_name or symbol_uid is required.' };
     }
 
-    /** Guard: ensure a file path resolves within the repo root (prevents path traversal) */
-    const assertSafePath = (filePath: string): string => {
-      const full = path.resolve(repo.repoPath, filePath);
-      if (!full.startsWith(repo.repoPath + path.sep) && full !== repo.repoPath) {
-        throw new Error(`Path traversal blocked: ${filePath}`);
-      }
-      return full;
-    };
-    
+    /** Local alias — thin closure over the module-level
+     *  `assertSafePath` (security-1 hardening: symlink
+     *  dereference + `mode` gating). Read-mode by default;
+     *  the single write site at the bottom of this method
+     *  passes `'write'` explicitly. The local name shadows
+     *  the module export so the existing call sites
+     *  (`assertSafePath(sym.filePath)`) keep their shape
+     *  while routing through the hardened helper. */
+    const assertSafePath = (filePath: string, mode: 'read' | 'write' = 'read'): string =>
+      assertSafePathForRepo(repo.repoPath, filePath, mode);
+
     // Step 1: Find the target symbol (reuse context's lookup)
     const lookupResult = await this.context(repo, {
       name: params.symbol_name,
@@ -1394,11 +3489,123 @@ export class LocalBackend {
     if (oldName === new_name) {
       return { error: 'New name is the same as the current name.' };
     }
-    
+
+    // ── WI-4 (issue #159 P2): opt-in `precision:'lsp'` branch ────
+    // Top-of-function guard: when the caller asked for the LSP path
+    // AND every gate (server, probe, resolveSymbol, mappable
+    // WorkspaceEdit) succeeds, return early with `source:'lsp'` +
+    // `applyPreciseEdits` apply (KD-2). On ANY gate failure
+    // (funnel returns `null`), fall through to the unchanged
+    // heuristic body below — the caller's `source` becomes
+    // `'heuristic'` with an `lsp_status` notice (AC-2 / AC-3,
+    // byte-identical edits vs. no-`precision`).
+    //
+    // Guards above this point (P5 `oldName===new_name` and P6
+    // `status:'ambiguous'`) have already short-circuited, so the
+    // funnel is only ever called when the symbol is uniquely
+    // resolved and the new name is different.
+    const precision = params.precision;
+    let lspStatus: string | undefined;
+    if (precision === 'lsp' && sym.filePath) {
+      // The funnel needs an absolute `file://` URI for the
+      // target's definition file (used by `didOpen` + as the
+      // LSP requests' `textDocument.uri`). We resolve via
+      // `assertSafePath` so the URI is rooted inside the repo
+      // (Inv-8 / KD-7).
+      let targetUri: string;
+      try {
+        targetUri = pathToFileURL(assertSafePath(sym.filePath)).toString();
+      } catch {
+        targetUri = '';
+      }
+      if (targetUri) {
+        // We need two views of the adapter result:
+        //   - applier shape (`ApplierChangesFile[]`) for the
+        //     precise per-edit splice (KD-2) — carries the raw
+        //     `newText`/`range` the applier needs, plus the
+        //     pre-read `content` (E-1: shared between adapter
+        //     and applier);
+        //   - public display shape (`ChangesFile[]`) for the wire
+        //     output — emitted on the `rename` MCP response.
+        // We compute BOTH shapes inside the funnel callback.
+        // Each adapter reads each file (the second read is a
+        // page-cache hit, cost is negligible). We accept the
+        // redundant read in exchange for not having to
+        // hand-project the applier shape back to the public
+        // shape (S-14 + S-30: remove the hand-projection).
+        const lspResult = await withReferenceProvider(repo, targetUri, async (provider) => {
+          // KD-4: pin the identifier position via `workspace/symbol`.
+          const loc = await provider.resolveSymbol(oldName, sym.filePath);
+          if (!loc) return null;
+          // `textDocument/rename` → `WorkspaceEdit` (or `null` on
+          // server refuse / non-text op).
+          const edit = await provider.rename(loc, new_name);
+          if (!edit) return null;
+          // Public-shape adapter: refuse node_modules/.d.ts/out-of-repo/
+          // multi-line (KD-7).
+          const publicChanges = await workspaceEditToChanges(edit, repo.repoPath);
+          // Applier-shape adapter: also refuse (same gates), but
+          // keep the raw `newText`/`range` and the pre-read
+          // `content` (KD-2 + E-1).
+          const lspChanges = await workspaceEditToApplierChanges(edit, repo.repoPath);
+          if (!publicChanges || !lspChanges) return null;
+          return { publicChanges, lspChanges };
+        });
+        if (lspResult) {
+          const { publicChanges, lspChanges } = lspResult;
+          // KD-2: apply via the precise per-edit applier (NOT the
+          // file-global regex apply at `:3604-3615`, which is
+          // unchanged and stays on the heuristic path). The
+          // applier writes once per file with `dry_run` honored.
+          // The applier takes the `ApplierChangesFile[]` shape
+          // (carries the raw LSP `newText`/`range` and the
+          // pre-read `content` from E-1); the wire output uses
+          // the public `ChangesFile[]` shape.
+          const writeSummary = await applyPreciseEdits(lspChanges, {
+            repoPath: repo.repoPath,
+            dryRun: dry_run,
+          }).catch((e) => { logQueryError('rename:lsp-apply', e); return { written: 0, skipped: 0 }; });
+          return {
+            status: 'success',
+            old_name: oldName,
+            new_name,
+            files_affected: publicChanges.length,
+            total_edits: publicChanges.reduce((sum, c) => sum + c.edits.length, 0),
+            graph_edits: 0,
+            text_search_edits: 0,
+            changes: publicChanges,
+            applied: !dry_run,
+            source: 'lsp',
+            lsp_written: writeSummary.written,
+            lsp_skipped: writeSummary.skipped,
+          };
+        }
+        // Funnel returned `null` — record the notice + fall through
+        // to the heuristic body (byte-identical edits, AC-2).
+        lspStatus = 'LSP unavailable; fell back to heuristic rename.';
+      } else {
+        lspStatus = 'LSP target path could not be resolved; fell back to heuristic rename.';
+      }
+    }
+    // ── end WI-4 branch (fall-through continues to heuristic body) ──
+
     // Step 2: Collect edits from graph (high confidence)
     const changes = new Map<string, { file_path: string; edits: any[] }>();
-    
+
+    // (#37) Track (file, line, oldText, newText) tuples to
+    // dedupe edits. The same import line can be discovered
+    // via two graph edges (e.g. EXTENDS + IMPORTS both
+    // pointing to the same import statement). The previous
+    // addEdit blindly pushed every call, producing two
+    // identical edits on the same line. With dry_run=false
+    // that would attempt to apply the same edit twice. We
+    // dedupe here so callers see one entry per unique
+    // (file, line, oldText, newText) combination.
+    const seenEdits = new Set<string>();
     const addEdit = (filePath: string, line: number, oldText: string, newText: string, confidence: string) => {
+      const key = `${filePath}\0${line}\0${oldText}\0${newText}`;
+      if (seenEdits.has(key)) return;
+      seenEdits.add(key);
       if (!changes.has(filePath)) {
         changes.set(filePath, { file_path: filePath, edits: [] });
       }
@@ -1413,17 +3620,118 @@ export class LocalBackend {
         const lineIdx = sym.startLine - 1;
         if (lineIdx >= 0 && lineIdx < lines.length && lines[lineIdx].includes(oldName)) {
           const defRegex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
-          addEdit(sym.filePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(defRegex, new_name).trim(), 'graph');
+          // (#60) Verify the regex actually finds a match. The
+          // previous String.includes() check is a substring match
+          // (e.g. "getAllBond" is included in "getAllBondCategory")
+          // and the subsequent String.replace() with a word-bounded
+          // regex then produces a no-op edit (old === new),
+          // polluting the edit list. Gate on regex.test() so only
+          // true symbol-accurate matches contribute.
+          defRegex.lastIndex = 0;
+          if (defRegex.test(lines[lineIdx])) {
+            defRegex.lastIndex = 0;
+            addEdit(sym.filePath, sym.startLine, lines[lineIdx].trim(), lines[lineIdx].replace(defRegex, new_name).trim(), 'graph');
+          }
         }
       } catch (e) { logQueryError('rename:read-definition', e); }
     }
 
+    // (#61) Implementation walk: when the user renames a method
+    // declared on an interface, the lookup returns the interface
+    // method's node — the definition edit above covers the
+    // interface file. But callers reference the method via the
+    // implementing class (e.g. BondServiceImpl.getBondById),
+    // and that class's method definition would still use the
+    // old name after the rename, leaving the codebase broken.
+    //
+    // We walk the IMPLEMENTS edge: for each class that
+    // implements the method's parent interface, find the
+    // matching method on the class and add an edit for its
+    // definition line. This ensures the rename covers both
+    // the interface declaration and the implementation.
+    //
+    // We use `lookupResult.incoming.implements` (already
+    // collected below) to find candidate implementing files,
+    // then verify each contains a real word-boundary match
+    // for `oldName` before producing an edit. If `sym` is
+    // not a method, or if the implementing class's method
+    // has a different name (rare but possible via explicit
+    // overrides), the regex test prevents a no-op edit.
+    const symKind = sym.kind || '';
+    if (symKind === 'Method' || symKind === 'Constructor') {
+      try {
+        const implEdges = lookupResult.incoming?.implements || [];
+        for (const implEdge of implEdges) {
+          if (!implEdge.filePath) continue;
+          try {
+            const implContent = await fs.readFile(assertSafePath(implEdge.filePath), 'utf-8');
+            const implLines = implContent.split('\n');
+            for (let i = 0; i < implLines.length; i++) {
+              const line = implLines[i];
+              if (!line.includes(oldName)) continue;
+              if (line.trimStart().startsWith('//') || line.trimStart().startsWith('*')) continue;
+              const implRegex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+              implRegex.lastIndex = 0;
+              if (implRegex.test(line)) {
+                implRegex.lastIndex = 0;
+                addEdit(
+                  implEdge.filePath,
+                  i + 1,
+                  line.trim(),
+                  line.replace(implRegex, new_name).trim(),
+                  'graph',
+                );
+                break;
+              }
+            }
+          } catch (e) { logQueryError('rename:read-impl-definition', e); }
+        }
+      } catch (e) { logQueryError('rename:impl-walk', e); }
+    }
+
     // All incoming refs from graph (callers, importers, etc.)
-    const allIncoming = [
+    //
+    // (#72) For Class/Interface symbols, we explicitly add
+    // the sym's own definition file as a synthetic incoming
+    // entry. This is so the loop below scans the WHOLE file
+    // for word-bounded matches of `oldName`, catching:
+    //   - the class declaration (already added by the
+    //     definition edit at sym.startLine, but only if
+    //     that line passes both substring and regex gates)
+    //   - field declarations referencing the class
+    //     (e.g. `private BondServiceImpl instance;`)
+    //   - constructor invocations
+    //     (e.g. `return new BondServiceImpl();`)
+    //   - static method calls
+    //     (e.g. `BondServiceImpl.staticMethod()`)
+    // The text-search phase (Step 3) skips any file in
+    // `graphFiles`, which includes `sym.filePath`, so the
+    // graph phase is the only chance to surface these
+    // intra-file references. Without this entry, only the
+    // line at `sym.startLine` is captured (via the
+    // definition edit), and other uses in the same file
+    // are permanently missed.
+    //
+    // The synthetic entry uses the same shape as the real
+    // graph entries (`{ filePath, name, uid, kind }`) so
+    // the loop below treats it identically. The `seenEdits`
+    // Set (#37) dedupes the synthetic entry's edit at
+    // `sym.startLine` against the earlier definition edit.
+    const symIsClassLike = sym.kind === 'Class' || sym.kind === 'Interface';
+    const allIncoming: IncomingRef[] = [
+      ...(symIsClassLike && sym.filePath
+        ? [{
+            filePath: sym.filePath,
+            name: sym.name,
+            uid: sym.uid,
+            kind: sym.kind,
+          }]
+        : []),
       ...(lookupResult.incoming.calls || []),
       ...(lookupResult.incoming.imports || []),
       ...(lookupResult.incoming.extends || []),
       ...(lookupResult.incoming.implements || []),
+      ...(lookupResult.incoming.accesses || []),
     ];
     
     let graphEdits = changes.size > 0 ? 1 : 0; // count definition edit
@@ -1435,9 +3743,54 @@ export class LocalBackend {
         const lines = content.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].includes(oldName)) {
-            addEdit(ref.filePath, i + 1, lines[i].trim(), lines[i].replace(new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'), new_name).trim(), 'graph');
-            graphEdits++;
-            break; // one edit per file from graph refs
+            // (#60) Same gate as the definition edit: substring
+            // match is too loose, so verify the word-bounded
+            // regex finds a real match before producing an
+            // edit. The reproduction in #60 was renaming
+            // `getAllBond` on BondService — the IMPLEMENTS edge
+            // from AssetDetailServiceImpl pulled its file into
+            // the rename, and lines like
+            // `protected ... getAllBondCategory() {` matched
+            // String.includes('getAllBond') but the regex found
+            // nothing — producing a no-op edit.
+            const refRegex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+            refRegex.lastIndex = 0;
+            if (refRegex.test(lines[i])) {
+              refRegex.lastIndex = 0;
+              addEdit(ref.filePath, i + 1, lines[i].trim(), lines[i].replace(refRegex, new_name).trim(), 'graph');
+              // (#62) (#63) Do NOT break here. Previous code
+              // exited the inner line loop after the first
+              // substring match — even when the regex gate
+              // (#60) rejected it as a false positive. That
+              // caused two distinct bugs:
+              //
+              //   #62 — `getAllBondCategory` matches
+              //     String.includes('getAllBond') and the regex
+              //     gate rejects it, but the `break` still fired,
+              //     skipping later actual call sites of
+              //     `getAllBond` in the same file. Symptom:
+              //     false positives, missed call sites.
+              //
+              //   #63 — even when a true match was found, the
+              //     `break` exited the loop, so subsequent
+              //     occurrences of the same name on later
+              //     lines were never visited. The text-search
+              //     phase skips files already covered by the
+              //     graph (`graphFiles`), so duplicates in
+              //     graph-covered files were permanently
+              //     missed. Symptom: only the first occurrence
+              //     per file was edited.
+              //
+              // Continue scanning all lines in the file. The
+              // `seenEdits` Set (added in #37) dedupes
+              // identical edits, and the regex gate
+              // prevents no-op edits. The `graphEdits++`
+              // counter lives INSIDE the regex-success branch
+              // so it now counts only genuine edits (matches
+              // the `text_search` counter's behavior and
+              // makes the metric meaningful).
+              graphEdits++;
+            }
           }
         }
       } catch (e) { logQueryError('rename:read-ref', e); }
@@ -1461,7 +3814,7 @@ export class LocalBackend {
       const files = output.trim().split('\n').filter(f => f.length > 0);
       
       for (const file of files) {
-        const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
+        const normalizedFile = normalizeFilePath(file);
         if (graphFiles.has(normalizedFile)) continue; // already covered by graph
         
         try {
@@ -1488,7 +3841,13 @@ export class LocalBackend {
       // Apply edits to files
       for (const change of allChanges) {
         try {
-          const fullPath = assertSafePath(change.file_path);
+          // `mode: 'write'` — refuses to operate on a path
+          // whose target is missing (a write to a non-
+          // existent file is suspicious; the rename tool
+          // only edits existing files). Symlink-bridged
+          // escapes are caught by the `realpathSync` step
+          // in `assertSafePathForRepo`.
+          const fullPath = assertSafePath(change.file_path, 'write');
           let content = await fs.readFile(fullPath, 'utf-8');
           const regex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
           content = content.replace(regex, new_name);
@@ -1507,6 +3866,13 @@ export class LocalBackend {
       text_search_edits: astSearchEdits,
       changes: allChanges,
       applied: !dry_run,
+      // WI-4: the heuristic body is the default path (and the
+      // LSP-branch fallback). `source` annotates the provenance
+      // (AC-7). `lsp_status` is set ONLY when `precision:'lsp'`
+      // was requested AND the funnel refused — it surfaces the
+      // notice in a structured form for the caller.
+      source: 'heuristic',
+      ...(lspStatus ? { lsp_status: lspStatus } : {}),
     };
   }
 
@@ -1517,7 +3883,22 @@ export class LocalBackend {
     relationTypes?: string[];
     includeTests?: boolean;
     minConfidence?: number;
+    // (#159 P2) WI-5: opt-in LSP provenance. Forwarded to
+    // `_impactImpl` unchanged. The `params` shape is pass-through
+    // to `_impactImpl`, so adding the field here is purely
+    // additive — the existing call sites that omit it see no
+    // behavior change.
+    precision?: 'lsp';
   }): Promise<any> {
+    // Validate minConfidence range (#66). Reject out-of-range values explicitly
+    // so callers learn about the 0-1 contract instead of silently getting
+    // an empty result set (minConfidence=1.5 reads as "no result above 150%").
+    if (params.minConfidence !== undefined &&
+        (params.minConfidence < 0 || params.minConfidence > 1)) {
+      throw new Error(
+        `minConfidence must be between 0 and 1 (got ${params.minConfidence})`
+      );
+    }
     try {
       return await this._impactImpl(repo, params);
     } catch (err: any) {
@@ -1540,10 +3921,25 @@ export class LocalBackend {
     relationTypes?: string[];
     includeTests?: boolean;
     minConfidence?: number;
+    // (#53) Disambiguate overloaded methods (interface vs impl) by file path,
+    // matching the `context` tool's `file_path` parameter contract. Forwarded
+    // to the name-resolution sub-queries so the candidate whose filePath
+    // contains the suffix is preferred.
+    file_path?: string;
+    // (#159 P2) WI-5: opt-in LSP provenance + union-seeding on the d=1
+    // caller set. Additive (omitted ⇒ byte-stable). Acts ONLY when
+    // `precision==='lsp' && direction==='upstream'`; any other
+    // combination is a no-op identical to the no-precision path.
+    // See design doc `## Contracts` (impact) + KD-5.
+    precision?: 'lsp';
   }): Promise<any> {
     await this.ensureInitialized(repo.id);
-    
+
     const { target, direction } = params;
+    const isQualified = target.includes(':') || target.includes('/');
+    // For uid-format targets (e.g. "Class:UserController"), extract the name
+    // part for name-based fallback lookups.
+    const targetName = isQualified ? (target.split(/[:/]/).pop() ?? target) : target;
     const maxDepth = params.maxDepth || 3;
     const rawRelTypes = params.relationTypes && params.relationTypes.length > 0
       ? params.relationTypes.filter(t => VALID_RELATION_TYPES.has(t))
@@ -1563,49 +3959,192 @@ export class LocalBackend {
     let sym: any = null;
     let symType = '';
 
-    try {
-      const rows = await executeParameterized(repo.id, `
-        MATCH (n:\`Class\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Interface\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Function\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Method\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Constructor\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority LIMIT 1
-      `, { targetName: target }).catch(() => []);
-
-      if (rows.length > 0) {
-        // Pick the row with the lowest priority value (Class wins over Constructor)
-        const best = rows.reduce((a: any, b: any) =>
-          (a.priority ?? a[3] ?? 99) <= (b.priority ?? b[3] ?? 99) ? a : b,
-        );
-        sym = best;
-        const priorityToLabel = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
-        symType = priorityToLabel[best.priority ?? best[3]] ?? '';
-      }
-    } catch { /* fall through to unlabeled match */ }
-
-    // Fall back to unlabeled match for any other node type
-    if (!sym) {
-      const rows = await executeParameterized(repo.id, `
-        MATCH (n)
-        WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath
+    // If target looks like a uid (Type:Name or path/Name), try exact id match first
+    if (isQualified) {
+      const uidRows = await executeParameterized(repo.id, `
+        MATCH (n) WHERE n.id = $targetName
+        RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath
         LIMIT 1
-      `, { targetName: target });
-      if (rows.length > 0) sym = rows[0];
+      `, { targetName: target }).catch((e) => { logQueryError('impact:uid-resolution', e); return []; });
+      if (uidRows.length > 0) {
+        sym = uidRows[0];
+        symType = sym.type || '';
+      }
+    }
+
+    if (!sym) {
+      try {
+        // (#10) Collect ALL matches across types, not just the first per type.
+        // When a name like "GetOrder" exists in multiple files (e.g., a
+        // service method and a handler method), silently picking the first
+        // candidate gives a misleading blast radius. Mirror the `context`
+        // tool's `status: 'ambiguous'` contract so callers can disambiguate
+        // with `file_path` rather than receive silently-wrong results.
+        const rows = await executeParameterized(repo.id, `
+          MATCH (n:\`Class\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority
+          UNION ALL
+          MATCH (n:\`Interface\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority
+          UNION ALL
+          MATCH (n:\`Function\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority
+          UNION ALL
+          MATCH (n:\`Method\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority
+          UNION ALL
+          MATCH (n:\`Constructor\`) WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority
+        `, { targetName }).catch(() => []);
+
+        if (rows.length > 0) {
+          const filePathFilter = params.file_path;
+          const fpLower = filePathFilter?.toLowerCase();
+          // Build a deduplicated, priority-sorted list of candidates. Two
+          // rows with the same id are a single candidate.
+          const uniqueById = new Map<string, any>();
+          for (const r of rows) {
+            const id = r.id || r[0];
+            if (id && !uniqueById.has(id)) uniqueById.set(id, r);
+          }
+          const candidates = Array.from(uniqueById.values()).sort(
+            (a, b) => (a.priority ?? a[3] ?? 99) - (b.priority ?? b[3] ?? 99),
+          );
+
+          // (#53) If `file_path` is supplied, prefer the row whose filePath
+          // contains it as a suffix. This disambiguates interface-vs-impl
+          // overloading (e.g., `unholdMoney` defined in both
+          // CashService.java and CashServiceV2Impl.java).
+          if (fpLower) {
+            const matched = candidates.find((r: any) => {
+              const fp = (r.filePath ?? r[2] ?? '') as string;
+              return fp && fp.toLowerCase().endsWith(fpLower);
+            });
+            if (matched) {
+              sym = matched;
+            }
+          }
+          if (!sym) {
+            // (#10) When a name matches multiple distinct files (e.g.,
+            // GetOrder in handlers/ vs services/), the result is genuinely
+            // ambiguous — picking one candidate silently mis-states the
+            // blast radius. Surface the ambiguity in a structured shape
+            // the caller can act on (re-run with file_path, or inspect
+            // candidates). Same-file matches (e.g., a Class and its
+            // Constructor with the same name) silently prefer Class via
+            // the priority sort, mirroring #480.
+            const distinctFiles = new Set(
+              candidates.map((r: any) => (r.filePath ?? r[2] ?? '') as string),
+            );
+            if (candidates.length > 1 && distinctFiles.size > 1) {
+              return {
+                status: 'ambiguous',
+                target: targetName,
+                candidates: candidates.map((r: any) => ({
+                  uid: r.id || r[0],
+                  name: r.name || r[1],
+                  kind: ['Class', 'Interface', 'Function', 'Method', 'Constructor'][
+                    r.priority ?? r[3]
+                  ] ?? '',
+                  filePath: r.filePath || r[2],
+                })),
+                suggestion:
+                  'Re-run with file_path parameter to scope impact analysis to a single candidate (matches the context tool contract).',
+              };
+            }
+            sym = candidates[0];
+          }
+          const priorityToLabel = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
+          symType = priorityToLabel[sym.priority ?? sym[3]] ?? '';
+        }
+      } catch { /* fall through to unlabeled match */ }
+
+      // Fall back to unlabeled match for any other node type
+      if (!sym) {
+        const rows = await executeParameterized(repo.id, `
+          MATCH (n)
+          WHERE n.name = $targetName
+          RETURN n.id AS id, n.name AS name, labels(n) AS type, n.filePath AS filePath
+          LIMIT 1
+        `, { targetName });
+        if (rows.length > 0) {
+          // (#53) Honor `file_path` for disambiguation if a filePath matches
+          // the supplied suffix; otherwise pick the first row as before.
+          const fpLower = params.file_path?.toLowerCase();
+          const matched = fpLower
+            ? rows.find((r: any) => {
+                const fp = (r.filePath ?? r[3] ?? '') as string;
+                return fp && fp.toLowerCase().endsWith(fpLower);
+              })
+            : undefined;
+          sym = matched ?? rows[0];
+          symType = sym.type || sym[2] || '';
+        }
+      }
     }
 
     if (!sym) return { error: `Target '${target}' not found` };
 
     const symId = sym.id || sym[0];
+    const symFilePath = (sym.filePath ?? sym[3] ?? '') as string;
+
+    // ── (#159 P2) WI-5: opt-in LSP provenance + union-seeding ─────
+    // Resolves the target sym's location via LSP, gathers
+    // textDocument/references, and maps each reference to a
+    // graph nodeId. The result `lspIds` is the set of CALLERS
+    // the LSP server sees for this target — superset of the
+    // graph's d=1 set. `null` ⇒ refuse (no LSP enrichment,
+    // graph result unchanged). The union with the d=1
+    // heuristic set happens INSIDE the BFS loop (see below) at
+    // the depth-1 boundary; appending to visited/frontier after
+    // the loop exits would be a no-op (KD-5).
+    //
+    // Compute ONLY when precision==='lsp' && direction==='upstream'.
+    // For downstream + precision:'lsp' (or any other combo),
+    // `lspIds` stays `null` ⇒ the BFS runs unchanged.
+    let lspIds: Set<string> | null = null;
+    if (params.precision === 'lsp' && direction === 'upstream') {
+      const targetFileUri = symFilePath
+        ? (symFilePath.startsWith('file://') ? symFilePath : pathToFileURL(path.resolve(symFilePath)).href)
+        : '';
+      lspIds = await withReferenceProvider(
+        repo as any,
+        targetFileUri,
+        async (provider) => {
+          // Resolve the identifier position for the target. We
+          // pass `symFilePath` as a hint so the funnel can
+          // narrow `workspace/symbol` when the name is common.
+          // `null` ⇒ refuse.
+          const loc = await provider.resolveSymbol(targetName, symFilePath || undefined);
+          if (!loc) return null;
+          // Gather LSP references (caller positions).
+          // `null` ⇒ refuse; `[]` ⇒ empty set (legitimate answer,
+          // the union is empty, no entry to add).
+          const refs = await provider.references(loc);
+          if (refs === null) return null;
+          // Map each Location → nodeId. NO_NODE and AMBIGUOUS
+          // are skipped (refuse over guess) — they are NOT
+          // errors; they are expected outcomes for references
+          // in non-indexed files or with multi-match positions.
+          const ids = new Set<string>();
+          for (const ref of refs) {
+            const mapped: MapperResult = await mapLocationToNodeId(ref, repo.id);
+            // MapperResult: { kind: 'node', nodeId } | { kind: 'NO_NODE' } | { kind: 'AMBIGUOUS' }
+            if (mapped.kind === 'node' && typeof mapped.nodeId === 'string') {
+              ids.add(mapped.nodeId);
+            }
+          }
+          return ids;
+        },
+      );
+      // `lspIds` is `Set<string> | null` — the funnel returns
+      // `null` on any gate failure and the fn's resolved value
+      // (an empty Set on the "ran, found no callers" branch)
+      // otherwise. The downstream `if (lspIds)` guard handles
+      // the null case correctly; the `undefined` normalization
+      // is dead because the funnel never resolves to `undefined`
+      // (S-16).
+    }
 
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
@@ -1621,12 +4160,30 @@ export class LocalBackend {
     // upstream dependent. The BFS will discover IMPORTS edges on it naturally.
     if (symType === 'Class' || symType === 'Interface') {
       try {
-        // Run both seed queries in parallel — they are independent.
-        const [ctorRows, fileRows] = await Promise.all([
+        // Run all seed queries in parallel — they are independent.
+        //
+        // (#75) Class nodes have HAS_METHOD edges to BOTH Constructor and
+        // Method nodes. The original seed only collected Constructor (which
+        // is enough for typical Java bean patterns but misses real service
+        // methods like `pricingIConnect` that hold the actual downstream
+        // CALLS edges). Pull both node types so the BFS reaches method-level
+        // edges at depth 2+, making `maxDepth` actually meaningful for
+        // class-level impact analysis.
+        //
+        // Note: Method nodes are added to the BFS frontier but NOT to
+        // `visited` — they must be discoverable as HAS_METHOD results at
+        // depth 1 (the legitimate "direct callers" of the class). Adding
+        // them to `visited` would dedupe those legitimate results away.
+        const [ctorRows, methodRows, fileRows] = await Promise.all([
           executeParameterized(repo.id, `
             MATCH (n)-[hm:CodeRelation]->(c:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
             RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
+          `, { symId }),
+          executeParameterized(repo.id, `
+            MATCH (n)-[hm:CodeRelation]->(m:Method)
+            WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+            RETURN m.id AS id, m.name AS name, labels(m)[0] AS type, m.filePath AS filePath
           `, { symId }),
           // Restrict to DEFINES edges only — other File->Class edge types (if
           // any) should not be treated as the owning file relationship.
@@ -1637,9 +4194,19 @@ export class LocalBackend {
           `, { symId }),
         ]);
 
+        // Constructors: add to both visited and frontier (Java class↔ctor
+        // name collision; they have no incoming HAS_METHOD from the class).
         for (const r of ctorRows) {
           const rid = r.id || r[0];
           if (rid && !visited.has(rid)) { visited.add(rid); frontier.push(rid); }
+        }
+        // Methods: add to frontier ONLY (not visited) so the depth-1
+        // HAS_METHOD edges from the Class are still discoverable. The
+        // Methods are already the targets of those edges, so we want to
+        // traverse FROM them at depth 2+ (their outgoing CALLS, etc.).
+        for (const r of methodRows) {
+          const rid = r.id || r[0];
+          if (rid && !frontier.includes(rid)) { frontier.push(rid); }
         }
         for (const r of fileRows) {
           const rid = r.id || r[0];
@@ -1648,48 +4215,99 @@ export class LocalBackend {
             frontier.push(rid);
           }
         }
+
+        // (#36) Seed frontier with interfaces the class implements AND
+        // their owning files. In typical Java/Spring code, callers depend
+        // on the interface, not the implementation — and the caller's
+        // file-level IMPORTS edge points to the INTERFACE FILE, not the
+        // interface node itself. Without seeding the interface's file,
+        // the BFS would never see `callerFile -[IMPORTS]-> interfaceFile`.
+        // We also seed the interface node so callers via IMPLEMENTS
+        // (other classes implementing the same interface) are reached.
+        if (symType === 'Class') {
+          const [ifaceRows, ifaceFileRows] = await Promise.all([
+            executeParameterized(repo.id, `
+              MATCH (n)-[impl:CodeRelation {type: 'IMPLEMENTS'}]->(iface:Interface)
+              WHERE n.id = $symId
+              RETURN iface.id AS id, iface.name AS name, labels(iface)[0] AS type, iface.filePath AS filePath
+            `, { symId }).catch((e) => { logQueryError('impact:interface-seed', e); return []; }),
+            executeParameterized(repo.id, `
+              MATCH (n)-[impl:CodeRelation {type: 'IMPLEMENTS'}]->(iface:Interface)
+              WHERE n.id = $symId
+              MATCH (f:File)-[d2:CodeRelation {type: 'DEFINES'}]->(iface)
+              RETURN f.id AS id, f.name AS name, labels(f)[0] AS type, f.filePath AS filePath
+            `, { symId }).catch((e) => { logQueryError('impact:interface-file-seed', e); return []; }),
+          ]);
+          for (const r of ifaceRows) {
+            const rid = r.id || r[0];
+            if (rid && !visited.has(rid)) {
+              visited.add(rid);
+              frontier.push(rid);
+            }
+          }
+          for (const r of ifaceFileRows) {
+            const rid = r.id || r[0];
+            if (rid && !visited.has(rid)) {
+              visited.add(rid);
+              frontier.push(rid);
+            }
+          }
+        }
       } catch (e) {
         logQueryError('impact:class-node-expansion', e);
       }
     }
-    
+
     for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
       const nextFrontier: string[] = [];
-      
+
       // Batch frontier nodes into a single Cypher query per depth level
       const idList = frontier.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
       const query = direction === 'upstream'
         ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence`
         : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
-      
+
       try {
         const related = await executeQuery(repo.id, query);
-        
+
         for (const rel of related) {
           const relId = rel.id || rel[1];
           const filePath = rel.filePath || rel[4] || '';
-          
+
           if (!includeTests && isTestFilePath(filePath)) continue;
-          
+
           if (!visited.has(relId)) {
             visited.add(relId);
             nextFrontier.push(relId);
-            const storedConfidence = rel.confidence ?? rel[6];
-            const relationType = rel.relType || rel[5];
-            // Prefer the stored confidence from the graph (set at analysis time);
-            // fall back to the per-type floor for edges without a stored value.
-            const effectiveConfidence =
-              typeof storedConfidence === 'number' && storedConfidence > 0
-                ? storedConfidence
-                : confidenceForRelType(relationType);
+            // (S-17 + S-22) At d=1, tag the entry as 'both' or
+            // 'heuristic' right here, in the push loop. The
+            // lsp-only stub pass below (still inside this d=1
+            // iteration) adds the lsp-only entries with
+            // source:'lsp'. No post-hoc re-walk of `impacted`
+            // is needed — the d1GraphRaw Set + the second
+            // for-loop are deleted (S-17).
+            //
+            // The source field is only set when the funnel
+            // returned a non-null `lspIds`. When the funnel
+            // refused (`lspIds === null`), we leave the field
+            // OFF so legacy consumers see "no source field"
+            // (the AC-10 byte-identical contract: precision
+            // mode does not change the wire shape when the LSP
+            // path refused at any gate). The M4/M4b/M4c tests
+            // pin this behavior.
+            let source: 'lsp' | 'heuristic' | 'both' | undefined;
+            if (depth === 1 && lspIds) {
+              source = lspIds.has(relId) ? 'both' : 'heuristic';
+            }
             impacted.push({
               depth,
               id: relId,
               name: rel.name || rel[2],
               type: rel.type || rel[3],
               filePath,
-              relationType,
-              confidence: effectiveConfidence,
+              relationType: rel.relType || rel[5],
+              confidence: rel.confidence || rel[6] || 1.0,
+              ...(source !== undefined ? { source } : {}),
             });
           }
         }
@@ -1700,7 +4318,43 @@ export class LocalBackend {
         traversalComplete = false;
         break;
       }
-      
+
+      // ── (#159 P2) WI-5: depth-1 boundary LSP union (KD-5) ────────
+      // The load-bearing KD-5 invariant: the union MUST happen
+      // INSIDE the loop, at the depth-1 iteration, AFTER the
+      // graph query at d=1 has run and BEFORE the loop advances
+      // to d=2. Post-loop appending is a no-op — the BFS is
+      // driven by the `frontier` array, which has already moved
+      // on.
+      //
+      // d=1 graph entries are tagged at the push site above
+      // (S-17 + S-22 — single-pass). The lsp-only stubs are
+      // added HERE (S-17). No re-walk of `impacted` is needed.
+      //
+      // No-ops (graph unchanged) when `lspIds === null`
+      // (provider refused at any gate). When lspIds is an
+      // empty Set, the union loop is a no-op and every d=1
+      // graph entry got 'heuristic' above — correct: precision
+      // mode is active but the LSP path found no callers.
+      if (depth === 1 && lspIds) {
+        for (const id of lspIds) {
+          if (id === symId) continue;          // never the target itself
+          if (visited.has(id)) continue;        // already graph-resident (graph ∩ lsp)
+          visited.add(id);
+          nextFrontier.push(id);
+          impacted.push({
+            depth: 1,
+            id,
+            name: id,                           // lsp-only stub (no name from LSP)
+            type: '',                           // unknown without graph
+            filePath: '',                       // unknown without graph
+            relationType: 'CALLS',              // best-effort: LSP references are call-shaped
+            confidence: 1.0,
+            source: 'lsp',
+          });
+        }
+      }
+
       frontier = nextFrontier;
     }
     
@@ -1716,219 +4370,90 @@ export class LocalBackend {
     let affectedModules: any[] = [];
 
     if (impacted.length > 0) {
+      const allIdsArr = impacted.map(i => i.id);
+      const d1IdsArr = (grouped[1] || []).map((i: any) => i.id);
+
+      // Chunk IDs into batches of 100 for parameterized queries
       const CHUNK_SIZE = 100;
-      // Max number of chunks to process to avoid unbounded DB round-trips.
-      // Configurable via env IMPACT_MAX_CHUNKS, default 10 => max items = 1000
-      const MAX_CHUNKS = parseInt(process.env.IMPACT_MAX_CHUNKS || '10', 10);
+      const chunkIds = (ids: string[]): string[][] => {
+        const chunks: string[][] = [];
+        for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+          chunks.push(ids.slice(i, i + CHUNK_SIZE));
+        }
+        return chunks;
+      };
 
-      // ── Process enrichment: batched chunking (bounded by MAX_CHUNKS) ─
-      // Uses merged Cypher query (WITH + OPTIONAL MATCH) to fetch
-      // process + entry point info in 1 round-trip per chunk. Converted to
-      // parameterized queries to avoid manual string escaping and long query strings.
-      const entryPointMap = new Map<string, {
-        name: string; type: string; filePath: string;
-        affected_process_count: number;
-        total_hits: number;
-        earliest_broken_step: number;
-      }>();
-
-      // Map process id -> entryPointId to allow fixing missing minStep values later
-      const processToEntryPoint = new Map<string, string>();
-      // Collect process ids where MIN(r.step) returned null so we can retry in batch
-      const processesMissingMinStep = new Set<string>();
-
+      // Affected processes: which execution flows are broken and at which step
+      const maxChunks = parseInt(process.env.IMPACT_MAX_CHUNKS || '999999', 10);
+      const processChunks = chunkIds(allIdsArr);
+      const processRows: any[] = [];
+      const processedIds: string[] = [];
       let chunksProcessed = 0;
-      for (let i = 0; i < impacted.length && chunksProcessed < MAX_CHUNKS; i += CHUNK_SIZE, chunksProcessed++) {
-        const chunk = impacted.slice(i, i + CHUNK_SIZE);
-        const ids = chunk.map(item => String(item.id ?? ''));
+      for (const chunk of processChunks) {
+        if (chunksProcessed >= maxChunks) {
+          traversalComplete = false;
+          break;
+        }
+        processedIds.push(...chunk);
+        const result = await executeParameterized(repo.id, `
+          MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+          WHERE s.id IN $ids
+          RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
+          ORDER BY hits DESC
+          LIMIT 20
+        `, { ids: chunk }).catch(() => []);
+        processRows.push(...result);
+        chunksProcessed++;
+      }
 
-        try {
-          // Use parameterized list to avoid building long query strings
-          const rows = await executeParameterized(repo.id, `
-            MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-            WHERE s.id IN $ids
-            WITH p, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep
-            OPTIONAL MATCH (ep {id: p.entryPointId})
-            RETURN p.id AS pId, p.heuristicLabel AS name, p.processType AS processType,
-                   p.entryPointId AS entryPointId, hits, minStep, p.stepCount AS stepCount,
-                   ep.name AS epName, labels(ep)[0] AS epType, ep.filePath AS epFilePath
-          `, { ids }).catch(() => []);
-
-          for (const row of rows) {
-            const pId = row.pId ?? row[0];
-            const epId = row.entryPointId ?? row[3] ?? row.pId ?? row[0];
-            // Track mapping from process -> entryPoint so we can backfill missing minStep
-            if (pId) processToEntryPoint.set(String(pId), String(epId));
-
-             // Normalize epName: prefer epName, fall back to other columns, and
-             // ensure we don't keep an empty string (labels(...) can return "").
-             const epNameRaw = row.epName ?? row[7] ?? row.name ?? row[1] ?? 'unknown';
-             const epName = (typeof epNameRaw === 'string' && epNameRaw.trim().length > 0) ? epNameRaw.trim() : 'unknown';
-
-             // Normalize epType: labels(ep)[0] can return an empty string in
-             // some DBs (LadybugDB). Using nullish coalescing (??) preserves
-             // empty strings, which results in empty `type` values being
-             // propagated. Treat empty-string labels as missing and fall back
-             // to the next candidate or a sensible default.
-             const epTypeRaw = row.epType ?? row[8] ?? '';
-             const epType = (typeof epTypeRaw === 'string' && epTypeRaw.trim().length > 0)
-               ? epTypeRaw.trim()
-               : 'Function';
-
-             const epFilePath = row.epFilePath ?? row[9] ?? '';
-             const hits = row.hits ?? row[4] ?? 0;
-             const minStep = row.minStep ?? row[5];
-             // If the DB returned null for minStep, note the process id so we
-             // can run a follow-up query using a different aggregation strategy.
-             if (minStep === null || minStep === undefined) {
-               if (pId) processesMissingMinStep.add(String(pId));
-             }
-             if (!entryPointMap.has(epId)) {
-               entryPointMap.set(epId, {
-                 name: epName,
-                 type: epType,
-                 filePath: epFilePath,
-                 affected_process_count: 0,
-                 total_hits: 0,
-                 earliest_broken_step: Infinity,
-               });
-             }
-             const ep = entryPointMap.get(epId)!;
-             ep.affected_process_count += 1;
-             ep.total_hits += hits;
-             ep.earliest_broken_step = Math.min(ep.earliest_broken_step, minStep ?? Infinity);
-           }
-         } catch (e) {
-           logQueryError('impact:process-chunk', e);
-         }
-       }
-
-      // If some processes returned null minStep, try a batched follow-up query
-      // using the full impacted id set. This handles older indexes or DBs
-      // where MIN(r.step) can come back null even when step properties exist.
-      if (processesMissingMinStep.size > 0) {
-        try {
-          const pIds = Array.from(processesMissingMinStep);
-          const allImpactedIds = impacted.map(it => String(it.id ?? ''));
-          const missingRows = await executeParameterized(repo.id, `
-            MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-            WHERE p.id IN $pIds AND s.id IN $ids
-            RETURN p.id AS pid, MIN(r.step) AS minStep
-          `, { pIds, ids: allImpactedIds }).catch(() => []);
-
-          for (const mr of missingRows) {
-            const pid = mr.pid ?? mr[0];
-            const minStep = mr.minStep ?? mr[1];
-            const epId = processToEntryPoint.get(String(pid));
-            if (!epId) continue;
-            const ep = entryPointMap.get(epId);
-            if (!ep) continue;
-            if (typeof minStep === 'number') {
-              ep.earliest_broken_step = Math.min(ep.earliest_broken_step, minStep);
-            }
-          }
-        } catch (e) {
-          logQueryError('impact:process-chunk-backfill', e);
+      // Re-aggregate and limit to top 20 after merging all chunks
+      const aggregatedProcesses = new Map<string, any>();
+      for (const row of processRows) {
+        const key = row.name;
+        if (aggregatedProcesses.has(key)) {
+          const existing = aggregatedProcesses.get(key);
+          existing.hits += row.hits;
+          if (row.minStep < existing.minStep) existing.minStep = row.minStep;
+        } else {
+          aggregatedProcesses.set(key, { ...row });
         }
       }
-
-      // If we capped chunks, mark traversal incomplete so caller knows results are partial
-      if (chunksProcessed * CHUNK_SIZE < impacted.length) {
-        traversalComplete = false;
-      }
-
-       affectedProcesses = Array.from(entryPointMap.values())
-         .map(ep => ({
-           ...ep,
-           earliest_broken_step: ep.earliest_broken_step === Infinity ? null : ep.earliest_broken_step,
-         }))
-         .sort((a, b) => b.total_hits - a.total_hits);
-
-      // ── Module enrichment: use same cap as process enrichment and parameterized queries
-      const maxItems = Math.min(impacted.length, MAX_CHUNKS * CHUNK_SIZE);
-      const cappedImpacted = impacted.slice(0, maxItems);
-      const allIdsArr = cappedImpacted.map((i: any) => String(i.id ?? ''));
-      const d1Items = (grouped[1] || []).slice(0, maxItems);
-      const d1IdsArr = d1Items.map((i: any) => String(i.id ?? ''));
-
-      // Chunked module enrichment: run the MEMBER_OF queries in chunks
-      // to avoid large single queries or concurrent Kuzu calls that can
-      // crash (SIGSEGV) on arm64 macOS; behavior preserves existing maxItems cap and returns equivalent aggregated results.
-      const moduleHitsMap = new Map<string, number>();
-      const directModuleSet = new Set<string>();
-
-      // Helper to run a single module chunk and accumulate hits by name
-      const runModuleChunk = async (idsChunk: string[]) => {
-        if (!idsChunk || idsChunk.length === 0) return;
-        try {
-          const rows = await executeParameterized(repo.id, `
-            MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-            WHERE s.id IN $ids
-            RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
-            ORDER BY hits DESC
-            LIMIT 20
-          `, { ids: idsChunk }).catch(() => []);
-
-          for (const r of rows) {
-            const name = r.name ?? r[0] ?? null;
-            const hits = (r.hits ?? r[1]) || 0;
-            if (!name) continue;
-            moduleHitsMap.set(name, (moduleHitsMap.get(name) || 0) + hits);
-          }
-        } catch (e) {
-          logQueryError('impact:module-chunk', e);
-        }
-      };
-
-      // Run module query chunks sequentially (safe on arm64 macOS)
-      for (let i = 0; i < allIdsArr.length; i += CHUNK_SIZE) {
-        const chunkIds = allIdsArr.slice(i, i + CHUNK_SIZE);
-        await runModuleChunk(chunkIds);
-      }
-
-      // Run direct module query similarly (distinct heuristic labels for depth-1 items)
-      const runDirectModuleChunk = async (idsChunk: string[]) => {
-        if (!idsChunk || idsChunk.length === 0) return;
-        try {
-          const rows = await executeParameterized(repo.id, `
-            MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-            WHERE s.id IN $ids
-            RETURN DISTINCT c.heuristicLabel AS name
-          `, { ids: idsChunk }).catch(() => []);
-          for (const r of rows) {
-            const name = r.name ?? r[0] ?? null;
-            if (name) directModuleSet.add(name);
-          }
-        } catch (e) {
-          logQueryError('impact:direct-module-chunk', e);
-        }
-      };
-
-      for (let i = 0; i < d1IdsArr.length; i += CHUNK_SIZE) {
-        const chunkIds = d1IdsArr.slice(i, i + CHUNK_SIZE);
-        await runDirectModuleChunk(chunkIds);
-      }
-
-      // Build final moduleRows array from aggregated hits map, sorted & limited
-      const moduleRows = Array.from(moduleHitsMap.entries())
-        .map(([name, hits]) => ({ name, hits }))
+      const topProcesses = Array.from(aggregatedProcesses.values())
         .sort((a, b) => b.hits - a.hits)
         .slice(0, 20);
 
-      const directModuleRows = Array.from(directModuleSet).map(name => ({ name }));
+      const [moduleRows, directModuleRows] = await Promise.all([
+        executeQuery(repo.id, `
+          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE s.id IN [${processedIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]
+          RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
+          ORDER BY hits DESC
+          LIMIT 20
+        `).catch(() => []),
+        d1IdsArr.length > 0 ? executeQuery(repo.id, `
+          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE s.id IN [${d1IdsArr.filter(id => processedIds.includes(id)).map(id => `'${id.replace(/'/g, "''")}'`).join(', ')}]
+          RETURN DISTINCT c.heuristicLabel AS name
+        `).catch(() => []) : Promise.resolve([]),
+      ]);
 
-      // Build affectedModules in the same shape as original implementation
-      const directModuleNameSet = new Set(directModuleRows.map((r: any) => r.name || r[0]));
+      affectedProcesses = topProcesses.map((r: any) => ({
+        name: r.name || r[0],
+        total_hits: r.hits || r[1],
+        broken_at_step: r.minStep ?? r[2],
+        step_count: r.stepCount ?? r[3],
+      }));
+
+      const directModuleSet = new Set(directModuleRows.map((r: any) => r.name || r[0]));
       affectedModules = moduleRows.map((r: any) => {
-        const name = r.name ?? r[0];
-        const hits = r.hits ?? r[1] ?? 0;
+        const name = r.name || r[0];
         return {
           name,
-          hits,
-          impact: directModuleNameSet.has(name) ? 'direct' : 'indirect',
+          hits: r.hits || r[1],
+          impact: directModuleSet.has(name) ? 'direct' : 'indirect',
         };
       });
-     }
+    }
 
     // Risk scoring
     const processCount = affectedProcesses.length;
@@ -1946,8 +4471,8 @@ export class LocalBackend {
       target: {
         id: symId,
         name: sym.name || sym[1],
-        type: symType,
-        filePath: sym.filePath || sym[2],
+        type: sym.type || sym[2],
+        filePath: sym.filePath || sym[3],
       },
       direction,
       impactedCount: impacted.length,
@@ -1962,348 +4487,6 @@ export class LocalBackend {
       affected_modules: affectedModules,
       byDepth: grouped,
     };
-  }
-
-  /**
-   * Fetch Route nodes with their consumers in a single query.
-   * Shared by routeMap and shapeCheck to avoid N+1 query patterns.
-   */
-  private async fetchRoutesWithConsumers(
-    repoId: string,
-    routeFilter: string,
-    params: Record<string, string>,
-  ): Promise<Array<{ id: string; name: string; filePath: string; responseKeys: string[] | null; errorKeys: string[] | null; middleware: string[] | null; consumers: Array<{ name: string; filePath: string; accessedKeys?: string[]; fetchCount?: number }> }>> {
-    const rows = await executeParameterized(repoId, `
-      MATCH (n:Route)
-      WHERE n.id STARTS WITH 'Route:' ${routeFilter}
-      OPTIONAL MATCH (consumer)-[r:CodeRelation]->(n)
-      WHERE r.type = 'FETCHES'
-      RETURN n.id AS routeId, n.name AS routeName, n.filePath AS handlerFile,
-             n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware,
-             consumer.name AS consumerName, consumer.filePath AS consumerFile,
-             r.reason AS fetchReason
-    `, params);
-
-    // Strip wrapping quotes from DB array elements — CSV COPY stores ['key'] which
-    // LadybugDB may return as "'key'" rather than "key"
-    const stripQuotes = (keys: string[] | null): string[] | null =>
-      keys ? keys.map(k => k.replace(/^['"]|['"]$/g, '')) : null;
-
-    const routeMap = new Map<string, { id: string; name: string; filePath: string; responseKeys: string[] | null; errorKeys: string[] | null; middleware: string[] | null; consumers: Array<{ name: string; filePath: string; accessedKeys?: string[]; fetchCount?: number }> }>();
-    for (const row of rows) {
-      const id = row.routeId ?? row[0];
-      const name = row.routeName ?? row[1];
-      const filePath = row.handlerFile ?? row[2];
-      const responseKeys = stripQuotes(row.responseKeys ?? row[3] ?? null);
-      const errorKeys = stripQuotes(row.errorKeys ?? row[4] ?? null);
-      const middleware = stripQuotes(row.middleware ?? row[5] ?? null);
-      const consumerName = row.consumerName ?? row[6];
-      const consumerFile = row.consumerFile ?? row[7];
-      const fetchReason: string | null = row.fetchReason ?? row[8] ?? null;
-
-      if (!routeMap.has(id)) {
-        routeMap.set(id, { id, name, filePath, responseKeys, errorKeys, middleware, consumers: [] });
-      }
-      if (consumerName && consumerFile) {
-        // Parse accessed keys from reason field: "fetch-url-match|keys:data,pagination|fetches:3"
-        let accessedKeys: string[] | undefined;
-        let fetchCount: number | undefined;
-        if (fetchReason) {
-          const keysMatch = fetchReason.match(/\|keys:([^|]+)/);
-          if (keysMatch) {
-            accessedKeys = keysMatch[1].split(',').filter(k => k.length > 0);
-          }
-          const fetchesMatch = fetchReason.match(/\|fetches:(\d+)/);
-          if (fetchesMatch) {
-            fetchCount = parseInt(fetchesMatch[1], 10);
-          }
-        }
-        routeMap.get(id)!.consumers.push({
-          name: consumerName,
-          filePath: consumerFile,
-          ...(accessedKeys ? { accessedKeys } : {}),
-          ...(fetchCount && fetchCount > 1 ? { fetchCount } : {}),
-        });
-      }
-    }
-
-    return [...routeMap.values()];
-  }
-
-  /**
-   * Batch-fetch execution flows linked to a set of Route or Tool nodes.
-   * Single query instead of N+1.
-   */
-  private async fetchLinkedFlowsBatch(repoId: string, nodeIds: string[]): Promise<Map<string, string[]>> {
-    const result = new Map<string, string[]>();
-    if (nodeIds.length === 0) return result;
-    try {
-      // Use list_contains to filter at DB level instead of fetching all and filtering in memory
-      const rows = await executeParameterized(repoId, `
-        MATCH (source)-[r:CodeRelation]->(proc:Process)
-        WHERE r.type = 'ENTRY_POINT_OF'
-          AND list_contains($nodeIds, source.id)
-        RETURN source.id AS sourceId, proc.label AS name
-      `, { nodeIds });
-      for (const row of rows) {
-        const sourceId = row.sourceId ?? row[0];
-        const name = row.name ?? row[1];
-        if (!name) continue;
-        let list = result.get(sourceId);
-        if (!list) { list = []; result.set(sourceId, list); }
-        list.push(name);
-      }
-    } catch { /* no ENTRY_POINT_OF edges yet */ }
-    return result;
-  }
-
-  private async routeMap(repo: RepoHandle, params: { route?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
-    const queryParams = params.route ? { route: params.route } : {};
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
-
-    if (routes.length === 0) {
-      return { routes: [], total: 0, message: params.route ? `No routes matching "${params.route}"` : 'No routes found in this project.' };
-    }
-
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, routes.map(r => r.id));
-
-    return {
-      routes: routes.map(r => ({
-        route: r.name, handler: r.filePath,
-        middleware: r.middleware || [],
-        consumers: r.consumers,
-        flows: flowMap.get(r.id) || [],
-      })),
-      total: routes.length,
-    };
-  }
-
-  private async shapeCheck(repo: RepoHandle, params: { route?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    const routeFilter = params.route ? `AND n.name CONTAINS $route` : '';
-    const queryParams = params.route ? { route: params.route } : {};
-    const allRoutes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
-
-    const results = allRoutes
-      .filter(r => ((r.responseKeys && r.responseKeys.length > 0) || (r.errorKeys && r.errorKeys.length > 0)) && r.consumers.length > 0)
-      .map(r => {
-        // Keys already normalized by fetchRoutesWithConsumers (quotes stripped)
-        const responseKeys = r.responseKeys ?? [];
-        const errorKeys = r.errorKeys ?? [];
-        // Combined set: consumer accessing either success or error keys is valid
-        const allKnownKeys = new Set([...responseKeys, ...errorKeys]);
-
-        // Check each consumer's accessed keys against the route's response shape
-        const responseKeySet = new Set(responseKeys);
-        const consumers = r.consumers.map(c => {
-          if (!c.accessedKeys || c.accessedKeys.length === 0) {
-            return { name: c.name, filePath: c.filePath };
-          }
-          const mismatched = c.accessedKeys.filter(k => !allKnownKeys.has(k));
-          // Keys in allKnownKeys but not in responseKeys — error-path access (e.g., .error from errorKeys)
-          const errorPathKeys = c.accessedKeys.filter(k => allKnownKeys.has(k) && !responseKeySet.has(k));
-          const isMultiFetch = (c.fetchCount ?? 1) > 1;
-          return {
-            name: c.name,
-            filePath: c.filePath,
-            accessedKeys: c.accessedKeys,
-            ...(mismatched.length > 0 ? { mismatched, mismatchConfidence: isMultiFetch ? 'low' as const : 'high' as const } : {}),
-            ...(errorPathKeys.length > 0 ? { errorPathKeys } : {}),
-            ...(isMultiFetch ? { attributionNote: `This file fetches ${c.fetchCount} routes — accessed keys may belong to a different route.` } : {}),
-          };
-        });
-
-        const hasMismatches = consumers.some(c => 'mismatched' in c && (c as any).mismatched.length > 0);
-
-        return {
-          route: r.name,
-          handler: r.filePath,
-          ...(responseKeys.length > 0 ? { responseKeys } : {}),
-          ...(errorKeys.length > 0 ? { errorKeys } : {}),
-          consumers,
-          ...(hasMismatches ? { status: 'MISMATCH' as const } : {}),
-        };
-      });
-
-    const mismatchCount = results.filter(r => r.status === 'MISMATCH').length;
-
-    return {
-      routes: results,
-      total: results.length,
-      routesWithShapes: results.length,
-      ...(mismatchCount > 0 ? { mismatches: mismatchCount } : {}),
-      message: results.length === 0
-        ? 'No routes with both response shapes and consumers found.'
-        : mismatchCount > 0
-          ? `Found ${results.length} route(s) with response shape data. ${mismatchCount} route(s) have consumer/shape mismatches.`
-          : `Found ${results.length} route(s) with response shape data and consumers.`,
-    };
-  }
-
-  private async toolMap(repo: RepoHandle, params: { tool?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    const toolFilter = params.tool ? `AND n.name CONTAINS $tool` : '';
-    const queryParams = params.tool ? { tool: params.tool } : {};
-
-    const rows = await executeParameterized(repo.id, `
-      MATCH (n:Tool)
-      WHERE n.id STARTS WITH 'Tool:' ${toolFilter}
-      RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.description AS description
-    `, queryParams);
-
-    if (rows.length === 0) {
-      return { tools: [], total: 0, message: params.tool ? `No tools matching "${params.tool}"` : 'No tool definitions found.' };
-    }
-
-    const toolIds = rows.map((r: any) => r.id ?? r[0]);
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, toolIds);
-
-    return {
-      tools: rows.map((r: any) => {
-        const id = r.id ?? r[0];
-        return {
-          name: r.name ?? r[1],
-          filePath: r.filePath ?? r[2],
-          description: (r.description ?? r[3] ?? '').slice(0, 200),
-          flows: flowMap.get(id) || [],
-        };
-      }),
-      total: rows.length,
-    };
-  }
-
-  private async apiImpact(repo: RepoHandle, params: { route?: string; file?: string }): Promise<any> {
-    await this.ensureInitialized(repo.id);
-
-    if (!params.route && !params.file) {
-      return { error: 'Either "route" or "file" parameter is required.' };
-    }
-
-    // If file is provided but route is not, look up the route by file path
-    let routeFilter = '';
-    const queryParams: Record<string, string> = {};
-
-    if (params.route) {
-      routeFilter = `AND n.name CONTAINS $route`;
-      queryParams.route = params.route;
-    } else if (params.file) {
-      routeFilter = `AND n.filePath CONTAINS $file`;
-      queryParams.file = params.file;
-    }
-
-    const routes = await this.fetchRoutesWithConsumers(repo.id, routeFilter, queryParams);
-
-    if (routes.length === 0) {
-      const target = params.route || params.file;
-      return { error: `No routes found matching "${target}".` };
-    }
-
-    const flowMap = await this.fetchLinkedFlowsBatch(repo.id, routes.map(r => r.id));
-
-    // Count how many routes share the same handler file (for middleware partial detection)
-    const routeCountByHandler = new Map<string, number>();
-    for (const r of routes) {
-      if (r.filePath) {
-        routeCountByHandler.set(r.filePath, (routeCountByHandler.get(r.filePath) ?? 0) + 1);
-      }
-    }
-
-    const results = routes.map(r => {
-      // Keys already normalized by fetchRoutesWithConsumers (quotes stripped)
-      const responseKeys = r.responseKeys ?? [];
-      const errorKeys = r.errorKeys ?? [];
-      const allKnownKeys = new Set([...responseKeys, ...errorKeys]);
-
-      // Build consumer list with mismatch detection
-      const consumers = r.consumers.map(c => ({
-        name: c.name,
-        file: c.filePath,
-        accesses: c.accessedKeys ?? [],
-        ...(c.fetchCount && c.fetchCount > 1 ? { attributionNote: `This file fetches ${c.fetchCount} routes — accessed keys may belong to a different route.` } : {}),
-      }));
-
-      // Detect mismatches: consumer accesses keys not in response shape
-      const mismatches: Array<{ consumer: string; field: string; reason: string; confidence: 'high' | 'low' }> = [];
-      if (allKnownKeys.size > 0) {
-        for (const c of r.consumers) {
-          if (!c.accessedKeys) continue;
-          const isMultiFetch = (c.fetchCount ?? 1) > 1;
-          for (const key of c.accessedKeys) {
-            if (!allKnownKeys.has(key)) {
-              mismatches.push({
-                consumer: c.filePath,
-                field: key,
-                reason: 'accessed but not in response shape',
-                confidence: isMultiFetch ? 'low' : 'high',
-              });
-            }
-          }
-        }
-      }
-
-      const flows = flowMap.get(r.id) || [];
-      const consumerCount = r.consumers.length;
-
-      // Risk level heuristic
-      let riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
-      if (consumerCount >= 10) {
-        riskLevel = 'HIGH';
-      } else if (consumerCount >= 4) {
-        riskLevel = 'MEDIUM';
-      } else {
-        riskLevel = 'LOW';
-      }
-      // Bump up one level if mismatches exist
-      if (mismatches.length > 0) {
-        if (riskLevel === 'LOW') riskLevel = 'MEDIUM';
-        else if (riskLevel === 'MEDIUM') riskLevel = 'HIGH';
-      }
-
-      const warning = consumerCount > 0
-        ? `Changing response shape will affect ${consumerCount} component${consumerCount === 1 ? '' : 's'}`
-        : undefined;
-
-      // Flag when middleware was detected but handler exports multiple HTTP methods
-      // (middleware chain may only reflect one export)
-      const middlewareArr = r.middleware || [];
-      const handlerRouteCount = r.filePath ? (routeCountByHandler.get(r.filePath) ?? 1) : 1;
-      const middlewarePartial = middlewareArr.length > 0 && handlerRouteCount > 1;
-
-      return {
-        route: r.name,
-        handler: r.filePath,
-        responseShape: {
-          success: responseKeys,
-          error: errorKeys,
-        },
-        middleware: middlewareArr,
-        ...(middlewarePartial ? {
-          middlewareDetection: 'partial' as const,
-          middlewareNote: 'Middleware captured from first HTTP method export only — other methods in this handler may use different middleware chains.',
-        } : {}),
-        consumers,
-        ...(mismatches.length > 0 ? { mismatches } : {}),
-        executionFlows: flows,
-        impactSummary: {
-          directConsumers: consumerCount,
-          affectedFlows: flows.length,
-          riskLevel,
-          ...(warning ? { warning } : {}),
-        },
-      };
-    });
-
-    // If a single route was targeted, return it directly (not wrapped in array)
-    if (results.length === 1) {
-      return results[0];
-    }
-
-    return { routes: results, total: results.length };
   }
 
   // ─── Direct Graph Queries (for resources.ts) ────────────────────
@@ -2396,7 +4579,7 @@ export class LocalBackend {
     const members = await executeParameterized(repo.id, `
       MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
-      RETURN DISTINCT n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+      RETURN DISTINCT n.name AS name, labels(n) AS type, n.filePath AS filePath
       LIMIT 30
     `, { clusterName: name });
 
@@ -2435,7 +4618,7 @@ export class LocalBackend {
     const procId = proc.id || proc[0];
     const steps = await executeParameterized(repo.id, `
       MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
-      RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
+      RETURN n.name AS name, labels(n) AS type, n.filePath AS filePath, r.step AS step
       ORDER BY r.step
     `, { procId });
 
@@ -2450,6 +4633,234 @@ export class LocalBackend {
     };
   }
 
+  /**
+   * Document Endpoint tool — Generate API documentation JSON.
+   */
+  private async documentEndpoint(repo: RepoHandle, params: any): Promise<{ result?: DocumentEndpointResult; error?: string } | OpenApiModeResult> {
+    await this.ensureInitialized(repo.id);
+    
+    // Ensure cross-registry is initialized (lazy init on first access)
+    if (!this.crossRepoRegistry) {
+      if (!this.crossRepoInitPromise) {
+        this.crossRepoInitPromise = this.initCrossRepoRegistry();
+      }
+      await this.crossRepoInitPromise;
+    }
+    
+    // Create cross-repo context
+    const crossRepo: CrossRepoContext = {
+      findDepRepo: (prefix) => this.findDepRepo(prefix),
+      queryMultipleRepos: (ids, query, p) => this.queryMultipleRepos(ids, query, p),
+      listDepRepos: async () => {
+        const repos = this.crossRepoRegistry!.listRepos();
+        return repos.map(r => r.repoId).filter(id => id !== repo.id);
+      }
+    };
+
+    // Backward-compat bridge: map legacy include_context to mode
+    let mode: 'openapi' | 'ai_context' = 'openapi';
+    if (params.mode === 'ai_context' || params.mode === 'openapi') {
+      mode = params.mode;
+    } else if (params.include_context === true) {
+      mode = 'ai_context';
+      console.warn('[DEPRECATED] include_context is deprecated. Use mode: "ai_context" instead.');
+    }
+    // Note: params.openapi is now the default (mode: 'openapi'), no-op mapping
+
+    const options: DocumentEndpointOptions = {
+      method: params.method,
+      path: params.path,
+      depth: params.depth ?? 10,
+      mode,
+      repo: params.repo,
+      crossRepo,
+    };
+    return documentEndpoint(repo, options);
+  }
+
+  /**
+   * Endpoints tool — query Route nodes for HTTP endpoints.
+   */
+  private async endpoints(
+    repo: RepoHandle,
+    params?: { method?: string; path?: string }
+  ): Promise<{ endpoints: EndpointInfo[] }> {
+    await this.ensureInitialized(repo.id);
+    return queryEndpoints(repo, params);
+  }
+
+  // ─── Cross-Repo Methods ─────────────────────────────────────────────
+
+  /**
+   * Execute the same Cypher query on multiple repos in parallel.
+   * Each result is attributed with its source repoId.
+   * Failed repos return empty results instead of throwing.
+   *
+   * @param repoIds - List of repo identifiers
+   * @param cypher - Cypher query to execute
+   * @param params - Optional query parameters
+   * @returns Array of { repoId, results } for each repo
+   */
+  async queryMultipleRepos(
+    repoIds: string[],
+    cypher: string,
+    params?: Record<string, unknown>
+  ): Promise<Array<{ repoId: string; results: unknown[] }>> {
+    if (repoIds.length === 0) return [];
+
+    const DEBUG = process.env.GITNEXUS_DEBUG === 'true';
+
+    const queryPromises = repoIds.map(async (repoId) => {
+      try {
+        // First try direct lookup
+        let handle = this.repos.get(repoId);
+
+        // Debug logging
+        if (DEBUG) {
+          console.error(`[GitNexus DEBUG] queryMultipleRepos: repoId=${repoId}, handleFound=${!!handle}`);
+          if (!handle) {
+            console.error(`[GitNexus DEBUG] Available repos: ${[...this.repos.keys()].join(', ')}`);
+          }
+        }
+
+        // If not found, try resolving by name
+        if (!handle) {
+          try {
+            handle = await this.resolveRepo(repoId);
+            if (DEBUG && handle) {
+              console.error(`[GitNexus DEBUG] Resolved repoId=${repoId} to handle.id=${handle.id}`);
+            }
+          } catch {
+            // Resolution failed
+          }
+        }
+
+        if (!handle) {
+          return { repoId, results: [] as unknown[], _error: 'repo_not_found' };
+        }
+
+        await this.ensureInitialized(handle.id);
+
+        if (!isLbugReady(handle.id)) {
+          if (DEBUG) {
+            console.error(`[GitNexus DEBUG] LadybugDB not ready for repo: ${repoId}`);
+          }
+          return { repoId, results: [] as unknown[], _error: 'ladybug_not_ready' };
+        }
+
+        const results = params
+          ? await executeParameterized(handle.id, cypher, params)
+          : await executeQuery(handle.id, cypher);
+
+        if (DEBUG) {
+          console.error(`[GitNexus DEBUG] queryMultipleRepos: repoId=${repoId}, resultCount=${results?.length || 0}`);
+        }
+
+        return { repoId, results: results || [] };
+      } catch (err) {
+        logQueryError(`queryMultipleRepos:${repoId}`, err);
+        return { repoId, results: [] as unknown[], _error: err instanceof Error ? err.message : String(err) };
+      }
+    });
+
+    return Promise.all(queryPromises);
+  }
+
+  /**
+   * Auto-expand a single repo to include its consumers via CrossRepoRegistry.
+   * Returns the deduplicated repo list [sourceRepoId, ...consumerRepoIds],
+   * or null if no consumers found / registry not available (caller falls back to single-repo).
+   */
+  private async expandToConsumers(sourceRepoId: string): Promise<string[] | null> {
+    // Lazy-initialize registry if needed
+    if (!this.crossRepoRegistry) {
+      if (!this.crossRepoInitPromise) {
+        this.crossRepoInitPromise = this.initCrossRepoRegistry();
+      }
+      await this.crossRepoInitPromise;
+    }
+
+    if (!this.crossRepoRegistry?.isInitialized()) {
+      return null;
+    }
+
+    const consumerRepoIds = this.crossRepoRegistry.findConsumers(sourceRepoId);
+    if (consumerRepoIds.length === 0) {
+      return null;
+    }
+
+    // Deduplicate: source repo always included, consumers filtered to exclude source
+    const seen = new Set<string>([sourceRepoId]);
+    const allRepoIds = [sourceRepoId];
+    for (const id of consumerRepoIds) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        allRepoIds.push(id);
+      }
+    }
+    return allRepoIds;
+  }
+
+
+  /**
+   * Get the manifest for a registered repo.
+   * Returns null if repo is unknown or manifest doesn't exist.
+   *
+   * @param repoId - The repo identifier
+   * @returns RepoManifest or null
+   */
+  async getManifest(repoId: string): Promise<RepoManifest | null> {
+    try {
+      const handle = await this.resolveRepo(repoId);
+      // Manifest is stored at <repoPath>/.gitnexus/repo_manifest.json
+      // Try repoPath first (standard location)
+      let manifest = await readManifest(handle.repoPath);
+      if (!manifest && handle.storagePath) {
+        // Fallback: some test setups use storagePath as the repo root
+        manifest = await readManifest(handle.storagePath);
+      }
+      return manifest;
+    } catch {
+      // Unknown repo or failed to read manifest
+      return null;
+    }
+  }
+
+  /**
+   * Find which repo provides a dependency.
+   * Lazy-initializes the CrossRepoRegistry on first call.
+   *
+   * @param depName - Dependency name (e.g., "shared-utils" or "com.example:lib")
+   * @returns repoId of the providing repo, or null if not found
+   */
+  async findDepRepo(depName: string): Promise<string | null> {
+    if (!depName) return null;
+
+    // Lazy-initialize registry on first access with race condition guard
+    if (!this.crossRepoRegistry) {
+      if (!this.crossRepoInitPromise) {
+        this.crossRepoInitPromise = this.initCrossRepoRegistry();
+      }
+      await this.crossRepoInitPromise;
+    }
+
+    return this.crossRepoRegistry.findDepRepo(depName);
+  }
+
+  /**
+   * Initialize CrossRepoRegistry (extracted for lazy init).
+   */
+  private async initCrossRepoRegistry(): Promise<void> {
+    const registry = new CrossRepoRegistry();
+    const repoInfos = [...this.repos.values()].map((h) => ({
+      repoId: h.id,
+      repoPath: h.repoPath,
+      storagePath: h.storagePath,
+    }));
+    await registry.initialize(repoInfos);
+    this.crossRepoRegistry = registry;
+  }
+
   async disconnect(): Promise<void> {
     await closeLbug(); // close all connections
     // Note: we intentionally do NOT call disposeEmbedder() here.
@@ -2460,5 +4871,10 @@ export class LocalBackend {
     this.repos.clear();
     this.contextCache.clear();
     this.initializedRepos.clear();
+    if (this.crossRepoRegistry) {
+      this.crossRepoRegistry.clear();
+      this.crossRepoRegistry = null;
+    }
+    this.crossRepoInitPromise = null;
   }
 }

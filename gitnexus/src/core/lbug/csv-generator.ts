@@ -15,7 +15,7 @@
 import fs from 'fs/promises';
 import { createWriteStream, WriteStream } from 'fs';
 import path from 'path';
-import { KnowledgeGraph, GraphNode, NodeLabel } from '../graph/types.js';
+import { KnowledgeGraph, GraphNode } from '../graph/types.js';
 import { NodeTableName } from './schema.js';
 
 /** Flush buffered rows to disk every N rows */
@@ -229,23 +229,23 @@ export const streamAllCSVsToDisk = async (
   const fileWriter = new BufferedCSVWriter(path.join(csvDir, 'file.csv'), 'id,name,filePath,content');
   const folderWriter = new BufferedCSVWriter(path.join(csvDir, 'folder.csv'), 'id,name,filePath');
   const codeElementHeader = 'id,name,filePath,startLine,endLine,isExported,content,description';
-  const functionWriter = new BufferedCSVWriter(path.join(csvDir, 'function.csv'), codeElementHeader);
-  const classWriter = new BufferedCSVWriter(path.join(csvDir, 'class.csv'), codeElementHeader);
+  // #86: Function gets its own header (parameterCount + returnType) so the
+  // COPY query can include them. The trailing repoId is left empty by the
+  // writer (we don't currently track per-File-function repoId) and backfilled
+  // by the lbug-adapter if/when cross-repo support needs it. The CSV header
+  // order MUST match the COPY column list in lbug-adapter.ts:getCopyQuery.
+  const functionHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType,repoId';
+  const functionWriter = new BufferedCSVWriter(path.join(csvDir, 'function.csv'), functionHeader);
+  const classHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,fields,annotations';
+  const classWriter = new BufferedCSVWriter(path.join(csvDir, 'class.csv'), classHeader);
   const interfaceWriter = new BufferedCSVWriter(path.join(csvDir, 'interface.csv'), codeElementHeader);
-  const methodHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType';
+  const methodHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType,parameters,annotations,parameterAnnotations';
   const methodWriter = new BufferedCSVWriter(path.join(csvDir, 'method.csv'), methodHeader);
   const codeElemWriter = new BufferedCSVWriter(path.join(csvDir, 'codeelement.csv'), codeElementHeader);
   const communityWriter = new BufferedCSVWriter(path.join(csvDir, 'community.csv'), 'id,label,heuristicLabel,keywords,description,enrichedBy,cohesion,symbolCount');
   const processWriter = new BufferedCSVWriter(path.join(csvDir, 'process.csv'), 'id,label,heuristicLabel,processType,stepCount,communities,entryPointId,terminalId');
-
-  // Section nodes have an extra 'level' column
-  const sectionWriter = new BufferedCSVWriter(path.join(csvDir, 'section.csv'), 'id,name,filePath,startLine,endLine,level,content,description');
-
-  // Route nodes for API endpoint mapping
-  const routeWriter = new BufferedCSVWriter(path.join(csvDir, 'route.csv'), 'id,name,filePath,responseKeys,errorKeys,middleware');
-
-  // Tool nodes for MCP tool definitions
-  const toolWriter = new BufferedCSVWriter(path.join(csvDir, 'tool.csv'), 'id,name,filePath,description');
+  const routeHeader = 'id,name,httpMethod,routePath,controllerName,methodName,filePath,startLine,lineNumber,isInherited,repoId,responseKeys,errorKeys,middleware,controllerClass,handlerMethod,isControllerClass,prefix';
+  const routeWriter = new BufferedCSVWriter(path.join(csvDir, 'route.csv'), routeHeader);
 
   // Multi-language node types share the same CSV shape (no isExported column)
   const multiLangHeader = 'id,name,filePath,startLine,endLine,content,description';
@@ -258,10 +258,13 @@ export const streamAllCSVsToDisk = async (
 
   const codeWriterMap: Record<string, BufferedCSVWriter> = {
     'Function': functionWriter,
-    'Class': classWriter,
     'Interface': interfaceWriter,
     'CodeElement': codeElemWriter,
   };
+
+  // #86: Function needs a dedicated case (not the codeWriterMap fallthrough)
+  // because its CSV header is wider than Interface/CodeElement. The map still
+  // routes to the right writer, but the row layout must be matched here.
 
   const seenFileIds = new Set<string>();
 
@@ -330,52 +333,77 @@ export const streamAllCSVsToDisk = async (
           escapeCSVField((node.properties as any).description || ''),
           escapeCSVNumber(node.properties.parameterCount, 0),
           escapeCSVField(node.properties.returnType || ''),
+          escapeCSVField((node.properties as any).parameters || ''),
+          escapeCSVField((node.properties as any).annotations || ''),
+          escapeCSVField((node.properties as any).parameterAnnotations || ''),
         ].join(','));
         break;
       }
-      case 'Section': {
+      case 'Function': {
+        // #86: Function rows use a wider CSV header than the generic
+        // codeWriterMap fallthrough. Column order MUST match functionHeader
+        // above and the COPY query in lbug-adapter.ts:getCopyQuery.
         const content = await extractContent(node, contentCache);
-        await sectionWriter.addRow([
+        await functionWriter.addRow([
           escapeCSVField(node.id),
           escapeCSVField(node.properties.name || ''),
           escapeCSVField(node.properties.filePath || ''),
           escapeCSVNumber(node.properties.startLine, -1),
           escapeCSVNumber(node.properties.endLine, -1),
-          escapeCSVNumber((node.properties as any).level, 1),
+          node.properties.isExported ? 'true' : 'false',
           escapeCSVField(content),
           escapeCSVField((node.properties as any).description || ''),
+          escapeCSVNumber(node.properties.parameterCount, 0),
+          escapeCSVField(node.properties.returnType || ''),
+          // repoId is the last column; populated for cross-repo use, empty
+          // for single-repo ingestion. Use (any) cast since NodeProperties
+          // doesn't strictly carry it.
+          escapeCSVField((node.properties as any).repoId || ''),
+        ].join(','));
+        break;
+      }
+      case 'Class': {
+        const content = await extractContent(node, contentCache);
+        await classWriter.addRow([
+          escapeCSVField(node.id),
+          escapeCSVField(node.properties.name || ''),
+          escapeCSVField(node.properties.filePath || ''),
+          escapeCSVNumber(node.properties.startLine, -1),
+          escapeCSVNumber(node.properties.endLine, -1),
+          node.properties.isExported ? 'true' : 'false',
+          escapeCSVField(content),
+          escapeCSVField((node.properties as any).description || ''),
+          escapeCSVField((node.properties as any).fields || ''),
+          escapeCSVField((node.properties as any).annotations || ''),
         ].join(','));
         break;
       }
       case 'Route': {
-        const responseKeys = (node.properties as any).responseKeys || [];
-        // LadybugDB array literal inside a quoted CSV field: escapeCSVField wraps in "..."
-        // and the array uses single-quoted elements
-        const keysStr = `[${responseKeys.map((k: string) => `'${k.replace(/'/g, "''")}'`).join(',')}]`;
-        const errorKeys = (node.properties as any).errorKeys || [];
-        const errorKeysStr = `[${errorKeys.map((k: string) => `'${k.replace(/'/g, "''")}'`).join(',')}]`;
-        const middleware = (node.properties as any).middleware || [];
-        const middlewareStr = `[${middleware.map((m: string) => `'${m.replace(/'/g, "''")}'`).join(',')}]`;
         await routeWriter.addRow([
           escapeCSVField(node.id),
           escapeCSVField(node.properties.name || ''),
+          escapeCSVField((node.properties as any).httpMethod || ''),
+          escapeCSVField((node.properties as any).routePath || ''),
+          escapeCSVField((node.properties as any).controllerName || ''),
+          escapeCSVField((node.properties as any).methodName || ''),
           escapeCSVField(node.properties.filePath || ''),
-          escapeCSVField(keysStr),
-          escapeCSVField(errorKeysStr),
-          escapeCSVField(middlewareStr),
+          escapeCSVNumber(node.properties.startLine, -1),
+          escapeCSVNumber((node.properties as any).lineNumber, -1),
+          (node.properties as any).isInherited ? 'true' : 'false',
+          escapeCSVField((node.properties as any).repoId || ''),
+          escapeCSVField((node.properties as any).responseKeys || ''),
+          escapeCSVField((node.properties as any).errorKeys || ''),
+          escapeCSVField((node.properties as any).middleware || ''),
+          // #67: spec-named aliases + ExtractedRoute fields
+          escapeCSVField((node.properties as any).controllerClass || (node.properties as any).controllerName || ''),
+          escapeCSVField((node.properties as any).handlerMethod || (node.properties as any).methodName || ''),
+          (node.properties as any).isControllerClass ? 'true' : 'false',
+          escapeCSVField((node.properties as any).prefix || ''),
         ].join(','));
         break;
       }
-      case 'Tool':
-        await toolWriter.addRow([
-          escapeCSVField(node.id),
-          escapeCSVField(node.properties.name || ''),
-          escapeCSVField(node.properties.filePath || ''),
-          escapeCSVField((node.properties as any).description || ''),
-        ].join(','));
-        break;
       default: {
-        // Code element nodes (Function, Class, Interface, CodeElement)
+        // Code element nodes (Function, Interface, CodeElement)
         const writer = codeWriterMap[node.label];
         if (writer) {
           const content = await extractContent(node, contentCache);
@@ -411,20 +439,66 @@ export const streamAllCSVsToDisk = async (
   }
 
   // Finish all node writers
-  const allWriters = [fileWriter, folderWriter, functionWriter, classWriter, interfaceWriter, methodWriter, codeElemWriter, communityWriter, processWriter, sectionWriter, routeWriter, toolWriter, ...multiLangWriters.values()];
+  const allWriters = [fileWriter, folderWriter, functionWriter, classWriter, interfaceWriter, methodWriter, codeElemWriter, communityWriter, processWriter, routeWriter, ...multiLangWriters.values()];
   await Promise.all(allWriters.map(w => w.finish()));
 
   // --- Stream relationship CSV ---
+  // #159 P3 Mode A (WI-1): 7th column `source` is the near-irreversible
+  // edge provenance tag. lbug-adapter uses HEADER=true, so Kùzu binds CSV
+  // columns to CodeRelation properties BY NAME, not by position. The 7-col
+  // header `from,to,type,confidence,reason,step,source` must match the
+  // CodeRelation property names exactly; column ORDER is for human
+  // readability only. Kùzu rel-table-group COPY does NOT support an
+  // explicit property column-list — only the per-label from/to binding
+  // is allowed after the table name. The default 'heuristic' is applied
+  // here (serializer-side) per the design contract: callers never
+  // produce a NULL/undefined `source` into the DB.
   const relCsvPath = path.join(csvDir, 'relations.csv');
-  const relWriter = new BufferedCSVWriter(relCsvPath, 'from,to,type,confidence,reason,step');
+  // #174: header gains sourceLine + sourceCol (0-based tree-sitter/LSP coords).
+  // Kùzu COPY uses HEADER=true and binds by column name, so adding columns
+  // to the right is safe for readers that don't yet know these columns.
+  // Empty string in a row → Kùzu reads as NULL (INT64 null for missing position).
+  const relWriter = new BufferedCSVWriter(relCsvPath, 'from,to,type,confidence,reason,step,source,sourceLine,sourceCol');
   for (const rel of graph.iterRelationships()) {
+    // Default 'heuristic' is the EdgeSource union member for pre-WI-1
+    // rows; see `graph/types.ts` for the source of truth.
+    //
+    // m5 (defense-in-depth): validate the EdgeSource union at
+    // the CSV boundary. A future caller that hands in a
+    // hand-typed relationship (or a stale pre-WI-1 row) cannot
+    // emit a `source` value outside the closed union. Unknown
+    // values are coerced to 'heuristic' per the existing
+    // default below.
+    const VALID_EDGE_SOURCES: ReadonlySet<string> = new Set([
+      'heuristic',
+      'lsp-confirmed',
+      'lsp-corrected',
+      'lsp-recall',
+    ]);
+    const rawSource = rel.source ?? 'heuristic';
+    const sourceValue = VALID_EDGE_SOURCES.has(rawSource)
+      ? rawSource
+      : 'heuristic';
+    // T1: `step` is optional on `GraphRelationship`; `??`
+    // handles the absent case the same way the `source`
+    // coercion does. The `(rel as any).step` cast is gone.
+    // #174: sourceLine / sourceCol are 0-based INT64 columns. When the
+    // in-memory edge carries a numeric value we serialize it as a plain
+    // integer; when absent (undefined) we emit '""' (quoted empty) so
+    // Kùzu reads the cell as NULL for INT64. Bare empty (,,) in a 9-col
+    // header triggers "expected 9 values, got 8" — quoted empty is safe.
+    const sourceLineStr = typeof rel.line === 'number' ? String(rel.line) : '""';
+    const sourceColStr  = typeof rel.column === 'number' ? String(rel.column) : '""';
     await relWriter.addRow([
       escapeCSVField(rel.sourceId),
       escapeCSVField(rel.targetId),
       escapeCSVField(rel.type),
       escapeCSVNumber(rel.confidence, 1.0),
       escapeCSVField(rel.reason),
-      escapeCSVNumber((rel as any).step, 0),
+      escapeCSVNumber(rel.step ?? 0, 0),
+      escapeCSVField(sourceValue),
+      sourceLineStr,
+      sourceColStr,
     ].join(','));
   }
   await relWriter.finish();
@@ -437,9 +511,7 @@ export const streamAllCSVsToDisk = async (
     ['Interface', interfaceWriter], ['Method', methodWriter],
     ['CodeElement', codeElemWriter],
     ['Community', communityWriter], ['Process', processWriter],
-    ['Section' as NodeTableName, sectionWriter],
-    ['Route' as NodeTableName, routeWriter],
-    ['Tool' as NodeTableName, toolWriter],
+    ['Route', routeWriter],
     ...Array.from(multiLangWriters.entries()).map(([name, w]) => [name as NodeTableName, w] as [NodeTableName, BufferedCSVWriter]),
   ];
   for (const [name, writer] of tableMap) {

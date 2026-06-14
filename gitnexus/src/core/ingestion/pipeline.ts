@@ -1,101 +1,41 @@
 import { createKnowledgeGraph } from '../graph/graph.js';
 import { processStructure } from './structure-processor.js';
-import { processMarkdown } from './markdown-processor.js';
-import { processCobol, isCobolFile, isJclFile } from './cobol-processor.js';
+import { isConfigFile, processConfigFiles } from './config-indexer.js';
 import { processParsing } from './parsing-processor.js';
 import {
   processImports,
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { EMPTY_INDEX } from './import-resolvers/utils.js';
-import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, processNextjsFetchRoutes, extractFetchCallsFromFiles, seedCrossFileReceiverTypes, buildImportedReturnTypes, buildImportedRawReturnTypes, type ExportedTypeMap, buildExportedTypeMapFromGraph } from './call-processor.js';
-import { nextjsFileToRouteURL, normalizeFetchURL } from './route-extractors/nextjs.js';
-import { expoFileToRouteURL } from './route-extractors/expo.js';
-import { phpFileToRouteURL } from './route-extractors/php.js';
-import { extractResponseShapes, extractPHPResponseShapes } from './route-extractors/response-shapes.js';
-import { extractMiddlewareChain, extractNextjsMiddlewareConfig, compileMatcher, compiledMatcherMatchesRoute } from './route-extractors/middleware.js';
-import { generateId } from '../../lib/utils.js';
-import type { ExtractedFetchCall, ExtractedRoute, ExtractedDecoratorRoute, ExtractedToolDef, ExtractedORMQuery } from './workers/parse-worker.js';
-import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
+import { processCalls, processCallsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutesWithRepoId, processExpoRouterNavigations, processDecoratorRoutesWithRepoId, processPHPRoutesWithRepoId, processNextjsRoutesWithRepoId, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted, type ProcessCallsOpts, type CorrectionFeedItem, type RecallFeedItem } from './call-processor.js';
+import type { ExtractedRoute, ExtractedExpoNav, ExtractedORMQuery, ExtractedDecoratorRoute, ExtractedFetchCall, ExtractedToolDef } from './workers/parse-worker.js';
+import type { CrossRepoRegistry } from './cross-repo-registry.js';
+import { processHeritage, processHeritageFromExtracted, type ProcessHeritageOpts, type HeritageFeedItem } from './heritage-processor.js';
+import { processAngularMetadataFromExtracted } from './angular-metadata-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
-import { createResolutionContext } from './resolution-context.js';
+import { extractDependencies } from './dependency-extractor.js';
+// WI-5 (#159 P3 Mode A): the reconciler is imported here — it lives at
+// `core/ingestion/mode-a-reconciler.ts` and mutates ONLY the in-memory
+// graph; it imports no direct-DB writer (I-7).
+import { withReconciliationSession, applyDecisions, reconcileDecisions, candidateLocationKey, type Candidate, type Location, type ReconciliationReport } from './mode-a-reconciler.js';
+import { selectAdapter } from './lsp/language-adapter.js';
+import { mapLocationToNodeId } from './lsp/location-mapper.js';
+import { createInMemoryNodeQuery, type InMemoryNode } from './in-memory-node-query.js';
+import { writeManifest } from '../../storage/repo-manifest.js';
+import { createResolutionContext, type ResolutionContext } from './resolution-context.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
 import { getLanguageFromFilename } from './utils/language-detection.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
-import { SupportedLanguages } from '../../config/supported-languages.js';
-import { providers, getProvider, getProviderForFile } from './languages/index.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const isDev = process.env.NODE_ENV === 'development';
-
-const EXPO_NAV_PATTERNS = [
-  /router\.(push|replace|navigate)\(\s*['"`]([^'"`]+)['"`]/g,
-  /<Link\s+[^>]*href=\s*['"`]([^'"`]+)['"`]/g,
-];
-
-/** A group of files with no mutual dependencies, safe to process in parallel. */
-type IndependentFileGroup = readonly string[];
-
-/** Kahn's algorithm: returns files grouped by topological level.
- *  Files in the same level have no mutual dependencies — safe to process in parallel.
- *  Files in cycles are returned as a final group (no cross-cycle propagation). */
-export function topologicalLevelSort(
-  importMap: ReadonlyMap<string, ReadonlySet<string>>,
-): { levels: readonly IndependentFileGroup[]; cycleCount: number } {
-  // Build in-degree map and reverse dependency map
-  const inDegree = new Map<string, number>();
-  const reverseDeps = new Map<string, string[]>();
-
-  for (const [file, deps] of importMap) {
-    if (!inDegree.has(file)) inDegree.set(file, 0);
-    for (const dep of deps) {
-      if (!inDegree.has(dep)) inDegree.set(dep, 0);
-      // file imports dep, so dep must be processed before file
-      // In Kahn's terms: dep → file (dep is a prerequisite of file)
-      inDegree.set(file, (inDegree.get(file) ?? 0) + 1);
-      let rev = reverseDeps.get(dep);
-      if (!rev) { rev = []; reverseDeps.set(dep, rev); }
-      rev.push(file);
-    }
-  }
-
-  // BFS from zero-in-degree nodes, grouping by level
-  const levels: string[][] = [];
-  let currentLevel = [...inDegree.entries()]
-    .filter(([, d]) => d === 0)
-    .map(([f]) => f);
-
-  while (currentLevel.length > 0) {
-    levels.push(currentLevel);
-    const nextLevel: string[] = [];
-    for (const file of currentLevel) {
-      for (const dependent of reverseDeps.get(file) ?? []) {
-        const newDeg = (inDegree.get(dependent) ?? 1) - 1;
-        inDegree.set(dependent, newDeg);
-        if (newDeg === 0) nextLevel.push(dependent);
-      }
-    }
-    currentLevel = nextLevel;
-  }
-
-  // Files still with positive in-degree are in cycles — add as final group
-  const cycleFiles = [...inDegree.entries()]
-    .filter(([, d]) => d > 0)
-    .map(([f]) => f);
-  if (cycleFiles.length > 0) {
-    levels.push(cycleFiles);
-  }
-
-  return { levels, cycleCount: cycleFiles.length };
-}
 
 /** Max bytes of source content to load per parse chunk. Each chunk's source +
  *  parsed ASTs + extracted records + worker serialization overhead all live in
@@ -106,629 +46,363 @@ const CHUNK_BYTE_BUDGET = 20 * 1024 * 1024; // 20MB
 /** Max AST trees to keep in LRU cache */
 const AST_CACHE_CAP = 50;
 
-
-/** Minimum percentage of files that must benefit from cross-file seeding to justify the re-resolution pass. */
-const CROSS_FILE_SKIP_THRESHOLD = 0.03;
-/** Hard cap on files re-processed during cross-file propagation. */
-const MAX_CROSS_FILE_REPROCESS = 2000;
-
-/** Node labels that represent top-level importable symbols.
- *  Excludes Method, Property, Constructor (accessed via receiver, not directly imported),
- *  and structural labels (File, Folder, Package, Module, Project, etc.). */
-const IMPORTABLE_SYMBOL_LABELS = new Set([
-  'Function', 'Class', 'Interface', 'Struct', 'Enum', 'Trait',
-  'TypeAlias', 'Const', 'Static', 'Record', 'Union', 'Typedef', 'Macro',
-]);
-
-/** Max synthetic bindings per importing file — prevents memory bloat for
- *  C/C++ files that include many large headers. */
-const MAX_SYNTHETIC_BINDINGS_PER_FILE = 1000;
-
-/** Pre-computed language sets derived from providers at module load. */
-const WILDCARD_LANGUAGES = new Set(
-  Object.values(providers).filter(p => p.importSemantics === 'wildcard').map(p => p.id)
-);
-const SYNTHESIS_LANGUAGES = new Set(
-  Object.values(providers).filter(p => p.importSemantics !== 'named').map(p => p.id)
-);
-
-/** Check if a language uses wildcard (whole-module) import semantics.
- *  Derived from LanguageProvider.importSemantics — no hardcoded set needed. */
-function isWildcardImportLanguage(lang: SupportedLanguages): boolean {
-  return WILDCARD_LANGUAGES.has(lang);
-}
-
-/** Check if a language needs synthesis before call resolution.
- *  True for wildcard-import languages AND namespace-import languages (Python). */
-function needsSynthesis(lang: SupportedLanguages): boolean {
-  return SYNTHESIS_LANGUAGES.has(lang);
-}
-
-/** Synthesize namedImportMap entries for languages with whole-module imports.
- *  These languages (Go, Ruby, C/C++, Swift, Python) import all exported symbols from a
- *  file, not specific named symbols. After parsing, we know which symbols each file
- *  exports (via graph isExported), so we can expand ImportMap edges into per-symbol
- *  bindings that Phase 14 can use for cross-file type propagation. */
-function synthesizeWildcardImportBindings(
-  graph: ReturnType<typeof createKnowledgeGraph>,
-  ctx: ReturnType<typeof createResolutionContext>,
-): number {
-  // Pre-compute exported symbols per file from graph (single pass)
-  const exportedSymbolsByFile = new Map<string, { name: string; filePath: string }[]>();
-  graph.forEachNode(node => {
-    if (!node.properties?.isExported) return;
-    if (!IMPORTABLE_SYMBOL_LABELS.has(node.label)) return;
-    const fp = node.properties.filePath;
-    const name = node.properties.name;
-    if (!fp || !name) return;
-    let symbols = exportedSymbolsByFile.get(fp);
-    if (!symbols) { symbols = []; exportedSymbolsByFile.set(fp, symbols); }
-    symbols.push({ name, filePath: fp });
-  });
-
-  if (exportedSymbolsByFile.size === 0) return 0;
-
-  // Build a merged import map: ctx.importMap has file-based imports (Ruby, C/C++),
-  // but Go/C# package imports use graph IMPORTS edges + PackageMap instead.
-  // Collect graph-level IMPORTS edges for wildcard languages missing from ctx.importMap.
-  const FILE_PREFIX = 'File:';
-  const graphImports = new Map<string, Set<string>>();
-  graph.forEachRelationship(rel => {
-    if (rel.type !== 'IMPORTS') return;
-    if (!rel.sourceId.startsWith(FILE_PREFIX) || !rel.targetId.startsWith(FILE_PREFIX)) return;
-    const srcFile = rel.sourceId.slice(FILE_PREFIX.length);
-    const tgtFile = rel.targetId.slice(FILE_PREFIX.length);
-    const lang = getLanguageFromFilename(srcFile);
-    if (!lang || !isWildcardImportLanguage(lang)) return;
-    // Only add if not already in ctx.importMap (avoid duplicates)
-    if (ctx.importMap.get(srcFile)?.has(tgtFile)) return;
-    let set = graphImports.get(srcFile);
-    if (!set) { set = new Set(); graphImports.set(srcFile, set); }
-    set.add(tgtFile);
-  });
-
-  let totalSynthesized = 0;
-
-  // Helper: synthesize bindings for a file given its imported files
-  const synthesizeForFile = (filePath: string, importedFiles: Iterable<string>) => {
-    let fileBindings = ctx.namedImportMap.get(filePath);
-    let fileCount = fileBindings?.size ?? 0;
-
-    for (const importedFile of importedFiles) {
-      const exportedSymbols = exportedSymbolsByFile.get(importedFile);
-      if (!exportedSymbols) continue;
-
-      for (const sym of exportedSymbols) {
-        if (fileCount >= MAX_SYNTHETIC_BINDINGS_PER_FILE) return;
-        if (fileBindings?.has(sym.name)) continue;
-
-        if (!fileBindings) {
-          fileBindings = new Map();
-          ctx.namedImportMap.set(filePath, fileBindings);
-        }
-        fileBindings.set(sym.name, {
-          sourcePath: importedFile,
-          exportedName: sym.name,
-        });
-        fileCount++;
-        totalSynthesized++;
-      }
-    }
-  };
-
-  // Process files from ctx.importMap (Ruby, C/C++, Swift file-based imports)
-  for (const [filePath, importedFiles] of ctx.importMap) {
-    const lang = getLanguageFromFilename(filePath);
-    if (!lang || !isWildcardImportLanguage(lang)) continue;
-    synthesizeForFile(filePath, importedFiles);
-  }
-
-  // Process files from graph IMPORTS edges (Go and other wildcard-import languages)
-  for (const [filePath, importedFiles] of graphImports) {
-    synthesizeForFile(filePath, importedFiles);
-  }
-
-  // Build module alias map for Python namespace imports.
-  // `import models` in app.py → ctx.moduleAliasMap['app.py']['models'] = 'models.py'
-  // Enables `models.User()` to resolve to models.py:User without ambiguous symbol expansion.
-  const buildPythonModuleAliasForFile = (callerFile: string, importedFiles: Iterable<string>) => {
-    let aliasMap = ctx.moduleAliasMap.get(callerFile);
-    for (const importedFile of importedFiles) {
-      // Derive the module alias from the imported filename stem (e.g. "models.py" → "models")
-      const lastSlash = importedFile.lastIndexOf('/');
-      const base = lastSlash >= 0 ? importedFile.slice(lastSlash + 1) : importedFile;
-      const dot = base.lastIndexOf('.');
-      const stem = dot >= 0 ? base.slice(0, dot) : base;
-      if (!stem) continue;
-      if (!aliasMap) {
-        aliasMap = new Map();
-        ctx.moduleAliasMap.set(callerFile, aliasMap);
-      }
-      aliasMap.set(stem, importedFile);
-    }
-  };
-
-  for (const [filePath, importedFiles] of ctx.importMap) {
-    const provider = getProviderForFile(filePath);
-    if (!provider || provider.importSemantics !== 'namespace') continue;
-    buildPythonModuleAliasForFile(filePath, importedFiles);
-  }
-
-  return totalSynthesized;
-}
-
-/** Phase 14: Cross-file binding propagation.
- *  Seeds downstream files with resolved type bindings from upstream exports.
- *  Files are processed in topological import order so upstream bindings are
- *  available when downstream files are re-resolved. */
-async function runCrossFileBindingPropagation(
-  graph: ReturnType<typeof createKnowledgeGraph>,
-  ctx: ReturnType<typeof createResolutionContext>,
-  exportedTypeMap: ExportedTypeMap,
-  allPaths: string[],
-  totalFiles: number,
-  repoPath: string,
-  pipelineStart: number,
-  onProgress: (progress: PipelineProgress) => void,
-): Promise<void> {
-  // For the worker path, buildTypeEnv runs inside workers without SymbolTable,
-  // so exported bindings must be collected from graph + SymbolTable in main thread.
-  if (exportedTypeMap.size === 0 && graph.nodeCount > 0) {
-    const graphExports = buildExportedTypeMapFromGraph(graph, ctx.symbols);
-    for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
-  }
-
-  if (exportedTypeMap.size === 0 || ctx.namedImportMap.size === 0) return;
-
-  const allPathSet = new Set(allPaths);
-  const { levels, cycleCount } = topologicalLevelSort(ctx.importMap);
-
-  // Cycle diagnostic: only log when actual cycles detected (cycleCount from Kahn's BFS)
-  if (isDev && cycleCount > 0) {
-    console.log(`🔄 ${cycleCount} files in import cycles (skipped for cross-file propagation)`);
-  }
-
-  // Quick count of files with cross-file binding gaps (early exit once threshold exceeded)
-  let filesWithGaps = 0;
-  const gapThreshold = Math.max(1, Math.ceil(totalFiles * CROSS_FILE_SKIP_THRESHOLD));
-  outer: for (const level of levels) {
-    for (const filePath of level) {
-      const imports = ctx.namedImportMap.get(filePath);
-      if (!imports) continue;
-      for (const [, binding] of imports) {
-        const upstream = exportedTypeMap.get(binding.sourcePath);
-        if (upstream?.has(binding.exportedName)) { filesWithGaps++; break; }
-        const def = ctx.symbols.lookupExactFull(binding.sourcePath, binding.exportedName);
-        if (def?.returnType) { filesWithGaps++; break; }
-      }
-      if (filesWithGaps >= gapThreshold) break outer;
-    }
-  }
-
-  const gapRatio = totalFiles > 0 ? filesWithGaps / totalFiles : 0;
-  if (gapRatio < CROSS_FILE_SKIP_THRESHOLD && filesWithGaps < gapThreshold) {
-    if (isDev) {
-      console.log(`⏭️ Cross-file re-resolution skipped (${filesWithGaps}/${totalFiles} files, ${(gapRatio * 100).toFixed(1)}% < ${CROSS_FILE_SKIP_THRESHOLD * 100}% threshold)`);
-    }
-    return;
-  }
-
-  onProgress({
-    phase: 'parsing',
-    percent: 82,
-    message: `Cross-file type propagation (${filesWithGaps}+ files)...`,
-    stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-  });
-
-  let crossFileResolved = 0;
-  const crossFileStart = Date.now();
-  let astCache = createASTCache(AST_CACHE_CAP);
-
-  for (const level of levels) {
-    const levelCandidates: { filePath: string; seeded: Map<string, string>; importedReturns: ReadonlyMap<string, string>; importedRawReturns: ReadonlyMap<string, string> }[] = [];
-    for (const filePath of level) {
-      if (crossFileResolved + levelCandidates.length >= MAX_CROSS_FILE_REPROCESS) break;
-      const imports = ctx.namedImportMap.get(filePath);
-      if (!imports) continue;
-
-      const seeded = new Map<string, string>();
-      for (const [localName, binding] of imports) {
-        const upstream = exportedTypeMap.get(binding.sourcePath);
-        if (upstream) {
-          const type = upstream.get(binding.exportedName);
-          if (type) seeded.set(localName, type);
-        }
-      }
-
-      const importedReturns = buildImportedReturnTypes(filePath, ctx.namedImportMap, ctx.symbols);
-      const importedRawReturns = buildImportedRawReturnTypes(filePath, ctx.namedImportMap, ctx.symbols);
-      if (seeded.size === 0 && importedReturns.size === 0) continue;
-      if (!allPathSet.has(filePath)) continue;
-
-      const lang = getLanguageFromFilename(filePath);
-      if (!lang || !isLanguageAvailable(lang)) continue;
-
-      levelCandidates.push({ filePath, seeded, importedReturns, importedRawReturns });
-    }
-
-    if (levelCandidates.length === 0) continue;
-
-    const levelPaths = levelCandidates.map(c => c.filePath);
-    const contentMap = await readFileContents(repoPath, levelPaths);
-
-    for (const { filePath, seeded, importedReturns, importedRawReturns } of levelCandidates) {
-      const content = contentMap.get(filePath);
-      if (!content) continue;
-
-      const reFile = [{ path: filePath, content }];
-      const bindings = new Map<string, ReadonlyMap<string, string>>();
-      if (seeded.size > 0) bindings.set(filePath, seeded);
-
-      const importedReturnTypesMap = new Map<string, ReadonlyMap<string, string>>();
-      if (importedReturns.size > 0) {
-        importedReturnTypesMap.set(filePath, importedReturns);
-      }
-
-      const importedRawReturnTypesMap = new Map<string, ReadonlyMap<string, string>>();
-      if (importedRawReturns.size > 0) {
-        importedRawReturnTypesMap.set(filePath, importedRawReturns);
-      }
-
-      await processCalls(graph, reFile, astCache, ctx, undefined, exportedTypeMap, bindings.size > 0 ? bindings : undefined, importedReturnTypesMap.size > 0 ? importedReturnTypesMap : undefined, importedRawReturnTypesMap.size > 0 ? importedRawReturnTypesMap : undefined);
-      crossFileResolved++;
-    }
-
-    if (crossFileResolved >= MAX_CROSS_FILE_REPROCESS) {
-      if (isDev) console.log(`⚠️ Cross-file re-resolution capped at ${MAX_CROSS_FILE_REPROCESS} files`);
-      break;
-    }
-  }
-
-  astCache.clear();
-
-  if (isDev) {
-    const elapsed = Date.now() - crossFileStart;
-    const totalElapsed = Date.now() - pipelineStart;
-    const reResolutionPct = totalElapsed > 0 ? ((elapsed / totalElapsed) * 100).toFixed(1) : '0';
-    console.log(
-      `🔗 Cross-file re-resolution: ${crossFileResolved} candidates re-processed` +
-      ` in ${elapsed}ms (${reResolutionPct}% of total ingestion time so far)`,
-    );
-  }
-}
-
 export interface PipelineOptions {
   /** Skip MRO, community detection, and process extraction for faster test runs. */
   skipGraphPhases?: boolean;
+  /**
+   * #50: when provided, unresolved imports whose package maps to an indexed
+   * dependency repo create an external File node + CROSS_IMPORTS edge. When
+   * omitted (the default), ingestion is single-repo and creates no external nodes.
+   */
+  crossRepoRegistry?: CrossRepoRegistry;
+  /**
+   * WI-5 (#159 P3 Mode A): when `enabled` is true, the pipeline runs the
+   * LSP reconciler over the heuristic CALLS feed AFTER all CALLS emission
+   * completes. When omitted (the default), the default `analyze` (no flag)
+   * is byte-identical — no server is started, the feeds are empty, the
+   * reconciler is not invoked.
+   *
+   * `dryRun: true` prints every decision tuple and writes nothing
+   * (AC-6 / KD-11). It is a child of `enabled` — when `dryRun` is true but
+   * `enabled` is false, the option is a no-op.
+   */
+  lsp?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+  };
 }
 
-// ── Extracted pipeline phases ──────────────────────────────────────────────
-// Each function represents a natural phase boundary in the ingestion pipeline.
-// Data flow is explicit through parameters and return values.
-
-type ProgressFn = (progress: PipelineProgress) => void;
-type ScannedFile = { path: string; size: number };
-
-/**
- * Phase 1+2: Scan repository paths, build file/folder structure, process markdown.
- *
- * @reads  repoPath (filesystem)
- * @writes graph (File, Folder nodes + CONTAINS edges; Markdown sections + cross-links)
- */
-async function runScanAndStructure(
+export const runPipelineFromRepo = async (
   repoPath: string,
-  graph: ReturnType<typeof createKnowledgeGraph>,
-  onProgress: ProgressFn,
-): Promise<{ scannedFiles: ScannedFile[]; allPaths: string[]; totalFiles: number }> {
-  // ── Phase 1: Scan paths only (no content read) ─────────────────────
-  onProgress({
-    phase: 'extracting',
-    percent: 0,
-    message: 'Scanning repository...',
-  });
+  onProgress: (progress: PipelineProgress) => void,
+  options?: PipelineOptions,
+): Promise<PipelineResult> => {
+  const graph = createKnowledgeGraph();
+  let ctx: ResolutionContext;
+  let symbolTable;
+  let astCache = createASTCache(AST_CACHE_CAP);
 
-  const scannedFiles = await walkRepositoryPaths(repoPath, (current, total, filePath) => {
-    const scanProgress = Math.round((current / total) * 15);
-    onProgress({
-      phase: 'extracting',
-      percent: scanProgress,
-      message: 'Scanning repository...',
-      detail: filePath,
-      stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
-    });
-  });
-
-  const totalFiles = scannedFiles.length;
-
-  onProgress({
-    phase: 'extracting',
-    percent: 15,
-    message: 'Repository scanned successfully',
-    stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-  });
-
-  // ── Phase 2: Structure (paths only — no content needed) ────────────
-  onProgress({
-    phase: 'structure',
-    percent: 15,
-    message: 'Analyzing project structure...',
-    stats: { filesProcessed: 0, totalFiles, nodesCreated: graph.nodeCount },
-  });
-
-  const allPaths = scannedFiles.map(f => f.path);
-  processStructure(graph, allPaths);
-
-  onProgress({
-    phase: 'structure',
-    percent: 20,
-    message: 'Project structure analyzed',
-    stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-  });
-
-  // ── Custom (non-tree-sitter) processors ─────────────────────────────
-  // Each custom processor follows the pattern in markdown-processor.ts:
-  //   1. Export a process function: (graph, files, allPathSet) => result
-  //   2. Export a file detection function: (path) => boolean
-  //   3. Filter files by extension, write nodes/edges directly to graph
-  // To add a new language: create a new processor file, import it here,
-  // and add a filter-read-call-log block following the pattern below.
-
-  // ── Phase 2.5: Markdown processing (headings + cross-links) ────────
-  const mdScanned = scannedFiles.filter(f => f.path.endsWith('.md') || f.path.endsWith('.mdx'));
-  if (mdScanned.length > 0) {
-    const mdContents = await readFileContents(repoPath, mdScanned.map(f => f.path));
-    const mdFiles = mdScanned
-      .filter(f => mdContents.has(f.path))
-      .map(f => ({ path: f.path, content: mdContents.get(f.path)! }));
-    const allPathSet = new Set(allPaths);
-    const mdResult = processMarkdown(graph, mdFiles, allPathSet);
-    if (isDev) {
-      console.log(`  Markdown: ${mdResult.sections} sections, ${mdResult.links} cross-links from ${mdFiles.length} files`);
-    }
-  }
-
-  // ── Phase 2.6: COBOL processing (regex extraction, no tree-sitter) ──
-  const cobolScanned = scannedFiles.filter(f => isCobolFile(f.path) || isJclFile(f.path));
-  if (cobolScanned.length > 0) {
-    const cobolContents = await readFileContents(repoPath, cobolScanned.map(f => f.path));
-    const cobolFiles = cobolScanned
-      .filter(f => cobolContents.has(f.path))
-      .map(f => ({ path: f.path, content: cobolContents.get(f.path)! }));
-    const allPathSet = new Set(allPaths);
-    const cobolResult = processCobol(graph, cobolFiles, allPathSet);
-    if (isDev) {
-      console.log(`  COBOL: ${cobolResult.programs} programs, ${cobolResult.paragraphs} paragraphs, ${cobolResult.sections} sections from ${cobolFiles.length} files`);
-      if (cobolResult.execSqlBlocks > 0 || cobolResult.execCicsBlocks > 0 || cobolResult.entryPoints > 0) {
-        console.log(`  COBOL enriched: ${cobolResult.execSqlBlocks} SQL blocks, ${cobolResult.execCicsBlocks} CICS blocks, ${cobolResult.entryPoints} entry points, ${cobolResult.moves} moves, ${cobolResult.fileDeclarations} file declarations`);
-      }
-      if (cobolResult.jclJobs > 0) {
-        console.log(`  JCL: ${cobolResult.jclJobs} jobs, ${cobolResult.jclSteps} steps`);
-      }
-    }
-  }
-
-  return { scannedFiles, allPaths, totalFiles };
-}
-
-/**
- * Phase 3+4: Chunked parse + resolve loop.
- *
- * Reads source in byte-budget chunks (~20MB each). For each chunk:
- * 1. Parse via worker pool (or sequential fallback)
- * 2. Resolve imports from extracted data
- * 3. Synthesize wildcard import bindings (Go/Ruby/C++/Swift/Python)
- * 4. Resolve calls, heritage, routes concurrently (Promise.all)
- * 5. Collect TypeEnv bindings for cross-file propagation
- *
- * State accumulated across chunks: symbolTable, importMap, namedImportMap,
- * moduleAliasMap (all via ResolutionContext), exportedTypeMap, workerTypeEnvBindings.
- *
- * @reads  graph (structure nodes from Phase 1+2)
- * @reads  allPaths (from scan phase)
- * @writes graph (Symbol nodes, IMPORTS/CALLS/EXTENDS/IMPLEMENTS/ACCESSES edges)
- * @writes ctx.symbolTable, ctx.importMap, ctx.namedImportMap, ctx.moduleAliasMap
- */
-async function runChunkedParseAndResolve(
-  graph: ReturnType<typeof createKnowledgeGraph>,
-  ctx: ReturnType<typeof createResolutionContext>,
-  scannedFiles: ScannedFile[],
-  allPaths: string[],
-  totalFiles: number,
-  repoPath: string,
-  pipelineStart: number,
-  onProgress: ProgressFn,
-): Promise<{
-  exportedTypeMap: ExportedTypeMap;
-  allFetchCalls: ExtractedFetchCall[];
-  allExtractedRoutes: ExtractedRoute[];
-  allDecoratorRoutes: ExtractedDecoratorRoute[];
-  allToolDefs: ExtractedToolDef[];
-  allORMQueries: ExtractedORMQuery[];
-}> {
-  const symbolTable = ctx.symbols;
-
-  const parseableScanned = scannedFiles.filter(f => {
-    const lang = getLanguageFromFilename(f.path);
-    return lang && isLanguageAvailable(lang);
-  });
-
-  // Warn about files skipped due to unavailable parsers
-  const skippedByLang = new Map<string, number>();
-  for (const f of scannedFiles) {
-    const lang = getLanguageFromFilename(f.path);
-    if (lang && !isLanguageAvailable(lang)) {
-      skippedByLang.set(lang, (skippedByLang.get(lang) || 0) + 1);
-    }
-  }
-  for (const [lang, count] of skippedByLang) {
-    console.warn(`Skipping ${count} ${lang} file(s) — ${lang} parser not available (native binding may not have built). Try: npm rebuild tree-sitter-${lang}`);
-  }
-
-  const totalParseable = parseableScanned.length;
-
-  if (totalParseable === 0) {
-    onProgress({
-      phase: 'parsing',
-      percent: 82,
-      message: 'No parseable files found — skipping parsing phase',
-      stats: { filesProcessed: 0, totalFiles: 0, nodesCreated: graph.nodeCount },
-    });
-  }
-
-  // Build byte-budget chunks
-  const chunks: string[][] = [];
-  let currentChunk: string[] = [];
-  let currentBytes = 0;
-  for (const file of parseableScanned) {
-    if (currentChunk.length > 0 && currentBytes + file.size > CHUNK_BYTE_BUDGET) {
-      chunks.push(currentChunk);
-      currentChunk = [];
-      currentBytes = 0;
-    }
-    currentChunk.push(file.path);
-    currentBytes += file.size;
-  }
-  if (currentChunk.length > 0) chunks.push(currentChunk);
-
-  const numChunks = chunks.length;
-
-  if (isDev) {
-    const totalMB = parseableScanned.reduce((s, f) => s + f.size, 0) / (1024 * 1024);
-    console.log(`📂 Scan: ${totalFiles} paths, ${totalParseable} parseable (${totalMB.toFixed(0)}MB), ${numChunks} chunks @ ${CHUNK_BYTE_BUDGET / (1024 * 1024)}MB budget`);
-  }
-
-  onProgress({
-    phase: 'parsing',
-    percent: 20,
-    message: `Parsing ${totalParseable} files in ${numChunks} chunk${numChunks !== 1 ? 's' : ''}...`,
-    stats: { filesProcessed: 0, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-  });
-
-  // Don't spawn workers for tiny repos — overhead exceeds benefit
-  const MIN_FILES_FOR_WORKERS = 15;
-  const MIN_BYTES_FOR_WORKERS = 512 * 1024;
-  const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
-
-  // Create worker pool once, reuse across chunks
-  let workerPool: WorkerPool | undefined;
-  if (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS) {
-    try {
-      let workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
-      // When running under vitest, import.meta.url points to src/ where no .js exists.
-      // Fall back to the compiled dist/ worker so the pool can spawn real worker threads.
-      const thisDir = fileURLToPath(new URL('.', import.meta.url));
-      if (!fs.existsSync(fileURLToPath(workerUrl))) {
-        const distWorker = path.resolve(thisDir, '..', '..', '..', 'dist', 'core', 'ingestion', 'workers', 'parse-worker.js');
-        if (fs.existsSync(distWorker)) {
-          workerUrl = pathToFileURL(distWorker) as URL;
-        }
-      }
-      workerPool = createWorkerPool(workerUrl);
-    } catch (err) {
-      if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
-    }
-  }
-
-  let filesParsedSoFar = 0;
-
-  // AST cache sized for one chunk (sequential fallback uses it for import/call/heritage)
-  const maxChunkFiles = chunks.reduce((max, c) => Math.max(max, c.length), 0);
-  let astCache = createASTCache(maxChunkFiles);
-
-  // Build import resolution context once — suffix index, file lists, resolve cache.
-  // Reused across all chunks to avoid rebuilding O(files × path_depth) structures.
-  const importCtx = buildImportResolutionContext(allPaths);
-  const allPathObjects = allPaths.map(p => ({ path: p }));
-
-  // Single-pass: parse + resolve imports/calls/heritage per chunk.
-  // Calls/heritage use the symbol table built so far (symbols from earlier chunks
-  // are already registered). This trades ~5% cross-chunk resolution accuracy for
-  // 200-400MB less memory — critical for Linux-kernel-scale repos.
-  const sequentialChunkPaths: string[][] = [];
-  // Pre-compute which chunks need synthesis — O(1) lookup per chunk.
-  const chunkNeedsSynthesis = chunks.map(paths =>
-    paths.some(p => {
-      const lang = getLanguageFromFilename(p);
-      return lang != null && needsSynthesis(lang);
-    }),
-  );
-  // Phase 14: Collect exported type bindings for cross-file propagation
-  const exportedTypeMap: ExportedTypeMap = new Map();
-  // Accumulate file-scope TypeEnv bindings from workers (closes worker/sequential quality gap)
-  const workerTypeEnvBindings: { filePath: string; bindings: [string, string][] }[] = [];
-  // Accumulate fetch() calls from workers for Next.js route matching
-  const allFetchCalls: ExtractedFetchCall[] = [];
-  // Accumulate framework-extracted routes (Laravel, etc.) for Route node creation
-  const allExtractedRoutes: ExtractedRoute[] = [];
-  // Accumulate decorator-based routes (@Get, @Post, @app.route, etc.)
-  const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
-  // Accumulate MCP/RPC tool definitions (@mcp.tool(), @app.tool(), etc.)
-  const allToolDefs: ExtractedToolDef[] = [];
-    const allORMQueries: ExtractedORMQuery[] = [];
+  const cleanup = () => {
+    astCache.clear();
+    ctx.clear();
+  };
 
   try {
-    for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
-      const chunkPaths = chunks[chunkIdx];
+    // ── Phase 1: Scan paths only (no content read) ─────────────────────
+    onProgress({
+      phase: 'extracting',
+      percent: 0,
+      message: 'Scanning repository...',
+    });
 
-      // Read content for this chunk only
-      const chunkContents = await readFileContents(repoPath, chunkPaths);
-      const chunkFiles = chunkPaths
-        .filter(p => chunkContents.has(p))
-        .map(p => ({ path: p, content: chunkContents.get(p)! }));
+    const scannedFiles = await walkRepositoryPaths(repoPath, (current, total, filePath) => {
+      const scanProgress = Math.round((current / total) * 15);
+      onProgress({
+        phase: 'extracting',
+        percent: scanProgress,
+        message: 'Scanning repository...',
+        detail: filePath,
+        stats: { filesProcessed: current, totalFiles: total, nodesCreated: graph.nodeCount },
+      });
+    });
 
-      // Parse this chunk (workers or sequential fallback)
-      const chunkWorkerData = await processParsing(
-        graph, chunkFiles, symbolTable, astCache,
-        (current, _total, filePath) => {
-          const globalCurrent = filesParsedSoFar + current;
-          const parsingProgress = 20 + ((globalCurrent / totalParseable) * 62);
-          onProgress({
-            phase: 'parsing',
-            percent: Math.round(parsingProgress),
-            message: `Parsing chunk ${chunkIdx + 1}/${numChunks}...`,
-            detail: filePath,
-            stats: { filesProcessed: globalCurrent, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-          });
-        },
-        workerPool,
-      );
+    const totalFiles = scannedFiles.length;
 
-      const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
+    onProgress({
+      phase: 'extracting',
+      percent: 15,
+      message: 'Repository scanned successfully',
+      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+    });
 
-      if (chunkWorkerData) {
-        // Imports
-        await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
-          onProgress({
-            phase: 'parsing',
-            percent: Math.round(chunkBasePercent),
-            message: `Resolving imports (chunk ${chunkIdx + 1}/${numChunks})...`,
-            detail: `${current}/${total} files`,
-            stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-          });
-        }, repoPath, importCtx);
-        // ── Wildcard-import synthesis (Ruby / C/C++ / Swift / Go) + Python module aliases ─
-        // Synthesize namedImportMap entries for wildcard-import languages and build
-        // moduleAliasMap for Python namespace imports. Must run after imports are resolved
-        // (importMap is populated) but BEFORE call resolution.
-        if (chunkNeedsSynthesis[chunkIdx]) synthesizeWildcardImportBindings(graph, ctx);
-        // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
-        // before call resolution — eliminates re-parse for single-hop imported receivers.
-        // NOTE: In the worker path, exportedTypeMap is empty during chunk processing
-        // (populated later in runCrossFileBindingPropagation). This block is latent —
-        // it activates only if incremental export collection is added per-chunk.
-        if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
-          const { enrichedCount } = seedCrossFileReceiverTypes(
-            chunkWorkerData.calls, ctx.namedImportMap, exportedTypeMap,
-          );
-          if (isDev && enrichedCount > 0) {
-            console.log(`🔗 E1: Seeded ${enrichedCount} cross-file receiver types (chunk ${chunkIdx + 1})`);
+    // ── Phase 2: Structure (paths only — no content needed) ────────────
+    onProgress({
+      phase: 'structure',
+      percent: 15,
+      message: 'Analyzing project structure...',
+      stats: { filesProcessed: 0, totalFiles, nodesCreated: graph.nodeCount },
+    });
+
+    const allPaths = scannedFiles.map(f => f.path);
+    processStructure(graph, allPaths);
+
+    onProgress({
+      phase: 'structure',
+      percent: 20,
+      message: 'Project structure analyzed',
+      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+    });
+
+    // ── Phase 2.5: Config Files (application*.properties/yml) ────────────
+    // Index config files separately from source code parsing
+    const configFileNames = allPaths.filter(isConfigFile);
+    if (configFileNames.length > 0) {
+      onProgress({
+        phase: 'parsing',
+        percent: 21,
+        message: `Indexing ${configFileNames.length} config file${configFileNames.length !== 1 ? 's' : ''}...`,
+        stats: { filesProcessed: 0, totalFiles: configFileNames.length, nodesCreated: graph.nodeCount },
+      });
+
+      const configFileContents = await readFileContents(repoPath, configFileNames);
+      const configFiles = configFileNames
+        .filter(p => configFileContents.has(p))
+        .map(p => ({ path: p, content: configFileContents.get(p)! }));
+
+      const propertyCount = processConfigFiles(graph, configFiles);
+      
+      if (isDev && propertyCount > 0) {
+        console.log(`⚙️  Indexed ${propertyCount} properties from ${configFileNames.length} config file${configFileNames.length !== 1 ? 's' : ''}`);
+      }
+    }
+
+    // ── Phase 2.5: Dependency Extraction ─────────────────────────────
+    onProgress({
+      phase: 'extracting',
+      percent: 20,
+      message: 'Extracting dependencies...',
+    });
+
+    let extractionRepoId: string | undefined;
+    try {
+      const extractionResult = await extractDependencies(repoPath);
+      extractionRepoId = extractionResult.repoId;
+      // Convert ExtractionResult to RepoManifest format
+      const manifest: import('../../storage/repo-manifest.js').RepoManifest = {
+        repoId: extractionResult.repoId,
+        indexedAt: extractionResult.indexedAt,
+        dependencies: extractionResult.dependencies.map(d => d.name),
+      };
+      if (isDev && manifest.dependencies.length > 0) {
+        console.log(`📦 Extracted ${manifest.dependencies.length} dependencies from ${extractionResult.ecosystem}`);
+      }
+      try {
+        await writeManifest(repoPath, manifest);
+      } catch (manifestErr) {
+        console.warn('Failed to write repo manifest:', (manifestErr as Error).message);
+      }
+    } catch (err) {
+      // Non-fatal: dependency extraction failure shouldn't stop indexing
+      console.warn('Dependency extraction failed:', (err as Error).message);
+    }
+
+    // Always initialize ctx/symbolTable — never leave them undefined
+    ctx = createResolutionContext(graph, extractionRepoId);
+    symbolTable = ctx.symbols;
+
+    // ── Phase 3+4: Chunked read + parse ────────────────────────────────
+    // Group parseable files into byte-budget chunks so only ~20MB of source
+    // is in memory at a time. Each chunk is: read → parse → extract → free.
+
+    const parseableScanned = scannedFiles.filter(f => {
+      const lang = getLanguageFromFilename(f.path);
+      return lang && isLanguageAvailable(lang);
+    });
+
+    // Warn about files skipped due to unavailable parsers
+    const skippedByLang = new Map<string, number>();
+    for (const f of scannedFiles) {
+      const lang = getLanguageFromFilename(f.path);
+      if (lang && !isLanguageAvailable(lang)) {
+        skippedByLang.set(lang, (skippedByLang.get(lang) || 0) + 1);
+      }
+    }
+    for (const [lang, count] of skippedByLang) {
+      console.warn(`Skipping ${count} ${lang} file(s) — ${lang} parser not available (native binding may not have built). Try: npm rebuild tree-sitter-${lang}`);
+    }
+
+    const totalParseable = parseableScanned.length;
+
+    if (totalParseable === 0) {
+      onProgress({
+        phase: 'parsing',
+        percent: 82,
+        message: 'No parseable files found — skipping parsing phase',
+        stats: { filesProcessed: 0, totalFiles: 0, nodesCreated: graph.nodeCount },
+      });
+    }
+
+    // Build byte-budget chunks
+    const chunks: string[][] = [];
+    let currentChunk: string[] = [];
+    let currentBytes = 0;
+    for (const file of parseableScanned) {
+      if (currentChunk.length > 0 && currentBytes + file.size > CHUNK_BYTE_BUDGET) {
+        chunks.push(currentChunk);
+        currentChunk = [];
+        currentBytes = 0;
+      }
+      currentChunk.push(file.path);
+      currentBytes += file.size;
+    }
+    if (currentChunk.length > 0) chunks.push(currentChunk);
+
+    const numChunks = chunks.length;
+
+    if (isDev) {
+      const totalMB = parseableScanned.reduce((s, f) => s + f.size, 0) / (1024 * 1024);
+      console.log(`📂 Scan: ${totalFiles} paths, ${totalParseable} parseable (${totalMB.toFixed(0)}MB), ${numChunks} chunks @ ${CHUNK_BYTE_BUDGET / (1024 * 1024)}MB budget`);
+    }
+
+    onProgress({
+      phase: 'parsing',
+      percent: 20,
+      message: `Parsing ${totalParseable} files in ${numChunks} chunk${numChunks !== 1 ? 's' : ''}...`,
+      stats: { filesProcessed: 0, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+    });
+
+    // Don't spawn workers for tiny repos — overhead exceeds benefit
+    const MIN_FILES_FOR_WORKERS = 1000000;
+    const MIN_BYTES_FOR_WORKERS = 1024 * 1024 * 1024;  // 512KB threshold
+    const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
+
+    // Create worker pool once, reuse across chunks
+    let workerPool: WorkerPool | undefined;
+    if (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS) {
+      try {
+        let workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
+        // When running under vitest, import.meta.url points to src/ where no .js exists.
+        // Fall back to the compiled dist/ worker so the pool can spawn real worker threads.
+        const thisDir = fileURLToPath(new URL('.', import.meta.url));
+        if (!fs.existsSync(fileURLToPath(workerUrl))) {
+          const distWorker = path.resolve(thisDir, '..', '..', '..', 'dist', 'core', 'ingestion', 'workers', 'parse-worker.js');
+          if (fs.existsSync(distWorker)) {
+            workerUrl = pathToFileURL(distWorker) as URL;
           }
         }
-        // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
-        // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
-        // and the single-threaded event loop prevents races between synchronous addRelationship calls.
-        await Promise.all([
-          processCallsFromExtracted(
+        workerPool = createWorkerPool(workerUrl);
+      } catch (err) {
+        if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
+      }
+    }
+
+    let filesParsedSoFar = 0;
+
+    // AST cache sized for one chunk (sequential fallback uses it for import/call/heritage)
+    const maxChunkFiles = chunks.reduce((max, c) => Math.max(max, c.length), 0);
+    astCache = createASTCache(maxChunkFiles);
+
+    // Build import resolution context once — suffix index, file lists, resolve cache.
+    // Reused across all chunks to avoid rebuilding O(files × path_depth) structures.
+    const importCtx = buildImportResolutionContext(allPaths);
+    const allPathObjects = allPaths.map(p => ({ path: p }));
+
+    // Single-pass: parse + resolve imports/calls/heritage per chunk.
+    // Calls/heritage use the symbol table built so far (symbols from earlier chunks
+    // are already registered). This trades ~5% cross-chunk resolution accuracy for
+    // 200-400MB less memory — critical for Linux-kernel-scale repos.
+    const sequentialChunkPaths: string[][] = [];
+    const sequentialChunkRoutes: ExtractedRoute[][] = [];
+    // Accumulate expoNavCalls, ormQueries, fetchCalls across chunks for processing after all chunks
+    const allExpoNavCalls: ExtractedExpoNav[] = [];
+    const allORMQueries: ExtractedORMQuery[] = [];
+    const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
+    const allFetchCalls: ExtractedFetchCall[] = [];
+    const allToolDefs: ExtractedToolDef[] = [];
+    const allAngularMetadata: import('./workers/parse-worker.js').ExtractedAngularEdge[] = [];
+    // #31: Angular CALLS extracted in the sequential parsing pass (DI/template).
+    const allSequentialCalls: import('./workers/parse-worker.js').ExtractedCall[] = [];
+
+    // WI-5 (#159 P3 Mode A): the candidate feed arrays. We pass them
+    // as sinks into `processCallsFromExtracted` ONLY when
+    // `options.lsp.enabled` is true; the default path leaves both
+    // arrays empty and the call processor never references them
+    // (the call processor checks `opts?.lsp` and `opts?.correctionFeed`
+    // / `opts?.recallFeed` before pushing). One pair of arrays is
+    // declared up front and SHARED across all chunks and the
+    // sequential-fallback re-resolution, so the reconciler sees a
+    // single merged feed.
+    const correctionFeed: CorrectionFeedItem[] = [];
+    const recallFeed: RecallFeedItem[] = [];
+    const lspFeedsOpt: ProcessCallsOpts | undefined = options?.lsp?.enabled
+      ? { lsp: true, correctionFeed, recallFeed }
+      : undefined;
+
+    // WI-4 / WI-6 (#159 P3 Mode A — heritage feed): the
+    // heritage candidate feed. We pass it as a sink into
+    // `processHeritageFromExtracted` (worker path) and
+    // `processHeritage` (sequential fallback) ONLY when
+    // `options.lsp.enabled` is true. The default path leaves
+    // the array empty and the heritage processor never
+    // references it (the heritage processor checks
+    // `opts?.lsp && opts.heritageFeed` before pushing). One
+    // array is declared up front and SHARED across all chunks
+    // and the sequential-fallback re-resolution, so the
+    // reconciler sees a single merged heritage feed. The
+    // candidate-merge block below concats the heritage feed
+    // into the same `Candidate[]` stream the CALLS feeds feed
+    // into — exactly ONE `withReconciliationSession` call
+    // drains the merged stream.
+    const heritageFeed: HeritageFeedItem[] = [];
+    const lspHeritageOpt: ProcessHeritageOpts | undefined = options?.lsp?.enabled
+      ? { lsp: true, heritageFeed }
+      : undefined;
+
+    try {
+      for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
+        const chunkPaths = chunks[chunkIdx];
+
+        // Read content for this chunk only
+        const chunkContents = await readFileContents(repoPath, chunkPaths);
+        const chunkFiles = chunkPaths
+          .filter(p => chunkContents.has(p))
+          .map(p => ({ path: p, content: chunkContents.get(p)! }));
+
+        // Parse this chunk (workers or sequential fallback)
+        const chunkWorkerData = await processParsing(
+          graph, chunkFiles, symbolTable, astCache,
+          (current, _total, filePath) => {
+            const globalCurrent = filesParsedSoFar + current;
+            const parsingProgress = 20 + ((globalCurrent / totalParseable) * 62);
+            onProgress({
+              phase: 'parsing',
+              percent: Math.round(parsingProgress),
+              message: `Parsing chunk ${chunkIdx + 1}/${numChunks}...`,
+              detail: filePath,
+              stats: { filesProcessed: globalCurrent, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+            });
+          },
+          workerPool,
+        );
+
+        const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
+
+        if (workerPool && chunkWorkerData) {
+          // Worker path: use extracted data for imports, heritage, calls, routes
+          // Imports
+          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
+            onProgress({
+              phase: 'parsing',
+              percent: Math.round(chunkBasePercent),
+              message: `Resolving imports (chunk ${chunkIdx + 1}/${numChunks})...`,
+              detail: `${current}/${total} files`,
+              stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+            });
+          }, repoPath, importCtx, options?.crossRepoRegistry);
+          // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
+          // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
+          // and the single-threaded event loop prevents races between synchronous addRelationship calls.
+
+          // Heritage MUST run before calls: IMPLEMENTS edges (from heritage) are needed
+          // for D5 call resolution to work correctly. Call resolution depends on
+          // interface/implementation edges being established first.
+          await processHeritageFromExtracted(
+            graph,
+            chunkWorkerData.heritage,
+            ctx,
+            (current, total) => {
+              onProgress({
+                phase: 'parsing',
+                percent: Math.round(chunkBasePercent),
+                message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
+                detail: `${current}/${total} records`,
+                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+              });
+            },
+            lspHeritageOpt,
+          );
+
+          await processCallsFromExtracted(
             graph,
             chunkWorkerData.calls,
             ctx,
@@ -742,22 +416,11 @@ async function runChunkedParseAndResolve(
               });
             },
             chunkWorkerData.constructorBindings,
-          ),
-          processHeritageFromExtracted(
-            graph,
-            chunkWorkerData.heritage,
-            ctx,
-            (current, total) => {
-              onProgress({
-                phase: 'parsing',
-                percent: Math.round(chunkBasePercent),
-                message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
-                detail: `${current}/${total} records`,
-                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-              });
-            },
-          ),
-          processRoutesFromExtracted(
+            undefined, // typeEnvBindings — not used in the worker path
+            lspFeedsOpt,
+          );
+
+          await processRoutesFromExtracted(
             graph,
             chunkWorkerData.routes ?? [],
             ctx,
@@ -770,632 +433,666 @@ async function runChunkedParseAndResolve(
                 stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
               });
             },
-          ),
-        ]);
-        // Process field write assignments (synchronous, runs after calls resolve)
-        if (chunkWorkerData.assignments?.length) {
-          processAssignmentsFromExtracted(graph, chunkWorkerData.assignments, ctx, chunkWorkerData.constructorBindings);
+          );
+          // Accumulate expoNavCalls and ormQueries for post-processing after all chunks
+          if (chunkWorkerData.expoNavCalls) {
+            allExpoNavCalls.push(...chunkWorkerData.expoNavCalls);
+          }
+          if (chunkWorkerData.ormQueries) {
+            allORMQueries.push(...chunkWorkerData.ormQueries);
+          }
+          // Accumulate decoratorRoutes (Express/Hono) for post-processing
+          if (chunkWorkerData.decoratorRoutes) {
+            allDecoratorRoutes.push(...chunkWorkerData.decoratorRoutes);
+          }
+          // Accumulate angularMetadata (NgModule edges) for post-processing
+          if (chunkWorkerData.angularMetadata) {
+            allAngularMetadata.push(...chunkWorkerData.angularMetadata);
+          }
+          // Accumulate fetchCalls for post-processing
+          if (chunkWorkerData.fetchCalls) {
+            allFetchCalls.push(...chunkWorkerData.fetchCalls);
+          }
+          // Accumulate toolDefs for post-processing
+          if (chunkWorkerData.toolDefs) {
+            allToolDefs.push(...chunkWorkerData.toolDefs);
+          }
+        } else {
+          // Sequential path: processImports adds symbols, then heritage/calls are resolved
+          // in the sequential fallback loop below (lines 351-365)
+          await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths, options?.crossRepoRegistry);
+          sequentialChunkPaths.push(chunkPaths);
+          sequentialChunkRoutes.push(chunkWorkerData.routes ?? []);
+          // Accumulate expoNavCalls and ormQueries for sequential path too
+          if (chunkWorkerData.expoNavCalls) {
+            allExpoNavCalls.push(...chunkWorkerData.expoNavCalls);
+          }
+          if (chunkWorkerData.ormQueries) {
+            allORMQueries.push(...chunkWorkerData.ormQueries);
+          }
+          if (chunkWorkerData.decoratorRoutes) {
+            allDecoratorRoutes.push(...chunkWorkerData.decoratorRoutes);
+          }
+          if (chunkWorkerData.angularMetadata) {
+            allAngularMetadata.push(...chunkWorkerData.angularMetadata);
+          }
+          // #31: Angular CALLS extracted by the sequential parsing pass. The
+          // general call graph is resolved via processCalls re-extraction below;
+          // chunkWorkerData.calls carries ONLY the Angular DI/template calls here.
+          if (chunkWorkerData.calls && chunkWorkerData.calls.length > 0) {
+            allSequentialCalls.push(...chunkWorkerData.calls);
+          }
+          // Accumulate fetchCalls for sequential path too
+          if (chunkWorkerData.fetchCalls) {
+            allFetchCalls.push(...chunkWorkerData.fetchCalls);
+          }
+          // Accumulate toolDefs for sequential path too
+          if (chunkWorkerData.toolDefs) {
+            allToolDefs.push(...chunkWorkerData.toolDefs);
+          }
         }
-        // Collect TypeEnv file-scope bindings for exported type enrichment
-        if (chunkWorkerData.typeEnvBindings?.length) {
-          workerTypeEnvBindings.push(...chunkWorkerData.typeEnvBindings);
-        }
-        // Collect fetch() calls for Next.js route matching
-        if (chunkWorkerData.fetchCalls?.length) {
-          allFetchCalls.push(...chunkWorkerData.fetchCalls);
-        }
-        if (chunkWorkerData.routes?.length) {
-          allExtractedRoutes.push(...chunkWorkerData.routes);
-        }
-        if (chunkWorkerData.decoratorRoutes?.length) {
-          allDecoratorRoutes.push(...chunkWorkerData.decoratorRoutes);
-        }
-        if (chunkWorkerData.toolDefs?.length) {
-          allToolDefs.push(...chunkWorkerData.toolDefs);
-        }
-        if (chunkWorkerData.ormQueries?.length) {
-          allORMQueries.push(...chunkWorkerData.ormQueries);
-        }
-      } else {
-        await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
-        sequentialChunkPaths.push(chunkPaths);
+
+        filesParsedSoFar += chunkFiles.length;
+
+        // Clear AST cache between chunks to free memory
+        astCache.clear();
+        // chunkContents + chunkFiles + chunkWorkerData go out of scope → GC reclaims
       }
+    } finally {
+      await workerPool?.terminate();
+    }
 
-      filesParsedSoFar += chunkFiles.length;
-
-      // Clear AST cache between chunks to free memory
+    // Sequential fallback chunks: re-read source for call/heritage resolution
+    for (let chunkIdx = 0; chunkIdx < sequentialChunkPaths.length; chunkIdx++) {
+      const chunkPaths = sequentialChunkPaths[chunkIdx];
+      const chunkContents = await readFileContents(repoPath, chunkPaths);
+      const chunkFiles = chunkPaths
+        .filter(p => chunkContents.has(p))
+        .map(p => ({ path: p, content: chunkContents.get(p)! }));
+      astCache = createASTCache(chunkFiles.length);
+      // WI-4 / WI-6: pass `lspHeritageOpt` so the AST-path
+      // `processHeritage` populates the shared heritage feed
+      // (mirrors the worker-path threading at `:388-403`).
+      await processHeritage(graph, chunkFiles, astCache, ctx, undefined, lspHeritageOpt);
+      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx, undefined, undefined, undefined, undefined, undefined, lspFeedsOpt);
+      if (rubyHeritage.length > 0) {
+        await processHeritageFromExtracted(graph, rubyHeritage, ctx, undefined, lspHeritageOpt);
+      }
+      const chunkRoutes = sequentialChunkRoutes[chunkIdx];
+      if (chunkRoutes.length > 0) {
+        await processRoutesFromExtracted(graph, chunkRoutes, ctx);
+      }
       astCache.clear();
-      // chunkContents + chunkFiles + chunkWorkerData go out of scope → GC reclaims
     }
-  } finally {
-    await workerPool?.terminate();
-  }
 
-  // Sequential fallback chunks: re-read source for call/heritage resolution
-  // Synthesize wildcard import bindings once after ALL imports are processed,
-  // before any call resolution — same rationale as the worker-path inline synthesis.
-  if (sequentialChunkPaths.length > 0) synthesizeWildcardImportBindings(graph, ctx);
-  for (const chunkPaths of sequentialChunkPaths) {
-    const chunkContents = await readFileContents(repoPath, chunkPaths);
-    const chunkFiles = chunkPaths
-      .filter(p => chunkContents.has(p))
-      .map(p => ({ path: p, content: chunkContents.get(p)! }));
-    astCache = createASTCache(chunkFiles.length);
-    const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx, undefined, exportedTypeMap);
-    await processHeritage(graph, chunkFiles, astCache, ctx);
-    if (rubyHeritage.length > 0) {
-      await processHeritageFromExtracted(graph, rubyHeritage, ctx);
-    }
-    // Extract fetch() calls for Next.js route matching (sequential path)
-    const chunkFetchCalls = await extractFetchCallsFromFiles(chunkFiles, astCache);
-    if (chunkFetchCalls.length > 0) {
-      allFetchCalls.push(...chunkFetchCalls);
-    }
-    // Extract ORM queries (sequential path)
-    for (const f of chunkFiles) {
-      extractORMQueriesInline(f.path, f.content, allORMQueries);
-    }
-    astCache.clear();
-  }
-
-  // Log resolution cache stats
-  if (isDev) {
-    const rcStats = ctx.getStats();
-    const total = rcStats.cacheHits + rcStats.cacheMisses;
-    const hitRate = total > 0 ? ((rcStats.cacheHits / total) * 100).toFixed(1) : '0';
-    console.log(`🔍 Resolution cache: ${rcStats.cacheHits} hits, ${rcStats.cacheMisses} misses (${hitRate}% hit rate)`);
-  }
-
-  // ── Worker path quality enrichment: merge TypeEnv file-scope bindings into ExportedTypeMap ──
-  // Workers return file-scope bindings from their TypeEnv fixpoint (includes inferred types
-  // like `const config = getConfig()` → Config). Filter by graph isExported to match
-  // the sequential path's collectExportedBindings behavior.
-  if (workerTypeEnvBindings.length > 0) {
-    let enriched = 0;
-    for (const { filePath, bindings } of workerTypeEnvBindings) {
-      for (const [name, type] of bindings) {
-        // Verify the symbol is exported via graph node
-        const nodeId = `Function:${filePath}:${name}`;
-        const varNodeId = `Variable:${filePath}:${name}`;
-        const constNodeId = `Const:${filePath}:${name}`;
-        const node = graph.getNode(nodeId) ?? graph.getNode(varNodeId) ?? graph.getNode(constNodeId);
-        if (!node?.properties?.isExported) continue;
-
-        let fileExports = exportedTypeMap.get(filePath);
-        if (!fileExports) { fileExports = new Map(); exportedTypeMap.set(filePath, fileExports); }
-        // Don't overwrite existing entries (Tier 0 from SymbolTable is authoritative)
-        if (!fileExports.has(name)) {
-          fileExports.set(name, type);
-          enriched++;
-        }
+    // Post-processing: Expo routes and ORM queries (accumulated across all chunks)
+    // Process Expo Router routes and navigation
+    const expoPaths = allPaths.filter(p => p.includes('app/'));
+    if (expoPaths.length > 0) {
+      const routeRegistry = processExpoRoutesWithRepoId(graph, expoPaths, ctx.repoId ?? '');
+      if (allExpoNavCalls.length > 0) {
+        processExpoRouterNavigations(graph, allExpoNavCalls, routeRegistry);
       }
     }
-    if (isDev && enriched > 0) {
-      console.log(`🔗 Worker TypeEnv enrichment: ${enriched} fixpoint-inferred exports added to ExportedTypeMap`);
+
+    // Process ORM queries
+    if (allORMQueries.length > 0) {
+      processORMQueriesFromExtracted(graph, allORMQueries);
     }
-  }
 
-  // ── Final synthesis pass for whole-module-import languages ──
-  // Per-chunk synthesis (above) already ran incrementally. This final pass ensures
-  // any remaining files whose imports were not covered inline are also synthesized,
-  // and that Phase 14 type propagation has complete namedImportMap data.
-  const synthesized = synthesizeWildcardImportBindings(graph, ctx);
-  if (isDev && synthesized > 0) {
-    console.log(`🔗 Synthesized ${synthesized} additional wildcard import bindings (Go/Ruby/C++/Swift/Python)`);
-  }
+    // Process Express/Hono routes (decoratorRoutes extracted from JS/TS files)
+    if (allDecoratorRoutes.length > 0) {
+      processDecoratorRoutesWithRepoId(graph, allDecoratorRoutes, ctx.repoId ?? '');
+    }
 
-  // Free import resolution context — suffix index + resolve cache no longer needed
-  // (allPathObjects and importCtx hold ~94MB+ for large repos)
-  allPathObjects.length = 0;
-  importCtx.resolveCache.clear();
-  importCtx.index = EMPTY_INDEX; // Release suffix index memory (~30MB for large repos)
-  importCtx.normalizedFileList = [];
+    // Process Angular @NgModule metadata edges (#32 — AppModule outgoing edges)
+    if (allAngularMetadata.length > 0) {
+      await processAngularMetadataFromExtracted(graph, allAngularMetadata, ctx);
+    }
 
-  return { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allORMQueries };
-}
+    // Process Angular CALLS edges (#31 — DI token -> service, template -> method).
+    // Runs after the sequential fallback so component/service symbols exist.
+    if (allSequentialCalls.length > 0) {
+      await processCallsFromExtracted(
+        graph,
+        allSequentialCalls,
+        ctx,
+        undefined, // onProgress
+        undefined, // constructorBindings
+        undefined, // typeEnvBindings
+        lspFeedsOpt,
+      );
+    }
 
-/**
- * Post-parse graph analysis: MRO, community detection, process extraction.
- *
- * @reads  graph (all nodes and relationships from parse + resolve phases)
- * @writes graph (Community nodes, Process nodes, MEMBER_OF edges, STEP_IN_PROCESS edges, OVERRIDES edges)
- */
-async function runGraphAnalysisPhases(
-  graph: ReturnType<typeof createKnowledgeGraph>,
-  totalFiles: number,
-  onProgress: ProgressFn,
-  routeRegistry?: Map<string, { filePath: string; source: string }>,
-  toolDefs?: { name: string; filePath: string; description: string }[],
-): Promise<{
-  communityResult: Awaited<ReturnType<typeof processCommunities>>;
-  processResult: Awaited<ReturnType<typeof processProcesses>>;
-}> {
-  // ── Phase 4.5: Method Resolution Order ──────────────────────────────
-  onProgress({
-    phase: 'parsing',
-    percent: 81,
-    message: 'Computing method resolution order...',
-    stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-  });
+    // Process MCP tool definitions (@mcp.tool() decorators)
+    if (allToolDefs.length > 0) {
+      await processToolDefsFromExtracted(graph, allToolDefs, ctx);
+    }
 
-  const mroResult = computeMRO(graph);
-  if (isDev && mroResult.entries.length > 0) {
-    console.log(`🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`);
-  }
+    // Process PHP file-based routes (direct file routing in api/ directory)
+    const phpApiPaths = allPaths.filter(p => p.endsWith('.php') && (p.startsWith('api/') || p.includes('/api/')));
+    if (phpApiPaths.length > 0) {
+      const phpContents = await readFileContents(repoPath, phpApiPaths);
+      processPHPRoutesWithRepoId(graph, phpApiPaths, phpContents, ctx.repoId ?? '');
+    }
 
-  // ── Phase 5: Communities ───────────────────────────────────────────
-  onProgress({
-    phase: 'communities',
-    percent: 82,
-    message: 'Detecting code communities...',
-    stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-  });
+    // Process Next.js App Router routes (app/api/**/route.ts files)
+    // Match files like: app/api/grants/route.ts, app/api/users/[id]/route.ts
+    const nextjsRoutePaths = allPaths.filter(p => /(?:^|\/)app\/api\/.*\/route\.(ts|js|tsx|jsx)$/.test(p));
+    let nextjsRouteRegistry: Map<string, string> | undefined;
+    if (nextjsRoutePaths.length > 0) {
+      const nextjsContents = await readFileContents(repoPath, nextjsRoutePaths);
+      nextjsRouteRegistry = processNextjsRoutesWithRepoId(graph, nextjsRoutePaths, nextjsContents, ctx.repoId ?? '');
+    }
 
-  const communityResult = await processCommunities(graph, (message, progress) => {
-    const communityProgress = 82 + (progress * 0.10);
-    onProgress({
-      phase: 'communities',
-      percent: Math.round(communityProgress),
-      message,
-      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-    });
-  });
+    // Process Next.js project-level middleware.ts and link to matching routes
+    const allFileContents = await readFileContents(repoPath, allPaths);
+    processNextjsMiddleware(graph, allPaths, allFileContents);
 
-  if (isDev) {
-    console.log(`🏘️ Community detection: ${communityResult.stats.totalCommunities} communities found (modularity: ${communityResult.stats.modularity.toFixed(3)})`);
-  }
+    // Process fetch() calls to create FETCHES edges to Route nodes
+    if (allFetchCalls.length > 0 && nextjsRouteRegistry && nextjsRouteRegistry.size > 0) {
+      // `allFileContents` was loaded above; filter it down to the
+      // consumer file set rather than re-issuing `readFileContents`
+      // for the same paths.
+      const consumerPaths = [...new Set(allFetchCalls.map(c => c.filePath))];
+      const consumerContents = new Map(
+        consumerPaths
+          .map(p => [p, allFileContents.get(p)] as const)
+          .filter((entry): entry is readonly [string, string] => entry[1] !== undefined),
+      );
+      processNextjsFetchRoutes(graph, allFetchCalls, nextjsRouteRegistry, consumerContents);
+    }
 
-  communityResult.communities.forEach(comm => {
-    graph.addNode({
-      id: comm.id,
-      label: 'Community' as const,
-      properties: {
-        name: comm.label,
-        filePath: '',
-        heuristicLabel: comm.heuristicLabel,
-        cohesion: comm.cohesion,
-        symbolCount: comm.symbolCount,
+    // Log resolution cache stats
+    if (isDev) {
+      const rcStats = ctx.getStats();
+      const total = rcStats.cacheHits + rcStats.cacheMisses;
+      const hitRate = total > 0 ? ((rcStats.cacheHits / total) * 100).toFixed(1) : '0';
+      console.log(`🔍 Resolution cache: ${rcStats.cacheHits} hits, ${rcStats.cacheMisses} misses (${hitRate}% hit rate)`);
+    }
+
+    // Free import resolution context — suffix index + resolve cache no longer needed
+    // (allPathObjects and importCtx hold ~94MB+ for large repos)
+    allPathObjects.length = 0;
+    importCtx.resolveCache.clear();
+    (importCtx as any).suffixIndex = null;
+    (importCtx as any).normalizedFileList = null;
+
+    // ── WI-5 (#159 P3 Mode A) — LSP reconciliation ────────────────────
+    // Runs AFTER every CALLS emitter has finished (the three
+    // `processCallsFromExtracted` paths above + the Angular
+    // sequential-fallback re-resolution) and BEFORE the
+    // community/process phases mutate the graph further. The
+    // reconciler mutates the in-memory graph in place; the
+    // downstream load-to-LadybugDB path (lbug-adapter) is the
+    // sole serialization surface, so the `source` column rides
+    // through the normal CSV→COPY path.
+    //
+    // Default `analyze` (no `opts.lsp`) hits the `else` branch —
+    // the array empty-checks short-circuit and no server is
+    // ever discovered or started. The default path is byte-
+    // identical.
+    // The engine no longer carries `serverVersion` on its
+    // report (the session has the authoritative value via
+    // `SessionMeta`); we attach it here so the
+    // observability print line keeps a single source of
+    // truth and the type system is happy.
+    type PipelineLspReport = ReconciliationReport & { serverVersion: string };
+    let lspReport: PipelineLspReport | null = null;
+    if (options?.lsp?.enabled) {
+      const lspStart = Date.now();
+      const dryRun = options.lsp.dryRun === true;
+
+      // Build the in-memory node adapter the mapper needs. We
+      // project the in-memory graph's nodes into the adapter's
+      // minimal shape (`InMemoryNode`). The adapter itself is
+      // read-only (KD-2); the reconciler mutates ONLY the
+      // in-memory `KnowledgeGraph` it was given.
+      const lspNodes: InMemoryNode[] = [];
+      graph.forEachNode((n) => {
+        // Every GraphNode carries a `properties` object by
+        // type contract; the typeof guards below normalize
+        // *missing* fields (the properties record is
+        // partial in practice) to the empty/zero defaults
+        // the adapter expects.
+        const props = n.properties;
+        lspNodes.push({
+          id: n.id,
+          name: typeof props.name === 'string' ? props.name : '',
+          startLine: typeof props.startLine === 'number' ? props.startLine : 0,
+          endLine: typeof props.endLine === 'number' ? props.endLine : 0,
+          label: n.label,
+          filePath: typeof props.filePath === 'string' ? props.filePath : '',
+        });
+      });
+      const inMemoryQuery = createInMemoryNodeQuery(lspNodes);
+
+      // Merge feeds into a single `Candidate[]` stream. The
+      // session funnel stable-sorts by
+      // (sourceId, calledName, line, character) and caps at
+      // 2000 — see `withReconciliationSession` (KD-9). Recall
+      // candidates lack `oldTargetId`; correction candidates
+      // carry it. We unify the two shapes here. WI-1 / #159
+      // also threads `oldRelId` so the engine's site-precise
+      // `correct`/`confirm` can target the exact edge id
+      // minted by the heuristic (call-processor.ts:668/:1537
+      // `:L${line}` suffix).
+      const candidates: Candidate[] = [];
+      for (const c of correctionFeed) {
+        candidates.push({
+          sourceId: c.sourceId,
+          calledName: c.calledName,
+          oldTargetId: c.oldTargetId,
+          oldRelId: c.oldRelId,
+          file: c.file,
+          line: c.line,
+          character: c.character,
+        });
       }
-    });
-  });
+      for (const r of recallFeed) {
+        candidates.push({
+          sourceId: r.sourceId,
+          calledName: r.calledName,
+          file: r.file,
+          line: r.line,
+          character: r.character,
+        });
+      }
 
-  communityResult.memberships.forEach(membership => {
-    graph.addRelationship({
-      id: `${membership.nodeId}_member_of_${membership.communityId}`,
-      type: 'MEMBER_OF',
-      sourceId: membership.nodeId,
-      targetId: membership.communityId,
-      confidence: 1.0,
-      reason: 'leiden-algorithm',
-    });
-  });
+      // WI-6 (#159 P3 Mode A — pipeline merge): concat the
+      // heritage feed into the same `Candidate[]` stream.
+      // The heritage processor emits a `HeritageFeedItem`
+      // per heuristic heritage edge that passes the WI-4
+      // gate (lsp on, TS-family, parent at global/unresolved
+      // tier, position available, edge actually emitted).
+      // Each `HeritageFeedItem` maps to a `Candidate` with
+      // `relType` set (WI-5: `'IMPLEMENTS' | 'EXTENDS'`) and
+      // `parentName` mapped to `calledName` (the parent
+      // identifier is the LSP query target — KD-5: definition
+      // at the parent position). `oldTargetId` / `oldRelId`
+      // ride through unchanged so the engine can find the
+      // heuristic edge and (on `correct`) remove it by exact
+      // id. The shared 2000 cap applies to the merged stream
+      // — CALLS + heritage compete for the deterministic
+      // prefix after the stable sort (partitioning is a
+      // documented follow-up).
+      for (const h of heritageFeed) {
+        candidates.push({
+          sourceId: h.sourceId,
+          calledName: h.parentName,
+          oldTargetId: h.oldTargetId,
+          oldRelId: h.oldRelId,
+          relType: h.relType,
+          file: h.file,
+          line: h.line,
+          character: h.character,
+        });
+      }
 
-  // ── Phase 6: Processes ─────────────────────────────────────────────
-  onProgress({
-    phase: 'processes',
-    percent: 94,
-    message: 'Detecting execution flows...',
-    stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-  });
+      // WI-1 (#166 P3 Mode A) — dedup merged stream by
+      // `candidateLocationKey`. The active `processCalls` (`:492`,
+      // wired this WI) and the Angular post-pass (`:531`) now
+      // share these feed arrays. When the same call site is
+      // reachable by both producers (e.g. an Angular component
+      // file that also falls into the sequential fallback), the
+      // session funnel would see the same candidate twice. The
+      // funnel sorts but does not dedup, so we dedup here once
+      // (O(n)) keyed on the canonical four-tuple the engine
+      // itself uses (`mode-a-reconciler.ts:1626`). First writer
+      // wins (Map iteration order is insertion order); the
+      // correction shape carries `oldTargetId` so a correction
+      // beats a recall when both arrive for the same site.
+      const dedupedCandidates: Candidate[] = [];
+      const seenKeys = new Set<string>();
+      for (const c of candidates) {
+        const k = candidateLocationKey(c);
+        if (seenKeys.has(k)) continue;
+        seenKeys.add(k);
+        dedupedCandidates.push(c);
+      }
 
-  let symbolCount = 0;
-  graph.forEachNode(n => { if (n.label !== 'File') symbolCount++; });
-  const dynamicMaxProcesses = Math.max(20, Math.min(300, Math.round(symbolCount / 10)));
+      // WI-6 (#159 P3): select the language adapter once for this
+      // repo. `selectAdapter` performs an extension census (KD-4)
+      // and returns the dominant adapter or `null` (no supported
+      // language). A `null` result is passed directly into the
+      // session deps — the session short-circuits cleanly and
+      // returns `null` without spawning anything.
+      //
+      // The adapter is threaded through three DI seams:
+      //   1. `adapter` dep → session selects server binary + args.
+      //   2. `probe` override → `buildCanarySamples` uses
+      //      `adapter.canary` strategy so Java repos sample `.java`
+      //      files instead of TypeScript files.
+      //   3. `defaultCreateLspClient` → `LspClient` receives the
+      //      adapter and spawns the correct binary.
+      const lspAdapter = selectAdapter(repoPath);
 
-  const processResult = await processProcesses(
-    graph,
-    communityResult.memberships,
-    (message, progress) => {
-      const processProgress = 94 + (progress * 0.05);
+      // Pre-resolve the repo root once for the entire reconciliation
+      // session. mapLocationToNodeId calls realpathSync(repoPath) on
+      // every invocation when only `repoPath` is supplied — for a
+      // large Python repo (10k+ CALL candidates) that emits 10k
+      // redundant stat(2) syscalls against the same constant value.
+      // Supplying the pre-resolved root as `resolvedRepoPath` lets the
+      // mapper skip that call entirely in the hot path.
+      let resolvedRepoPath: string | undefined;
+      try {
+        resolvedRepoPath = fs.realpathSync(repoPath);
+      } catch {
+        // Non-existent or inaccessible repo root — leave undefined so
+        // the mapper falls back to its own realpathSync on each call
+        // (pre-existing behavior, preserves correctness).
+        resolvedRepoPath = undefined;
+      }
+
+      // The session funnel is the single refuse path. The
+      // per-candidate `textDocument/definition` requests are
+      // issued inside it; the responses are collected into
+      // `locations` via the `handToEngine` seam. We then run
+      // the engine decision pass (`reconcileDecisions`) once,
+      // followed by `applyDecisions` (which is a no-op in
+      // dryRun).
+      const locations = new Map<string, Location[]>();
+
       onProgress({
-        phase: 'processes',
-        percent: Math.round(processProgress),
-        message,
+        phase: 'parsing',
+        percent: 80,
+        message: dryRun ? 'LSP dry-run: resolving candidates...' : 'LSP reconciliation: resolving candidates...',
         stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
       });
-    },
-    { maxProcesses: dynamicMaxProcesses, minSteps: 3 }
-  );
 
-  if (isDev) {
-    console.log(`🔄 Process detection: ${processResult.stats.totalProcesses} processes found (${processResult.stats.crossCommunityCount} cross-community)`);
-  }
-
-  processResult.processes.forEach(proc => {
-    graph.addNode({
-      id: proc.id,
-      label: 'Process' as const,
-      properties: {
-        name: proc.label,
-        filePath: '',
-        heuristicLabel: proc.heuristicLabel,
-        processType: proc.processType,
-        stepCount: proc.stepCount,
-        communities: proc.communities,
-        entryPointId: proc.entryPointId,
-        terminalId: proc.terminalId,
-      }
-    });
-  });
-
-  processResult.steps.forEach(step => {
-    graph.addRelationship({
-      id: `${step.nodeId}_step_${step.step}_${step.processId}`,
-      type: 'STEP_IN_PROCESS',
-      sourceId: step.nodeId,
-      targetId: step.processId,
-      confidence: 1.0,
-      reason: 'trace-detection',
-      step: step.step,
-    });
-  });
-
-  // Link Route and Tool nodes to Processes via reverse index (file → node id)
-  if ((routeRegistry?.size ?? 0) > 0 || (toolDefs?.length ?? 0) > 0) {
-    // Reverse indexes: file → all route URLs / tool names (handles multi-route files)
-    const routesByFile = new Map<string, string[]>();
-    if (routeRegistry) {
-      for (const [url, entry] of routeRegistry) {
-        let list = routesByFile.get(entry.filePath);
-        if (!list) { list = []; routesByFile.set(entry.filePath, list); }
-        list.push(url);
-      }
-    }
-    const toolsByFile = new Map<string, string[]>();
-    if (toolDefs) {
-      for (const td of toolDefs) {
-        let list = toolsByFile.get(td.filePath);
-        if (!list) { list = []; toolsByFile.set(td.filePath, list); }
-        list.push(td.name);
-      }
-    }
-
-    let linked = 0;
-    for (const proc of processResult.processes) {
-      if (!proc.entryPointId) continue;
-      const entryNode = graph.getNode(proc.entryPointId);
-      if (!entryNode) continue;
-      const entryFile = entryNode.properties.filePath;
-      if (!entryFile) continue;
-
-      const routeURLs = routesByFile.get(entryFile);
-      if (routeURLs) {
-        for (const routeURL of routeURLs) {
-          const routeNodeId = generateId('Route', routeURL);
-          graph.addRelationship({
-            id: generateId('ENTRY_POINT_OF', `${routeNodeId}->${proc.id}`),
-            sourceId: routeNodeId,
-            targetId: proc.id,
-            type: 'ENTRY_POINT_OF',
-            confidence: 0.85,
-            reason: 'route-handler-entry-point',
-          });
-          linked++;
-        }
-      }
-      const toolNames = toolsByFile.get(entryFile);
-      if (toolNames) {
-        for (const toolName of toolNames) {
-          const toolNodeId = generateId('Tool', toolName);
-          graph.addRelationship({
-            id: generateId('ENTRY_POINT_OF', `${toolNodeId}->${proc.id}`),
-            sourceId: toolNodeId,
-            targetId: proc.id,
-            type: 'ENTRY_POINT_OF',
-            confidence: 0.85,
-            reason: 'tool-handler-entry-point',
-          });
-          linked++;
-        }
-      }
-    }
-    if (isDev && linked > 0) {
-      console.log(`🔗 Linked ${linked} Route/Tool nodes to execution flows`);
-    }
-  }
-
-  return { communityResult, processResult };
-}
-
-// ── Pipeline orchestrator ─────────────────────────────────────────────────
-
-export const runPipelineFromRepo = async (
-  repoPath: string,
-  onProgress: (progress: PipelineProgress) => void,
-  options?: PipelineOptions,
-): Promise<PipelineResult> => {
-  const graph = createKnowledgeGraph();
-  const ctx = createResolutionContext();
-  const pipelineStart = Date.now();
-
-  try {
-    // Phase 1+2: Scan paths, build structure, process markdown
-    const { scannedFiles, allPaths, totalFiles } = await runScanAndStructure(repoPath, graph, onProgress);
-
-    // Phase 3+4: Chunked parse + resolve (imports, calls, heritage, routes)
-    const { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allORMQueries } = await runChunkedParseAndResolve(
-      graph, ctx, scannedFiles, allPaths, totalFiles, repoPath, pipelineStart, onProgress,
-    );
-
-    // ── Phase 3.5: Route Registry (Next.js + PHP + Laravel + decorators) ──
-    type RouteEntry = { filePath: string; source: string };
-    const routeRegistry = new Map<string, RouteEntry>();
-
-    // Detect Expo Router app/ roots vs Next.js app/ roots (monorepo-safe).
-    const expoAppRoots = new Set<string>();
-    const nextjsAppRoots = new Set<string>();
-    const expoAppPaths = new Set<string>();
-    for (const p of allPaths) {
-      const norm = p.replace(/\\/g, '/');
-      const appIdx = norm.lastIndexOf('app/');
-      if (appIdx < 0) continue;
-      const root = norm.slice(0, appIdx + 4);
-      if (/\/_layout\.(tsx?|jsx?)$/.test(norm)) expoAppRoots.add(root);
-      if (/\/page\.(tsx?|jsx?)$/.test(norm)) nextjsAppRoots.add(root);
-    }
-    for (const root of nextjsAppRoots) expoAppRoots.delete(root);
-    if (expoAppRoots.size > 0) {
-      for (const p of allPaths) {
-        const norm = p.replace(/\\/g, '/');
-        const appIdx = norm.lastIndexOf('app/');
-        if (appIdx >= 0 && expoAppRoots.has(norm.slice(0, appIdx + 4))) expoAppPaths.add(p);
-      }
-    }
-
-    for (const p of allPaths) {
-      if (expoAppPaths.has(p)) {
-        const expoURL = expoFileToRouteURL(p);
-        if (expoURL && !routeRegistry.has(expoURL)) {
-          routeRegistry.set(expoURL, { filePath: p, source: 'expo-filesystem-route' });
-          continue;
-        }
-      }
-      const nextjsURL = nextjsFileToRouteURL(p);
-      if (nextjsURL && !routeRegistry.has(nextjsURL)) {
-        routeRegistry.set(nextjsURL, { filePath: p, source: 'nextjs-filesystem-route' });
-        continue;
-      }
-      if (p.endsWith('.php')) {
-        const phpURL = phpFileToRouteURL(p);
-        if (phpURL && !routeRegistry.has(phpURL)) {
-          routeRegistry.set(phpURL, { filePath: p, source: 'php-file-route' });
-        }
-      }
-    }
-
-    const ensureSlash = (path: string) => path.startsWith('/') ? path : '/' + path;
-    let duplicateRoutes = 0;
-    const addRoute = (url: string, entry: RouteEntry) => {
-      if (routeRegistry.has(url)) { duplicateRoutes++; return; }
-      routeRegistry.set(url, entry);
-    };
-    for (const route of allExtractedRoutes) {
-      if (!route.routePath) continue;
-      addRoute(ensureSlash(route.routePath), { filePath: route.filePath, source: 'framework-route' });
-    }
-    for (const dr of allDecoratorRoutes) {
-      addRoute(ensureSlash(dr.routePath), { filePath: dr.filePath, source: `decorator-${dr.decoratorName}` });
-    }
-
-    let handlerContents: Map<string, string> | undefined;
-    if (routeRegistry.size > 0) {
-      const handlerPaths = [...routeRegistry.values()].map(e => e.filePath);
-      handlerContents = await readFileContents(repoPath, handlerPaths);
-
-      for (const [routeURL, entry] of routeRegistry) {
-        const { filePath: handlerPath, source: routeSource } = entry;
-        const content = handlerContents.get(handlerPath);
-
-        const { responseKeys, errorKeys } = content
-          ? (handlerPath.endsWith(".php") ? extractPHPResponseShapes(content) : extractResponseShapes(content))
-          : { responseKeys: undefined, errorKeys: undefined };
-
-        const mwResult = content ? extractMiddlewareChain(content) : undefined;
-        const middleware = mwResult?.chain;
-
-        const routeNodeId = generateId('Route', routeURL);
-        graph.addNode({
-          id: routeNodeId,
-          label: 'Route',
-          properties: {
-            name: routeURL,
-            filePath: handlerPath,
-            ...(responseKeys ? { responseKeys } : {}),
-            ...(errorKeys ? { errorKeys } : {}),
-            ...(middleware && middleware.length > 0 ? { middleware } : {}),
+      const sessionResult = await withReconciliationSession(
+        { id: ctx.repoId ?? 'default', repoPath },
+        dedupedCandidates,
+        async (selected, meta, skipped) => {
+          // The session's own per-candidate loop drives the
+          // `textDocument/definition` requests; the engine
+          // seam is `handToEngine`. The session has already
+          // populated `locations` by the time the work fn
+          // runs. We return the meta + skipped count so the
+          // outer code can report it.
+          return { meta, selectedCount: selected.length, skipped };
+        },
+        {
+          // WI-6: pass the selected adapter (or null) so the
+          // session can pick the correct discovered server and
+          // spawn the correct binary. null → session short-circuits.
+          adapter: lspAdapter,
+          // probe: wire a real canary-based readiness check.
+          // The `defaultProbe` in mode-a-reconciler.ts passes
+          // empty samples → probe always refuses (structural no-op).
+          // We override it here with `buildCanarySamples` so the
+          // session can actually gate on whether the server has
+          // resolved the workspace module graph.
+          //
+          // WI-6: pass `{ strategy: lspAdapter.canary }` so the
+          // sampler uses the correct language strategy — Java repos
+          // scan `.java` files; TS repos scan `.ts`/`.tsx`/etc.
+          // `adapter.canary` may be `null` for stub adapters
+          // (pre-WI-2); `buildCanarySamples` falls back to
+          // TS_CANARY_STRATEGY safely in that case.
+          //
+          // The probe signature wants the full `LspClient`; the
+          // session narrows it to `ReconciliationLspClient` for the
+          // work-fn seam. The narrowing is behavior-preserving (the
+          // four picked members are the only ones the probe touches
+          // in this codepath) — a structural cast is sound but TS
+          // can't prove it without the double-as. Mirrors the
+          // casting pattern in defaultProbe (mode-a-reconciler.ts).
+          probe: lspAdapter === null ? undefined : async (client) => {
+            const { probeWorkspaceReadiness } = await import('./lsp/workspace-readiness-probe.js');
+            const { buildCanarySamples } = await import('./lsp/canary-sampler.js');
+            return probeWorkspaceReadiness(
+              client as unknown as import('./lsp/lsp-client.js').LspClient,
+              await buildCanarySamples(repoPath, { strategy: lspAdapter.canary }),
+              { perRequestTimeoutMs: 3000 },
+            );
           },
-        });
-
-        const handlerFileId = generateId('File', handlerPath);
-        graph.addRelationship({
-          id: generateId('HANDLES_ROUTE', `${handlerFileId}->${routeNodeId}`),
-          sourceId: handlerFileId,
-          targetId: routeNodeId,
-          type: 'HANDLES_ROUTE',
-          confidence: 1.0,
-          reason: routeSource,
-        });
-      }
-
-      if (isDev) {
-        console.log(`🗺️ Route registry: ${routeRegistry.size} routes${duplicateRoutes > 0 ? ` (${duplicateRoutes} duplicate URLs skipped)` : ''}`);
-      }
-    }
-
-
-    // ── Phase 3.5b: Link Next.js project-level middleware.ts to routes ──
-    if (routeRegistry.size > 0) {
-      const middlewareCandidates = allPaths.filter(p =>
-        p === 'middleware.ts' || p === 'middleware.js' || p === 'middleware.tsx' || p === 'middleware.jsx' ||
-        p === 'src/middleware.ts' || p === 'src/middleware.js' || p === 'src/middleware.tsx' || p === 'src/middleware.jsx'
+          // The session calls this once per candidate with
+          // the normalized `Location[]` payload. We key on
+          // the canonical four-tuple so the engine can look
+          // it up later.
+          handToEngine: async (candidate, responseLocs) => {
+            // Use the SAME key helper the engine uses to look
+            // up the payload — keeps producer/consumer in sync
+            // if the key shape ever evolves.
+            locations.set(candidateLocationKey(candidate), responseLocs);
+          },
+        },
       );
-      if (middlewareCandidates.length > 0) {
-        const mwContents = await readFileContents(repoPath, middlewareCandidates);
-        for (const [mwPath, mwContent] of mwContents) {
-          const config = extractNextjsMiddlewareConfig(mwContent);
-          if (!config) continue;
-          const mwLabel = config.wrappedFunctions.length > 0
-            ? config.wrappedFunctions
-            : [config.exportedName];
 
-          // Pre-compile matchers once per middleware file
-          const compiled = config.matchers.map(compileMatcher).filter((m): m is NonNullable<typeof m> => m !== null);
+      // `sessionResult` is the work fn's return value (or
+      // `null` on gate failure). The `meta` is lost on a
+      // gate failure, so we defensively default to an empty
+      // string for the server version. The `skipped` count
+      // is the session's real cap-rejection figure
+      // (`feed.length − selected.length`) — we thread it
+      // into the engine report so the summary line is
+      // truthful.
+      const serverVersion = sessionResult?.meta?.serverVersion ?? '';
+      const sessionSkipped = sessionResult?.skipped ?? 0;
 
-          let linkedCount = 0;
-          for (const [routeURL] of routeRegistry) {
-            const matches = compiled.length === 0 ||
-              compiled.some(cm => compiledMatcherMatchesRoute(cm, routeURL));
-            if (!matches) continue;
+      // ── Engine decision pass (per-candidate) ────────────────────
+      // Replay every candidate through the decision table
+      // using the `locations` map the session populated.
+      // Candidates the session refused (no Location entry)
+      // fall through to the engine as `[]` → NO_NODE →
+      // keep/refuse per the decision table.
+      const reconcileReport = await reconcileDecisions(
+        graph,
+        dedupedCandidates,
+        locations,
+        {
+          mapLocationToNodeId: (loc, repoId) =>
+            mapLocationToNodeId(loc, repoId, {
+              executeParameterized: inMemoryQuery,
+              repoPath,
+              resolvedRepoPath,
+              // KD-3: thread the adapter's URI classifier so jdt:// and
+              // classpath:// URIs returned by jdtls are explicitly refused as
+              // external (NO_NODE + external:true) rather than traversing the
+              // full DB-query path and returning a plain NO_NODE. For Java repos
+              // where 30–50% of CALLS target stdlib/Spring types, this avoids
+              // hundreds of avoidable in-memory Cypher queries per run and
+              // correctly flags each such refusal as an external one (not a
+              // recall-miss) in any downstream metric.
+              // Defensive null-guard: lspAdapter is non-null at this code path
+              // (the session gate above short-circuits when lspAdapter is null),
+              // but an optional-chain is cleaner than an assertion.
+              classifyUri: lspAdapter?.classifyUri.bind(lspAdapter),
+              // WI-5 (#159 P5): thread the adapter id so the mapper's
+              // out-of-repo containment guard can tag Python site-packages
+              // / stdlib `file://` URIs as `{ kind: 'NO_NODE', external: true }`
+              // rather than bare `NO_NODE`. TS/Java paths omit this field
+              // (lspAdapter?.id is 'typescript'/'java') — only 'python'
+              // activates the external:true gate.
+              adapterId: lspAdapter?.id,
+            }),
+          repoId: ctx.repoId ?? 'default',
+          skipped: sessionSkipped,
+        },
+      );
 
-            const routeNodeId = generateId('Route', routeURL);
-            const existing = graph.getNode(routeNodeId);
-            if (!existing) continue;
+      // ── Apply (skip every mutation in dryRun) ───────────────────
+      const applyResult = applyDecisions(graph, reconcileReport.decisions, { dryRun });
 
-            const currentMw = (existing.properties.middleware as string[] | undefined) ?? [];
-            // Prepend project-level middleware (runs before handler-level wrappers)
-            existing.properties.middleware = [...mwLabel, ...currentMw.filter(m => !mwLabel.includes(m))];
-            linkedCount++;
-          }
-          if (isDev && linkedCount > 0) {
-            console.log(`🛡️ Linked ${mwPath} middleware [${mwLabel.join(', ')}] to ${linkedCount} routes`);
-          }
+      lspReport = {
+        decisions: applyResult.decisions,
+        confirmed: reconcileReport.confirmed,
+        corrected: reconcileReport.corrected,
+        recall: reconcileReport.recall,
+        refused: reconcileReport.refused,
+        skipped: reconcileReport.skipped,
+        serverVersion,
+      };
+
+      // ── Observability: dry-run report vs. summary line ──────────
+      if (dryRun) {
+        // AC-6: print every {action, from→to, why} tuple, write nothing.
+        //
+        // Security note: we print a TRUNCATED id (last
+        // colon-segment, plus a prefix length cap) so the
+        // full repo file paths in node ids never appear
+        // verbatim in CI logs. A full id is
+        // `Label:src/path/to/file.ts:Name:1` — the file
+        // path can include private module names, machine
+        // names from monorepos, etc. The truncated form
+        // is enough for a human to triage and keeps the
+        // log disclosure surface small.
+        for (const d of lspReport.decisions) {
+          const from = redactNodeId(d.from);
+          const to = d.to ? redactNodeId(d.to) : '(none)';
+          // m3: strip CR/LF from the formatted line so a
+          // node id that happens to contain a control
+          // char (theoretical — node ids are sanitized at
+          // construction, but defense-in-depth) cannot
+          // forge a log line. Same fix the `sanitizeUTF8`
+          // helper applies on the file-content side. The
+          // regex is applied to the WHOLE line so the
+          // structure of the line is preserved.
+          // eslint-disable-next-line no-console
+          console.log(
+            `  lsp-dry-run: ${d.action.padEnd(8)} ${from} -> ${to}  (${d.reason})`
+              .replace(/[\r\n]+/g, ' '),
+          );
         }
+        // eslint-disable-next-line no-console
+        console.log(`  lsp-dry-run: ${lspReport.decisions.length} decision(s), 0 edges written`);
+      } else {
+        const lspElapsed = ((Date.now() - lspStart) / 1000).toFixed(1);
+        // eslint-disable-next-line no-console
+        console.log(
+          `  lsp: confirmed ${lspReport.confirmed}, corrected ${lspReport.corrected}, ` +
+          `recall +${lspReport.recall}, refused ${lspReport.refused}, ` +
+          `skipped(cap) ${lspReport.skipped}, server <${lspReport.serverVersion || 'unknown'}> (${lspElapsed}s)`,
+        );
       }
     }
 
-    // Scan HTML/PHP/template files for <form action="/path"> and AJAX url patterns
-    // Scan HTML/template files for <form action="/path"> and AJAX url patterns
-    // Skip .php — already parsed by tree-sitter with http_client/fetch queries
-    const htmlCandidates = allPaths.filter(p =>
-      p.endsWith('.html') || p.endsWith('.htm') ||
-      p.endsWith('.ejs') || p.endsWith('.hbs') || p.endsWith('.blade.php')
-    );
-    if (htmlCandidates.length > 0 && routeRegistry.size > 0) {
-      const htmlContents = await readFileContents(repoPath, htmlCandidates);
-      const htmlPatterns = [/action=["']([^"']+)["']/g, /url:\s*["']([^"']+)["']/g];
-      for (const [filePath, content] of htmlContents) {
-        for (const pattern of htmlPatterns) {
-          pattern.lastIndex = 0;
-          let match;
-          while ((match = pattern.exec(content)) !== null) {
-            const normalized = normalizeFetchURL(match[1]);
-            if (normalized) {
-              allFetchCalls.push({ filePath, fetchURL: normalized, lineNumber: 0 });
-            }
-          }
-        }
-      }
-    }
-
-    // ── Phase 3.5c: Extract Expo Router navigation patterns ──
-    if (expoAppPaths.size > 0 && routeRegistry.size > 0) {
-      const unreadExpoPaths = [...expoAppPaths].filter(p => !handlerContents?.has(p));
-      const extraContents = unreadExpoPaths.length > 0 ? await readFileContents(repoPath, unreadExpoPaths) : new Map<string, string>();
-      const allExpoContents = new Map([...(handlerContents ?? new Map()), ...extraContents]);
-      for (const [filePath, content] of allExpoContents) {
-        if (!expoAppPaths.has(filePath)) continue;
-        for (const pattern of EXPO_NAV_PATTERNS) {
-          pattern.lastIndex = 0;
-          let match;
-          while ((match = pattern.exec(content)) !== null) {
-            const url = match[2] ?? match[1];
-            if (url && url.startsWith('/')) {
-              allFetchCalls.push({ filePath, fetchURL: url, lineNumber: 0 });
-            }
-          }
-        }
-      }
-    }
-
-    if (routeRegistry.size > 0 && allFetchCalls.length > 0) {
-      const routeURLToFile = new Map<string, string>();
-      for (const [url, entry] of routeRegistry) routeURLToFile.set(url, entry.filePath);
-
-      // Read consumer file contents so we can extract property access patterns
-      const consumerPaths = [...new Set(allFetchCalls.map(c => c.filePath))];
-      const consumerContents = await readFileContents(repoPath, consumerPaths);
-
-      processNextjsFetchRoutes(graph, allFetchCalls, routeURLToFile, consumerContents);
-      if (isDev) {
-        console.log(`🔗 Processed ${allFetchCalls.length} fetch() calls against ${routeRegistry.size} routes`);
-      }
-    }
-
-    // ── Phase 3.6: Tool Detection (MCP/RPC) ──────────────────────────
-    const toolDefs: { name: string; filePath: string; description: string }[] = [];
-    const seenToolNames = new Set<string>();
-
-    for (const td of allToolDefs) {
-      if (seenToolNames.has(td.toolName)) continue;
-      seenToolNames.add(td.toolName);
-      toolDefs.push({ name: td.toolName, filePath: td.filePath, description: td.description });
-    }
-
-    // TS tool definition arrays — require inputSchema nearby to distinguish from config objects
-    const toolCandidatePaths = allPaths.filter(p =>
-      (p.endsWith('.ts') || p.endsWith('.js')) && p.toLowerCase().includes('tool')
-      && !p.includes('node_modules') && !p.includes('test') && !p.includes('__')
-    );
-    if (toolCandidatePaths.length > 0) {
-      const toolContents = await readFileContents(repoPath, toolCandidatePaths);
-      for (const [filePath, content] of toolContents) {
-        // Only scan files that contain 'inputSchema' — this is the MCP tool signature
-        if (!content.includes('inputSchema')) continue;
-        const toolPattern = /name:\s*['"](\w+)['"]\s*,\s*\n?\s*description:\s*[`'"]([\s\S]*?)[`'"]/g;
-        let match;
-        while ((match = toolPattern.exec(content)) !== null) {
-          const name = match[1];
-          if (seenToolNames.has(name)) continue;
-          seenToolNames.add(name);
-          toolDefs.push({ name, filePath, description: match[2].slice(0, 200).replace(/\n/g, ' ').trim() });
-        }
-      }
-    }
-
-    // Create Tool nodes and HANDLES_TOOL edges
-    if (toolDefs.length > 0) {
-      for (const td of toolDefs) {
-        const toolNodeId = generateId('Tool', td.name);
-        graph.addNode({
-          id: toolNodeId,
-          label: 'Tool',
-          properties: { name: td.name, filePath: td.filePath, description: td.description },
-        });
-
-        const handlerFileId = generateId('File', td.filePath);
-        graph.addRelationship({
-          id: generateId('HANDLES_TOOL', `${handlerFileId}->${toolNodeId}`),
-          sourceId: handlerFileId,
-          targetId: toolNodeId,
-          type: 'HANDLES_TOOL',
-          confidence: 1.0,
-          reason: 'tool-definition',
-        });
-      }
-
-      if (isDev) {
-        console.log(`🔧 Tool registry: ${toolDefs.length} tools detected`);
-      }
-    }
-
-    // ── Phase 3.7: ORM Dataflow Detection (Prisma + Supabase) ──────────
-    if (allORMQueries.length > 0) {
-      processORMQueries(graph, allORMQueries, isDev);
-    }
-
-    // ── Phase 14: Cross-file binding propagation (topological level sort) ──
-    await runCrossFileBindingPropagation(
-      graph, ctx, exportedTypeMap, allPaths, totalFiles, repoPath, pipelineStart, onProgress,
-    );
-
-    // Post-parse graph analysis (MRO, communities, processes)
     let communityResult: Awaited<ReturnType<typeof processCommunities>> | undefined;
     let processResult: Awaited<ReturnType<typeof processProcesses>> | undefined;
 
     if (!options?.skipGraphPhases) {
-      const graphResults = await runGraphAnalysisPhases(graph, totalFiles, onProgress, routeRegistry, toolDefs);
-      communityResult = graphResults.communityResult;
-      processResult = graphResults.processResult;
+      // ── Phase 4.5: Method Resolution Order ──────────────────────────────
+      onProgress({
+        phase: 'parsing',
+        percent: 81,
+        message: 'Computing method resolution order...',
+        stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+      });
+
+      const mroResult = computeMRO(graph);
+      if (isDev && mroResult.entries.length > 0) {
+        console.log(`🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`);
+      }
+
+      // ── Phase 5: Communities ───────────────────────────────────────────
+      onProgress({
+        phase: 'communities',
+        percent: 82,
+        message: 'Detecting code communities...',
+        stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+      });
+
+      communityResult = await processCommunities(graph, (message, progress) => {
+        const communityProgress = 82 + (progress * 0.10);
+        onProgress({
+          phase: 'communities',
+          percent: Math.round(communityProgress),
+          message,
+          stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+        });
+      });
+
+      if (isDev) {
+        console.log(`🏘️ Community detection: ${communityResult.stats.totalCommunities} communities found (modularity: ${communityResult.stats.modularity.toFixed(3)})`);
+      }
+
+      communityResult.communities.forEach(comm => {
+        graph.addNode({
+          id: comm.id,
+          label: 'Community' as const,
+          properties: {
+            name: comm.label,
+            filePath: '',
+            heuristicLabel: comm.heuristicLabel,
+            cohesion: comm.cohesion,
+            symbolCount: comm.symbolCount,
+          }
+        });
+      });
+
+      communityResult.memberships.forEach(membership => {
+        graph.addRelationship({
+          id: `${membership.nodeId}_member_of_${membership.communityId}`,
+          type: 'MEMBER_OF',
+          sourceId: membership.nodeId,
+          targetId: membership.communityId,
+          confidence: 1.0,
+          reason: 'leiden-algorithm',
+          source: 'heuristic',
+        });
+      });
+
+      // ── Phase 6: Processes ─────────────────────────────────────────────
+      onProgress({
+        phase: 'processes',
+        percent: 94,
+        message: 'Detecting execution flows...',
+        stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+      });
+
+      let symbolCount = 0;
+      graph.forEachNode(n => { if (n.label !== 'File') symbolCount++; });
+      const dynamicMaxProcesses = Math.max(20, Math.min(300, Math.round(symbolCount / 10)));
+
+      processResult = await processProcesses(
+        graph,
+        communityResult.memberships,
+        (message, progress) => {
+          const processProgress = 94 + (progress * 0.05);
+          onProgress({
+            phase: 'processes',
+            percent: Math.round(processProgress),
+            message,
+            stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+          });
+        },
+        { maxProcesses: dynamicMaxProcesses, minSteps: 3 }
+      );
+
+      if (isDev) {
+        console.log(`🔄 Process detection: ${processResult.stats.totalProcesses} processes found (${processResult.stats.crossCommunityCount} cross-community)`);
+      }
+
+      processResult.processes.forEach(proc => {
+        graph.addNode({
+          id: proc.id,
+          label: 'Process' as const,
+          properties: {
+            name: proc.label,
+            filePath: '',
+            heuristicLabel: proc.heuristicLabel,
+            processType: proc.processType,
+            stepCount: proc.stepCount,
+            communities: proc.communities,
+            entryPointId: proc.entryPointId,
+            terminalId: proc.terminalId,
+          }
+        });
+      });
+
+      processResult.steps.forEach(step => {
+        graph.addRelationship({
+          id: `${step.nodeId}_step_${step.step}_${step.processId}`,
+          type: 'STEP_IN_PROCESS',
+          sourceId: step.nodeId,
+          targetId: step.processId,
+          confidence: 1.0,
+          reason: 'trace-detection',
+          step: step.step,
+          source: 'heuristic',
+        });
+      });
     }
 
     onProgress({
@@ -1411,98 +1108,128 @@ export const runPipelineFromRepo = async (
       },
     });
 
-    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult };
+    astCache.clear();
+
+    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult, lspReport };
   } catch (error) {
-    ctx.clear();
+    cleanup();
     throw error;
   }
 };
 
-// Inline ORM regex extraction (avoids importing parse-worker which has worker-only code)
-const PRISMA_QUERY_RE = /\bprisma\.(\w+)\.(findMany|findFirst|findUnique|findUniqueOrThrow|findFirstOrThrow|create|createMany|update|updateMany|delete|deleteMany|upsert|count|aggregate|groupBy)\s*\(/g;
-const SUPABASE_QUERY_RE = /\bsupabase\.from\s*\(\s*['"](\w+)['"]\s*\)\s*\.(select|insert|update|delete|upsert)\s*\(/g;
-
-function extractORMQueriesInline(filePath: string, content: string, out: ExtractedORMQuery[]): void {
-  const hasPrisma = content.includes('prisma.');
-  const hasSupabase = content.includes('supabase.from');
-  if (!hasPrisma && !hasSupabase) return;
-
-  if (hasPrisma) {
-    PRISMA_QUERY_RE.lastIndex = 0;
-    let m;
-    while ((m = PRISMA_QUERY_RE.exec(content)) !== null) {
-      const model = m[1];
-      if (model.startsWith('$')) continue;
-      out.push({ filePath, orm: 'prisma', model, method: m[2], lineNumber: content.substring(0, m.index).split('\n').length - 1 });
-    }
-  }
-
-  if (hasSupabase) {
-    SUPABASE_QUERY_RE.lastIndex = 0;
-    let m;
-    while ((m = SUPABASE_QUERY_RE.exec(content)) !== null) {
-      out.push({ filePath, orm: 'supabase', model: m[1], method: m[2], lineNumber: content.substring(0, m.index).split('\n').length - 1 });
-    }
-  }
+/**
+ * Redact a graph node id for log lines.
+ *
+ * Why: a full id is `Label:filePath:name[:overloadIndex]`
+ * — the file path can include private module names,
+ * monorepo layout, etc. We keep the label and the LAST
+ * colon-segment (typically `name[:overloadIndex]`) and
+ * abbreviate the dropped middle. The truncated form is
+ * enough for a human to triage and keeps the CI log
+ * disclosure surface small.
+ *
+ * Shape compatibility: the `analyze-lsp-mode-a.test.ts`
+ * regex is
+ * `/^  lsp-dry-run: (confirm|correct|add|keep|refuse)\s+\S+ -> .+?\s+\(.+\)$/`
+ * — `\S+` accepts any non-space output, so the truncation
+ * shape is compatible.
+ */
+export function redactNodeId(id: string): string {
+  const parts = id.split(':');
+  if (parts.length <= 2) return id; // `Label:name` — already short.
+  const label = parts[0];
+  const tail = parts[parts.length - 1];
+  const middle = parts.slice(1, -1).join(':');
+  const redacted = middle.length > 8 ? `${middle.slice(0, 4)}…${middle.slice(-3)}` : middle;
+  return `${label}:${redacted}:${tail}`;
 }
 
-// ============================================================================
-// ORM Query Processing — creates QUERIES edges from callers to model nodes
-// ============================================================================
+/**
+ * Topological sort of files by import dependencies.
+ * Files with no imports (in-degree 0) go in level 0.
+ * Files that only depend on level 0 go in level 1, etc.
+ * Files involved in cycles (no entry point) are grouped in a final level
+ * and contribute to cycleCount.
+ *
+ * @param importMap  Map of file path → set of files it imports
+ * @returns levels array (each level is an array of file paths) and cycle count
+ */
+export function topologicalLevelSort(
+  importMap: Map<string, Set<string>>
+): { levels: string[][]; cycleCount: number } {
+  // in-degree = number of unprocessed dependencies this file has
+  // A file can be processed when all its dependencies (imports) are processed
+  const inDegree = new Map<string, number>();
+  // dependents = files that depend on this file (for notification)
+  const dependents = new Map<string, Set<string>>();
 
-function processORMQueries(
-  graph: ReturnType<typeof createKnowledgeGraph>,
-  queries: ExtractedORMQuery[],
-  isDev: boolean,
-): void {
-  const modelNodes = new Map<string, string>();
-  const seenEdges = new Set<string>();
-  let edgesCreated = 0;
-
-  for (const q of queries) {
-    const modelKey = `${q.orm}:${q.model}`;
-    let modelNodeId = modelNodes.get(modelKey);
-    if (!modelNodeId) {
-      const candidateIds = [
-        generateId('Class', `${q.model}`),
-        generateId('Interface', `${q.model}`),
-        generateId('CodeElement', `${q.model}`),
-      ];
-      const existing = candidateIds.find(id => graph.getNode(id));
-      if (existing) {
-        modelNodeId = existing;
-      } else {
-        modelNodeId = generateId('CodeElement', `${q.orm}:${q.model}`);
-        graph.addNode({
-          id: modelNodeId,
-          label: 'CodeElement',
-          properties: {
-            name: q.model,
-            filePath: '',
-            description: `${q.orm} model/table: ${q.model}`,
-          },
-        });
-      }
-      modelNodes.set(modelKey, modelNodeId);
+  // Collect ALL files: both keys (files with imports) and values (imported files)
+  const allFiles = new Set<string>(importMap.keys());
+  for (const deps of importMap.values()) {
+    for (const dep of deps) {
+      allFiles.add(dep);
     }
-
-    const fileId = generateId('File', q.filePath);
-    const edgeKey = `${fileId}->${modelNodeId}:${q.method}`;
-    if (seenEdges.has(edgeKey)) continue;
-    seenEdges.add(edgeKey);
-
-    graph.addRelationship({
-      id: generateId('QUERIES', edgeKey),
-      sourceId: fileId,
-      targetId: modelNodeId,
-      type: 'QUERIES',
-      confidence: 0.9,
-      reason: `${q.orm}-${q.method}`,
-    });
-    edgesCreated++;
   }
 
-  if (isDev) {
-    console.log(`ORM dataflow: ${edgesCreated} QUERIES edges, ${modelNodes.size} models (${queries.length} total calls)`);
+  // Initialize: all files start with in-degree 0
+  for (const file of allFiles) {
+    inDegree.set(file, 0);
+    dependents.set(file, new Set());
   }
+
+  // Compute in-degrees: for each file, count its dependencies (imports)
+  // Build reverse graph: for each imported file, track who imports it
+  for (const [file, deps] of importMap) {
+    // in-degree is the number of dependencies this file has
+    inDegree.set(file, deps.size);
+    for (const dep of deps) {
+      // dep is imported by file, so file depends on dep
+      // When dep is processed, file should be notified
+      dependents.get(dep)!.add(file);
+    }
+  }
+
+  const levels: string[][] = [];
+  let cycleCount = 0;
+
+  // Kahn's algorithm: process nodes with in-degree 0 (no remaining dependencies)
+  let queue: string[] = [];
+  for (const [file, degree] of inDegree) {
+    if (degree === 0) queue.push(file);
+  }
+
+  while (queue.length > 0) {
+    // All nodes in current queue are at the same level
+    levels.push([...queue]);
+    
+    // Process all nodes at current level and collect next level
+    const nextQueue: string[] = [];
+    for (const file of queue) {
+      // Notify all dependents that this dependency is processed
+      for (const dependent of dependents.get(file) ?? new Set()) {
+        const newDegree = (inDegree.get(dependent) ?? 1) - 1;
+        inDegree.set(dependent, newDegree);
+        if (newDegree === 0) {
+          nextQueue.push(dependent);
+        }
+      }
+    }
+    
+    queue = nextQueue;
+  }
+
+  // Remaining nodes are in cycles (no entry point found)
+  const cycleNodes: string[] = [];
+  for (const [file, degree] of inDegree) {
+    if (degree > 0) {
+      cycleNodes.push(file);
+    }
+  }
+
+  if (cycleNodes.length > 0) {
+    levels.push(cycleNodes);
+    cycleCount = cycleNodes.length;
+  }
+
+  return { levels, cycleCount };
 }

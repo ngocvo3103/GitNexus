@@ -30,6 +30,8 @@ program
   .option('--skills', 'Generate repo-specific skill files from detected communities')
   .option('--skip-git', 'Index a folder without requiring a .git directory')
    .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
+   .option('--lsp', 'Augment CALLS resolution with the TypeScript language server (TS-only, CALLS-only, confidence 0.70)')
+   .option('--lsp-dry-run', 'Preview every LSP reconciliation decision and write nothing; implies --lsp')
    .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
@@ -125,6 +127,22 @@ program
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
 
+program
+  .command('document-endpoint')
+  .description('Generate API documentation JSON for an endpoint')
+  .option('--all', 'Document all endpoints (always uses openapi mode, requires --outputPath)')
+  .option('--allow-partial', 'Exit 0 if >=1 endpoint succeeds (default: exit 1 on any failure)')
+  .option('--method <method>', 'HTTP method (GET, POST, PUT, DELETE, PATCH)')
+  .option('--path <pattern>', 'Path pattern to match (e.g., "suggest", "/bookings/{id}")')
+  .option('--depth <n>', 'Max trace depth (default: 10)', '10')
+  .option('--mode <mode>', 'Output mode: openapi (default) or ai_context', 'openapi')
+  .option('--input-yaml <path>', 'CLI-only: path to existing YAML to enrich')
+  .option('--outputPath <path>', 'Output directory for JSON and OpenAPI YAML files')
+  .option('--schema-path <path>', 'Path to custom JSON schema file (default: bundled schema)')
+  .option('--strict', 'Fail on schema validation errors (default: warn)', false)
+  .option('-r, --repo <name>', 'Target repository')
+  .action(createLazyAction(() => import('./tool.js'), 'documentEndpointCommand'));
+
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 
 program
@@ -133,5 +151,32 @@ program
   .option('-p, --port <port>', 'Port number', '4848')
   .option('--idle-timeout <seconds>', 'Auto-shutdown after N seconds idle (0 = disabled)', '0')
   .action(createLazyAction(() => import('./eval-server.js'), 'evalServerCommand'));
+
+// ─── LSP utilities (one-shot `doctor` diagnostic) ──────────────────
+//
+// WI-#7: surfaces whether `typescript-language-server` is on PATH
+// and whether the workspace is in a state where LSP results are
+// trustworthy. Always exits 0 (informational — absence is a
+// normal report, not an error). See design `#sd-lsp-doctor`.
+
+program
+  .command('lsp <action>')
+  .description('LSP utilities (doctor)')
+  .option('--format <format>', 'text or json (default: text)', 'text')
+  .action(createLazyAction(() => import('./lsp.js'), 'lspCommand'));
+
+// ─── Verify (LSP read-only — Mode C) ────────────────────────────────
+//
+// WI-#8: read-only verifier that compares heuristic CALLS edges
+// to LSP-resolved definitions. See design `#sd-verify-mode-c`.
+
+program
+  .command('verify')
+  .description('Verify heuristic accuracy against LSP (Mode C) — read-only')
+  .option('--lsp', 'Run Mode C: compare heuristic CALLS edges to LSP-resolved targets')
+  .option('--strict', 'Exit non-zero when LSP is unavailable')
+  .option('--sample <n>', 'Sample size (default: 200)', '200')
+  .option('-r, --repo <name>', 'Target repository')
+  .action(createLazyAction(() => import('./verify.js'), 'verifyCommand'));
 
 program.parse(process.argv);
