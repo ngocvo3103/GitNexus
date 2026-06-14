@@ -117,6 +117,7 @@ import {
   parseVersion,
   TYPESCRIPT_LANGUAGE_SERVER_BIN,
   JDTLS_BIN,
+  PYLSP_BIN,
 } from '../../../src/core/ingestion/lsp/server-discovery.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -790,6 +791,186 @@ describe('server-discovery', () => {
 
       const result = await discoverOne(JDTLS_BIN, { cwd: '/nonexistent/empty' });
       expect(result).toBeNull();
+    });
+  });
+
+  // ─── WI-4: pylsp discovery ────────────────────────────────────────────
+  //
+  // Decision table on 4 resolution sources (node_modules/.bin | PATH | npx | absent)
+  // mirroring the WI-3 jdtls pattern. Tests also verify the spread-omit invariant
+  // (python omitted when absent) and the "never drop" guarantee from RC#1.
+
+  describe('WI-4 — pylsp discovery via discoverServers()', () => {
+    it('exports PYLSP_BIN constant with the correct value', () => {
+      expect(PYLSP_BIN).toBe('pylsp');
+    });
+
+    // ── Case 1: node_modules/.bin hit ──────────────────────────────
+    it('case 1: pylsp staged at node_modules/.bin → python entry version 1.14.0', async () => {
+      const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-sd-pylsp-nm-'));
+      const pylspBin = path.join(projectRoot, 'node_modules', '.bin', PYLSP_BIN);
+      stageBinary(pylspBin);
+      registerSpawn(pylspBin, () => 'pylsp v1.14.0\n');
+
+      const result = await discoverOne(PYLSP_BIN, { cwd: projectRoot });
+
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(pylspBin);
+      expect(result!.version).toBe('1.14.0');
+
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    });
+
+    // ── Case 2: PATH hit ────────────────────────────────────────────
+    it('case 2: pylsp on PATH → python entry version 1.12.0', async () => {
+      const pylspBin = '/Users/NgocVo_1/.local/bin/pylsp';
+      stageBinary(pylspBin);
+      registerSpawn(pylspBin, () => 'pylsp 1.12.0\n');
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === PYLSP_BIN) return `${pylspBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+
+      const result = await discoverOne(PYLSP_BIN, {
+        cwd: '/nonexistent/empty',
+      });
+
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(pylspBin);
+      expect(result!.version).toBe('1.12.0');
+    });
+
+    // ── Case 3: npx fallback ────────────────────────────────────────
+    it('case 3: pylsp absent from node_modules/.bin and PATH, npx fallback sets path', async () => {
+      const pylspBin = '/usr/local/lib/node_modules/.bin/pylsp';
+      stageBinary(pylspBin);
+      npxResponse = 'pylsp 1.14.0\n';
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === PYLSP_BIN) return `${pylspBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+
+      const result = await discoverOne(PYLSP_BIN, {
+        cwd: '/nonexistent/empty',
+      });
+
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(pylspBin);
+    });
+
+    // ── Case 4: absent everywhere ───────────────────────────────────
+    it('case 4: pylsp absent from all sources → python undefined; typescript still resolves', async () => {
+      // Stage a TS binary so typescript is found; pylsp is absent.
+      const tsBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      stageBinary(tsBin);
+      registerSpawn(tsBin, () => 'typescript-language-server 4.3.3\n');
+      // No pylsp anywhere.
+
+      const result = await discoverServers();
+
+      expect(result.python).toBeUndefined();
+      expect(result.typescript).not.toBeNull();
+      expect(result.typescript!.version).toBe('4.3.3');
+    });
+
+    // ── Case 5: --version exits non-zero → version 'unknown', never drop ──
+    it('case 5: pylsp --version exits non-zero → python.version === "unknown" (never drop)', async () => {
+      const pylspBin = '/usr/local/bin/pylsp';
+      stageBinary(pylspBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === PYLSP_BIN) return `${pylspBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      // Non-zero exit: execFileSync throws with a numeric status (no ENOENT code).
+      registerSpawn(pylspBin, () => {
+        const e: any = new Error('Command failed with exit code 1');
+        e.status = 1;
+        // Deliberately no `code` property — this is a runtime exit, not spawn failure.
+        throw e;
+      });
+
+      const result = await discoverOne(PYLSP_BIN, { cwd: '/nonexistent/empty' });
+
+      // Must be kept with 'unknown' — not dropped.
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(pylspBin);
+      expect(result!.version).toBe('unknown');
+    });
+
+    // ── Case 6: garbled version string → version 'unknown', never drop ──
+    it('case 6: pylsp --version returns garbled string → python.version === "unknown"', async () => {
+      const pylspBin = '/usr/local/bin/pylsp';
+      stageBinary(pylspBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === PYLSP_BIN) return `${pylspBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      registerSpawn(pylspBin, () => 'something completely garbled with no version token\n');
+
+      const result = await discoverOne(PYLSP_BIN, { cwd: '/nonexistent/empty' });
+
+      expect(result).not.toBeNull();
+      expect(result!.path).toBe(pylspBin);
+      expect(result!.version).toBe('unknown');
+    });
+
+    // ── Case 7: PYLSP_BIN exported value ─── (covered by the first it() above)
+
+    // ── Case 8: existing JDTLS and TS assertions unaffected ────────
+    it('case 8: pylsp present does not affect typescript or java entries', async () => {
+      const tsBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      const jdtlsBin = '/opt/homebrew/bin/jdtls';
+      const pylspBin = '/usr/local/bin/pylsp';
+      stageBinary(tsBin);
+      stageBinary(jdtlsBin);
+      stageBinary(pylspBin);
+
+      registerSpawn(tsBin, () => 'typescript-language-server 4.3.3\n');
+      registerSpawn(jdtlsBin, () => 'jdtls 1.26.0\n');
+      registerSpawn(pylspBin, () => 'pylsp v1.14.0\n');
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === JDTLS_BIN) return `${jdtlsBin}\n`;
+        if (args[0] === PYLSP_BIN) return `${pylspBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+
+      const result = await discoverServers();
+
+      // Existing entries must be byte-identical to pre-WI-4 values.
+      expect(result.typescript).toEqual({ path: tsBin, version: '4.3.3' });
+      expect(result.java).toEqual({ path: jdtlsBin, version: '1.26.0' });
+      // Python is now also present.
+      expect(result.python).not.toBeNull();
+      expect(result.python!.path).toBe(pylspBin);
+      expect(result.python!.version).toBe('1.14.0');
+    });
+
+    // ── spread-omit invariant: absent python key is omitted not null ──
+    it('spread-omit: absent pylsp yields python===undefined (toEqual sees no python key)', async () => {
+      // The critical invariant: when python is absent, discoverServers() must
+      // omit the key entirely (not include `python: null`). This ensures the
+      // existing `toEqual({ typescript: null })` test stays green.
+      const result = await discoverServers();
+
+      // python key must be absent (undefined), not null.
+      expect(result.python).toBeUndefined();
+      // toEqual ignores undefined-valued keys, so this passes:
+      expect(result).toEqual({ typescript: null });
     });
   });
 });

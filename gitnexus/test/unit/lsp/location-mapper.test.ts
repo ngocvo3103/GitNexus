@@ -28,8 +28,12 @@
  * the rest is BVA / EP around the tie-breaker chain.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { generateId, normalizeFilePath } from '../../../src/lib/utils.js';
+import * as nodePath from 'node:path';
+import { realpathSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import * as os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import {
   mapLocationToNodeId,
   __test__,
@@ -829,5 +833,370 @@ describe('location-mapper — reconstructed id matches generateId', () => {
       throw new Error(`expected node, got ${result.kind}`);
     }
     expect(result.nodeId).toBe(realGenerateId('Method', 'src/foo.ts:whatever'));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// WI-5 (#159 P5): Python external-refusal seam
+//
+// These tests use REAL filesystem paths to avoid mocking `realpathSync`.
+// Key fixtures:
+//   repoRoot  — the current working directory (always a real path on disk)
+//   outOfRepo — process.execPath (the Node binary; real, exists, outside repoRoot)
+//   inRepo    — process.execPath doesn't exist inside repoRoot; we use a real
+//               file INSIDE repoRoot: the compiled package.json (always exists)
+//
+// The mapper's containment check: realpathSync(absFile) + path.relative(repoRoot, abs)
+// → starts with '..' → out-of-repo. Real paths guarantee realpathSync succeeds.
+//
+// Decision table (4 branches):
+//   1. In-repo file:// + adapter    → { kind: 'node' }
+//   2. Out-of-repo (rel ..) + adapt → { kind: 'NO_NODE', external: true }
+//   3. Out-of-repo (abs diff root)  → { kind: 'NO_NODE', external: true }
+//   4. Site-packages file:// + adap → { kind: 'NO_NODE', external: true }
+//   5. No adapter (adapterId absent) → bare NO_NODE or node (TS byte-identical)
+//   6. Java jdt:// with classifyUri  → { NO_NODE, external: true } (KD-3)
+//   7. isUnindexablePath (.d.ts)     → bare {NO_NODE} (pre-existing)
+//  10. In-repo symlink → site-pkgs   → { kind: 'NO_NODE', external: true }
+//
+// Plus BVA at containment boundary and two HARD gate fixtures (cases 8, 9).
+// ─────────────────────────────────────────────────────────────────────────
+
+// Real path fixtures — derived at module load time so they are always valid.
+// repoRoot: the gitnexus package dir (parent of this test file's src/).
+// outOfRepoFile: process.execPath (Node binary), which lives outside repoRoot.
+// inRepoFile: the gitnexus package.json — always exists inside repoRoot.
+const repoRoot = realpathSync(nodePath.resolve(fileURLToPath(import.meta.url), '../../../../..'));
+const outOfRepoFile = realpathSync(process.execPath); // e.g. /opt/homebrew/.../node
+const inRepoFile = realpathSync(nodePath.join(repoRoot, 'package.json')); // always exists
+// Relative path of inRepoFile within repoRoot (what the DB stores).
+const inRepoRelPath = nodePath.relative(repoRoot, inRepoFile).replace(/\\/g, '/');
+
+describe('Python external-refusal seam (WI-5)', () => {
+  // Case 1: In-repo file:// + Python adapter → { kind: 'node' }
+  it('Case 1: in-repo file:// + Python adapter → node result', async () => {
+    // Use a real in-repo file (package.json) so realpathSync succeeds and
+    // containment check confirms it's inside repoRoot.
+    const uri = `file://${inRepoFile}`;
+    const { deps, execute } = makeDeps([
+      row({
+        id: `File:${inRepoRelPath}:root`,
+        name: 'root',
+        startLine: 0,
+        endLine: 30,
+        label: 'File',
+        filePath: inRepoRelPath,
+      }),
+    ]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 5),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    // The mapper queries the DB with the repo-relative path.
+    // The DB mock returns a node → result.kind === 'node'.
+    expect(result.kind).toBe('node');
+    expect(execute).toHaveBeenCalledTimes(1);
+    const params = execute.mock.calls[0][2];
+    // relPath must be the repo-relative path, not the absolute path.
+    expect(params.relPath).toBe(inRepoRelPath);
+  });
+
+  // Case 2: Out-of-repo file:// (rel starts ..) + Python adapter → external:true
+  it('Case 2: out-of-repo file:// (process.execPath outside repoRoot) + Python adapter → NO_NODE external:true', async () => {
+    // process.execPath is a real file that exists outside the repo root.
+    // realpathSync succeeds; path.relative gives '../...' (starts with ..).
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    // DB should never be touched — refused before query.
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 3: isAbsolute(relPath) branch — distinct from Case 2's startsWith('..') branch.
+  //
+  // The isOutOfRepo predicate in location-mapper.ts has TWO sub-conditions:
+  //   (a) relPath.startsWith('..')  — covered by Case 2 (real out-of-repo file via rebase)
+  //   (b) nodePath.isAbsolute(relPath) — covered HERE
+  //
+  // On POSIX, path.relative() never returns an absolute path, so the isAbsolute
+  // guard fires via the normalizeLocationUri fallback path: inject a custom
+  // normalizeFilePath that returns an absolute string, use a non-file:// URI (so
+  // the rebase block is skipped entirely), and supply repoPath so the
+  // `repoPath !== undefined` condition holds. The mapper then evaluates:
+  //   relPath = normalizeFilePath(stripped)  →  '/injected/absolute/path.py'
+  //   isAbsolute(relPath)                    →  true
+  //   isOutOfRepo                            →  true
+  //   isPythonAdapter                        →  true
+  //   → { kind: 'NO_NODE', external: true }
+  it('Case 3: isAbsolute(relPath) branch + Python adapter → NO_NODE external:true', async () => {
+    // A non-file:// URI skips the fileURLToPath/realpathSync rebase block.
+    // The injected normalizeFilePath returns an absolute path, making
+    // relPath absolute and triggering the isAbsolute guard in isOutOfRepo.
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc('python-stdlib:///builtins.py', 3),
+      'py-repo',
+      {
+        ...deps,
+        repoPath: repoRoot,
+        adapterId: 'python',
+        // Force relPath to be absolute so nodePath.isAbsolute(relPath) fires.
+        normalizeFilePath: () => '/injected/absolute/builtins.py',
+      },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    // DB must never be touched — isOutOfRepo guard fires before the MATCH.
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 4: Site-packages file:// — acceptance criterion from the WI spec.
+  // Uses a real known path to /usr/bin/python3 if it exists; falls back to
+  // process.execPath (always outside repo).
+  it('Case 4: out-of-repo file:// (AC: site-packages semantics) + Python adapter → NO_NODE external:true', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 5: No adapterId (TS funnel) → bare NO_NODE for out-of-repo path
+  it('Case 5: no adapterId → bare NO_NODE for out-of-repo path (TS path byte-identical)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'py-repo',
+      // NO adapterId — TS funnel path
+      { ...deps, repoPath: repoRoot },
+    );
+    // Must be bare NO_NODE (no external flag) — TS path byte-identical to pre-WI-5
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 5b (ruling #1 mandatory fitness test — Challenge Ledger accepted BLOCKER):
+  // Full pipeline deps bag: repoPath + classifyUri BOTH present, no adapterId.
+  // This is the exact combination pipeline.ts sends for TS/Java runs (classifyUri
+  // is always present when lspAdapter is non-null, but adapterId is absent on the
+  // TS path). The result MUST be bare {NO_NODE} — NOT { external: true } — because
+  // external:true is gated on adapterId === 'python', NOT on classifyUri presence.
+  // Without this case a typo on the gate expression can silently set external:true
+  // on TS out-of-repo defs and break the I-1 byte-identical golden.
+  it('Case 5b: repoPath + classifyUri present, no adapterId, out-of-repo URI → bare NO_NODE (ruling #1)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'ts-repo',
+      {
+        ...deps,
+        repoPath: repoRoot,
+        // classifyUri present (mirrors live TS/Java pipeline closure) but adapterId absent
+        classifyUri: (u) => (u.startsWith('file://') ? 'workspace' : 'external'),
+        // NO adapterId — TS funnel; external:true gate must NOT fire
+      },
+    );
+    // external:true is gated on adapterId === 'python'; classifyUri alone must not trigger it
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 6: Java jdt:// with classifyUri → KD-3 block fires first → external:true
+  it('Case 6: jdt:// with classifyUri → NO_NODE external:true (KD-3 unaffected)', async () => {
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc('jdt://contents/java.lang.String.class', 0),
+      'java-repo',
+      {
+        ...deps,
+        classifyUri: (u) => (u.startsWith('jdt://') ? 'external' : 'workspace'),
+      },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 7: isUnindexablePath (.d.ts inside repo) → bare {NO_NODE} even with Python adapter
+  it('Case 7: in-repo .d.ts path + Python adapter → bare NO_NODE (pre-existing, no external)', async () => {
+    // A .d.ts path passed as a scheme-stripped synthetic URI (no realpathSync needed).
+    // isUnindexablePath fires → bare NO_NODE. The path is NOT out-of-repo (no `..`),
+    // so external:true must NOT be set even with Python adapter.
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc('file:///repo/types/api.d.ts', 0),
+      'py-repo',
+      // Supply adapterId but NO repoPath → falls through to scheme-strip only.
+      // relPath = 'repo/types/api.d.ts' → isUnindexablePath → bare NO_NODE.
+      { ...deps, adapterId: 'python' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 10: In-repo symlink → out-of-repo after realpath → external:true
+  // Simulate: process.execPath acts as the "symlink target" — it's a real file
+  // whose realpath is outside repoRoot. We use process.execPath directly as the
+  // file URI (no symlink needed — the containment check only cares about the
+  // realpath result being outside the repo, which is already true here).
+  it('Case 10: file resolves (via realpath) to path outside repo + Python adapter → NO_NODE external:true', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // R2-1: isOutOfRepo=true + isUnindexablePath=true — real fixture exercising
+  // the isUnindexablePath return site at line 581-587 of location-mapper.ts.
+  //
+  // Construction: a real tmp directory whose absolute path contains '/dist/'
+  // is created outside repoRoot. realpathSync resolves to the real path
+  // (so the realpath+relative check fires: rebasedOutOfRepo=true, rebased=null).
+  // The scheme-strip fallback then yields relPath = '/tmp/.../dist/mod.py'
+  // which matches isUnindexablePath (contains '/dist/'). Since isPythonAdapter &&
+  // isOutOfRepo, the isUnindexablePath guard returns { kind: 'NO_NODE', external: true }.
+  //
+  // This path is DISTINCT from Cases 2-4 which route through the outer isOutOfRepo
+  // guard (line 594-596) — here the earlier isUnindexablePath guard (line 581-587)
+  // fires first. A regression that drops the `isPythonAdapter && isOutOfRepo` check
+  // at the isUnindexablePath site (while keeping the outer guard) would leave
+  // Cases 2-4 green but break this test.
+  describe('R2-1: isOutOfRepo=true + isUnindexablePath=true → external:true', () => {
+    let distDir: string;
+    let distFile: string;
+
+    beforeAll(() => {
+      // Create a real temp directory with '/dist/' in its absolute path, outside repoRoot.
+      const tmpBase = mkdtempSync(nodePath.join(os.tmpdir(), 'gn-r2-1-'));
+      distDir = nodePath.join(tmpBase, 'dist');
+      mkdirSync(distDir, { recursive: true });
+      const filePath = nodePath.join(distDir, 'mod.py');
+      writeFileSync(filePath, '# generated\n');
+      distFile = realpathSync(filePath);
+    });
+
+    afterAll(() => {
+      // Clean up the temp tree.
+      try { rmSync(nodePath.dirname(distDir), { recursive: true, force: true }); } catch { /* ignore */ }
+    });
+
+    it('out-of-repo /dist/ path + Python adapter → NO_NODE external:true (isUnindexablePath site)', async () => {
+      // GIVEN a real file at /tmp/.../dist/mod.py (outside repoRoot, contains /dist/)
+      const uri = `file://${distFile}`;
+      const { deps, execute } = makeDeps([]);
+
+      // WHEN mapLocationToNodeId is called with repoPath + Python adapter
+      const result = await mapLocationToNodeId(
+        loc(uri, 0),
+        'py-repo',
+        { ...deps, repoPath: repoRoot, adapterId: 'python' },
+      );
+
+      // THEN the isUnindexablePath guard (line 581-587) fires: returns external:true
+      // WITHOUT reaching the outer isOutOfRepo guard (lines 593-596).
+      expect(result).toEqual({ kind: 'NO_NODE', external: true });
+      // The DB must not be queried — the guard short-circuits before the MATCH.
+      expect(execute).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// WI-5 (#159 P5): Python realpath-failure refusal (HARD gate)
+//
+// Cases 8 + 9: failures that give NO in/out-of-repo signal MUST produce
+// bare {NO_NODE} — NOT {NO_NODE, external:true} (I-9 / R2-2).
+// These tests prove the :482 scheme-strip fallthrough door is closed
+// when the Python adapter is active.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('Python realpath-failure refusal — HARD gate (WI-5)', () => {
+  // Case 8: Malformed file:// URI (fileURLToPath throws) + Python adapter → bare {NO_NODE}
+  it('Case 8: malformed file:// URI (fileURLToPath throws) + Python adapter → bare NO_NODE (HARD gate)', async () => {
+    // A URI with invalid percent-encoding causes fileURLToPath to throw.
+    // This gives NO in/out-of-repo signal → external:true is PROHIBITED (I-9).
+    // WI-5: Python adapter active → return bare {NO_NODE} instead of falling
+    // through to scheme-strip (ruling R2-4 — close the wrong-node door).
+    const malformedUri = 'file:///path/with/%GG/invalid/percent-encoding.py';
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(malformedUri, 0),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    // MUST be bare {NO_NODE} — NOT external:true
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 9: realpathSync throws (ENOENT — non-existent file) + Python adapter → bare {NO_NODE}
+  it('Case 9: realpathSync throws (ENOENT, non-existent file) + Python adapter → bare NO_NODE (HARD gate)', async () => {
+    // A non-existent file: fileURLToPath succeeds (well-formed URI), but
+    // realpathSync throws ENOENT. This gives NO in/out-of-repo signal
+    // → external:true is PROHIBITED (I-9 / R2-2).
+    // WI-5: Python adapter active → return bare {NO_NODE} (ruling R2-4).
+    const nonExistentUri = 'file:///tmp/__gitnexus_test_nonexistent_55a4b3c/foo.py';
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(nonExistentUri, 0),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    // MUST be bare {NO_NODE} — NOT external:true
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Case 11: Mode-C wire seam — adapterId=python + out-of-repo → external:true
+  // (catches any-typed key typo at the mode-c-verifier.ts wire site — ruling R2-7)
+  it('Case 11: Mode-C mapperDeps passthrough — adapterId=python + real out-of-repo → external:true', async () => {
+    // Simulate exactly what classifyEdge builds when opts.adapter.id === 'python':
+    //   mapperDeps = { classifyUri, repoPath: opts.repoPath, adapterId: opts.adapter?.id }
+    // The mapper must return { kind: 'NO_NODE', external: true } for an out-of-repo
+    // URI. This test would FAIL with a key typo like 'adapterid'.
+    const fakeAdapter = {
+      id: 'python' as const,
+      classifyUri: (u: string): 'workspace' | 'external' | 'unmappable' =>
+        u.startsWith('file://') ? 'workspace' : 'unmappable',
+    };
+
+    // Build mapperDeps exactly as mode-c-verifier.ts does (WI-5 wire site).
+    const mapperDeps = fakeAdapter
+      ? {
+          classifyUri: (u: string) => fakeAdapter.classifyUri(u),
+          repoPath: repoRoot,
+          adapterId: fakeAdapter.id,
+        }
+      : undefined;
+
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(`file://${outOfRepoFile}`, 0),
+      'crawl4ai',
+      { ...deps, ...mapperDeps },
+    );
+    // Must be external-refusal — the Mode-C external-refusal bucket fires.
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
   });
 });
