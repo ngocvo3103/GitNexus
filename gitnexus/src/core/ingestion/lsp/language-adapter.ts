@@ -23,6 +23,7 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { type MessageConnection } from 'vscode-languageserver-protocol/node';
 
@@ -30,7 +31,7 @@ import { getGlobalDir } from '../../../storage/repo-manager.js';
 import { TYPESCRIPT_LANGUAGE_SERVER_BIN } from './server-discovery.js';
 // WI-2: import canary strategies. canary-sampler.ts only `import type`s from this
 // file (LanguageCanaryStrategy), so the import is erased at runtime — no cycle.
-import { TS_CANARY_STRATEGY, JAVA_CANARY_STRATEGY, buildCanarySamples } from './canary-sampler.js';
+import { TS_CANARY_STRATEGY, JAVA_CANARY_STRATEGY, PYTHON_CANARY_STRATEGY, buildCanarySamples } from './canary-sampler.js';
 
 // ─── Forward-declared types (filled in by WI-2/WI-4) ─────────────────
 
@@ -102,8 +103,8 @@ export interface AdapterReadyCtx {
  * threaded through all LSP-stack entry points.
  */
 export interface LanguageAdapter {
-  /** Closed union; grows for go/python in future slices. */
-  readonly id: 'typescript' | 'java';
+  /** Closed union; widened additively — no switch/discriminant over .id in production. */
+  readonly id: 'typescript' | 'java' | 'python';
 
   /**
    * Binary basename passed to server discovery.
@@ -369,7 +370,7 @@ export const JAVA_ADAPTER: LanguageAdapter = {
               let fileContent = '';
               try {
                 fileContent = await fs.promises.readFile(
-                  sample.textDocument.uri.replace(/^file:\/\//, ''),
+                  fileURLToPath(sample.textDocument.uri),
                   'utf8',
                 );
               } catch { /* unreadable — send empty content */ }
@@ -423,6 +424,202 @@ export const JAVA_ADAPTER: LanguageAdapter = {
   },
 };
 
+// ─── PYTHON_ADAPTER ───────────────────────────────────────────────────
+
+/**
+ * Hard deadline for `PYTHON_ADAPTER.awaitReady` (milliseconds from call time).
+ *
+ * 30 s is the R2-10 unmeasured-fallback default; a scouting run on crawl4ai
+ * observed pylsp connecting within the funnel's 17.3 s phase, so 30 s is safe
+ * with margin.
+ *
+ * Exported so callers and tests can override via environment config or
+ * `AdapterReadyCtx.deadlineMs`.
+ */
+export const PYLSP_READY_DEADLINE_MS = 30_000;
+
+/**
+ * Python language adapter (WI-2 implementation — full awaitReady).
+ *
+ * `awaitReady`: PRIMARY multi-sample canary round-trip (ruling R2-11).
+ * pylsp emits NO `language/status`/`ServiceReady` notification, so there
+ * is no notification wait — the probe is the primary and only readiness
+ * signal. Iterates `buildCanarySamples` results; resolves `true` on the
+ * first non-empty `Location[]`; resolves `false` if all samples are
+ * exhausted OR deadline elapses (never rejects).
+ *
+ * `classifyUri` returns `'workspace'` for ALL `file://` URIs by design —
+ * scheme-only signal. Out-of-repo containment is owned by location-mapper
+ * gated on `adapterId` (ruling R2-13; ADR-001). Do NOT relocate
+ * containment into `classifyUri`.
+ *
+ * `serverBinary`: `'pylsp'` — confirmed v1.14.0 at /Users/NgocVo_1/.local/bin/pylsp.
+ * `spawnArgs`: `[]` — pylsp uses stdio by default; v1.14.0 rejects `--stdio` (exit 2). No `-data` dir; no GITNEXUS_HOME (no JVM state).
+ * `initializationOptions`: `{}` — pylsp accepts the LSP default.
+ */
+export const PYTHON_ADAPTER: LanguageAdapter = {
+  id: 'python',
+  serverBinary: 'pylsp',
+  languageId: 'python',
+
+  spawnArgs(_ctx: { workspaceRoot: string }): string[] {
+    // pylsp uses stdio transport by default (no --stdio flag required or accepted).
+    // pylsp v1.14.0 does not recognize --stdio and exits with code 2 if passed.
+    // Returning [] lets LspClient spawn pylsp without any extra arguments,
+    // which is the correct invocation for stdio mode.
+    return [];
+  },
+
+  initializationOptions: {},
+
+  awaitReady(ctx: AdapterReadyCtx): Promise<boolean> {
+    // KD-1 (Python variant): PRIMARY multi-sample canary round-trip.
+    //
+    // pylsp emits no `language/status`/`ServiceReady` notification —
+    // DO NOT register a notification handler. The canary round-trip
+    // is the only readiness signal.
+    //
+    // Algorithm:
+    //   1. Build canary samples from `ctx.workspaceRoot` using PYTHON_ADAPTER.canary.
+    //   2. If no samples: resolve false immediately (no candidate files).
+    //   3. Otherwise, for each sample (until deadline):
+    //      a. Send `textDocument/didOpen` (pylsp needs the file open to serve defs).
+    //      b. Send `textDocument/definition` at the sample position.
+    //      c. Non-empty Location[]: resolve true (server is ready).
+    //      d. Empty/null: try next sample.
+    //   4. If deadline elapses or all samples exhausted without a hit: resolve false.
+    //
+    // Contract: never rejects; always disposes the timer (no leak).
+    // The inline probe shape mirrors Java path-B (lines 344–400) minus the
+    // `language/status` notification registration and the notification-wait
+    // outer shell. See ruling R2-11 for the structural rationale.
+    const capturedCanary = PYTHON_ADAPTER.canary;
+    const capturedWorkspaceRoot = ctx.workspaceRoot;
+
+    return new Promise<boolean>((resolve) => {
+      const deadline = ctx.deadlineMs ?? PYLSP_READY_DEADLINE_MS;
+      const conn = ctx.connection as MessageConnection;
+
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      function settle(value: boolean): void {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        resolve(value);
+      }
+
+      // Set the hard deadline — resolves false if the probe loop does not
+      // produce a ready signal before it elapses.
+      timer = setTimeout(() => {
+        settle(false);
+      }, deadline);
+
+      // Prevent the timer from keeping the Node.js event loop alive past teardown.
+      if (
+        typeof (timer as unknown) === 'object' &&
+        timer !== null &&
+        typeof (timer as NodeJS.Timeout).unref === 'function'
+      ) {
+        (timer as NodeJS.Timeout).unref();
+      }
+
+      // Run the probe loop asynchronously so we do not block the event loop.
+      void (async () => {
+        try {
+          // Optional injected backstop probe (seam for unit tests — same as Java path A).
+          // When present, use it as the authoritative readiness verdict and skip
+          // the inline loop. Production code never injects this.
+          if (ctx.backstopProbe) {
+            const ready = await ctx.backstopProbe();
+            settle(ready);
+            return;
+          }
+
+          // Build canary samples from the workspace root using the Python strategy.
+          const samples = await buildCanarySamples(capturedWorkspaceRoot, {
+            strategy: capturedCanary,
+            maxFiles: 3,
+          });
+
+          if (samples.length === 0) {
+            // No candidate .py files found — cannot verify readiness; degrade gracefully.
+            settle(false);
+            return;
+          }
+
+          // Iterate samples; resolve true on the first non-empty Location[].
+          for (const sample of samples) {
+            if (settled) return; // deadline fired while we were iterating
+
+            // Open the file in the workspace BEFORE requesting its definition.
+            // pylsp (like jdtls) may return an empty array for an unopened file.
+            // Best-effort: if didOpen fails we still proceed with the definition request.
+            try {
+              let fileContent = '';
+              try {
+                fileContent = await fs.promises.readFile(
+                  fileURLToPath(sample.textDocument.uri),
+                  'utf8',
+                );
+              } catch { /* unreadable — send empty content */ }
+              await conn.sendNotification('textDocument/didOpen', {
+                textDocument: {
+                  uri: sample.textDocument.uri,
+                  languageId: PYTHON_ADAPTER.languageId,
+                  version: 1,
+                  text: fileContent,
+                },
+              });
+            } catch { /* best-effort: proceed even if didOpen fails */ }
+
+            if (settled) return; // deadline fired during didOpen
+
+            const result = await conn.sendRequest<unknown>(
+              'textDocument/definition',
+              { textDocument: sample.textDocument, position: sample.position },
+            );
+
+            // A non-null, non-empty response means the server resolved the
+            // definition — workspace is ready.
+            const ready =
+              result !== null &&
+              result !== undefined &&
+              !(Array.isArray(result) && result.length === 0);
+
+            if (ready) {
+              settle(true);
+              return;
+            }
+            // Empty result: try the next sample.
+          }
+
+          // All samples exhausted without a positive result.
+          settle(false);
+        } catch {
+          // Any unhandled error during the probe (e.g. connection disposed) — degrade.
+          settle(false);
+        }
+      })();
+    });
+  },
+
+  // PYTHON_CANARY_STRATEGY is fully implemented in canary-sampler.ts (WI-2/WI-3).
+  canary: PYTHON_CANARY_STRATEGY,
+
+  classifyUri(uri: string): 'workspace' | 'external' | 'unmappable' {
+    // Returns 'workspace' for ALL file:// URIs by design — scheme-only signal.
+    // Out-of-repo containment is owned by location-mapper gated on adapterId
+    // (ruling R2-13; ADR-001). Do NOT add path-based logic here.
+    if (uri.startsWith('file://')) return 'workspace';
+    return 'unmappable';
+  },
+};
+
 // ─── Extension census for KD-4 adapter selection ─────────────────────
 
 /** Extensions that indicate a TypeScript/JavaScript LSP project. */
@@ -430,6 +627,9 @@ const TS_EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.m
 
 /** Extensions that indicate a Java LSP project. */
 const JAVA_EXTENSIONS = new Set(['.java']);
+
+/** Extensions that indicate a Python LSP project. */
+const PY_EXTENSIONS = new Set(['.py']);
 
 /**
  * Directories to skip during the extension census walk. Skipping
@@ -449,6 +649,13 @@ const SKIP_DIRS = new Set([
   '__pycache__',
   '.venv',
   'vendor',
+  // Python virtualenv / package installation dirs — excluded to avoid
+  // inflating pyCount with installed third-party packages (I-7).
+  'site-packages',
+  'dist-packages',
+  '.tox',
+  'eggs',
+  '.eggs',
 ]);
 
 /**
@@ -463,11 +670,12 @@ const CENSUS_FILE_LIMIT = 2_000;
  * Walk `dir` recursively, counting LSP-relevant file extensions.
  * Bails out once `CENSUS_FILE_LIMIT` files have been inspected.
  *
- * Returns `{ tsCount, javaCount }`.
+ * Returns `{ tsCount, javaCount, pyCount }`.
  */
-function censusExtensions(dir: string): { tsCount: number; javaCount: number } {
+function censusExtensions(dir: string): { tsCount: number; javaCount: number; pyCount: number } {
   let tsCount = 0;
   let javaCount = 0;
+  let pyCount = 0;
   let inspected = 0;
 
   function walk(current: string): void {
@@ -496,13 +704,15 @@ function censusExtensions(dir: string): { tsCount: number; javaCount: number } {
           tsCount++;
         } else if (JAVA_EXTENSIONS.has(ext)) {
           javaCount++;
+        } else if (PY_EXTENSIONS.has(ext)) {
+          pyCount++;
         }
       }
     }
   }
 
   walk(dir);
-  return { tsCount, javaCount };
+  return { tsCount, javaCount, pyCount };
 }
 
 /**
@@ -511,11 +721,14 @@ function censusExtensions(dir: string): { tsCount: number; javaCount: number } {
  *
  * Algorithm:
  *   1. Count TS-family files (`.ts`, `.tsx`, `.mts`, `.cts`,
- *      `.js`, `.jsx`, `.mjs`, `.cjs`) and Java files (`.java`)
- *      under `repoPath` (skipping `node_modules`, `dist`, `target`, …).
- *   2. The dominant count wins. Ties go to TypeScript (more common
- *      in practice; TS adapter is the proven-stable one).
- *   3. If both counts are zero, return `null` — the funnel is not
+ *      `.js`, `.jsx`, `.mjs`, `.cjs`), Java files (`.java`),
+ *      and Python files (`.py`) under `repoPath` (skipping
+ *      `node_modules`, `dist`, `target`, `site-packages`, …).
+ *   2. Python must STRICTLY dominate (pyCount > tsCount AND > javaCount)
+ *      to win — checked before the TS/Java tie-break so that a pure-
+ *      Python repo is not swallowed by the `tsCount >= javaCount` branch
+ *      (0 >= 0 is true). Ties go to TypeScript (proven-stable default).
+ *   3. If all counts are zero, return `null` — the funnel is not
  *      entered for unsupported repos (no LSP server will be spawned).
  *
  * @param repoPath  Absolute path to the repository root.
@@ -523,14 +736,22 @@ function censusExtensions(dir: string): { tsCount: number; javaCount: number } {
  *          was detected.
  */
 export function selectAdapter(repoPath: string): LanguageAdapter | null {
-  const { tsCount, javaCount } = censusExtensions(repoPath);
+  const { tsCount, javaCount, pyCount } = censusExtensions(repoPath);
 
-  if (tsCount === 0 && javaCount === 0) {
+  if (tsCount === 0 && javaCount === 0 && pyCount === 0) {
     // No supported LSP language detected — funnel not entered.
     return null;
   }
 
-  // Ties go to TS (safe default — TS adapter is the proven path).
+  // Python strict dominance: must beat BOTH TS and Java counts.
+  // Checked BEFORE the TS/Java tie-break — otherwise a pure-Python repo
+  // (tsCount=0, javaCount=0, pyCount=N) short-circuits to TS via 0 >= 0.
+  if (pyCount > tsCount && pyCount > javaCount) {
+    return PYTHON_ADAPTER;
+  }
+
+  // Ties (including tsCount === pyCount) go to TS (safe default — TS adapter
+  // is the proven path; Python wins only on strict dominance).
   if (tsCount >= javaCount) {
     return TYPESCRIPT_ADAPTER;
   }

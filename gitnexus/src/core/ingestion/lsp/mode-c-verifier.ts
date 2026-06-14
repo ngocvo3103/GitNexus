@@ -161,6 +161,20 @@ export interface RunModeCVerifyOpts {
    */
   repoPath?: string;
   /**
+   * Pre-resolved (realpath'd) absolute path to the repository root.
+   *
+   * Performance: when only `repoPath` is supplied, `mapLocationToNodeId`
+   * calls `realpathSync(repoPath)` on every mapper invocation — 10k+
+   * redundant stat(2) syscalls for a large Python repo. Supplying the
+   * pre-resolved root here lets `classifyEdge` pass it directly to
+   * `MapperDeps.resolvedRepoPath` so the hot path skips the syscall.
+   *
+   * Must be the result of `realpathSync(repoPath)`. When absent, the
+   * mapper falls back to resolving on the fly (pre-existing behaviour;
+   * all existing callers and tests remain unaffected).
+   */
+  resolvedRepoPath?: string;
+  /**
    * Maps an LSP Location to a graph nodeId. Default: real `mapLocationToNodeId`.
    *
    * The optional third argument is a partial `MapperDeps` bag. When
@@ -753,7 +767,18 @@ async function classifyEdge(
     // TS path (no adapter): third arg is undefined → mapper skips KD-3 block
     // entirely, byte-identical to pre-WI-7.
     const mapperDeps = opts.adapter
-      ? { classifyUri: (u: string) => opts.adapter!.classifyUri(u) }
+      ? {
+          classifyUri: (u: string) => opts.adapter!.classifyUri(u),
+          // WI-5 (#159 P5): thread repoPath + adapterId so the mapper's
+          // containment guard fires for Python out-of-repo file:// URIs
+          // (site-packages, stdlib) → { kind: 'NO_NODE', external: true }.
+          // Without repoPath the containment branch never runs in Mode-C
+          // (BLOCKER — ruling #2 / R2-5). adapterId gates external:true
+          // (ruling #1); both are undefined when no adapter is active.
+          repoPath: opts.repoPath,
+          resolvedRepoPath: opts.resolvedRepoPath,
+          adapterId: opts.adapter?.id,
+        }
       : undefined;
     mapperResult = await opts.mapLocationToNodeId(locations[0], opts.repoId, mapperDeps);
   }

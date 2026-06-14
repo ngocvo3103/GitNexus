@@ -106,6 +106,14 @@ const EXCLUDED_DIRS = new Set([
   '.gitnexus',
   'build',
   'coverage',
+  // Python-specific (I-7): canary walk + census SKIP_DIRS both carry this set
+  '__pycache__',
+  '.venv',
+  'site-packages',
+  'dist-packages',
+  '.tox',
+  'eggs',
+  '.eggs',
 ]);
 
 // ─── TypeScript regex patterns (priority order) ───────────────────────
@@ -525,6 +533,247 @@ export const TS_CANARY_STRATEGY: LanguageCanaryStrategy = {
       const pos = findIdentifierPosition(lines, name, lineOffset);
       if (pos !== null) {
         return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    return null;
+  },
+};
+
+// ─── Python regex patterns (priority order) ───────────────────────────
+
+/**
+ * Python Priority 1a — `def` or `async def` declaration (indented or not):
+ *   def function_name(
+ *   async def function_name(
+ *       def method(self):     ← indented methods inside classes
+ *
+ * Leading `[ \t]*` allows indented defs (methods inside class bodies).
+ * Captures the function name. pylsp resolves `textDocument/definition`
+ * at the function name to a non-empty `Location[]` (the declaration site).
+ */
+const RE_PY_DEF = /^[ \t]*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/m;
+
+/**
+ * Python Priority 1b — `class` declaration (indented or not):
+ *   class MyClass:
+ *   class MyClass(Base):
+ *       class Inner:     ← nested class
+ */
+const RE_PY_CLASS = /^[ \t]*class\s+([A-Za-z_][A-Za-z0-9_]*)\s*[:(]/m;
+
+/**
+ * Python Priority 2 — call-site (fallback when no def/class):
+ *   some_func(x, y)
+ *   result = some_func(arg)
+ *
+ * Captures the function name before the open-paren. Applied to safe text.
+ * pylsp resolves definition requests at call sites reliably; useful when
+ * a file has no top-level or method declarations. Priority 1 beats this
+ * whenever a def/class is present.
+ *
+ * The optional `SIMPLE_IDENT =` prefix allows `result = some_func(arg)`
+ * to capture `some_func`. The key fix vs. the original: the LHS arm uses
+ * `[A-Za-z_][A-Za-z0-9_]*` (no dot) instead of `[A-Za-z_][A-Za-z0-9_.]*`.
+ * This prevents `obj.method(` from being consumed as "the optional LHS" —
+ * `obj` does not satisfy the non-dotted pattern followed by `=`, so the
+ * optional group backtracks; then `([A-Za-z_][A-Za-z0-9_]*)` matches `obj`
+ * but the next character is `.`, not `(`, so the overall match fails.
+ * Expressions like `obj.method(` and `result = obj.method(arg)` are now
+ * correctly rejected — method calls on a dotted receiver are lower-quality
+ * canary targets than standalone function calls.
+ */
+const RE_PY_CALL =
+  /^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/m;
+
+/**
+ * Python Priority 3 (LAST-RESORT FALLBACK) — `import` statement:
+ *   import os
+ *   from os import path
+ *   from . import utils
+ *
+ * pylsp returns [] for definition requests on import tokens (same
+ * behaviour as jdtls on Java import declarations). Retained only so an
+ * import-only file still yields a sample rather than being dropped.
+ */
+const RE_PY_IMPORT =
+  /^(?:from\s+[\w.]+\s+import\s+([A-Za-z_][A-Za-z0-9_]*)|import\s+([A-Za-z_][A-Za-z0-9_]*))/m;
+
+/**
+ * Python identifier continuation class (same as Java — no dollar-sign).
+ */
+const PY_IDENT_AFTER = new RegExp('[A-Za-z0-9_]');
+
+/**
+ * Return a copy of `text` where every line that is wholly or partly
+ * inside a Python `#` line comment or a triple-quoted string
+ * (`"""` or `'''`) is replaced with a blank line of the same length.
+ * Preserves all line numbers so `findIdentifierPosition` offsets stay
+ * valid.
+ *
+ * Limitation: this is NOT a full Python lexer. Single-quoted strings
+ * (non-triple) are not tracked; the `def`/`class` regexes are unlikely
+ * to appear verbatim inside ordinary single-line strings. The multiple-
+ * sample strategy provides a second chance if one file's sample is wrong.
+ */
+function blankPythonUnsafeLines(text: string): string {
+  const lines = text.split('\n');
+  const blanked: string[] = [];
+  let tripleQuoteChar: string | null = null; // '"' or "'" when inside """...""" / '''...'''
+
+  for (const line of lines) {
+    // Inside a triple-quoted string — blank the line and check for end delimiter.
+    if (tripleQuoteChar !== null) {
+      const endDelimiter = tripleQuoteChar.repeat(3);
+      const endIdx = line.indexOf(endDelimiter);
+      if (endIdx !== -1) {
+        // Closing delimiter found — remainder of the line after it is
+        // normal code, but since the line straddles the string boundary
+        // we blank the whole line for simplicity (same rationale as
+        // `blankUnsafeLines` for block comments).
+        tripleQuoteChar = null;
+      }
+      blanked.push(' '.repeat(line.length));
+      continue;
+    }
+
+    // Scan the line for triple-quote openers and # comments.
+    let safe = true;
+    let i = 0;
+    let safeUpTo = 0; // index at which the line became unsafe
+
+    while (i < line.length) {
+      // # comment — rest of line is a comment.
+      if (line[i] === '#') {
+        safe = false;
+        safeUpTo = i;
+        break;
+      }
+      // Triple-quote opener — """ or '''.
+      if (
+        (line[i] === '"' && line[i + 1] === '"' && line[i + 2] === '"') ||
+        (line[i] === "'" && line[i + 1] === "'" && line[i + 2] === "'")
+      ) {
+        const q = line[i];
+        const endDelimiter = q.repeat(3);
+        // Look for the closing delimiter on the same line (skip past the opener).
+        const afterOpen = i + 3;
+        const closeIdx = line.indexOf(endDelimiter, afterOpen);
+        if (closeIdx !== -1) {
+          // Inline triple-quoted string (opens and closes on the same line).
+          // Mark this line unsafe and skip past the closing delimiter.
+          safe = false;
+          safeUpTo = i;
+          i = closeIdx + 3;
+          continue;
+        } else {
+          // Multi-line triple-quoted string starts here.
+          safe = false;
+          safeUpTo = i;
+          tripleQuoteChar = q;
+          break;
+        }
+      }
+      i++;
+    }
+
+    if (safe) {
+      blanked.push(line);
+    } else {
+      // Preserve the prefix of the line that is safe (before the comment / string),
+      // then blank the rest to preserve character offsets.
+      blanked.push(line.slice(0, safeUpTo) + ' '.repeat(line.length - safeUpTo));
+    }
+  }
+
+  return blanked.join('\n');
+}
+
+// ─── Python canary strategy ───────────────────────────────────────────
+
+/**
+ * `PYTHON_CANARY_STRATEGY` — canary sampling for `.py` source files.
+ *
+ * Uses `blankPythonUnsafeLines` to strip `#` comments and triple-quoted
+ * strings before applying regexes. This prevents a `def`-shaped string
+ * inside a docstring from yielding an unanswerable probe position.
+ *
+ * Priority order (first match wins):
+ *   1. `def` (or `async def`) function/method name — most reliable;
+ *      pylsp returns the declaration `Location` for a definition request
+ *      at the function name token.
+ *   2. `class` declaration name — equally reliable.
+ *   3. `import` / `from ... import` — last-resort fallback; some imports
+ *      (e.g. stdlib) may resolve to an external file:// URI, which is fine
+ *      because the probe only tests that pylsp returns a non-empty result.
+ *
+ * `isCandidateFile`: accepts `.py` only; excludes nothing else (unlike
+ * the TS strategy, `.py` has no "declaration-only" equivalent of `.d.ts`
+ * that would produce unreliable probe positions).
+ */
+export const PYTHON_CANARY_STRATEGY: LanguageCanaryStrategy = {
+  isCandidateFile(name: string): boolean {
+    return name.endsWith('.py');
+  },
+
+  tryExtractSample(
+    absolutePath: string,
+    text: string,
+  ): { textDocument: { uri: string }; position: { line: number; character: number } } | null {
+    const safeText = blankPythonUnsafeLines(text);
+    const lines = text.split('\n');
+
+    // Priority 1a: def / async def declaration (indented or not).
+    // Most reliable pylsp probe target — resolves to the declaration's own site.
+    const defMatch = RE_PY_DEF.exec(safeText);
+    if (defMatch) {
+      const name = defMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(defMatch[0]), PY_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // Priority 1b: class declaration.
+    const classMatch = RE_PY_CLASS.exec(safeText);
+    if (classMatch) {
+      const name = classMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(classMatch[0]), PY_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // Priority 2: call-site — useful when a file has no top-level decls.
+    // pylsp resolves definition requests at call sites (unlike import tokens).
+    const callMatch = RE_PY_CALL.exec(safeText);
+    if (callMatch) {
+      const name = callMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(callMatch[0]), PY_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // Priority 3 (LAST-RESORT FALLBACK): import statement.
+    // pylsp returns [] for definition requests on import tokens — retained
+    // only so an import-only file still yields a sample.
+    const importMatch = RE_PY_IMPORT.exec(safeText);
+    if (importMatch) {
+      const name = importMatch[1] ?? importMatch[2];
+      if (name) {
+        const pos = findIdentifierPosition(
+          lines, name, safeText.indexOf(importMatch[0]), PY_IDENT_AFTER,
+        );
+        if (pos !== null) {
+          return makeSample(absolutePath, pos.line, pos.character);
+        }
       }
     }
 

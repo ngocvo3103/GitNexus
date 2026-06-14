@@ -1,0 +1,134 @@
+// Solution-design structural model — #159 P5: Python/pylsp LSP-adapter
+// C2 shows new components within the existing lsp-layer container.
+// C3 shows each lsp-layer component with change-coding.
+// Change-coding: green = new [N], light-yellow = updated [~].
+// No system is added or removed → no C1 view.
+
+specification {
+  element system
+  element container
+  element component
+  element store
+
+  color lightyellow #FDE68A   // "updated" [~]
+
+  tag new
+  tag updated
+}
+
+model {
+  gitnexus = system 'GitNexus' {
+
+    ingestion = container 'Ingestion pipeline' {
+      description 'RunPipelineFromRepo + VerifyCommand execution paths'
+      link ./159-p5-python-pylsp.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + PYTHON_ADAPTER wiring'
+
+      pipeline = component 'pipeline.ts' {
+        link ./159-p5-python-pylsp.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + PYTHON_ADAPTER wiring'
+      }
+
+      verifyCmd = component 'verify.ts' {
+        link ./159-p5-python-pylsp.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + PYTHON_ADAPTER wiring'
+      }
+
+      modeAReconciler = component 'mode-a-reconciler.ts' {
+        link ./159-p5-python-pylsp.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + PYTHON_ADAPTER wiring'
+      }
+    }
+
+    lspLayer = container 'LSP layer' {
+      #updated
+      style { color lightyellow }
+      description 'LSP-augmentation layer — language-adapter.ts, lsp-client.ts, location-mapper.ts, canary-sampler.ts, server-discovery.ts, mode-c-verifier.ts'
+      link ./159-p5-python-pylsp.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + PYTHON_ADAPTER wiring'
+      link ./159-p5-python-pylsp.html#sd-canary-probe 'Sequence: canary probe + awaitReady'
+      link ./159-p5-python-pylsp.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+
+      langAdapter = component 'language-adapter.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] censusExtensions +pyCount; selectAdapter Python-dominant branch; PYTHON_ADAPTER singleton [N]; LanguageAdapter.id widened to include python'
+        link ./159-p5-python-pylsp.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + PYTHON_ADAPTER wiring'
+      }
+
+      pythonAdapter = component 'PYTHON_ADAPTER' {
+        #new
+        style { color green }
+        description '[N] Module-level singleton. spawnArgs→[--stdio], languageId→python, classifyUri(file://)→workspace, awaitReady→canary round-trip ~10s'
+        link ./159-p5-python-pylsp.html#sd-canary-probe 'Sequence: canary probe + awaitReady'
+        link ./159-p5-python-pylsp.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+      }
+
+      canarySampler = component 'canary-sampler.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] PYTHON_CANARY_STRATEGY [N]: def/class > call-site > import priority; blankPythonUnsafeLines [N]; EXCLUDED_DIRS +venv/package dirs'
+        link ./159-p5-python-pylsp.html#sd-canary-probe 'Sequence: canary probe + awaitReady'
+      }
+
+      serverDiscovery = component 'server-discovery.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] PYLSP_BIN=pylsp [N]; DiscoveredServers +python? key; discoverOne(PYLSP_BIN) in Promise.all; unknown-version tolerance'
+        link ./159-p5-python-pylsp.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + PYTHON_ADAPTER wiring'
+      }
+
+      locationMapper = component 'location-mapper.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] Out-of-repo file:// containment branch gains external:true when adapterId===python (seam Option C, ruling #1); TS/Java paths byte-identical.'
+        link ./159-p5-python-pylsp.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+      }
+
+      lspClient = component 'lsp-client.ts' {
+        description 'Unchanged — already adapter-parameterized (WI-4 Java slice). Zero code changes.'
+        link ./159-p5-python-pylsp.html#sd-canary-probe 'Sequence: canary probe + awaitReady'
+        link ./159-p5-python-pylsp.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+      }
+
+      modeCVerifier = component 'mode-c-verifier.ts' {
+        description 'Unchanged — already adapter-aware (WI-7 Java slice). Inherits external-refusal bucketing via location-mapper.'
+        link ./159-p5-python-pylsp.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+      }
+    }
+
+    pylsp = container 'pylsp process' {
+      #new
+      style { color green }
+      description '[N] External process: python-lsp-server (pylsp v1.14.0). Communicates over stdio. Returns file:// URIs for all definitions (workspace and stdlib/site-packages alike).'
+      link ./159-p5-python-pylsp.html#sd-canary-probe 'Sequence: canary probe + awaitReady'
+      link ./159-p5-python-pylsp.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+    }
+  }
+
+  // --- relationships ---
+  pipeline -> lspLayer 'selectAdapter + withReconciliationSession'
+  verifyCmd -> lspLayer 'selectAdapter + verifyCommand'
+  modeAReconciler -> langAdapter 'selectAdapter(repoPath)'
+  modeAReconciler -> serverDiscovery 'discoverServers() → discovered[python]'
+  modeAReconciler -> lspClient 'createLspClient({adapter:PYTHON_ADAPTER})'
+  lspClient -> pylsp 'spawn pylsp --stdio; JSON-RPC over stdio'
+  modeAReconciler -> pythonAdapter 'awaitReady(ctx)'
+  pythonAdapter -> canarySampler 'buildCanarySamples(repoPath, {strategy:PYTHON_CANARY_STRATEGY})'
+  pythonAdapter -> lspClient 'textDocument/definition (canary probe)'
+  lspClient -> locationMapper 'mapLocationToNodeId(uri, deps+classifyUri)'
+  locationMapper -> pythonAdapter 'classifyUri(uri) → workspace|unmappable'
+  modeCVerifier -> locationMapper 'mapLocationToNodeId(uri, deps+classifyUri)'
+}
+
+views {
+  // C2 — container topology: pylsp process is new; lspLayer updated
+  view c2_lsp_layer {
+    title 'C2 — LSP layer containers (Python slice)'
+    description 'New pylsp container [N]; lspLayer updated [~]. Ingestion pipeline and ingestion containers are structural context only.'
+    include ingestion, lspLayer, pylsp
+  }
+
+  // C3 — lspLayer components: PYTHON_ADAPTER is new; several components updated
+  view c3_lsp_components of lspLayer {
+    title 'C3 — LSP layer components (Python slice)'
+    description 'PYTHON_ADAPTER [N]; language-adapter/canary-sampler/server-discovery/location-mapper [~]; lsp-client/mode-c-verifier unchanged.'
+    include *
+    include ingestion, pylsp
+  }
+}

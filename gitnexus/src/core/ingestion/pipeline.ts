@@ -767,6 +767,23 @@ export const runPipelineFromRepo = async (
       //      adapter and spawns the correct binary.
       const lspAdapter = selectAdapter(repoPath);
 
+      // Pre-resolve the repo root once for the entire reconciliation
+      // session. mapLocationToNodeId calls realpathSync(repoPath) on
+      // every invocation when only `repoPath` is supplied — for a
+      // large Python repo (10k+ CALL candidates) that emits 10k
+      // redundant stat(2) syscalls against the same constant value.
+      // Supplying the pre-resolved root as `resolvedRepoPath` lets the
+      // mapper skip that call entirely in the hot path.
+      let resolvedRepoPath: string | undefined;
+      try {
+        resolvedRepoPath = fs.realpathSync(repoPath);
+      } catch {
+        // Non-existent or inaccessible repo root — leave undefined so
+        // the mapper falls back to its own realpathSync on each call
+        // (pre-existing behavior, preserves correctness).
+        resolvedRepoPath = undefined;
+      }
+
       // The session funnel is the single refuse path. The
       // per-candidate `textDocument/definition` requests are
       // issued inside it; the responses are collected into
@@ -869,6 +886,7 @@ export const runPipelineFromRepo = async (
             mapLocationToNodeId(loc, repoId, {
               executeParameterized: inMemoryQuery,
               repoPath,
+              resolvedRepoPath,
               // KD-3: thread the adapter's URI classifier so jdt:// and
               // classpath:// URIs returned by jdtls are explicitly refused as
               // external (NO_NODE + external:true) rather than traversing the
@@ -881,6 +899,13 @@ export const runPipelineFromRepo = async (
               // (the session gate above short-circuits when lspAdapter is null),
               // but an optional-chain is cleaner than an assertion.
               classifyUri: lspAdapter?.classifyUri.bind(lspAdapter),
+              // WI-5 (#159 P5): thread the adapter id so the mapper's
+              // out-of-repo containment guard can tag Python site-packages
+              // / stdlib `file://` URIs as `{ kind: 'NO_NODE', external: true }`
+              // rather than bare `NO_NODE`. TS/Java paths omit this field
+              // (lspAdapter?.id is 'typescript'/'java') — only 'python'
+              // activates the external:true gate.
+              adapterId: lspAdapter?.id,
             }),
           repoId: ctx.repoId ?? 'default',
           skipped: sessionSkipped,
