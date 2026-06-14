@@ -98,8 +98,10 @@ const SCAN_CAP = 500;
 /**
  * Directories whose contents are never useful canary sources.
  * Names are compared case-sensitively (Unix convention).
+ *
+ * Exported for direct membership assertions in unit tests (C3-17).
  */
-const EXCLUDED_DIRS = new Set([
+export const EXCLUDED_DIRS = new Set([
   'node_modules',
   'dist',
   '.git',
@@ -114,6 +116,8 @@ const EXCLUDED_DIRS = new Set([
   '.tox',
   'eggs',
   '.eggs',
+  // Go-specific (WI-3): vendor directory contains third-party deps, not canary targets
+  'vendor',
 ]);
 
 // ─── TypeScript regex patterns (priority order) ───────────────────────
@@ -776,6 +780,211 @@ export const PYTHON_CANARY_STRATEGY: LanguageCanaryStrategy = {
         }
       }
     }
+
+    return null;
+  },
+};
+
+// ─── Go regex patterns (priority order) ───────────────────────────────
+
+/**
+ * Go Priority 1a — function declaration:
+ *   func FunctionName(
+ *   func FunctionName[T any](
+ *
+ * Must NOT match method declarations (those have a receiver in parens
+ * between `func` and the name). We reject a `(` immediately after `func\s+`
+ * to avoid matching `func (r Receiver) Name(`. The look-ahead `[^(]` in the
+ * identifier character class handles this: `[A-Za-z_]` cannot be `(`.
+ * Captures the function name. Applied to safe (comment-blanked) text.
+ */
+const RE_GO_FUNC = /^func\s+([A-Za-z_][A-Za-z0-9_]*)\s*[([{]/m;
+
+/**
+ * Go Priority 1b — type declaration:
+ *   type MyStruct struct {
+ *   type MyInterface interface {
+ *   type Alias = OtherType
+ *
+ * Captures the type name after the `type` keyword.
+ */
+const RE_GO_TYPE = /^type\s+([A-Za-z_][A-Za-z0-9_]*)\s+/m;
+
+/**
+ * Go Priority 1c — method declaration:
+ *   func (r Receiver) MethodName(
+ *   func (r *Receiver) MethodName(
+ *
+ * After `func`, a receiver `(...)` appears before the method name.
+ * Pattern: `func` + whitespace + `(` + anything + `)` + whitespace +
+ * identifier (the method name) + `(`.
+ * Captures the method name.
+ */
+const RE_GO_METHOD = /^func\s+\([^)]*\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*[([{]/m;
+
+/**
+ * Go Priority 2 — call-site identifier (fallback when no decl present):
+ *   someFunc(arg)
+ *   result := someFunc(arg)
+ *
+ * Captures a plain identifier immediately followed by `(`. Leading
+ * optional `IDENT :=` or `IDENT =` assignment pattern is accepted so
+ * `result := someFunc(arg)` captures `someFunc`. Method calls on a
+ * dotted receiver (`obj.Method(`) are excluded: the identifier regex
+ * `[A-Za-z_][A-Za-z0-9_]*` is followed by `\s*(`, not `\.`, so a
+ * dotted expression backtracks and `obj` would be followed by `.`, not
+ * `(`, causing the overall match to fail.
+ *
+ * I-19 guard: Go reserved keywords that can precede `(` without being
+ * call-sites are excluded via a negative lookahead on the captured group.
+ * Without this, `import (` (grouped import block) would match because
+ * `import` is an identifier followed by `(`, causing an import-only file
+ * to yield a non-null sample from RE_GO_CALL — violating I-19, which
+ * requires import-only files to return null. The negative lookahead blocks
+ * the full set of Go statement-opening keywords that can syntactically
+ * appear before `(` but are never user-defined call-site identifiers.
+ *
+ * Applied to safe (comment-blanked) text.
+ */
+const GO_RESERVED_WORDS_RE =
+  /^(?:break|case|chan|const|continue|default|defer|else|fallthrough|for|func|go|goto|if|import|interface|map|package|range|return|select|struct|switch|type|var)\b/;
+const RE_GO_CALL =
+  /^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*:?=\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/m;
+
+/**
+ * Go Priority 3 (LAST-RESORT FALLBACK) — import declaration:
+ *   import "fmt"
+ *   import alias "pkg/path"
+ *   import ( "fmt" ) — multi-import block, captures first package name
+ *
+ * gopls returns [] for definition requests on import path tokens (same
+ * behaviour as jdtls / pylsp on import declarations). Retained only so
+ * an import-only file still yields a sample rather than being dropped.
+ *
+ * Captures the last path segment (the basename of the import path, which
+ * is the usable identifier token). Example: `"net/http"` → `http`.
+ */
+const RE_GO_IMPORT =
+  /^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"[^"]*\/([A-Za-z_][A-Za-z0-9_]*)"/m;
+
+/**
+ * Go identifier word-boundary continuation class.
+ * Go identifiers do not include the dollar-sign (unlike JavaScript).
+ */
+const GO_IDENT_AFTER = new RegExp('[A-Za-z0-9_]');
+
+// ─── Go canary strategy ───────────────────────────────────────────────
+
+/**
+ * `GO_CANARY_STRATEGY` — canary sampling for `.go` source files (WI-3).
+ *
+ * Reuses the same comment-blanking pre-pass (blankUnsafeLines) as
+ * the TS and Java strategies. Go uses // line comments and slash-star
+ * block comments — identical to C-style — and has NO template-literal
+ * equivalents (Go raw string literals use backticks, but they cannot
+ * contain a verbatim backtick, so they cannot produce false-positive
+ * import/func matches inside them in practice). The backtick-tracking
+ * inside blankUnsafeLines would blank raw string content, which is
+ * acceptable.
+ *
+ * `isCandidateFile`: accepts `.go` files EXCEPT files ending in
+ * `_test.go` — test files use testing-package identifiers that gopls
+ * may not resolve in a non-test build context.
+ *
+ * Priority order (first match wins):
+ *   1. `func Name(` (function decl) OR `type Name ` (type decl) OR
+ *      `func (r Receiver) Name(` (method decl) — most reliable gopls
+ *      probe targets; gopls returns the declaration `Location` for a
+ *      definition request at the name token.
+ *   2. Call-site identifier — useful when a file has no top-level
+ *      declarations (rare in Go, but possible for generated/stub files).
+ *   3. Import path segment (LAST-RESORT FALLBACK) — gopls returns []
+ *      for definition requests at import tokens; retained only so a
+ *      pathological import-only file still yields a sample rather than
+ *      being dropped from the canary set entirely.
+ *
+ * Invariant: `GO_IDENT_AFTER` has no `$` (Go identifiers exclude it).
+ */
+export const GO_CANARY_STRATEGY: LanguageCanaryStrategy = {
+  isCandidateFile(name: string): boolean {
+    // Exclude _test.go files: gopls may not resolve testing-package
+    // symbols in a non-test build context.
+    if (name.endsWith('_test.go')) return false;
+    return name.endsWith('.go');
+  },
+
+  tryExtractSample(
+    absolutePath: string,
+    text: string,
+  ): { textDocument: { uri: string }; position: { line: number; character: number } } | null {
+    // Apply the comment-blanking pre-pass so regexes cannot match inside
+    // // line comments or /* … */ block comments. The safe text has the
+    // same line count and character offsets as `text`; only unsafe lines
+    // are blanked. `blankUnsafeLines` is shared with TS and Java —
+    // reuse is safe because Go uses identical C-style comment syntax.
+    const safeText = blankUnsafeLines(text);
+    const lines = text.split('\n');
+
+    // Priority 1a: method declaration — checked BEFORE plain func so
+    // `func (r Receiver) Name(` is captured as a method (not confused
+    // with a func starting at the `N` after the receiver block).
+    const methodMatch = RE_GO_METHOD.exec(safeText);
+    if (methodMatch) {
+      const name = methodMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(methodMatch[0]), GO_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // Priority 1b: function declaration.
+    const funcMatch = RE_GO_FUNC.exec(safeText);
+    if (funcMatch) {
+      const name = funcMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(funcMatch[0]), GO_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // Priority 1c: type declaration.
+    const typeMatch = RE_GO_TYPE.exec(safeText);
+    if (typeMatch) {
+      const name = typeMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(typeMatch[0]), GO_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // Priority 2: call-site identifier.
+    // I-19 guard: skip the match if the captured identifier is a Go reserved
+    // keyword (e.g. `import` in a grouped import block, `if`, `for`, etc.).
+    // RE_GO_CALL would otherwise match `import (` as a call-site because
+    // `import` satisfies `[A-Za-z_][A-Za-z0-9_]*` and is followed by `(`.
+    const callMatch = RE_GO_CALL.exec(safeText);
+    if (callMatch && !GO_RESERVED_WORDS_RE.test(callMatch[1])) {
+      const name = callMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(callMatch[0]), GO_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // I-19: import-only / package-clause-only .go files MUST return null.
+    // The former Priority 3 RE_GO_IMPORT fallback fired on slashed import paths
+    // (e.g. `import "net/http"`) and returned a non-null sample, but gopls
+    // returns [] for definition requests on import tokens — poisoning the canary
+    // backstop. Removed to comply with I-19: files with no func/type/call-site
+    // correctly yield no sample.
 
     return null;
   },

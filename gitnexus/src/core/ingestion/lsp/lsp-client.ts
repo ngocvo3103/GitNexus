@@ -33,7 +33,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
-import { readFileSync, realpathSync } from 'fs';
+import { readFileSync, realpathSync, statSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as path from 'node:path';
 import {
@@ -45,7 +45,11 @@ import {
 } from 'vscode-languageserver-protocol/node';
 
 import { discoverOne } from './server-discovery.js';
-import { type LanguageAdapter, type AdapterReadyCtx, TYPESCRIPT_ADAPTER } from './language-adapter.js';
+import { type LanguageAdapter, type AdapterReadyCtx, TYPESCRIPT_ADAPTER, type ClientCapabilities } from './language-adapter.js';
+
+// Re-export ClientCapabilities so callers can import it from either this file
+// or language-adapter.ts without needing to know where it lives.
+export type { ClientCapabilities };
 
 // ─── Public types ─────────────────────────────────────────────────────
 
@@ -135,7 +139,7 @@ const TS_SERVER_CAPABILITIES = {
 interface InitializeParams {
   processId: number | null;
   rootUri: string;
-  capabilities: typeof TS_SERVER_CAPABILITIES;
+  capabilities: ClientCapabilities;
   workspaceFolders: { uri: string; name: string }[];
   initializationOptions?: Record<string, unknown>;
 }
@@ -240,6 +244,45 @@ export class LspClient {
 
   /** Resolve hook for the in-flight `initialize` request. */
   private initializePromise: Promise<void> | null = null;
+
+  /**
+   * Per-token correlation buffer for `$/progress` notifications (WI-0 R2-2).
+   *
+   * Populated by the pre-`initialize` `onNotification('$/progress')` handler
+   * (registered in `spawnAndInitialize` before `connection.sendRequest('initialize', …)`).
+   * Keys are progress token identifiers; values are the `begin.value.title` strings
+   * stored at `begin` time.  The `end` notification carries an EMPTY title (spike-
+   * confirmed for gopls), so the matcher MUST look up the stored title from this
+   * map — never read `end.title` directly.
+   *
+   * Read by `GO_ADAPTER.awaitReady` (WI-2).  Cleared on each `spawnAndInitialize`
+   * call so restarts start with a clean buffer.
+   */
+  readonly progressTokenTitles = new Map<string | number, string>();
+
+  /**
+   * Tokens that have received their `end` notification (WI-0 R2-2).
+   *
+   * Populated alongside `progressTokenTitles` by the pre-`initialize`
+   * `$/progress` handler.  `awaitReady` checks this set to detect a
+   * begin+end pair that arrived BEFORE `awaitReady` was invoked (the
+   * begin-before-awaitReady buffering guarantee).
+   */
+  readonly progressEndedTokens = new Set<string | number>();
+
+  /**
+   * Subscriber registry for `$/progress end` events (WI-2a).
+   *
+   * Callbacks registered via `ctx.onProgressEnd(cb)` are stored here.
+   * The pre-`initialize` `$/progress end` branch invokes each live callback
+   * with the ended token immediately after adding it to `progressEndedTokens`.
+   * Cleared at the start of each `spawnAndInitialize` (restart-clean) along
+   * with `progressTokenTitles` and `progressEndedTokens`.
+   *
+   * Non-Go adapters never register the `$/progress` handler (capability-gated),
+   * so this set is never notified from their code paths.
+   */
+  private readonly _progressEndSubs = new Set<(token: string | number) => void>();
 
   private readonly workspaceRoot: string;
   private readonly binaryOverride: string | null;
@@ -595,6 +638,14 @@ export class LspClient {
    * (start / restart) owns the state transitions.
    */
   private async spawnAndInitialize(): Promise<boolean> {
+    // Clear the progress token buffers for this spawn attempt.
+    // On restart, stale tokens from the previous session must not
+    // confuse `awaitReady` (WI-0 R2-2 / WI-2).
+    this.progressTokenTitles.clear();
+    this.progressEndedTokens.clear();
+    // Clear subscriber registry — restart starts with no stale subscribers (WI-2a).
+    this._progressEndSubs.clear();
+
     // Resolve binary (memoize so a degraded -> start cycle
     // doesn't re-discover if the caller already gave us a
     // path). Binary resolution is skipped entirely when `_inject`
@@ -602,7 +653,26 @@ export class LspClient {
     // and the connection, so there is no binary to locate.
     if (!this.resolvedBinary && !this.inject) {
       if (this.binaryOverride) {
-        this.resolvedBinary = this.binaryOverride;
+        // M-BINARY: validate the override path before trusting it.
+        // `binaryPath` is a public API option — any caller can supply an
+        // arbitrary string.  Verify the path is a real file (or symlink)
+        // before accepting it, and resolve symlinks so the containment check
+        // in `maybeDidOpenForDefinition` compares against the realpath'd root.
+        // A non-existent or non-file path is rejected the same way a missing
+        // discovered binary is — returns false → spawnAndInitialize aborts.
+        let validatedOverride: string;
+        try {
+          const st = statSync(this.binaryOverride);
+          if (!st.isFile() && !st.isSymbolicLink()) {
+            return false;
+          }
+          // Resolve symlinks so spawn() receives the canonical path.
+          validatedOverride = realpathSync(this.binaryOverride);
+        } catch {
+          // binaryOverride path does not exist or is inaccessible.
+          return false;
+        }
+        this.resolvedBinary = validatedOverride;
       } else {
         // S2: bound the discovery walk to the workspace root.
         // The pre-S2 call (`discoverServers()` with no
@@ -689,12 +759,70 @@ export class LspClient {
     // and a no-throw if already listening (vscode-jsonrpc 8.x).
     connection.listen();
 
+    // ── R2-2: Pre-initialize $/progress + window/workDoneProgress/create handlers ──
+    //
+    // gopls sends `$/progress begin` AND `window/workDoneProgress/create` at
+    // sinceInitialized=0ms — the same message batch as the `initialized` write.
+    // Registering these handlers inside `awaitReady` (post-`initialize`) WILL
+    // miss the `begin`, causing `awaitReady` to always fall to the deadline
+    // backstop (the #172 bug class). We MUST register before sending `initialize`.
+    //
+    // Capability-gated: only when `adapter.clientCapabilities?.window?.workDoneProgress`
+    // is truthy.  TS/Java/Python adapters omit `clientCapabilities` → they skip
+    // this block entirely → zero new handlers registered, zero wire-behavior change.
+    if (this.adapter.clientCapabilities?.window?.workDoneProgress) {
+      try {
+        // `$/progress` handler: buffers begin.value.title per token; records ended tokens.
+        // awaitReady (WI-2) reads these maps — it does NOT register this handler itself.
+        connection.onNotification('$/progress', (params: unknown) => {
+          if (params === null || typeof params !== 'object') return;
+          const p = params as Record<string, unknown>;
+          const token = p['token'] as string | number | undefined;
+          if (token === undefined) return;
+          const value = p['value'] as Record<string, unknown> | undefined;
+          if (!value || typeof value !== 'object') return;
+          const kind = value['kind'];
+          if (kind === 'begin') {
+            // Store the begin title keyed by token.  gopls's `end` carries an
+            // EMPTY title, so the match predicate MUST use the stored begin title,
+            // never `end.title` (spike-confirmed).
+            const title = typeof value['title'] === 'string' ? value['title'] : '';
+            this.progressTokenTitles.set(token, title);
+          } else if (kind === 'end') {
+            this.progressEndedTokens.add(token);
+            // Notify all live `onProgressEnd` subscribers (WI-2a).
+            // Use a snapshot to avoid mutation-during-iteration if a
+            // callback calls dispose() synchronously.
+            for (const cb of [...this._progressEndSubs]) {
+              try { cb(token); } catch { /* never let a subscriber crash the handler */ }
+            }
+          }
+        });
+      } catch {
+        // Registration failed (e.g. connection already disposed) — proceed anyway;
+        // awaitReady will fall to the canary backstop on deadline.
+      }
+
+      try {
+        // `window/workDoneProgress/create` is a server→client REQUEST (not a
+        // notification). gopls sends it to register a progress token; the client
+        // MUST respond `null` or gopls may stall.  Registered pre-`initialize`
+        // for the same timing reason as `$/progress`.
+        connection.onRequest('window/workDoneProgress/create', () => null);
+      } catch {
+        // Same: proceed; awaitReady backstop covers the fallback.
+      }
+    }
+
     // Send `initialize` with workspaceFolders.
+    // R2-1: use adapter.clientCapabilities if present; fall back to the shared
+    // TS_SERVER_CAPABILITIES object (as const, byte-identical for TS/Java/Python).
+    // Never mutate TS_SERVER_CAPABILITIES — it is a module-level const singleton.
     const rootUri = pathToFileUri(this.workspaceRoot);
     const initializeParams: InitializeParams = {
       processId: process.pid,
       rootUri,
-      capabilities: TS_SERVER_CAPABILITIES,
+      capabilities: this.adapter.clientCapabilities ?? TS_SERVER_CAPABILITIES,
       workspaceFolders: [{ uri: rootUri, name: 'root' }],
       initializationOptions: this.adapter.initializationOptions as Record<string, unknown>,
     };
@@ -741,10 +869,26 @@ export class LspClient {
     // leak into the caller), matching the surrounding handshake
     // discipline above.
     try {
+      // WI-2a: thread progress read-seam fields only for adapters that registered
+      // the $/progress handler (capability-gated: workDoneProgress === true).
+      // TS/Java/Python receive undefined for all three fields — their awaitReady
+      // implementations do not read them, so the ctx is structurally unchanged.
+      const progressSeam: Pick<AdapterReadyCtx, 'progressTokenTitles' | 'progressEndedTokens' | 'onProgressEnd'> =
+        this.adapter.clientCapabilities?.window?.workDoneProgress
+          ? {
+              progressTokenTitles: this.progressTokenTitles,
+              progressEndedTokens: this.progressEndedTokens,
+              onProgressEnd: (cb: (token: string | number) => void) => {
+                this._progressEndSubs.add(cb);
+                return { dispose: () => { this._progressEndSubs.delete(cb); } };
+              },
+            }
+          : {};
       const ctx: AdapterReadyCtx = {
         connection,
         workspaceRoot: this.workspaceRoot,
         // deadlineMs omitted → adapter default (120 000 ms for jdtls)
+        ...progressSeam,
       };
       if (!(await this.adapter.awaitReady(ctx))) {
         this.cleanupAfterFailure();

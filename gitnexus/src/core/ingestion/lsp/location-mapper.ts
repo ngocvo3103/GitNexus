@@ -87,13 +87,16 @@ export interface MapperDeps {
   /** Same shape as `lib/utils.normalizeFilePath`. Default: real fn. */
   normalizeFilePath: (p: string) => string;
   /**
-   * Language adapter id (e.g. `'python'`). When set to `'python'`,
-   * out-of-repo `file://` paths (absolute path outside `repoPath`, or
-   * `path.relative` result starting with `..`) are tagged
+   * Language adapter id (e.g. `'python'`, `'go'`). When set to `'python'`
+   * or `'go'`, out-of-repo `file://` paths (absolute path outside `repoPath`,
+   * or `path.relative` result starting with `..`) are tagged
    * `{ kind: 'NO_NODE', external: true }` instead of bare `{ kind: 'NO_NODE' }`.
    *
-   * This is the sole gate for Python external-refusal (ruling #1 / R2-1):
-   *   - `external:true` fires ONLY when `adapterId === 'python'`.
+   * This is the external-refusal gate (ruling #1 / R2-1):
+   *   - `external:true` fires ONLY when `adapterId === 'python'` or
+   *     `adapterId === 'go'`.  The Go case captures mod-cache / stdlib paths
+   *     (`~/go/pkg/mod/...`, `$GOROOT/src/...`) which resolve outside the
+   *     repo root — they must be bucketed as external-refusals, not recall-misses.
    *   - TS/Java callers that omit this field get byte-identical pre-WI-5
    *     behaviour (bare `NO_NODE` on out-of-repo paths).
    *   - `external:true` is NEVER set on `fileURLToPath`/`realpathSync`
@@ -465,9 +468,10 @@ export async function mapLocationToNodeId(
   //   4. Paths that resolve outside the repo (start with `..` or
   //      are absolute after `path.relative`) are stdlib / external
   //      deps — they yield `NO_NODE`, which is the correct refusal.
-  // WI-5 (#159 P5): Python adapter active flag — used below to gate external:true.
-  // `external:true` fires only when the adapter id is 'python' (ruling #1).
-  const isPythonAdapter = resolvedDeps.adapterId === 'python';
+  // WI-5 (#159 P5): External-refusal adapter gate — used below to gate external:true.
+  // `external:true` fires when the adapter id is 'python' or 'go' (ruling #1).
+  const isExternalRefusalAdapter =
+    resolvedDeps.adapterId === 'python' || resolvedDeps.adapterId === 'go';
 
   // WI-5: hoisted so the isOutOfRepo predicate at the end of this block can
   // see the flag regardless of which `if/else` branch was taken.
@@ -487,11 +491,11 @@ export async function mapLocationToNodeId(
     } catch {
       // Malformed URI — fileURLToPath threw. This gives NO in/out-of-repo
       // signal, so we MUST NOT tag external:true (I-9 / R2-2).
-      // WI-5: when Python adapter is active, refuse bare {NO_NODE} here
-      // instead of falling through to scheme-strip at the else-branch
-      // below (the "wrong-node door" — ruling R2-4). For TS/Java or no
-      // adapter, fall through to scheme-strip as before.
-      if (isPythonAdapter) {
+      // WI-5: when an external-refusal adapter is active (Python or Go),
+      // refuse bare {NO_NODE} here instead of falling through to scheme-strip
+      // at the else-branch below (the "wrong-node door" — ruling R2-4).
+      // For TS/Java or no adapter, fall through to scheme-strip as before.
+      if (isExternalRefusalAdapter) {
         return { kind: 'NO_NODE' };
       }
       absPath = '';
@@ -512,9 +516,10 @@ export async function mapLocationToNodeId(
         // realpathSync threw (broken symlink, FS race, non-existent path).
         // This gives NO in/out-of-repo signal, so we MUST NOT tag
         // external:true (I-9 / R2-2).
-        // WI-5: when Python adapter is active, refuse bare {NO_NODE} here
-        // instead of falling through to scheme-strip (ruling R2-4).
-        if (isPythonAdapter) {
+        // WI-5: when an external-refusal adapter is active (Python or Go),
+        // refuse bare {NO_NODE} here instead of falling through to scheme-strip
+        // (ruling R2-4).
+        if (isExternalRefusalAdapter) {
           return { kind: 'NO_NODE' };
         }
         realAbsPath = '';
@@ -589,20 +594,21 @@ export async function mapLocationToNodeId(
       (relPath.startsWith('..') || nodePath.isAbsolute(relPath)));
 
   if (isUnindexablePath(relPath)) {
-    // R2-1: tag external:true when Python adapter active AND path is
-    // out-of-repo. In-repo unindexable paths (.d.ts, node_modules) keep
-    // the pre-existing bare {NO_NODE} even for Python — they are NOT
-    // stdlib/site-packages (they are vendored in the repo).
-    if (isPythonAdapter && isOutOfRepo) {
+    // R2-1: tag external:true when an external-refusal adapter (Python or Go)
+    // is active AND path is out-of-repo. In-repo unindexable paths (.d.ts,
+    // node_modules) keep the pre-existing bare {NO_NODE} even for these
+    // adapters — they are vendored in the repo, not stdlib/site-packages.
+    if (isExternalRefusalAdapter && isOutOfRepo) {
       return { kind: 'NO_NODE', external: true };
     }
     return { kind: 'NO_NODE' };
   }
 
   // Outside-repo paths after rebase start with `..` or are absolute.
-  // WI-5 (ruling #1 / R2-1): tag external:true when Python adapter active.
+  // WI-5 (ruling #1 / R2-1): tag external:true when an external-refusal
+  // adapter (Python or Go) is active.
   if (isOutOfRepo) {
-    if (isPythonAdapter) {
+    if (isExternalRefusalAdapter) {
       return { kind: 'NO_NODE', external: true };
     }
     return { kind: 'NO_NODE' };

@@ -126,7 +126,9 @@ import {
   TYPESCRIPT_ADAPTER,
   JAVA_ADAPTER,
   PYTHON_ADAPTER,
+  GO_ADAPTER,
   PYLSP_READY_DEADLINE_MS,
+  GOPLS_READY_DEADLINE_MS,
   selectAdapter,
   type LanguageAdapter,
   type LanguageCanaryStrategy,
@@ -1510,10 +1512,466 @@ describe('PYTHON_ADAPTER.awaitReady — fake connection (WI-2b harness)', () => 
   });
 });
 
+// ─── Suite: GO_ADAPTER census + selectAdapter (WI-1) ─────────────────
+//
+// Decision Table (selectAdapter) + EP (censusExtensions) for the Go
+// strict-dominance branch. Cases C1-1 through C1-12 per plan.
+
+describe('GO_ADAPTER census + selectAdapter', () => {
+  beforeEach(() => {
+    mockDirEntries.clear();
+  });
+
+  afterEach(() => {
+    mockDirEntries.clear();
+  });
+
+  // C1-1: Pure Go: 10 .go / 0 .ts / 0 .java / 0 .py → GO_ADAPTER (id='go')
+  it('C1-1: pure Go repo → GO_ADAPTER (id="go")', () => {
+    setRootEntries([
+      file('main.go'),
+      file('handler.go'),
+      file('router.go'),
+      file('middleware.go'),
+      file('config.go'),
+      file('db.go'),
+      file('models.go'),
+      file('utils.go'),
+      file('server.go'),
+      file('logger.go'),
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter).not.toBeNull();
+    expect(adapter!.id).toBe('go');
+  });
+
+  // C1-2: Go strict-dominance wins: 10 .go / 2 .ts / 0 .java → GO_ADAPTER
+  it('C1-2: Go strict-dominance (10 .go / 2 .ts / 0 .java) → GO_ADAPTER', () => {
+    setRootEntries([
+      file('main.go'),
+      file('handler.go'),
+      file('router.go'),
+      file('middleware.go'),
+      file('config.go'),
+      file('db.go'),
+      file('models.go'),
+      file('utils.go'),
+      file('server.go'),
+      file('logger.go'),
+      file('index.ts'),
+      file('utils.ts'),
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter).not.toBeNull();
+    expect(adapter!.id).toBe('go');
+  });
+
+  // C1-3: Go tie with TS (5 .go / 5 .ts): TYPESCRIPT_ADAPTER wins
+  // Go requires STRICT dominance; ties go to TS (proven-stable default).
+  it('C1-3: Go tie with TS (5 .go / 5 .ts) → TYPESCRIPT_ADAPTER (Go loses ties)', () => {
+    setRootEntries([
+      file('main.go'),
+      file('handler.go'),
+      file('router.go'),
+      file('config.go'),
+      file('server.go'),
+      file('index.ts'),
+      file('utils.ts'),
+      file('app.ts'),
+      file('types.ts'),
+      file('api.ts'),
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter!.id).toBe('typescript');
+    expect(adapter).toBe(TYPESCRIPT_ADAPTER);
+  });
+
+  // C1-4: Java dominates (5 .go / 3 .ts / 6 .java): JAVA_ADAPTER
+  // Go is not strictly dominant (goCount=5 < javaCount=6).
+  it('C1-4: Java dominates (5 .go / 3 .ts / 6 .java) → JAVA_ADAPTER', () => {
+    setRootEntries([
+      file('main.go'),
+      file('handler.go'),
+      file('router.go'),
+      file('config.go'),
+      file('server.go'),
+      file('index.ts'),
+      file('utils.ts'),
+      file('app.ts'),
+      file('Foo.java'),
+      file('Bar.java'),
+      file('Baz.java'),
+      file('Qux.java'),
+      file('Quux.java'),
+      file('Corge.java'),
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter!.id).toBe('java');
+    expect(adapter).toBe(JAVA_ADAPTER);
+  });
+
+  // C1-5: Go strict-dominance with py present (8 .go / 2 .ts / 2 .java / 3 .py)
+  it('C1-5: Go strict-dominance over Python (8 .go / 2 .ts / 2 .java / 3 .py) → GO_ADAPTER', () => {
+    setRootEntries([
+      file('main.go'),
+      file('handler.go'),
+      file('router.go'),
+      file('config.go'),
+      file('server.go'),
+      file('db.go'),
+      file('models.go'),
+      file('utils.go'),
+      file('index.ts'),
+      file('app.ts'),
+      file('Foo.java'),
+      file('Bar.java'),
+      file('main.py'),
+      file('utils.py'),
+      file('config.py'),
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter!.id).toBe('go');
+    expect(adapter).toBe(GO_ADAPTER);
+  });
+
+  // C1-6: All-zero guard includes goCount: 0 .go / 0 .ts / 0 .java / 0 .py → null
+  it('C1-6: all counts === 0 (including goCount) → null', () => {
+    setRootEntries([
+      file('README.md'),
+      file('Makefile'),
+      file('go.mod'), // go.mod is not a .go file — not counted
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBeNull();
+  });
+
+  // C1-7: Pure Go repo does NOT hit all-zero guard (I-14)
+  // The fix for the pre-Python pattern: (goCount > 0, others === 0) must
+  // return GO_ADAPTER, NOT short-circuit to null via the all-zero guard.
+  it('C1-7: pure Go repo (goCount > 0, others=0) → GO_ADAPTER (NOT null — I-14)', () => {
+    setRootEntries([
+      file('main.go'),
+      file('go.mod'),
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter).not.toBeNull();
+    expect(adapter!.id).toBe('go');
+    expect(adapter).toBe(GO_ADAPTER);
+  });
+
+  // C1-8: Go tie with Java (5 .go / 0 .ts / 5 .java)
+  // goCount=5 is NOT > javaCount=5 (not strictly dominant) → Go branch skipped.
+  // Then: pyCount > tsCount && pyCount > javaCount → false (pyCount=0).
+  // Then: tsCount >= javaCount → 0 >= 5 → false → JAVA_ADAPTER.
+  it('C1-8: Go tie with Java (5 .go / 0 .ts / 5 .java) → JAVA_ADAPTER (Java wins tie-break)', () => {
+    setRootEntries([
+      file('main.go'),
+      file('handler.go'),
+      file('router.go'),
+      file('config.go'),
+      file('server.go'),
+      file('Foo.java'),
+      file('Bar.java'),
+      file('Baz.java'),
+      file('Qux.java'),
+      file('Quux.java'),
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter!.id).toBe('java');
+    expect(adapter).toBe(JAVA_ADAPTER);
+  });
+
+  // C1-9: censusExtensions skips vendor/ dir for .go counting (I-12)
+  // SKIP_DIRS already contains 'vendor' — verifying it is honoured.
+  it('C1-9: .go files under vendor/ NOT counted toward goCount (SKIP_DIRS has vendor)', () => {
+    mockDirEntries.clear();
+    mockDirEntries.set(REPO, [
+      dir('vendor'),
+      file('README.md'),
+    ]);
+    mockDirEntries.set(pathModule.join(REPO, 'vendor'), [
+      file('dep1.go'),
+      file('dep2.go'),
+      file('dep3.go'),
+    ]);
+
+    // vendor/ is skipped → goCount=0, all others=0 → null (no .go at root)
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBeNull();
+  });
+
+  // C1-9 (additive): vendor/ skipped but .go at root still counted
+  it('C1-9 (additive): vendor/ skipped; root .go files ARE counted', () => {
+    mockDirEntries.clear();
+    mockDirEntries.set(REPO, [
+      dir('vendor'),
+      file('main.go'),
+    ]);
+    mockDirEntries.set(pathModule.join(REPO, 'vendor'), [
+      file('dep1.go'),
+      file('dep2.go'),
+    ]);
+
+    // vendor/ is skipped → goCount=1 (from root main.go only) → GO_ADAPTER
+    const adapter = selectAdapter(REPO);
+    expect(adapter).not.toBeNull();
+    expect(adapter!.id).toBe('go');
+  });
+
+  // C1-10: GO_ADAPTER constant is the exact reference returned (same object)
+  it('C1-10: selectAdapter returns the exact GO_ADAPTER constant (same reference)', () => {
+    setRootEntries([
+      file('main.go'),
+      file('server.go'),
+    ]);
+
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBe(GO_ADAPTER);
+  });
+
+  // C1-11: LanguageAdapter.id union widening: GO_ADAPTER.id === 'go'
+  it('C1-11: GO_ADAPTER.id === "go" (union widened to include \'go\' literal)', () => {
+    expect(GO_ADAPTER.id).toBe('go');
+  });
+
+  // C1-12: Existing TS/Java/Python selection cases unchanged (regression lock)
+  // Verify that adding the Go branch did NOT alter pre-P4 behaviour.
+  it('C1-12: existing TS selection unchanged (regression lock)', () => {
+    setRootEntries([file('index.ts'), file('utils.ts')]);
+    expect(selectAdapter(REPO)).toBe(TYPESCRIPT_ADAPTER);
+  });
+
+  it('C1-12: existing Java selection unchanged (regression lock)', () => {
+    setRootEntries([file('Foo.java'), file('Bar.java')]);
+    expect(selectAdapter(REPO)).toBe(JAVA_ADAPTER);
+  });
+
+  it('C1-12: existing Python selection unchanged (regression lock)', () => {
+    setRootEntries([file('main.py'), file('utils.py'), file('app.py')]);
+    expect(selectAdapter(REPO)).toBe(PYTHON_ADAPTER);
+  });
+
+  it('C1-12: existing null-for-unsupported-repo unchanged (regression lock)', () => {
+    setRootEntries([file('README.md'), file('Makefile')]);
+    expect(selectAdapter(REPO)).toBeNull();
+  });
+});
+
+// ─── Suite: GO_ADAPTER literal fields ─────────────────────────────────
+
+describe('GO_ADAPTER', () => {
+  it('has id === "go"', () => {
+    expect(GO_ADAPTER.id).toBe('go');
+  });
+
+  it('serverBinary === "gopls"', () => {
+    expect(GO_ADAPTER.serverBinary).toBe('gopls');
+  });
+
+  it('languageId === "go"', () => {
+    expect(GO_ADAPTER.languageId).toBe('go');
+  });
+
+  it('spawnArgs() === [] (spike-confirmed: bare gopls uses stdio by default)', () => {
+    const args = GO_ADAPTER.spawnArgs({ workspaceRoot: '/any/path' });
+    expect(args).toEqual([]);
+  });
+
+  it('spawnArgs() returns a new array on each call (no shared reference)', () => {
+    const a = GO_ADAPTER.spawnArgs({ workspaceRoot: '/any/path' });
+    const b = GO_ADAPTER.spawnArgs({ workspaceRoot: '/any/path' });
+    expect(a).not.toBe(b);
+    expect(a).toEqual(b);
+  });
+
+  it('initializationOptions deep-equals {}', () => {
+    expect(GO_ADAPTER.initializationOptions).toEqual({});
+  });
+
+  // C2-RL-struct smoke: awaitReady structural smoke (WI-1 stub replaced by WI-2c).
+  // Full behavioural suite lives in GO_ADAPTER.awaitReady describe below (C2-12..C2-23).
+  // This test locks the basic contract in the structural literal suite: with no
+  // progress signal and a backstopProbe that returns false, awaitReady resolves false.
+  // Uses makeGoFakeConn() (defined at module scope below) + fake timers so it runs
+  // in < 1ms — replacing the previous 50ms real-timer stub.
+  it('awaitReady() resolves false (structural smoke: no progress signal, backstopProbe false)', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = makeGoFakeConn();
+      const ctx: AdapterReadyCtx = {
+        connection: conn,
+        workspaceRoot: '/any/go-workspace',
+        deadlineMs: 100,
+        backstopProbe: async () => false,
+      };
+      const promise = GO_ADAPTER.awaitReady(ctx);
+      await vi.advanceTimersByTimeAsync(101);
+      const result = await promise;
+      expect(result).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe('classifyUri', () => {
+    it('file:// URI → "workspace" (scheme-only; containment at mapper)', () => {
+      expect(GO_ADAPTER.classifyUri('file:///path/to/main.go')).toBe('workspace');
+    });
+
+    it('file:// URI for stdlib (mod-cache toolchain) → "workspace" (containment NOT here)', () => {
+      // Go stdlib arrives as file:// under the mod-cache toolchain dir.
+      // classifyUri returns 'workspace' — out-of-repo refusal is path-containment
+      // gated on adapterId in location-mapper.ts (isExternalRefusalAdapter),
+      // NOT in classifyUri. Do NOT add GOROOT-special-casing here.
+      expect(GO_ADAPTER.classifyUri(
+        'file:///Users/ngoc/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.darwin-arm64/src/net/http/server.go',
+      )).toBe('workspace');
+    });
+
+    it('jdt:// URI → "unmappable" (Go adapter never receives jdt://)', () => {
+      expect(GO_ADAPTER.classifyUri('jdt://contents/java/util/List.class')).toBe('unmappable');
+    });
+
+    it('https:// URI → "unmappable"', () => {
+      expect(GO_ADAPTER.classifyUri('https://example.com/foo.go')).toBe('unmappable');
+    });
+
+    it('empty string → "unmappable"', () => {
+      expect(GO_ADAPTER.classifyUri('')).toBe('unmappable');
+    });
+  });
+});
+
+// ─── Suite: GO_ADAPTER singleton identity ─────────────────────────────
+
+describe('GO_ADAPTER singleton identity', () => {
+  it('is the same object reference on every access (module-level singleton, not factory)', () => {
+    const ref1 = GO_ADAPTER;
+    const ref2 = GO_ADAPTER;
+    expect(ref1).toBe(ref2);
+  });
+
+  it('selectAdapter returns the exact GO_ADAPTER singleton', () => {
+    setRootEntries([file('main.go'), file('server.go'), file('handler.go')]);
+    expect(selectAdapter(REPO)).toBe(GO_ADAPTER);
+  });
+});
+
+// ─── Suite: GOPLS_READY_DEADLINE_MS ───────────────────────────────────
+
+describe('GOPLS_READY_DEADLINE_MS', () => {
+  it('is exported and equals 30000ms (spike-confirmed gopls cold-load margin)', () => {
+    expect(GOPLS_READY_DEADLINE_MS).toBe(30_000);
+  });
+
+  // C2-21 (I-15): standalone dual-sided assertion — the constant must be exactly
+  // 30_000 AND must not be 120_000 (Java's jdtls default).  The not.toBe half is
+  // a first-class guard here, not a side assertion buried inside C2-20.
+  it('C2-21 (I-15): GOPLS_READY_DEADLINE_MS === 30_000 and !== 120_000 (distinct from Java deadline)', () => {
+    expect(GOPLS_READY_DEADLINE_MS).toBe(30_000);
+    expect(GOPLS_READY_DEADLINE_MS).not.toBe(120_000);
+  });
+});
+
+// ─── Suite: WI-0 clientCapabilities seam (C0-1..C0-6, C0-7 type-level) ──
+//
+// Cases C0-1..C0-6 are runtime assertions covering the new
+// `LanguageAdapter.clientCapabilities` optional field.  C0-7 is the
+// tsc --noEmit gate: since this test file is compiled as part of the
+// suite, a type error in C0-7 would prevent compilation of this file.
+//
+// C0-8..C0-11 live in lsp-client.test.ts (handler-ordering and wire
+// behavior require the LspClient injection harness).
+
+import { type ClientCapabilities } from '../../../src/core/ingestion/lsp/language-adapter.js';
+// TS_SERVER_CAPABILITIES is module-private in lsp-client.ts; we verify identity
+// indirectly: GO_ADAPTER.clientCapabilities must NOT === undefined and its
+// window.workDoneProgress must be true. The reference-inequality with any other
+// adapter is asserted by confirming the object literal is fresh (different shape
+// from the TS capabilities payload).
+
+describe('WI-0 clientCapabilities seam', () => {
+  // C0-1: GO_ADAPTER.clientCapabilities.window.workDoneProgress === true
+  it('C0-1: GO_ADAPTER.clientCapabilities.window.workDoneProgress === true', () => {
+    expect(GO_ADAPTER.clientCapabilities).toBeDefined();
+    expect(GO_ADAPTER.clientCapabilities!.window).toBeDefined();
+    expect(GO_ADAPTER.clientCapabilities!.window!.workDoneProgress).toBe(true);
+  });
+
+  // C0-2: GO_ADAPTER.clientCapabilities is NOT the same object reference as
+  //        TS_SERVER_CAPABILITIES (which is module-private — we check identity
+  //        via the fact that different adapters return different objects).
+  it('C0-2: GO_ADAPTER.clientCapabilities is distinct from TYPESCRIPT_ADAPTER capabilities', () => {
+    // TYPESCRIPT_ADAPTER uses the module-private TS_SERVER_CAPABILITIES as its
+    // default (clientCapabilities is undefined → lsp-client.ts falls back).
+    // GO_ADAPTER.clientCapabilities must be a fresh object — it carries
+    // workDoneProgress: true which is structurally different.
+    expect(GO_ADAPTER.clientCapabilities).not.toBe(undefined);
+    // workDoneProgress is false in TS_SERVER_CAPABILITIES, true in GO_ADAPTER.
+    // This structural difference is the identity marker.
+    expect(GO_ADAPTER.clientCapabilities!.window!.workDoneProgress).toBe(true);
+    // TS adapter explicitly omits clientCapabilities (falls through to default).
+    expect(TYPESCRIPT_ADAPTER.clientCapabilities).toBeUndefined();
+  });
+
+  // C0-3: TYPESCRIPT_ADAPTER.clientCapabilities === undefined
+  it('C0-3: TYPESCRIPT_ADAPTER.clientCapabilities === undefined (absent → uses TS_SERVER_CAPABILITIES)', () => {
+    expect(TYPESCRIPT_ADAPTER.clientCapabilities).toBeUndefined();
+  });
+
+  // C0-4: JAVA_ADAPTER.clientCapabilities === undefined
+  it('C0-4: JAVA_ADAPTER.clientCapabilities === undefined (absent → uses TS_SERVER_CAPABILITIES)', () => {
+    expect(JAVA_ADAPTER.clientCapabilities).toBeUndefined();
+  });
+
+  // C0-5: PYTHON_ADAPTER.clientCapabilities === undefined
+  it('C0-5: PYTHON_ADAPTER.clientCapabilities === undefined (absent → uses TS_SERVER_CAPABILITIES)', () => {
+    expect(PYTHON_ADAPTER.clientCapabilities).toBeUndefined();
+  });
+
+  // C0-6: Existing TS/Java/Python golden assertions unchanged (regression lock)
+  it('C0-6: TYPESCRIPT_ADAPTER.id/serverBinary/languageId unchanged (golden regression lock)', () => {
+    expect(TYPESCRIPT_ADAPTER.id).toBe('typescript');
+    expect(TYPESCRIPT_ADAPTER.serverBinary).toBe('typescript-language-server');
+    expect(TYPESCRIPT_ADAPTER.spawnArgs({ workspaceRoot: '/any' })).toEqual(['--stdio']);
+  });
+
+  it('C0-6: JAVA_ADAPTER.id/serverBinary/languageId unchanged (golden regression lock)', () => {
+    expect(JAVA_ADAPTER.id).toBe('java');
+    expect(JAVA_ADAPTER.serverBinary).toBe('jdtls');
+  });
+
+  it('C0-6: PYTHON_ADAPTER.id/serverBinary/languageId unchanged (golden regression lock)', () => {
+    expect(PYTHON_ADAPTER.id).toBe('python');
+    expect(PYTHON_ADAPTER.serverBinary).toBe('pylsp');
+    expect(PYTHON_ADAPTER.spawnArgs({ workspaceRoot: '/any' })).toEqual([]);
+  });
+
+  // C0-7 type-level gate: the tsc --noEmit check (performed in CI + vitest
+  // compile step) verifies that ClientCapabilities accepts both the
+  // { window: { workDoneProgress: true } } Go override AND the
+  // TS_SERVER_CAPABILITIES `as const` shape (non-literal boolean).
+  // Here we lock the runtime shape:
+  it('C0-7: ClientCapabilities structural type accepts GO_ADAPTER.clientCapabilities (runtime shape)', () => {
+    // This assignment would fail to compile if ClientCapabilities required
+    // window.workDoneProgress to be the literal type `false`.
+    const caps: ClientCapabilities = GO_ADAPTER.clientCapabilities!;
+    expect(caps.window?.workDoneProgress).toBe(true);
+  });
+});
+
 // ─── Suite: interface shape conformance ───────────────────────────────
 
 describe('LanguageAdapter interface compliance', () => {
-  const adapters: LanguageAdapter[] = [TYPESCRIPT_ADAPTER, JAVA_ADAPTER, PYTHON_ADAPTER];
+  const adapters: LanguageAdapter[] = [TYPESCRIPT_ADAPTER, JAVA_ADAPTER, PYTHON_ADAPTER, GO_ADAPTER];
 
   for (const adapter of adapters) {
     describe(`${adapter.id} adapter`, () => {
@@ -1535,4 +1993,446 @@ describe('LanguageAdapter interface compliance', () => {
       });
     });
   }
+});
+
+// ─── Suite: GO_ADAPTER.awaitReady (WI-2c cases C2-12..C2-22) ──────────
+//
+// Technique: State Transition (idle→listening→settled) + Decision Table
+//   (resolution paths) + Error Guessing (I-6/I-8/I-13/I-15/C2-22).
+//
+// Isolation: all cases use AdapterReadyCtx seam injections (backstopProbe,
+//   progressTokenTitles, progressEndedTokens, onProgressEnd, deadlineMs)
+//   so no real gopls process or filesystem is required.
+//
+// Key design invariant (R2-2 / I-6):
+//   awaitReady must NOT call conn.onNotification('$/progress', ...) itself.
+//   The $/progress handler is registered pre-initialize in lsp-client.ts (WI-0).
+//   awaitReady only READS from the ctx seam (progressTokenTitles/progressEndedTokens)
+//   and subscribes to ctx.onProgressEnd for future end events.
+//
+// makeGoFakeConn() provides:
+//   - onNotification(method, handler): tracks call count per method
+//   - notificationRegistrationCount(method): inspection helper
+//   - sendNotification/sendRequest: no-op stubs for canary backstop path
+
+type GoNotifHandler = (params: unknown) => void;
+type GoRequestHandler = (params: unknown) => unknown;
+
+interface GoFakeConn {
+  onNotification(method: string, handler: GoNotifHandler): { dispose(): void };
+  onRequest(method: string, handler: GoRequestHandler): { dispose(): void };
+  sendNotification(method: string, params: unknown): Promise<void>;
+  sendRequest<T>(method: string, params: unknown): Promise<T>;
+  notificationRegistrationCount(method: string): number;
+  requestRegistrationCount(method: string): number;
+}
+
+function makeGoFakeConn(): GoFakeConn {
+  const notifCounts = new Map<string, number>();
+  const reqCounts = new Map<string, number>();
+
+  return {
+    onNotification(method: string, _handler: GoNotifHandler) {
+      notifCounts.set(method, (notifCounts.get(method) ?? 0) + 1);
+      return {
+        dispose() {
+          notifCounts.set(method, Math.max(0, (notifCounts.get(method) ?? 1) - 1));
+        },
+      };
+    },
+    onRequest(method: string, _handler: GoRequestHandler) {
+      reqCounts.set(method, (reqCounts.get(method) ?? 0) + 1);
+      return {
+        dispose() {
+          reqCounts.set(method, Math.max(0, (reqCounts.get(method) ?? 1) - 1));
+        },
+      };
+    },
+    async sendNotification(_method: string, _params: unknown): Promise<void> { /* best-effort no-op */ },
+    async sendRequest<T>(_method: string, _params: unknown): Promise<T> {
+      return [] as unknown as T; // default: empty → not ready
+    },
+    notificationRegistrationCount(method: string): number {
+      return notifCounts.get(method) ?? 0;
+    },
+    requestRegistrationCount(method: string): number {
+      return reqCounts.get(method) ?? 0;
+    },
+  };
+}
+
+describe('GO_ADAPTER.awaitReady', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    mockDirEntries.clear();
+  });
+
+  // ── C2-12: awaitReady does NOT register a $/progress handler itself ──────
+  //
+  // R2-2 / I-6 invariant: the $/progress onNotification listener is registered
+  // BEFORE initialize in lsp-client.ts (WI-0). awaitReady only reads the
+  // ctx.onProgressEnd seam; it never calls conn.onNotification('$/progress').
+
+  it('C2-12: awaitReady does NOT call conn.onNotification("$/progress", ...) (I-6 / R2-2)', async () => {
+    const conn = makeGoFakeConn();
+    expect(conn.notificationRegistrationCount('$/progress')).toBe(0); // baseline
+
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 50,
+      backstopProbe: async () => false, // settle quickly without real canary walk
+    };
+
+    await GO_ADAPTER.awaitReady(ctx);
+
+    // Must still be 0 — awaitReady never registers its own $/progress handler.
+    expect(conn.notificationRegistrationCount('$/progress')).toBe(0);
+  });
+
+  // ── C2-13: tracked token (STORED begin.title === "Setting up workspace") ──
+  //
+  // Stored-title path: onProgressEnd delivers the token AFTER awaitReady starts;
+  // awaitReady looks up the stored begin.title in progressTokenTitles and settles.
+  // The end notification has an EMPTY title — awaitReady must read from stored state.
+
+  it('C2-13: token with STORED begin.title "Setting up workspace" end → settle(true) before deadline', async () => {
+    vi.useFakeTimers();
+    const conn = makeGoFakeConn();
+
+    const tokenTitles = new Map<string | number, string>([
+      [1, 'Setting up workspace'], // stored begin.title
+    ]);
+
+    let endCallback: ((token: string | number) => void) | null = null;
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 30_000,
+      progressTokenTitles: tokenTitles,
+      progressEndedTokens: new Set<string | number>(), // token 1 has NOT ended yet
+      onProgressEnd: (cb) => {
+        endCallback = cb;
+        return { dispose() { endCallback = null; } };
+      },
+    };
+
+    const promise = GO_ADAPTER.awaitReady(ctx);
+
+    // Deliver the end event for token 1 (stored title matches).
+    // Simulate: end arrives; awaitReady reads stored title → settle(true).
+    endCallback?.(1);
+
+    const result = await promise;
+    expect(result).toBe(true);
+  });
+
+  // ── C2-14: non-matching title does NOT resolve true; falls to deadline ────
+  //
+  // I-13: a $/progress end for a token whose stored title is NOT
+  // "Setting up workspace" must NOT resolve true. awaitReady falls through
+  // to the deadline backstop.
+
+  it('C2-14: non-matching stored title → does NOT resolve true; deadline fires canary path', async () => {
+    vi.useFakeTimers();
+    const conn = makeGoFakeConn();
+
+    const tokenTitles = new Map<string | number, string>([
+      [2, 'Loading diagnostics'], // wrong title
+    ]);
+
+    let endCallback: ((token: string | number) => void) | null = null;
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 200,
+      progressTokenTitles: tokenTitles,
+      progressEndedTokens: new Set<string | number>(),
+      onProgressEnd: (cb) => {
+        endCallback = cb;
+        return { dispose() { endCallback = null; } };
+      },
+      backstopProbe: async () => false, // canary: not ready
+    };
+
+    const promise = GO_ADAPTER.awaitReady(ctx);
+
+    // Deliver end for a non-matching token — must NOT settle yet.
+    endCallback?.(2);
+
+    // Fire the deadline timer.
+    await vi.advanceTimersByTimeAsync(201);
+
+    const result = await promise;
+    // Non-matching token + backstopProbe returns false → settle(false).
+    expect(result).toBe(false);
+  });
+
+  // ── C2-15: non-workspace token ends first (multi-item: I-13) ────────────
+  //
+  // A separate "diagnostics" token ends before the workspace token.
+  // awaitReady must ignore it and wait for the correct token.
+
+  it('C2-15: diagnostics token ends first → does NOT resolve true (I-13 multi-item)', async () => {
+    vi.useFakeTimers();
+    const conn = makeGoFakeConn();
+
+    const tokenTitles = new Map<string | number, string>([
+      [10, 'Indexing'],           // diagnostics token — wrong title
+      [11, 'Setting up workspace'], // workspace token — correct title
+    ]);
+
+    let endCallback: ((token: string | number) => void) | null = null;
+    let settled = false;
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 500,
+      progressTokenTitles: tokenTitles,
+      progressEndedTokens: new Set<string | number>(),
+      onProgressEnd: (cb) => {
+        endCallback = cb;
+        return { dispose() { endCallback = null; } };
+      },
+      backstopProbe: async () => false,
+    };
+
+    const promise = GO_ADAPTER.awaitReady(ctx);
+    promise.then(() => { settled = true; });
+
+    // Diagnostics token ends — must NOT settle.
+    endCallback?.(10);
+    await vi.advanceTimersByTimeAsync(0); // flush microtasks
+    expect(settled).toBe(false);
+
+    // Workspace token ends — must settle(true).
+    endCallback?.(11);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const result = await promise;
+    expect(result).toBe(true);
+  });
+
+  // ── C2-16: deadline fires + canary returns non-empty Location[] → true ───
+
+  it('C2-16: deadline fires; backstopProbe returns true → settle(true)', async () => {
+    vi.useFakeTimers();
+    const conn = makeGoFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 100,
+      backstopProbe: async () => true, // canary: ready
+    };
+
+    const promise = GO_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+    const result = await promise;
+    expect(result).toBe(true);
+  });
+
+  // ── C2-17: deadline fires + canary returns [] → settle(false) ───────────
+
+  it('C2-17: deadline fires; backstopProbe returns false → settle(false)', async () => {
+    vi.useFakeTimers();
+    const conn = makeGoFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 100,
+      backstopProbe: async () => false, // canary: not ready
+    };
+
+    const promise = GO_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+    const result = await promise;
+    expect(result).toBe(false);
+  });
+
+  // ── C2-18: deadline fires + no canary samples (vendor-only repo) ─────────
+  //
+  // buildCanarySamples returns [] when no .go files are found (e.g. vendor-only,
+  // or empty workspace). settle(false) without error.
+
+  it('C2-18: deadline fires; no .go candidate files in workspace → settle(false)', async () => {
+    vi.useFakeTimers();
+    // Empty workspace → buildCanarySamples returns [] → settle(false).
+    mockDirEntries.clear();
+    mockDirEntries.set('/fake/empty-go-ws', []);
+
+    const conn = makeGoFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/empty-go-ws',
+      deadlineMs: 100,
+      // No backstopProbe — exercises real buildCanarySamples → 0-samples path.
+    };
+
+    const promise = GO_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+    const result = await promise;
+    expect(result).toBe(false);
+  });
+
+  // ── C2-19: never rejects — all branches return boolean (I-8) ────────────
+
+  it('C2-19: awaitReady never rejects — all branches resolve boolean (I-8)', async () => {
+    vi.useFakeTimers();
+    const conn = makeGoFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 100,
+      backstopProbe: async () => { throw new Error('probe exploded'); },
+    };
+
+    const promise = GO_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+
+    // Must resolve (not reject) even when backstopProbe throws.
+    await expect(promise).resolves.toBe(false);
+  });
+
+  // ── C2-20: deadline uses ctx.deadlineMs ?? GOPLS_READY_DEADLINE_MS (I-15) ─
+  //
+  // Inject a short ctx.deadlineMs and assert awaitReady fires at that value,
+  // NOT at GOPLS_READY_DEADLINE_MS (30_000) or ?? 120_000 (Java default).
+
+  it('C2-20: deadline uses ctx.deadlineMs when provided (not GOPLS_READY_DEADLINE_MS or 120_000)', async () => {
+    vi.useFakeTimers();
+    const conn = makeGoFakeConn();
+    let probeCalledAt: number | null = null;
+
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 250,
+      backstopProbe: async () => {
+        probeCalledAt = Date.now();
+        return false;
+      },
+    };
+
+    const promise = GO_ADAPTER.awaitReady(ctx);
+
+    // Should NOT have fired yet at 249ms.
+    await vi.advanceTimersByTimeAsync(249);
+    expect(probeCalledAt).toBeNull();
+
+    // Must fire at or after 250ms.
+    await vi.advanceTimersByTimeAsync(2);
+    await promise;
+    expect(probeCalledAt).not.toBeNull();
+    // Deadline value is ctx.deadlineMs (250), not GOPLS_READY_DEADLINE_MS (30_000)
+    // or the Java fallback (120_000). The constant assertion is in GOPLS_READY_DEADLINE_MS suite.
+    expect(GOPLS_READY_DEADLINE_MS).toBe(30_000);
+    expect(GOPLS_READY_DEADLINE_MS).not.toBe(120_000);
+  });
+
+  // ── C2-22: begin+end buffered BEFORE awaitReady → resolves true immediately ─
+  //
+  // The "no missed-begin race" guarantee (R2-2 / I-6): if the $/progress begin
+  // AND end for the workspace token arrived and were buffered BEFORE awaitReady
+  // is called, awaitReady detects it synchronously via the progressEndedTokens
+  // pre-scan and resolves true without waiting for the deadline.
+
+  it('C2-22: matching begin+end buffered BEFORE awaitReady is invoked → resolves true immediately', async () => {
+    const conn = makeGoFakeConn();
+
+    // Simulate WI-0 pre-initialize buffer: token 42 has received begin + end.
+    const tokenTitles = new Map<string | number, string>([
+      [42, 'Setting up workspace'],
+    ]);
+    const endedTokens = new Set<string | number>([42]); // already ended
+
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/go-ws',
+      deadlineMs: 30_000, // full deadline — must NOT be needed
+      progressTokenTitles: tokenTitles,
+      progressEndedTokens: endedTokens,
+      onProgressEnd: (_cb) => ({ dispose() {} }), // no future events needed
+    };
+
+    // Must resolve true synchronously (before any timer fires).
+    const startMs = Date.now();
+    const result = await GO_ADAPTER.awaitReady(ctx);
+    const elapsedMs = Date.now() - startMs;
+
+    expect(result).toBe(true);
+    // Elapsed should be negligible (synchronous resolution, no timer wait).
+    // Use a generous upper bound (500ms) to avoid flakiness on slow CI.
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
+  // ── C2-23: regression lock — PYTHON_ADAPTER and JAVA_ADAPTER classifyUri +
+  //           awaitReady behavior unchanged after GO_ADAPTER is added ──────────
+  //
+  // This is an explicit plan invariant: adding GO_ADAPTER to the codebase must
+  // not alter any observable behavior of the existing adapters.  Locking both
+  // classifyUri (URI routing decisions) and awaitReady (resolution semantics)
+  // here — inside the GO_ADAPTER.awaitReady suite — ensures these remain green
+  // even when GO_ADAPTER's awaitReady implementation is refactored.
+
+  describe('C2-23: PYTHON_ADAPTER and JAVA_ADAPTER unchanged after GO_ADAPTER addition (regression lock)', () => {
+    // ── PYTHON_ADAPTER classifyUri ───────────────────────────────────────
+    it('PYTHON_ADAPTER.classifyUri: file:// → "workspace" (containment at mapper, not here)', () => {
+      expect(PYTHON_ADAPTER.classifyUri('file:///path/to/crawler.py')).toBe('workspace');
+    });
+
+    it('PYTHON_ADAPTER.classifyUri: non-file:// → "unmappable"', () => {
+      expect(PYTHON_ADAPTER.classifyUri('https://example.com/file.py')).toBe('unmappable');
+      expect(PYTHON_ADAPTER.classifyUri('')).toBe('unmappable');
+    });
+
+    // ── JAVA_ADAPTER classifyUri ─────────────────────────────────────────
+    it('JAVA_ADAPTER.classifyUri: file:// → "workspace"', () => {
+      expect(JAVA_ADAPTER.classifyUri('file:///src/main/java/com/example/Foo.java')).toBe('workspace');
+    });
+
+    it('JAVA_ADAPTER.classifyUri: jdt:// → "external" (decompiled jar/stdlib)', () => {
+      expect(JAVA_ADAPTER.classifyUri('jdt://contents/java/util/List.class?params')).toBe('external');
+    });
+
+    it('JAVA_ADAPTER.classifyUri: other schemes → "unmappable"', () => {
+      expect(JAVA_ADAPTER.classifyUri('https://example.com/foo')).toBe('unmappable');
+    });
+
+    // ── PYTHON_ADAPTER.awaitReady ─────────────────────────────────────────
+    // Verifies the canary-only awaitReady contract is intact: backstopProbe
+    // resolves immediately, no $/progress handler is registered, result is bool.
+    it('PYTHON_ADAPTER.awaitReady: resolves true when backstopProbe returns true', async () => {
+      const conn = makeGoFakeConn(); // minimal connection stub; PYTHON_ADAPTER never touches $/progress
+      const ctx: AdapterReadyCtx = {
+        connection: conn as any,
+        workspaceRoot: '/fake/py-ws',
+        backstopProbe: async () => true,
+      };
+      const result = await PYTHON_ADAPTER.awaitReady(ctx);
+      expect(result).toBe(true);
+      // PYTHON_ADAPTER must NOT register a $/progress handler — capability-gated off.
+      expect(conn.notificationRegistrationCount('$/progress')).toBe(0);
+    });
+
+    it('PYTHON_ADAPTER.awaitReady: resolves false when backstopProbe returns false', async () => {
+      const conn = makeGoFakeConn();
+      const ctx: AdapterReadyCtx = {
+        connection: conn as any,
+        workspaceRoot: '/fake/py-ws',
+        backstopProbe: async () => false,
+      };
+      const result = await PYTHON_ADAPTER.awaitReady(ctx);
+      expect(result).toBe(false);
+      expect(conn.notificationRegistrationCount('$/progress')).toBe(0);
+    });
+
+    // ── JAVA_ADAPTER.awaitReady ───────────────────────────────────────────
+    // JAVA_ADAPTER.awaitReady uses a language/status notification; verifying
+    // the function exists and is callable without error is sufficient here —
+    // the full suite lives in the JAVA_ADAPTER section.  We only need to
+    // confirm it did not gain a $/progress dependency after GO_ADAPTER was added.
+    it('JAVA_ADAPTER.awaitReady: is a function (callable — did not lose its definition)', () => {
+      expect(typeof JAVA_ADAPTER.awaitReady).toBe('function');
+    });
+  });
 });

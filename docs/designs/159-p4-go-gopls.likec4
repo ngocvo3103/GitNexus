@@ -1,0 +1,129 @@
+// Solution-design structural model — #159 P4: Go/gopls LSP-adapter
+// C2 shows new/updated containers within the GitNexus system.
+// C3 shows each lsp-layer component with change-coding.
+// Change-coding: green = new [N], light-yellow = updated [~].
+// No system is added or removed → no C1 view.
+// NOTE: element names are suffixed _go to avoid collision with 159-p5-python-pylsp.likec4
+// in the shared docs/designs/ LikeC4 workspace.
+
+model {
+  gitnexus_go = system 'GitNexus' {
+
+    ingestion_go = container 'Ingestion pipeline' {
+      description 'RunPipelineFromRepo + VerifyCommand execution paths'
+      link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+
+      pipeline_go = component 'pipeline.ts' {
+        link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+      }
+
+      verifyCmd_go = component 'verify.ts' {
+        link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+      }
+
+      modeAReconciler_go = component 'mode-a-reconciler.ts' {
+        link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+      }
+    }
+
+    lspLayer_go = container 'LSP layer' {
+      #updated
+      style { color lightyellow }
+      description 'LSP-augmentation layer — language-adapter.ts, lsp-client.ts, location-mapper.ts, canary-sampler.ts, server-discovery.ts, mode-c-verifier.ts'
+      link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+      link ./159-p4-go-gopls.html#sd-await-ready 'Sequence: awaitReady — $/progress gate'
+      link ./159-p4-go-gopls.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+
+      langAdapter_go = component 'language-adapter.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] censusExtensions +goCount; GO_EXTENSIONS; selectAdapter Go strict-dominance branch; GO_ADAPTER singleton [N]; LanguageAdapter.id widened to include go; GOPLS_READY_DEADLINE_MS [N]'
+        link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+      }
+
+      goAdapter = component 'GO_ADAPTER' {
+        #new
+        style { color green }
+        description '[N] Module-level singleton. spawnArgs→[], languageId→go, classifyUri(file://)→workspace, awaitReady→$/progress (begin/report/end token-keyed correlation) notification wait + canary backstop'
+        link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+        link ./159-p4-go-gopls.html#sd-await-ready 'Sequence: awaitReady — $/progress gate'
+        link ./159-p4-go-gopls.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+      }
+
+      canarySampler_go = component 'canary-sampler.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] GO_CANARY_STRATEGY [N]: func/type/method decl > call-site > import priority; reuse blankUnsafeLines; EXCLUDED_DIRS +vendor'
+        link ./159-p4-go-gopls.html#sd-await-ready 'Sequence: awaitReady — $/progress gate'
+      }
+
+      serverDiscovery_go = component 'server-discovery.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] GOPLS_BIN=gopls [N]; DiscoveredServers +go? key; discoverOne(GOPLS_BIN) in Promise.all; parseVersion unchanged (regex already extracts 0.22.0 from banner text); NOTE: production probe runs `gopls version` subcommand (not --version flag — real binary rejects -version flag, yields empty stdout → version:unknown); WI-4 adds test case C4-4 for the --version-rejected path'
+        link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+      }
+
+      locationMapper_go = component 'location-mapper.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] isPythonAdapter → isExternalRefusalAdapter (adapterId===python || adapterId===go): 1 decl + 4 reads within mapLocationToNodeId (symbol anchors; no line numbers). GOROOT + module-cache file:// → {NO_NODE, external:true}; realpath throw → bare {NO_NODE} (R2-2).'
+        link ./159-p4-go-gopls.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+      }
+
+      lspClient_go = component 'lsp-client.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] WI-0: adapter.clientCapabilities ?? TS_SERVER_CAPABILITIES merge site at initialize call; optional onRequest(window/workDoneProgress/create) handler gated on adapter.clientCapabilities?.window?.workDoneProgress. ClientCapabilities type authored; InitializeParams.capabilities widened (tsc BLOCKER). TS/Java/Python init payloads byte-identical (TS_SERVER_CAPABILITIES object unchanged).'
+        link ./159-p4-go-gopls.html#sd-pipeline-selectadapter 'Sequence: selectAdapter + GO_ADAPTER wiring'
+        link ./159-p4-go-gopls.html#sd-await-ready 'Sequence: awaitReady — $/progress gate'
+        link ./159-p4-go-gopls.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+      }
+
+      modeCVerifier_go = component 'mode-c-verifier.ts' {
+        description 'Unchanged — already carries repoPath + adapterId (threaded in Python P5 WI). Inherits Go external-refusal via location-mapper gate.'
+        link ./159-p4-go-gopls.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+      }
+    }
+
+    gopls = container 'gopls process' {
+      #new
+      style { color green }
+      description '[N] External process: gopls v0.22.0 at /Users/NgocVo_1/.local/bin/gopls. Communicates over stdio (spawnArgs=[]). Emits $/progress (begin/report/end) notifications during workspace load; window/workDoneProgress/create is a server→client request (answered null), not the progress notification. Returns file:// URIs for workspace defs; resolves stdlib/module defs to GOROOT/GOPATH/pkg/mod (out-of-repo).'
+      link ./159-p4-go-gopls.html#sd-await-ready 'Sequence: awaitReady — $/progress gate'
+      link ./159-p4-go-gopls.html#sd-definition-lookup 'Sequence: textDocument/definition + external-refusal'
+    }
+  }
+
+  // --- relationships ---
+  pipeline_go -> lspLayer_go 'selectAdapter + withReconciliationSession'
+  verifyCmd_go -> lspLayer_go 'selectAdapter + verifyCommand'
+  modeAReconciler_go -> langAdapter_go 'selectAdapter(repoPath)'
+  modeAReconciler_go -> serverDiscovery_go 'discoverServers() → discovered[go]'
+  modeAReconciler_go -> lspClient_go 'createLspClient({adapter:GO_ADAPTER})'
+  lspClient_go -> gopls 'spawn gopls []; JSON-RPC over stdio'
+  modeAReconciler_go -> goAdapter 'awaitReady(ctx)'
+  goAdapter -> lspClient_go 'onNotification($/progress) — begin/report/end token correlation'
+  goAdapter -> canarySampler_go 'buildCanarySamples(repoPath, {strategy:GO_CANARY_STRATEGY})'
+  goAdapter -> lspClient_go 'textDocument/definition (canary backstop probe)'
+  lspClient_go -> locationMapper_go 'mapLocationToNodeId(uri, deps+adapterId=go)'
+  locationMapper_go -> goAdapter 'classifyUri(uri) → workspace|unmappable'
+  modeCVerifier_go -> locationMapper_go 'mapLocationToNodeId(uri, deps+adapterId=go)'
+}
+
+views {
+  // C2 — container topology: gopls process is new; lspLayer updated
+  view c2_lsp_layer_go {
+    title 'C2 — LSP layer containers (Go slice)'
+    description 'New gopls container [N]; lspLayer updated [~]. Ingestion pipeline is structural context only.'
+    include ingestion_go, lspLayer_go, gopls
+  }
+
+  // C3 — lspLayer components: GO_ADAPTER is new; several components updated
+  view c3_lsp_components_go of lspLayer_go {
+    title 'C3 — LSP layer components (Go slice)'
+    description 'GO_ADAPTER [N]; language-adapter/canary-sampler/server-discovery/location-mapper [~]; lsp-client/mode-c-verifier unchanged.'
+    include *
+    include ingestion_go, gopls
+  }
+}

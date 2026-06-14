@@ -33,12 +33,14 @@ export interface DiscoveredServer {
 
 /** Result of `discoverServers()`. Each value is null/undefined when the
  *  language's server could not be located through any source.
- *  `java` is undefined (omitted) when absent so that callers that only
- *  destructure `typescript` see no change — a strictly additive widening. */
+ *  `java`, `python`, and `go` are undefined (omitted) when absent so that
+ *  callers that only destructure `typescript` see no change — strictly
+ *  additive widening. */
 export type DiscoveredServers = {
   typescript: DiscoveredServer | null;
   java?: DiscoveredServer | null;
   python?: DiscoveredServer | null;
+  go?: DiscoveredServer | null;
 };
 
 /** The binary basename we look up for TypeScript. Exported for tests. */
@@ -49,6 +51,9 @@ export const JDTLS_BIN = 'jdtls';
 
 /** The binary basename we look up for Python (pylsp). Exported for tests. */
 export const PYLSP_BIN = 'pylsp';
+
+/** The binary basename we look up for Go (gopls). Exported for tests. */
+export const GOPLS_BIN = 'gopls';
 
 /**
  * Find the nearest ancestor directory that contains a
@@ -379,19 +384,22 @@ function tryNpx(binaryName: string): DiscoveredServer | null {
  * that only destructure `typescript` see no change — purely additive.
  */
 export async function discoverServers(): Promise<DiscoveredServers> {
-  const [typescript, java, python] = await Promise.all([
+  const [typescript, java, python, go] = await Promise.all([
     discoverOne(TYPESCRIPT_LANGUAGE_SERVER_BIN),
     discoverOne(JDTLS_BIN),
     discoverOne(PYLSP_BIN),
+    discoverOne(GOPLS_BIN),
   ]);
-  // `java` and `python` are included in the result only when actually found.
-  // Absent servers yield `undefined` (omitted key) rather than `null` so
-  // that existing callers relying on `toEqual({ typescript: … })` do not
-  // observe new keys. Callers interested in Java use `result.java ?? null`.
+  // `java`, `python`, and `go` are included in the result only when actually
+  // found. Absent servers yield `undefined` (omitted key) rather than `null`
+  // so that existing callers relying on `toEqual({ typescript: … })` do not
+  // observe new keys. Callers interested in a specific language use
+  // `result.java ?? null` / `result.go ?? null`.
   return {
     typescript,
     ...(java !== null ? { java } : {}),
     ...(python !== null ? { python } : {}),
+    ...(go !== null ? { go } : {}),
   };
 }
 
