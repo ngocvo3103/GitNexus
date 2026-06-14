@@ -7,7 +7,8 @@
 import { createRequire } from 'node:module';
 import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname, join, resolve, isAbsolute, sep } from 'path';
+import os from 'os';
 
 const _require = createRequire(import.meta.url);
 const Ajv = _require('ajv');
@@ -35,6 +36,42 @@ export function getDefaultSchemaPath(): string {
 }
 
 /**
+ * Validate that a user-supplied schema path is safe to read.
+ *
+ * Mirrors the path-traversal defence in `tool.ts:validateOutputPath`:
+ *   - Rejects `..` sequences.
+ *   - Requires the resolved path to fall within cwd, $HOME, or /tmp.
+ *
+ * Throws with a clear message on violation so the CLI can surface it.
+ * The bundled default path (getDefaultSchemaPath()) is always trusted and
+ * never passed through this function.
+ */
+function validateSchemaPath(userPath: string): string {
+  if (userPath.includes('..')) {
+    throw new Error('--schema-path cannot contain ".." sequences');
+  }
+  const resolved = resolve(userPath);
+  const cwd = process.cwd();
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? '';
+  const tmpDir = resolve(os.tmpdir());
+  const safeRoots = [cwd, home, '/tmp', '/var/tmp', tmpDir].filter(Boolean);
+  const safe = safeRoots.some((root) => {
+    const rr = resolve(root);
+    return resolved === rr || resolved.startsWith(rr + sep);
+  });
+  if (!safe) {
+    // "Schema file not found" phrasing is intentional: callers (including tests)
+    // expect any unusable schema path to surface as a "not found" variant.
+    // The containment details are appended so operators understand the root cause.
+    throw new Error(
+      `Schema file not found or path not allowed: ${resolved} ` +
+        `(--schema-path must be within the current directory, home directory, or /tmp)`,
+    );
+  }
+  return resolved;
+}
+
+/**
  * Load schema from file (cached)
  * @param schemaPath - Optional custom schema path. If not provided, uses bundled schema.
  */
@@ -44,13 +81,16 @@ export function loadSchema(schemaPath?: string): object {
     return cachedSchema;
   }
 
-  const path = schemaPath || getDefaultSchemaPath();
+  // Use the validated+resolved custom path, or fall back to the bundled default.
+  // The bundled path (getDefaultSchemaPath) is trusted — only the user-supplied
+  // --schema-path argument needs the containment check.
+  const safePath = schemaPath ? validateSchemaPath(schemaPath) : getDefaultSchemaPath();
 
-  if (!existsSync(path)) {
-    throw new Error(`Schema file not found: ${path}`);
+  if (!existsSync(safePath)) {
+    throw new Error(`Schema file not found: ${safePath}`);
   }
 
-  const schemaContent = readFileSync(path, 'utf-8');
+  const schemaContent = readFileSync(safePath, 'utf-8');
   const parsed = JSON.parse(schemaContent);
 
   cachedSchema = parsed;
