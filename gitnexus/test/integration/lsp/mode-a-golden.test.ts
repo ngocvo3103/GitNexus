@@ -400,6 +400,23 @@ describe('WI-V — default-path byte-identity (AC-2 / I-1) and dry-run writes-no
     expect(dryRunResult.lspReport).toBeDefined();
     expect(Array.isArray(dryRunResult.lspReport!.decisions)).toBe(true);
   });
+
+  it('(C7-8) dry-run summary line contains budget suffix "(budget 2000 of N candidates)" — no --lsp-budget flag', () => {
+    // WI-7 / C7-8: the budget suffix was added to the dry-run summary line in WI-5.
+    // This test verifies it is present when NO --lsp-budget flag is supplied (I-9):
+    // the line now reads "<N> decision(s), 0 edges written (budget 2000 of N candidates)".
+    // B=2000 because no --lsp-budget was passed; DEFAULT_CANDIDATE_CAP=2000 is used.
+    //
+    // If the suffix is absent, buildLspSummaryLine regressed or pipeline.ts stopped
+    // calling it on the dry-run path.
+    const summary = dryRunLogs.find((l) => l.includes('lsp-dry-run:') && l.includes('decision(s)'));
+    expect(summary, 'WI-7 C7-8: dry-run summary line must exist').toBeDefined();
+    // The budget suffix must appear in the summary line
+    expect(summary).toMatch(/\(budget 2000 of \d+ candidates\)/);
+    // Tokens that must NOT disappear (WI-7 invariant: existing tokens survive)
+    expect(summary).toContain('decision(s)');
+    expect(summary).toContain('0 edges written');
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1997,4 +2014,124 @@ withTestLbugDB('mode-a-ac7', (handle) => {
   });
 }, {
   poolAdapter: true,
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// WI-7 — C7-7 + C7-9: I-9 golden non-regression + funnel determinism
+//
+// C7-7: Run with no --lsp-budget flag; all byte-identical golden
+//        assertions pass (I-9 gate). Two independent default runs
+//        produce identical relationship snapshots.
+// C7-9: Two dry-run passes on same fixture with no --lsp-budget flag;
+//        funnel line (including budget suffix) is deterministic —
+//        same N and B each run.
+// ═══════════════════════════════════════════════════════════════════════
+describe('WI-7 — C7-7 + C7-9: I-9 golden non-regression + funnel determinism (no --lsp-budget flag)', () => {
+  let tmpDirWi7: string;
+  let wi7Run1: PipelineResult;
+  let wi7Run2: PipelineResult;
+  let wi7DryLogs1: string[];
+  let wi7DryLogs2: string[];
+
+  beforeAll(async () => {
+    tmpDirWi7 = fs.mkdtempSync(path.join(require('os').tmpdir(), 'gn-wi7-'));
+    // Same fixture as the (a)/(a2) block — a small TS repo that emits
+    // at least one global-0.50 CALLS edge (makes dry-run emit a funnel line).
+    fs.writeFileSync(path.join(tmpDirWi7, 'models.ts'), [
+      'export class User {',
+      '  save(): void {}',
+      '  getName(): string { return ""; }',
+      '}',
+      'export function getUser(): User { return new User(); }',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDirWi7, 'service.ts'),
+      "import { getUser } from './models';\nexport const user = getUser();\n");
+    fs.writeFileSync(path.join(tmpDirWi7, 'app.ts'), [
+      "import { user } from './service';",
+      'export function main() {',
+      '  user.save();',
+      '  user.getName();',
+      '}',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDirWi7, 'tsconfig.json'),
+      '{\n  "compilerOptions": {\n    "target": "es2020",\n    "module": "commonjs",\n    "strict": true\n  }\n}\n');
+
+    // C7-7 — Two independent default runs (no --lsp-budget, no lsp option at all).
+    // Proves byte-identity under the default path (I-9: budget suffix does not
+    // appear on the non-lsp default path).
+    wi7Run1 = await runPipelineFromRepo(tmpDirWi7, () => {}, { skipGraphPhases: true });
+    wi7Run2 = await runPipelineFromRepo(tmpDirWi7, () => {}, { skipGraphPhases: true });
+
+    // C7-9 — Two independent dry-run passes. The funnel line IS emitted on the
+    // dry-run path (lsp.enabled=true, dryRun=true). No --lsp-budget flag means
+    // B=DEFAULT_CANDIDATE_CAP=2000. Both runs must emit the same funnel line.
+    const captureLogs = (run: () => Promise<PipelineResult>): Promise<{ result: PipelineResult; logs: string[] }> => {
+      return new Promise<{ result: PipelineResult; logs: string[] }>(async (resolve) => {
+        const logs: string[] = [];
+        const orig = console.log;
+        console.log = (...args: any[]) => {
+          logs.push(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' '));
+        };
+        try {
+          const result = await run();
+          resolve({ result, logs });
+        } finally {
+          console.log = orig;
+        }
+      });
+    };
+
+    const { result: r1, logs: l1 } = await captureLogs(() =>
+      runPipelineFromRepo(tmpDirWi7, () => {}, { skipGraphPhases: true, lsp: { enabled: true, dryRun: true } }),
+    );
+    const { result: r2, logs: l2 } = await captureLogs(() =>
+      runPipelineFromRepo(tmpDirWi7, () => {}, { skipGraphPhases: true, lsp: { enabled: true, dryRun: true } }),
+    );
+    wi7DryLogs1 = l1; wi7DryLogs2 = l2;
+    // store results for potential future assertions
+    void r1; void r2;
+  }, 120_000);
+
+  afterAll(() => {
+    if (tmpDirWi7 && fs.existsSync(tmpDirWi7)) {
+      fs.rmSync(tmpDirWi7, { recursive: true, force: true });
+    }
+  });
+
+  it('(C7-7) I-9: two independent default runs (no --lsp-budget) produce identical relationship snapshots', () => {
+    // I-9 gate: the default path is byte-identical regardless of the budget suffix
+    // feature (which is not emitted on the non-lsp default path). If any new code
+    // in WI-5/WI-6/WI-7 mutates graph state on the default (no-lsp) path, this fails.
+    expect(snapshotRels(wi7Run1.graph)).toBe(snapshotRels(wi7Run2.graph));
+  });
+
+  it('(C7-7) I-9: every edge in both default runs carries source==="heuristic" — no lsp-* stamps on default path', () => {
+    // Belt-and-braces: the budget suffix (WI-7) must not accidentally stamp edges
+    // with a non-heuristic source on the default (no-lsp) path.
+    for (const run of [wi7Run1, wi7Run2]) {
+      for (const r of run.graph.iterRelationships()) {
+        expect(r.source).toBe('heuristic');
+      }
+    }
+  });
+
+  it('(C7-9) funnel determinism: two dry-run passes with no --lsp-budget emit identical budget suffix', () => {
+    // WI-7 C7-9: funnel line determinism. Two dry-run passes on the same fixture
+    // with no --lsp-budget flag must emit the same summary line. The budget suffix
+    // is (budget 2000 of N candidates) where N is the candidate count — which is
+    // deterministic for a fixed fixture. If N were non-deterministic (e.g. random
+    // BFS ordering, race condition), the two suffixes would differ.
+    const summary1 = wi7DryLogs1.find((l) => l.includes('lsp-dry-run:') && l.includes('decision(s)'));
+    const summary2 = wi7DryLogs2.find((l) => l.includes('lsp-dry-run:') && l.includes('decision(s)'));
+    // Both runs must emit a summary line
+    expect(summary1, 'C7-9: first dry-run must emit summary line').toBeDefined();
+    expect(summary2, 'C7-9: second dry-run must emit summary line').toBeDefined();
+    // Both summary lines must be identical (determinism)
+    expect(summary1).toBe(summary2);
+    // And both must contain the budget suffix with default cap=2000
+    expect(summary1).toMatch(/\(budget 2000 of \d+ candidates\)/);
+    expect(summary2).toMatch(/\(budget 2000 of \d+ candidates\)/);
+  });
 });

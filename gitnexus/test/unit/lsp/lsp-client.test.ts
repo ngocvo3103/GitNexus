@@ -1169,20 +1169,14 @@ describe('WI-0 — ClientCapabilities seam (C0-8..C0-11)', () => {
     }
   });
 
-  // C0-10: non-Go path: TS/Java/Python register NO $/progress/create handler
-  //        (capability-gated off)
-  //
-  // We create a fast-awaitReady wrapper for JAVA_ADAPTER so the test does not
-  // hang on the 120s language/status notification deadline.  The wrapper is
-  // structurally equivalent to the real adapter (same id, serverBinary, etc.)
-  // but overrides awaitReady to resolve true immediately.  This isolates the
-  // test to the pre-initialize handler registration gate, not the awaitReady path.
-  const fastJavaAdapter = { ...JAVA_ADAPTER, awaitReady: async () => true as const };
+  // C0-10: TS/Python register NO $/progress/create handler (capability-gated off).
+  //        WI-1 update: JAVA_ADAPTER now sets clientCapabilities.window.workDoneProgress=true
+  //        and is therefore MOVED to the "registers $/progress handler" group (C1-10 below).
+  //        Only TYPESCRIPT_ADAPTER and PYTHON_ADAPTER remain in the no-handler group.
   const fastPythonAdapter = { ...PYTHON_ADAPTER, awaitReady: async () => true as const };
 
   it.each([
     ['TYPESCRIPT_ADAPTER', TYPESCRIPT_ADAPTER],
-    ['JAVA_ADAPTER (fast-awaitReady)', fastJavaAdapter],
     ['PYTHON_ADAPTER (fast-awaitReady)', fastPythonAdapter],
   ] as const)('C0-10: %s → NO $/progress or window/workDoneProgress/create handler registered', async (name, adapter) => {
     const wire = makeWire();
@@ -1216,6 +1210,126 @@ describe('WI-0 — ClientCapabilities seam (C0-8..C0-11)', () => {
 
       expect(progressRegIdx).toBe(-1);
       expect(createRegIdx).toBe(-1);
+    } finally {
+      try { await lspClient.stop(); } catch { /* noop */ }
+      server.dispose();
+      try { realClientConn.dispose(); } catch { /* noop */ }
+      wire.destroy();
+    }
+  });
+
+  // C4-7: RUST_ADAPTER registers $/progress and window/workDoneProgress/create handlers.
+  //
+  // RUST_ADAPTER.clientCapabilities = { window: { workDoneProgress: true },
+  //   experimental: { serverStatusNotification: true } }.
+  // The gate in lsp-client.ts is `adapter.clientCapabilities?.window?.workDoneProgress`,
+  // which is `true` for RUST_ADAPTER — so the $/progress handler IS registered for Rust.
+  // RUST's awaitReady reads only ctx.serverStatusLatest / ctx.onServerStatus (not $/progress
+  // directly), but the $/progress buffer is still populated for any future use.
+  //
+  // NOTE: WI-4c spec draft stated "RUST_ADAPTER does NOT register $/progress (gated
+  // on experimental.serverStatusNotification, not workDoneProgress)". That claim is
+  // incorrect — the $/progress gate is window.workDoneProgress (true for Rust), not
+  // experimental.serverStatusNotification. Production lsp-client.ts confirms: any adapter
+  // with window.workDoneProgress=true DOES register $/progress. See specMismatch note
+  // in StructuredOutput. RUST_ADAPTER belongs to the "registers $/progress" group, not
+  // the "no $/progress handler" group (TS/Python).
+  it('C4-7: RUST_ADAPTER — $/progress and window/workDoneProgress/create handlers ARE registered (window.workDoneProgress=true gate fires for Rust)', async () => {
+    const { RUST_ADAPTER } = await import('../../../src/core/ingestion/lsp/language-adapter.js');
+    // Fast awaitReady: RUST real impl reads experimental/serverStatus not wired here.
+    const fastRustAdapter = { ...RUST_ADAPTER, awaitReady: async () => true as const };
+    const wire = makeWire();
+    const server = makeFakeServer(wire);
+    const realClientConn = createMessageConnection(
+      new StreamMessageReader(wire.clientStdout),
+      new StreamMessageWriter(wire.clientStdin),
+      NullLogger,
+    );
+    const rec = makeRecordingConnection(wire, realClientConn);
+    const clientProcess = makeFakeChildProcess(wire);
+
+    const lspClient = new LspClient({
+      workspaceRoot: '/',
+      adapter: fastRustAdapter as any,
+      _inject: {
+        spawn: () => ({ process: clientProcess, connection: rec as any }),
+      },
+    });
+
+    try {
+      await lspClient.start();
+
+      const progressRegIdx = rec.events.findIndex(
+        (e) => e.kind === 'onNotification' && e.method === '$/progress',
+      );
+      const createRegIdx = rec.events.findIndex(
+        (e) => e.kind === 'onRequest' && e.method === 'window/workDoneProgress/create',
+      );
+      const initializeSendIdx = rec.events.findIndex(
+        (e) => e.kind === 'sendRequest' && e.method === 'initialize',
+      );
+
+      // RUST_ADAPTER.window.workDoneProgress=true → gate fires → both handlers registered.
+      expect(progressRegIdx).toBeGreaterThanOrEqual(0);
+      expect(createRegIdx).toBeGreaterThanOrEqual(0);
+      // Both must be registered BEFORE initialize is sent (R2-2 ordering).
+      expect(initializeSendIdx).toBeGreaterThanOrEqual(0);
+      expect(progressRegIdx).toBeLessThan(initializeSendIdx);
+      expect(createRegIdx).toBeLessThan(initializeSendIdx);
+    } finally {
+      try { await lspClient.stop(); } catch { /* noop */ }
+      server.dispose();
+      try { realClientConn.dispose(); } catch { /* noop */ }
+      wire.destroy();
+    }
+  });
+
+  // C1-10: JAVA_ADAPTER registers $/progress and window/workDoneProgress/create handlers
+  //        (WI-1: clientCapabilities.window.workDoneProgress=true activates the gate).
+  //
+  // Fast-awaitReady wrapper used so the test does not hang on JDTLS_READY_DEADLINE_MS
+  // (600 s). Mirrors C0-8 (GO_ADAPTER) — verifies handler registration ORDERING,
+  // not the awaitReady resolution value.
+  it('C1-10: JAVA_ADAPTER — $/progress and window/workDoneProgress/create handlers registered (workDoneProgress=true gate)', async () => {
+    const fastJavaAdapter = { ...JAVA_ADAPTER, awaitReady: async () => true as const };
+    const wire = makeWire();
+    const server = makeFakeServer(wire);
+    const realClientConn = createMessageConnection(
+      new StreamMessageReader(wire.clientStdout),
+      new StreamMessageWriter(wire.clientStdin),
+      NullLogger,
+    );
+    const rec = makeRecordingConnection(wire, realClientConn);
+    const clientProcess = makeFakeChildProcess(wire);
+
+    const lspClient = new LspClient({
+      workspaceRoot: '/',
+      adapter: fastJavaAdapter as any,
+      _inject: {
+        spawn: () => ({ process: clientProcess, connection: rec as any }),
+      },
+    });
+
+    try {
+      await lspClient.start();
+
+      const progressRegIdx = rec.events.findIndex(
+        (e) => e.kind === 'onNotification' && e.method === '$/progress',
+      );
+      const createRegIdx = rec.events.findIndex(
+        (e) => e.kind === 'onRequest' && e.method === 'window/workDoneProgress/create',
+      );
+      const initializeSendIdx = rec.events.findIndex(
+        (e) => e.kind === 'sendRequest' && e.method === 'initialize',
+      );
+
+      // Both handlers MUST be registered (JAVA_ADAPTER now has workDoneProgress=true).
+      expect(progressRegIdx).toBeGreaterThanOrEqual(0);
+      expect(createRegIdx).toBeGreaterThanOrEqual(0);
+      // And they must be registered BEFORE initialize is sent (R2-2 ordering).
+      expect(initializeSendIdx).toBeGreaterThanOrEqual(0);
+      expect(progressRegIdx).toBeLessThan(initializeSendIdx);
+      expect(createRegIdx).toBeLessThan(initializeSendIdx);
     } finally {
       try { await lspClient.stop(); } catch { /* noop */ }
       server.dispose();
@@ -1405,10 +1519,11 @@ describe('AdapterReadyCtx progress wiring (C2a-1..C2a-7)', () => {
     }
   });
 
-  // C2a-2: TS/Java/Python ctx omits all three progress fields (undefined).
+  // C2a-2: TS/Python ctx omits all three progress fields (undefined).
+  //        WI-1 update: JAVA_ADAPTER now has clientCapabilities.window.workDoneProgress=true,
+  //        so its ctx DOES receive the three progress fields — moved to C2a-2b below.
   it.each([
     ['TYPESCRIPT_ADAPTER', TYPESCRIPT_ADAPTER],
-    ['JAVA_ADAPTER (fast)', { ...JAVA_ADAPTER, awaitReady: async () => true as const }],
     ['PYTHON_ADAPTER (fast)', { ...PYTHON_ADAPTER, awaitReady: async () => true as const }],
   ] as const)(
     'C2a-2: %s ctx.progressTokenTitles / progressEndedTokens / onProgressEnd are undefined',
@@ -1454,6 +1569,43 @@ describe('AdapterReadyCtx progress wiring (C2a-1..C2a-7)', () => {
       }
     },
   );
+
+  // C2a-2b: JAVA_ADAPTER (WI-1 update) ctx DOES receive the three progress fields
+  //         (workDoneProgress=true activates the $/progress gate in lsp-client.ts).
+  it('C2a-2b: JAVA_ADAPTER (fast) ctx.progressTokenTitles / progressEndedTokens / onProgressEnd are DEFINED (WI-1)', async () => {
+    let capturedCtx: any = null;
+    const fastJavaAdapter = { ...JAVA_ADAPTER, awaitReady: async (ctx: any) => { capturedCtx = ctx; return true; } };
+    const wire = makeWire();
+    const server = makeFakeServer(wire);
+    const realClientConn = createMessageConnection(
+      new StreamMessageReader(wire.clientStdout),
+      new StreamMessageWriter(wire.clientStdin),
+      NullLogger,
+    );
+    const rec = makeRecordingConnection(wire, realClientConn);
+    const clientProcess = makeFakeChildProcess(wire);
+
+    const lspClient = new LspClient({
+      workspaceRoot: '/',
+      adapter: fastJavaAdapter as any,
+      _inject: {
+        spawn: () => ({ process: clientProcess, connection: rec as any }),
+      },
+    });
+
+    try {
+      await lspClient.start();
+      expect(capturedCtx).not.toBeNull();
+      expect(capturedCtx.progressTokenTitles).toBeDefined();
+      expect(capturedCtx.progressEndedTokens).toBeDefined();
+      expect(typeof capturedCtx.onProgressEnd).toBe('function');
+    } finally {
+      try { await lspClient.stop(); } catch { /* noop */ }
+      server.dispose();
+      try { realClientConn.dispose(); } catch { /* noop */ }
+      wire.destroy();
+    }
+  });
 
   // C2a-3: onProgressEnd(cb) -> $/progress end for token T -> cb invoked with T.
   it('C2a-3: onProgressEnd(cb) + $/progress end -> cb invoked with the ended token', async () => {

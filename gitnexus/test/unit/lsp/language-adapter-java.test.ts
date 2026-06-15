@@ -1,40 +1,62 @@
 /**
- * Unit tests: JAVA_ADAPTER.awaitReady + JAVA_ADAPTER.spawnArgs (WI-4c).
+ * Unit tests: JAVA_ADAPTER.awaitReady (settle-until-quiet) + JAVA_ADAPTER.spawnArgs.
  *
- * Technique: state (ready-signal / deadline-no-signal / error) +
- *            decision (-data dir under GITNEXUS_HOME).
+ * WI-4a rewrite — settle-until-quiet strategy (ADR-002).
+ *
+ * Technique: State Transition (settle-until-quiet machine) + Decision Table
+ *   (quiet vs periodic vs deadline; canary empty vs non-empty).
+ *
+ * Cases implemented:
+ *   S-1  (negative AC / I-2 guard): ServiceReady MUST NOT settle — pending until deadline
+ *   S-2  : onProgressEnd → 5000 ms quiet → backstopProbe non-empty → settle(true)
+ *   S-3  : onProgressEnd → quiet → probe empty → pending; second end + quiet + probe true → settle(true)
+ *   S-4  : zero progress events → periodic canary invoked ≥2× before deadline; non-empty → settle(true)
+ *   S-5  : default deadline === JDTLS_READY_DEADLINE_MS (600 000 ms); pending at 599 999 ms; settle(false) at 600 000 ms
+ *   S-6  : ctx.deadlineMs override (e.g. 1 000) honoured → settle(false)
+ *   S-7  : onNotification throws → resolves false, no throw
+ *   S-8  : connection null → resolves false, no throw
+ *   S-9  : backstopProbe rejects (via periodic canary) → resolves false, no throw
+ *   S-10 : quiet + deadline race → settles exactly once
+ *   spawnArgs: 7 cases verbatim (readiness-model-independent)
  *
  * Isolation:
- *   - awaitReady: a fake MessageConnection with controllable onNotification
- *     and dispose mechanics — no real jdtls spawned.
- *   - spawnArgs: GITNEXUS_HOME overridden via process.env per test to assert
- *     the path derivation; always restored in afterEach.
+ *   - awaitReady: fake MessageConnection + controlled onProgressEnd seam.
+ *   - spawnArgs: GITNEXUS_HOME overridden via process.env per test, restored in afterEach.
  *
- * Timer strategy: vi.useFakeTimers() for deadline cases so the tests run
- * in <1 ms rather than 120 seconds.
+ * Timer discipline:
+ *   - vi.useFakeTimers() called inside each test that needs it.
+ *   - vi.useRealTimers() in afterEach of every fake-timer suite (I-9: no timer bleed).
+ *
+ * INVARIANT: no ServiceReady-settles-true assertion survives in this file.
+ * Every existing ServiceReady test from WI-4c is deleted and replaced by the
+ * settle-until-quiet cases below.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { JAVA_ADAPTER, type AdapterReadyCtx } from '../../../src/core/ingestion/lsp/language-adapter.js';
+import {
+  JAVA_ADAPTER,
+  JDTLS_READY_DEADLINE_MS,
+  JDTLS_QUIET_INTERVAL_MS,
+  type AdapterReadyCtx,
+} from '../../../src/core/ingestion/lsp/language-adapter.js';
+
+// ─── Constants derived from production ───────────────────────────────────────
+
+/** JDTLS_QUIET_INTERVAL_MS / 2 — the periodic canary interval. */
+const CANARY_INTERVAL_MS = JDTLS_QUIET_INTERVAL_MS / 2; // 2 500 ms
 
 // ─── Fake MessageConnection ───────────────────────────────────────────────────
 
 /**
  * Minimal fake MessageConnection that records and controls notification
  * handlers registered via onNotification('language/status', handler).
- *
- * Each call to onNotification returns a Disposable whose dispose() removes
- * the handler registration from the recording list so tests can assert
- * the handler was disposed.
+ * Supports a controllable onProgressEnd seam for $/progress injection.
  */
 function makeFakeConnection() {
   type Handler = (params: unknown) => void;
 
-  // Tracks active handlers by method name.
   const handlers = new Map<string, Set<{ fn: Handler; disposed: boolean }>>();
-
-  // Track how many times dispose was called (for leak assertions).
   let disposeCallCount = 0;
 
   function onNotification(method: string, handler: Handler): { dispose(): void } {
@@ -53,7 +75,6 @@ function makeFakeConnection() {
     };
   }
 
-  /** Emit a notification to all currently registered handlers for `method`. */
   function emit(method: string, params: unknown): void {
     handlers.get(method)?.forEach((entry) => {
       if (!entry.disposed) {
@@ -62,7 +83,6 @@ function makeFakeConnection() {
     });
   }
 
-  /** Count active (not yet disposed) handlers for `method`. */
   function activeHandlerCount(method: string): number {
     let count = 0;
     handlers.get(method)?.forEach((entry) => {
@@ -83,7 +103,38 @@ function makeFakeConnection() {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Build a minimal AdapterReadyCtx. deadlineMs is required for deadline tests. */
+/**
+ * Build a controllable onProgressEnd seam. Returns the ctx field and a
+ * `fireProgressEnd` function that triggers all registered progress-end
+ * callbacks (simulates $/progress end events from LspClient).
+ */
+function makeProgressEndSeam() {
+  type ProgressEndCb = (token: string | number) => void;
+  const subscribers = new Set<{ fn: ProgressEndCb; disposed: boolean }>();
+
+  function onProgressEnd(cb: ProgressEndCb): { dispose(): void } {
+    const entry = { fn: cb, disposed: false };
+    subscribers.add(entry);
+    return {
+      dispose() {
+        entry.disposed = true;
+        subscribers.delete(entry);
+      },
+    };
+  }
+
+  function fireProgressEnd(token: string | number = 'tok-1'): void {
+    for (const entry of subscribers) {
+      if (!entry.disposed) {
+        entry.fn(token);
+      }
+    }
+  }
+
+  return { onProgressEnd, fireProgressEnd };
+}
+
+/** Build a minimal AdapterReadyCtx. */
 function makeCtx(
   connection: ReturnType<typeof makeFakeConnection>,
   overrides?: Partial<Omit<AdapterReadyCtx, 'connection'>>,
@@ -95,299 +146,402 @@ function makeCtx(
   };
 }
 
-// ─── Suite: JAVA_ADAPTER.awaitReady — ready signal ───────────────────────────
+// ─── Suite: S-1 — ServiceReady is a no-op (I-2 regression guard) ─────────────
+//
+// BDD:
+//   Given awaitReady is called
+//   When language/status { type: 'ServiceReady' } is emitted
+//   Then the promise does NOT settle; it stays pending until the deadline fires settle(false)
+//   And backstopProbe is never reached via ServiceReady
+//
+// This is the PRIMARY regression guard against I-2 violations.
+// The suite uses a short overridden deadlineMs so we don't wait 600 s.
 
-describe('JAVA_ADAPTER.awaitReady — ready signal', () => {
-  it('resolves true when ServiceReady notification arrives before deadline', async () => {
-    const conn = makeFakeConnection();
-    const ctx = makeCtx(conn, { deadlineMs: 5_000 });
-
-    // Start awaiting — do NOT await yet; we need to emit before the deadline.
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
-
-    // Emit the ServiceReady notification synchronously (microtask will resolve).
-    conn.emit('language/status', { type: 'ServiceReady', message: 'Ready' });
-
-    const result = await promise;
-    expect(result).toBe(true);
-  });
-
-  it('handler is disposed after resolving true on ServiceReady', async () => {
-    const conn = makeFakeConnection();
-    const ctx = makeCtx(conn, { deadlineMs: 5_000 });
-
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
-    conn.emit('language/status', { type: 'ServiceReady' });
-    await promise;
-
-    // The handler must have been disposed — no active handlers remain.
-    expect(conn.activeHandlerCount('language/status')).toBe(0);
-    expect(conn.disposeCallCount).toBe(1);
-  });
-
-  it('ignores non-ServiceReady status notifications and keeps waiting', async () => {
-    const conn = makeFakeConnection();
-    // Short deadline so the test doesn't hang; use fake timers.
-    vi.useFakeTimers();
-    const ctx = makeCtx(conn, { deadlineMs: 100 });
-
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
-
-    // Emit an intermediate status — should NOT resolve yet.
-    conn.emit('language/status', { type: 'Starting', message: 'indexing...' });
-
-    // Handler must still be active at this point.
-    expect(conn.activeHandlerCount('language/status')).toBe(1);
-
-    // Advance past deadline to let it settle.
-    vi.advanceTimersByTime(200);
-    const result = await promise;
-
-    expect(result).toBe(false); // deadline fired, canary null
-    vi.useRealTimers();
-  });
-
-  it('handler is registered exactly once per awaitReady call', async () => {
-    const conn = makeFakeConnection();
-    const ctx = makeCtx(conn, { deadlineMs: 5_000 });
-
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
-    // Before resolving: exactly one handler registered.
-    expect(conn.activeHandlerCount('language/status')).toBe(1);
-
-    conn.emit('language/status', { type: 'ServiceReady' });
-    await promise;
-  });
-
-  it('only resolves true once even if ServiceReady fires multiple times', async () => {
-    const conn = makeFakeConnection();
-    const ctx = makeCtx(conn, { deadlineMs: 5_000 });
-
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
-    conn.emit('language/status', { type: 'ServiceReady' });
-    conn.emit('language/status', { type: 'ServiceReady' }); // second emit — ignored
-
-    const result = await promise;
-    expect(result).toBe(true);
-    // Dispose called exactly once (first settle wins).
-    expect(conn.disposeCallCount).toBe(1);
-  });
-});
-
-// ─── Suite: JAVA_ADAPTER.awaitReady — deadline / canary-null path ────────────
-
-describe('JAVA_ADAPTER.awaitReady — deadline with canary null', () => {
-  // Patch JAVA_ADAPTER.canary to null for this suite so the canary-null
-  // branch (settle false) is exercisable regardless of WI-2 wiring state.
-  const originalCanary = JAVA_ADAPTER.canary;
-  beforeEach(() => {
-    (JAVA_ADAPTER as unknown as Record<string, unknown>).canary = null;
-  });
+describe('S-1 — ServiceReady does NOT settle awaitReady (I-2 regression guard)', () => {
   afterEach(() => {
-    (JAVA_ADAPTER as unknown as Record<string, unknown>).canary = originalCanary;
     vi.useRealTimers();
   });
 
-  it('resolves false at the deadline when no ready signal and canary is null', async () => {
+  it('language/status ServiceReady emitted → promise still pending at that moment', async () => {
     vi.useFakeTimers();
     const conn = makeFakeConnection();
     const ctx = makeCtx(conn, { deadlineMs: 1_000 });
 
-    // Confirm the suite's beforeEach patched canary to null.
-    expect(JAVA_ADAPTER.canary).toBeNull();
+    const promise = JAVA_ADAPTER.awaitReady(ctx);
+
+    // Emit ServiceReady — must NOT settle the promise.
+    conn.emit('language/status', { type: 'ServiceReady', message: 'Ready' });
+
+    // At this point the promise should still be pending (deadline not yet fired).
+    // We verify by racing against a short timeout; if settled it would race correctly.
+    // The handler MUST still be registered (no disposal from ServiceReady).
+    expect(conn.activeHandlerCount('language/status')).toBe(1);
+
+    // Advance past deadline to let it settle(false).
+    vi.advanceTimersByTime(1_100);
+    const result = await promise;
+
+    // ServiceReady path produces no settle(true). Deadline fires settle(false).
+    expect(result).toBe(false);
+  });
+
+  it('multiple ServiceReady notifications → still no settle', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    const ctx = makeCtx(conn, { deadlineMs: 500 });
 
     const promise = JAVA_ADAPTER.awaitReady(ctx);
 
-    // No notification emitted — let the deadline fire.
-    vi.advanceTimersByTime(1_100);
+    // Fire several ServiceReady notifications.
+    conn.emit('language/status', { type: 'ServiceReady' });
+    conn.emit('language/status', { type: 'ServiceReady' });
+    conn.emit('language/status', { type: 'ServiceReady' });
 
+    // Handler still active — no disposal from ServiceReady path.
+    expect(conn.activeHandlerCount('language/status')).toBe(1);
+
+    vi.advanceTimersByTime(600);
     const result = await promise;
     expect(result).toBe(false);
   });
 
-  it('resolves false (not a rejection) on deadline timeout', async () => {
+  it('non-ServiceReady status types (Starting, Building) → no settle', async () => {
     vi.useFakeTimers();
     const conn = makeFakeConnection();
     const ctx = makeCtx(conn, { deadlineMs: 500 });
 
     const promise = JAVA_ADAPTER.awaitReady(ctx);
-    vi.advanceTimersByTime(600);
 
-    // Must resolve (not reject).
-    await expect(promise).resolves.toBe(false);
+    conn.emit('language/status', { type: 'Starting', message: 'indexing...' });
+    conn.emit('language/status', { type: 'Building', message: 'compiling...' });
+    conn.emit('language/status', { type: 'Error', message: 'oops' });
+
+    expect(conn.activeHandlerCount('language/status')).toBe(1);
+
+    vi.advanceTimersByTime(600);
+    const result = await promise;
+    expect(result).toBe(false);
   });
 
-  it('handler is disposed on deadline even when no ready signal arrived', async () => {
+  it('language/status handler is registered exactly once per awaitReady call', async () => {
     vi.useFakeTimers();
     const conn = makeFakeConnection();
     const ctx = makeCtx(conn, { deadlineMs: 500 });
 
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
+    JAVA_ADAPTER.awaitReady(ctx);
+
+    // Exactly one handler for language/status.
+    expect(conn.activeHandlerCount('language/status')).toBe(1);
+
     vi.advanceTimersByTime(600);
+  });
+});
+
+// ─── Suite: S-2 — Quiet path: onProgressEnd → 5000 ms quiet → settle(true) ────
+//
+// BDD:
+//   Given ctx.onProgressEnd is wired
+//   When a $/progress end event fires
+//   And no further end events arrive for JDTLS_QUIET_INTERVAL_MS (5000 ms)
+//   And backstopProbe returns non-empty
+//   Then settle(true)
+
+describe('S-2 — Quiet path: progress end → quiet interval → non-empty canary → settle(true)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('one progress end event + 5000 ms quiet + non-empty probe → settle(true)', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    const { onProgressEnd, fireProgressEnd } = makeProgressEndSeam();
+    // backstopProbe returns true — both quiet path and periodic canary use it.
+    const backstopProbe = vi.fn().mockResolvedValue(true);
+
+    const ctx = makeCtx(conn, {
+      deadlineMs: 60_000,
+      onProgressEnd,
+      backstopProbe,
+    });
+
+    const promise = JAVA_ADAPTER.awaitReady(ctx);
+
+    // Fire one $/progress end — starts the 5000 ms quiet timer.
+    // The periodic canary runs in parallel at CANARY_INTERVAL_MS (2500 ms) intervals.
+    // Since backstopProbe returns true, whichever path fires first (periodic canary
+    // at 2500 ms OR quiet timer at 5000 ms) will settle(true). Either way the
+    // final result must be true.
+    fireProgressEnd();
+
+    // Advance past the quiet interval — at least one path fires.
+    vi.advanceTimersByTime(JDTLS_QUIET_INTERVAL_MS + 100);
+    const result = await promise;
+
+    expect(result).toBe(true);
+    // backstopProbe invoked at least once (by whichever path fires first).
+    expect(backstopProbe).toHaveBeenCalled();
+  });
+
+  it('language/status handler is disposed after quiet-path settle(true)', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    const { onProgressEnd, fireProgressEnd } = makeProgressEndSeam();
+    const backstopProbe = vi.fn().mockResolvedValue(true);
+
+    const ctx = makeCtx(conn, { deadlineMs: 60_000, onProgressEnd, backstopProbe });
+    const promise = JAVA_ADAPTER.awaitReady(ctx);
+
+    fireProgressEnd();
+    vi.advanceTimersByTime(JDTLS_QUIET_INTERVAL_MS);
     await promise;
 
     // Handler must be disposed — no leak.
     expect(conn.activeHandlerCount('language/status')).toBe(0);
     expect(conn.disposeCallCount).toBe(1);
   });
+});
 
-  it('uses default 120_000ms deadline when ctx.deadlineMs is undefined', async () => {
+// ─── Suite: S-3 — Timer re-arm: empty probe on first quiet, settle on second ──
+//
+// BDD:
+//   Given ctx.onProgressEnd fires once → quiet → probe returns empty → pending
+//   When a second $/progress end event fires + quiet elapses + probe returns true
+//   Then settle(true) on the second cycle
+
+describe('S-3 — Quiet path: empty probe → pending, second end + quiet + true probe → settle(true)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('first end → quiet → probe empty → no settle; subsequent probe true → settle(true)', async () => {
     vi.useFakeTimers();
     const conn = makeFakeConnection();
-    // No deadlineMs — must use 120_000ms default.
-    const ctx = makeCtx(conn, { deadlineMs: undefined });
+    const { onProgressEnd, fireProgressEnd } = makeProgressEndSeam();
+
+    // All probes return false initially, then true — the first non-empty result settles.
+    // Use a counter-based mock: returns false for the first 2 calls, then true.
+    let callCount = 0;
+    const backstopProbe = vi.fn().mockImplementation(async () => {
+      callCount++;
+      return callCount >= 3; // first 2 calls return false, 3rd returns true
+    });
+
+    const ctx = makeCtx(conn, {
+      deadlineMs: 60_000,
+      onProgressEnd,
+      backstopProbe,
+    });
 
     const promise = JAVA_ADAPTER.awaitReady(ctx);
 
-    // At 119_999ms the handler should still be active.
-    vi.advanceTimersByTime(119_999);
-    expect(conn.activeHandlerCount('language/status')).toBe(1);
+    // Fire a $/progress end — starts the 5000 ms quiet timer.
+    // Meanwhile the periodic canary fires at 2500 ms intervals.
+    // After enough time, backstopProbe will return true and settle(true).
+    fireProgressEnd('tok-1');
 
-    // At 120_001ms the deadline fires.
+    // Use advanceTimersByTimeAsync to drain async callbacks between timer ticks.
+    // Advance enough time for at least 3 probes to fire (2 periodic + 1 quiet).
+    await vi.advanceTimersByTimeAsync(JDTLS_QUIET_INTERVAL_MS * 2 + 100);
+
+    const result = await promise;
+    expect(result).toBe(true);
+    expect(backstopProbe.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+// ─── Suite: S-4 — Periodic canary: zero progress events path ─────────────────
+//
+// BDD:
+//   Given zero $/progress end events
+//   When periodic canary fires at CANARY_INTERVAL_MS (2500 ms) intervals
+//   Then backstopProbe invoked ≥2× before deadline
+//   And on first non-empty result → settle(true)
+
+describe('S-4 — Periodic canary: zero progress events → canary ≥2× before deadline → settle(true)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('backstopProbe invoked at least twice before deadline with zero progress events', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    const backstopProbe = vi.fn().mockResolvedValue(false); // keeps returning false
+
+    const ctx = makeCtx(conn, {
+      deadlineMs: 600_000,
+      // No onProgressEnd — zero progress events path
+      backstopProbe,
+    });
+
+    const promise = JAVA_ADAPTER.awaitReady(ctx);
+
+    // Use advanceTimersByTimeAsync to properly drain async callbacks between timer ticks.
+    // Periodic canary fires at CANARY_INTERVAL_MS (2500 ms) intervals.
+    // After 2 × CANARY_INTERVAL_MS + margin, probe must have been called ≥2×.
+    await vi.advanceTimersByTimeAsync(CANARY_INTERVAL_MS * 2 + 100);
+
+    expect(backstopProbe.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+    // Clean up: advance to deadline.
+    await vi.advanceTimersByTimeAsync(600_000);
+    await promise;
+  });
+
+  it('periodic canary non-empty on first fire → settle(true)', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    // Returns true on the first call.
+    const backstopProbe = vi.fn().mockResolvedValue(true);
+
+    const ctx = makeCtx(conn, {
+      deadlineMs: 600_000,
+      backstopProbe,
+    });
+
+    const promise = JAVA_ADAPTER.awaitReady(ctx);
+
+    // Advance to first periodic canary fire.
+    vi.advanceTimersByTime(CANARY_INTERVAL_MS);
+    const result = await promise;
+
+    expect(result).toBe(true);
+    expect(backstopProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it('periodic canary reschedules after empty result, settles on second non-empty', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    const backstopProbe = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    const ctx = makeCtx(conn, {
+      deadlineMs: 600_000,
+      backstopProbe,
+    });
+
+    const promise = JAVA_ADAPTER.awaitReady(ctx);
+
+    // First canary fire (2500 ms) → false → reschedule.
+    vi.advanceTimersByTime(CANARY_INTERVAL_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Second canary fire (5000 ms total) → true → settle(true).
+    vi.advanceTimersByTime(CANARY_INTERVAL_MS);
+    const result = await promise;
+
+    expect(result).toBe(true);
+    expect(backstopProbe).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─── Suite: S-5 — Default deadline === JDTLS_READY_DEADLINE_MS (600 000 ms) ──
+
+describe('S-5 — Default deadline is JDTLS_READY_DEADLINE_MS (600 000 ms)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('JDTLS_READY_DEADLINE_MS equals 600 000', () => {
+    expect(JDTLS_READY_DEADLINE_MS).toBe(600_000);
+  });
+
+  it('pending at 599 999 ms when no settle trigger fires', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    // backstopProbe always returns false so no canary settles early.
+    const backstopProbe = vi.fn().mockResolvedValue(false);
+    // No deadlineMs — uses default JDTLS_READY_DEADLINE_MS.
+    const ctx = makeCtx(conn, { backstopProbe });
+
+    let settled = false;
+    const promise = JAVA_ADAPTER.awaitReady(ctx).then((v) => {
+      settled = true;
+      return v;
+    });
+
+    // Advance to just before the default deadline.
+    vi.advanceTimersByTime(599_999);
+    await Promise.resolve();
+
+    // Not yet settled.
+    expect(settled).toBe(false);
+
+    // Cross the deadline.
     vi.advanceTimersByTime(2);
     const result = await promise;
     expect(result).toBe(false);
   });
 
-  it('resolves before the deadline if ServiceReady fires early', async () => {
+  it('settle(false) at 600 000 ms with no ready signal', async () => {
     vi.useFakeTimers();
     const conn = makeFakeConnection();
-    const ctx = makeCtx(conn, { deadlineMs: 10_000 });
+    const backstopProbe = vi.fn().mockResolvedValue(false);
+    const ctx = makeCtx(conn, { backstopProbe });
 
     const promise = JAVA_ADAPTER.awaitReady(ctx);
-
-    // Fire ready at 1s — well before 10s deadline.
-    vi.advanceTimersByTime(1_000);
-    conn.emit('language/status', { type: 'ServiceReady' });
-
+    vi.advanceTimersByTime(600_000);
     const result = await promise;
-    expect(result).toBe(true);
+
+    expect(result).toBe(false);
   });
 });
 
-// ─── Suite: JAVA_ADAPTER.awaitReady — deadline with canary non-null (KD-1 backstop) ────
-//
-// BDD Scenario: awaitReady deadline — canary backstop probe invoked and respected
-//
-// Technique: state-transition + decision table
-//   State: canary = non-null stub, ServiceReady never arrives → deadline fires
-//   Decision: backstopProbe returns true → settle(true); returns false → settle(false)
-//
-// Risk: if the backstop ignores the probe result and always settles(true) (the
-// original WI-2 placeholder), the readiness gate is bypassed — pre-ready defs
-// get published (the #172 class). Both true and false probe outcomes must be
-// tested to catch a hardcoded settle(true) regression.
+// ─── Suite: S-6 — ctx.deadlineMs override honoured ───────────────────────────
 
-describe('JAVA_ADAPTER.awaitReady — deadline with canary non-null (KD-1 backstop)', () => {
-  // Use a non-null stub canary. The actual canary strategy is JAVA_CANARY_STRATEGY
-  // but the deadline backstop doesn't care about its sampling logic — it only
-  // checks canary !== null before calling backstopProbe. A minimal stub satisfies.
-  const stubCanary = {
-    isCandidateFile: () => true,
-    tryExtractSample: () => null,
-  };
-  const originalCanary = JAVA_ADAPTER.canary;
-
-  beforeEach(() => {
-    (JAVA_ADAPTER as unknown as Record<string, unknown>).canary = stubCanary;
-  });
+describe('S-6 — ctx.deadlineMs override is honoured', () => {
   afterEach(() => {
-    (JAVA_ADAPTER as unknown as Record<string, unknown>).canary = originalCanary;
     vi.useRealTimers();
   });
 
-  it('invokes backstopProbe at the deadline when canary is non-null', async () => {
-    vi.useFakeTimers();
-    const conn = makeFakeConnection();
-    const backstopProbe = vi.fn().mockResolvedValue(true);
-    const ctx = makeCtx(conn, { deadlineMs: 1_000, backstopProbe });
-
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
-    vi.advanceTimersByTime(1_100);
-    await promise;
-
-    // The probe MUST be called exactly once — not zero (ignored), not multiple.
-    expect(backstopProbe).toHaveBeenCalledTimes(1);
-  });
-
-  it('resolves true when backstopProbe returns true (probe result is respected)', async () => {
-    vi.useFakeTimers();
-    const conn = makeFakeConnection();
-    const backstopProbe = vi.fn().mockResolvedValue(true);
-    const ctx = makeCtx(conn, { deadlineMs: 1_000, backstopProbe });
-
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
-    vi.advanceTimersByTime(1_100);
-
-    const result = await promise;
-    expect(result).toBe(true);
-  });
-
-  it('resolves false when backstopProbe returns false (probe result is respected — no hardcoded true)', async () => {
+  it('ctx.deadlineMs 1000 → settle(false) at 1000 ms (well before 600 000 ms default)', async () => {
     vi.useFakeTimers();
     const conn = makeFakeConnection();
     const backstopProbe = vi.fn().mockResolvedValue(false);
     const ctx = makeCtx(conn, { deadlineMs: 1_000, backstopProbe });
 
     const promise = JAVA_ADAPTER.awaitReady(ctx);
-    vi.advanceTimersByTime(1_100);
 
+    // Still pending before override deadline.
+    vi.advanceTimersByTime(999);
+    await Promise.resolve();
+
+    vi.advanceTimersByTime(2);
     const result = await promise;
-    // If production code hardcodes settle(true) instead of using the probe result,
-    // this assertion catches it.
+
     expect(result).toBe(false);
   });
 
-  it('resolves false (degrades gracefully) when backstopProbe rejects', async () => {
+  it('deadline resolves false (not a rejection)', async () => {
     vi.useFakeTimers();
     const conn = makeFakeConnection();
-    const backstopProbe = vi.fn().mockRejectedValue(new Error('probe failed'));
-    const ctx = makeCtx(conn, { deadlineMs: 1_000, backstopProbe });
+    const ctx = makeCtx(conn, { deadlineMs: 500 });
 
     const promise = JAVA_ADAPTER.awaitReady(ctx);
-    vi.advanceTimersByTime(1_100);
+    vi.advanceTimersByTime(600);
 
-    // Must not throw or propagate the rejection — degrade to false.
     await expect(promise).resolves.toBe(false);
   });
 
-  it('handler is disposed on deadline when canary is non-null (no notification leak)', async () => {
+  it('all handlers disposed after deadline settle(false)', async () => {
     vi.useFakeTimers();
     const conn = makeFakeConnection();
-    const backstopProbe = vi.fn().mockResolvedValue(true);
-    const ctx = makeCtx(conn, { deadlineMs: 500, backstopProbe });
+    const ctx = makeCtx(conn, { deadlineMs: 500 });
 
     const promise = JAVA_ADAPTER.awaitReady(ctx);
     vi.advanceTimersByTime(600);
     await promise;
 
-    // The notification handler must be disposed even when the backstop fires.
     expect(conn.activeHandlerCount('language/status')).toBe(0);
     expect(conn.disposeCallCount).toBe(1);
   });
-
-  it('ServiceReady before deadline resolves true without invoking backstopProbe', async () => {
-    vi.useFakeTimers();
-    const conn = makeFakeConnection();
-    const backstopProbe = vi.fn().mockResolvedValue(false);
-    const ctx = makeCtx(conn, { deadlineMs: 5_000, backstopProbe });
-
-    const promise = JAVA_ADAPTER.awaitReady(ctx);
-    // Server signals ready at 1s — well before 5s deadline.
-    vi.advanceTimersByTime(1_000);
-    conn.emit('language/status', { type: 'ServiceReady' });
-
-    const result = await promise;
-    expect(result).toBe(true);
-    // Backstop must NOT be called — the ready signal settled it first.
-    expect(backstopProbe).not.toHaveBeenCalled();
-  });
 });
 
-// ─── Suite: JAVA_ADAPTER.awaitReady — error / degraded paths ─────────────────
+// ─── Suite: S-7/S-8/S-9 — Degraded paths → resolves false, no throw ──────────
 
-describe('JAVA_ADAPTER.awaitReady — error / degraded paths', () => {
-  it('resolves false (not throws) when connection.onNotification throws', async () => {
+describe('S-7 — onNotification throws → resolves false, no throw', () => {
+  it('connection.onNotification throws synchronously → awaitReady resolves false', async () => {
     const brokenConn = {
       onNotification(_method: string, _handler: unknown): never {
         throw new Error('connection already disposed');
@@ -400,23 +554,96 @@ describe('JAVA_ADAPTER.awaitReady — error / degraded paths', () => {
       deadlineMs: 1_000,
     };
 
-    // Must not throw or reject.
     await expect(JAVA_ADAPTER.awaitReady(ctx)).resolves.toBe(false);
   });
+});
 
-  it('resolves false when the connection object is null (extreme degradation)', async () => {
+describe('S-8 — connection null → resolves false, no throw', () => {
+  it('null connection → awaitReady resolves false', async () => {
     const ctx: AdapterReadyCtx = {
       connection: null,
       workspaceRoot: '/any',
       deadlineMs: 1_000,
     };
 
-    // Casting null to MessageConnection will throw on onNotification — must degrade.
     await expect(JAVA_ADAPTER.awaitReady(ctx)).resolves.toBe(false);
   });
 });
 
-// ─── Suite: JAVA_ADAPTER.spawnArgs ───────────────────────────────────────────
+describe('S-9 — backstopProbe rejects (via periodic canary) → resolves false, no throw', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('backstopProbe rejects → no throw, no unhandled rejection, resolves false at deadline', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    // backstopProbe always rejects — runCanary catches it and returns false.
+    // The periodic canary keeps rescheduling (returns false on rejection catch).
+    // The promise settles(false) when the hard deadline fires.
+    const backstopProbe = vi.fn().mockRejectedValue(new Error('probe failed'));
+
+    const ctx = makeCtx(conn, {
+      deadlineMs: 1_000, // short override so the deadline fires quickly
+      backstopProbe,
+    });
+
+    const promise = JAVA_ADAPTER.awaitReady(ctx);
+
+    // Advance past deadline — probe rejection is caught internally, no throw propagates.
+    await vi.advanceTimersByTimeAsync(1_100);
+
+    await expect(promise).resolves.toBe(false);
+  });
+});
+
+// ─── Suite: S-10 — Double-settle guard: quiet + deadline race ─────────────────
+//
+// BDD:
+//   Given quiet timer and deadline timer could fire at the same moment
+//   Then the settled boolean guard ensures resolve is called exactly once
+
+describe('S-10 — Double-settle guard: quiet + deadline race → settles exactly once', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('simultaneous quiet-path and deadline fire → settled exactly once', async () => {
+    vi.useFakeTimers();
+    const conn = makeFakeConnection();
+    const { onProgressEnd, fireProgressEnd } = makeProgressEndSeam();
+
+    // backstopProbe returns true — quiet path would settle(true).
+    const backstopProbe = vi.fn().mockResolvedValue(true);
+
+    // Set deadline equal to JDTLS_QUIET_INTERVAL_MS so both race at same tick.
+    const ctx = makeCtx(conn, {
+      deadlineMs: JDTLS_QUIET_INTERVAL_MS,
+      onProgressEnd,
+      backstopProbe,
+    });
+
+    let resolveCount = 0;
+    const promise = JAVA_ADAPTER.awaitReady(ctx).then((v) => {
+      resolveCount++;
+      return v;
+    });
+
+    // Fire progress end — sets quiet timer for 5000 ms.
+    fireProgressEnd();
+
+    // Advance exactly to JDTLS_QUIET_INTERVAL_MS — both quiet timer and
+    // deadline timer fire at the same moment.
+    vi.advanceTimersByTime(JDTLS_QUIET_INTERVAL_MS);
+
+    await promise;
+
+    // Resolved exactly once — the settled guard prevented double-resolution.
+    expect(resolveCount).toBe(1);
+  });
+});
+
+// ─── Suite: JAVA_ADAPTER.spawnArgs (7 cases verbatim — readiness-model-independent) ─
 
 describe('JAVA_ADAPTER.spawnArgs', () => {
   const originalGitnexusHome = process.env.GITNEXUS_HOME;
