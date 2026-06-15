@@ -469,9 +469,13 @@ export async function mapLocationToNodeId(
   //      are absolute after `path.relative`) are stdlib / external
   //      deps — they yield `NO_NODE`, which is the correct refusal.
   // WI-5 (#159 P5): External-refusal adapter gate — used below to gate external:true.
-  // `external:true` fires when the adapter id is 'python' or 'go' (ruling #1).
+  // `external:true` fires when the adapter id is 'python', 'go', or 'rust' (ruling #1).
+  // WI-4 (#159): added 'rust' — rust-analyzer returns stdlib paths under ~/.rustup/toolchains
+  // and crate paths under ~/.cargo/registry; both must refuse with external:true (AC-7/AC-8).
   const isExternalRefusalAdapter =
-    resolvedDeps.adapterId === 'python' || resolvedDeps.adapterId === 'go';
+    resolvedDeps.adapterId === 'python' ||
+    resolvedDeps.adapterId === 'go' ||
+    resolvedDeps.adapterId === 'rust';
 
   // WI-5: hoisted so the isOutOfRepo predicate at the end of this block can
   // see the flag regardless of which `if/else` branch was taken.

@@ -284,6 +284,37 @@ export class LspClient {
    */
   private readonly _progressEndSubs = new Set<(token: string | number) => void>();
 
+  /**
+   * Latest `experimental/serverStatus` payload received from rust-analyzer (WI-3b2).
+   *
+   * Populated by the pre-`initialize` `experimental/serverStatus` handler
+   * (registered in `spawnAndInitialize` before `connection.sendRequest('initialize', …)`).
+   * Holds the most-recent `{ quiescent, health }` payload; overwrites on each
+   * subsequent notification. `undefined` until the first notification arrives.
+   *
+   * Read by `RUST_ADAPTER.awaitReady`. Cleared (→ `undefined`) at the start of
+   * each `spawnAndInitialize` call so restarts start with a clean buffer.
+   *
+   * Non-Rust adapters never register the `experimental/serverStatus` handler
+   * (capability-gated on `experimental?.serverStatusNotification`), so this
+   * field is always `undefined` for TS/Java/Python/Go.
+   */
+  serverStatusLatest: { quiescent: boolean; health: string } | undefined = undefined;
+
+  /**
+   * Subscriber registry for `experimental/serverStatus` notifications (WI-3b2).
+   *
+   * Callbacks registered via `ctx.onServerStatus(cb)` are stored here.
+   * The pre-`initialize` `experimental/serverStatus` handler invokes each live
+   * callback with the latest payload immediately after storing it in
+   * `serverStatusLatest`. Cleared at the start of each `spawnAndInitialize`
+   * (restart-clean) along with `serverStatusLatest`.
+   *
+   * Non-Rust adapters never register the handler (capability-gated), so this
+   * set is never notified from their code paths.
+   */
+  private readonly _serverStatusSubs = new Set<(payload: { quiescent: boolean; health: string }) => void>();
+
   private readonly workspaceRoot: string;
   private readonly binaryOverride: string | null;
   private readonly maxRestarts: number;
@@ -645,6 +676,11 @@ export class LspClient {
     this.progressEndedTokens.clear();
     // Clear subscriber registry — restart starts with no stale subscribers (WI-2a).
     this._progressEndSubs.clear();
+    // Clear the serverStatus seam for this spawn attempt (WI-3b2).
+    // On restart, a stale quiescent:true from a prior session must not
+    // satisfy a fresh awaitReady — the new session has not yet loaded.
+    this.serverStatusLatest = undefined;
+    this._serverStatusSubs.clear();
 
     // Resolve binary (memoize so a degraded -> start cycle
     // doesn't re-discover if the caller already gave us a
@@ -701,8 +737,17 @@ export class LspClient {
       connection = fake.connection;
     } else {
       try {
+        // Use the original binaryOverride path (not the realpath'd resolvedBinary)
+        // when a binaryOverride was supplied.  Tools like rustup act as proxy
+        // shims: the file at `~/.cargo/bin/rust-analyzer` is a symlink → rustup
+        // that dispatches based on argv[0].  realpathSync() resolves the symlink
+        // to `~/.cargo/bin/rustup` — spawning that canonical path sets argv[0]
+        // to "rustup", which causes rustup to print its own usage and exit(1)
+        // instead of proxying to the underlying rust-analyzer binary.
+        // Preserving the symlink keeps argv[0] as "rust-analyzer".
+        const spawnPath = this.binaryOverride ?? this.resolvedBinary;
         proc = spawn(
-          this.resolvedBinary,
+          spawnPath!,
           this.adapter.spawnArgs({ workspaceRoot: this.workspaceRoot }),
           {
             stdio: ['pipe', 'pipe', 'pipe'],
@@ -814,6 +859,40 @@ export class LspClient {
       }
     }
 
+    // ── R2-2 (Rust): Pre-initialize experimental/serverStatus handler ─────────
+    //
+    // rust-analyzer emits `experimental/serverStatus` at sinceInitialized≈20ms —
+    // the same message batch as the `initialized` write. Registering inside
+    // `awaitReady` (post-`initialized`) WILL miss the notification (the #172 bug
+    // class). We MUST register BEFORE sending `initialize`.
+    //
+    // Capability-gated: only when `adapter.clientCapabilities?.experimental?.serverStatusNotification`
+    // is truthy. TS/Java/Python/Go adapters omit `experimental` → they skip this
+    // block entirely → zero new handlers registered, zero wire-behavior change.
+    if (this.adapter.clientCapabilities?.experimental?.serverStatusNotification) {
+      try {
+        connection.onNotification('experimental/serverStatus', (params: unknown) => {
+          // Defensive parse: experimental is typed Record<string,unknown> (I-13).
+          if (params === null || typeof params !== 'object') return;
+          const p = params as Record<string, unknown>;
+          const quiescent = p['quiescent'];
+          const health = p['health'];
+          if (typeof quiescent !== 'boolean' || typeof health !== 'string') return;
+          // Update the holder. awaitReady reads this field as the buffer-hit path.
+          this.serverStatusLatest = { quiescent, health };
+          // Notify all live subscribers (WI-3b2).
+          // Snapshot-iterate so a callback that calls dispose() synchronously
+          // does not mutate the Set mid-iteration.
+          for (const cb of [...this._serverStatusSubs]) {
+            try { cb({ quiescent, health }); } catch { /* never crash the handler */ }
+          }
+        });
+      } catch {
+        // Registration failed (e.g. connection already disposed) — proceed anyway;
+        // awaitReady will fall to the canary backstop on deadline.
+      }
+    }
+
     // Send `initialize` with workspaceFolders.
     // R2-1: use adapter.clientCapabilities if present; fall back to the shared
     // TS_SERVER_CAPABILITIES object (as const, byte-identical for TS/Java/Python).
@@ -884,11 +963,29 @@ export class LspClient {
               },
             }
           : {};
+
+      // WI-3b2: thread serverStatus read-seam fields only for adapters that
+      // registered the experimental/serverStatus handler (capability-gated:
+      // experimental?.serverStatusNotification truthy).
+      // TS/Java/Python/Go receive undefined for both fields — their awaitReady
+      // implementations do not read them, so the ctx is structurally unchanged.
+      const serverStatusSeam: Pick<AdapterReadyCtx, 'serverStatusLatest' | 'onServerStatus'> =
+        this.adapter.clientCapabilities?.experimental?.serverStatusNotification
+          ? {
+              serverStatusLatest: this.serverStatusLatest,
+              onServerStatus: (cb: (payload: { quiescent: boolean; health: string }) => void) => {
+                this._serverStatusSubs.add(cb);
+                return { dispose: () => { this._serverStatusSubs.delete(cb); } };
+              },
+            }
+          : {};
+
       const ctx: AdapterReadyCtx = {
         connection,
         workspaceRoot: this.workspaceRoot,
         // deadlineMs omitted → adapter default (120 000 ms for jdtls)
         ...progressSeam,
+        ...serverStatusSeam,
       };
       if (!(await this.adapter.awaitReady(ctx))) {
         this.cleanupAfterFailure();
