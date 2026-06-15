@@ -139,6 +139,21 @@ export interface SessionMeta {
   requestTimeoutMs: number;
   /** Cap actually applied (default 2000; overridable via deps). */
   cap: number;
+  /**
+   * Count of candidates for which a `textDocument/definition` request
+   * was actually issued (i.e. passed the `isUnindexablePath` pre-filter
+   * and the `line`/`character` bounds gate). Populated by the dispatch
+   * loop BEFORE calling the work fn; zero if no requests were issued.
+   */
+  probed: number;
+  /**
+   * Count of candidates skipped by the `isUnindexablePath` pre-filter
+   * inside `fetchDefinitionForCandidate`. Distinct from `refused`
+   * (post-probe refusal when LSP returns no node or a non-callable
+   * node) and from `skipped` (cap-trimmed candidates that never
+   * entered the dispatch loop). Populated before calling the work fn.
+   */
+  preFilteredExternal: number;
 }
 
 /**
@@ -260,6 +275,53 @@ export interface WithReconciliationSessionDeps {
    * reads it from the discover result.
    */
   serverVersion?: string;
+  /**
+   * External pre-filter seam (WI-8).
+   *
+   * Called once per candidate BEFORE `fetchDefinitionForCandidate`.
+   * Return `true` ONLY when the candidate is PROVABLY EXTERNAL via
+   * a graph node-lookup — i.e. `graph.getNode(candidate.oldTargetId)`
+   * returns a node with `properties.isExternal === true`, OR the node
+   * is absent (undefined) for a correction candidate whose oldTargetId
+   * targets a known external-zone node id.
+   *
+   * Invariants (I-2c — no false skips):
+   *   - MUST return `false` for recall candidates (no `oldTargetId`).
+   *   - MUST return `false` for ambiguous/uncertain correction candidates.
+   *   - MUST return `false` when the lookup result is inconclusive.
+   *   - Return `true` only for correction candidates with a graph node
+   *     that is definitively external-zone.
+   *
+   * When absent from the deps bag, the session defaults to `() => false`
+   * (never-skip) — preserving pre-WI-8 behaviour exactly (backward compat).
+   *
+   * Skipped candidates increment `meta.preFilteredExternal` (not `meta.probed`);
+   * they are NOT handed to `handToEngine` and do NOT receive an LSP request.
+   */
+  canSkipCandidate?: (candidate: Candidate) => boolean;
+  /**
+   * WS-B / I-2d: discriminated gate-failure side-channel.
+   *
+   * Called (at most once) when the session refuses WITHOUT running the
+   * work fn. The `reason` distinguishes the three failure modes so the
+   * caller (pipeline.ts) can emit the correct per-path funnel message:
+   *
+   *   'no-server'      — `discoverServers` returned no entry for this adapter,
+   *                      OR `client.start()` threw.
+   *   'not-ready'      — probe returned `{ ready: false }`.
+   *   'dispatch-error' — an error was thrown inside the try block
+   *                      (per-candidate dispatch or fn threw) BEFORE
+   *                      the work fn completed.
+   *
+   * `elapsedS` is the formatted elapsed seconds string (e.g. `'2.5'`)
+   * measured from session entry to the gate failure, so the caller can
+   * embed it in messages like `'jdtls not ready after Xs'` without a
+   * separate timer.
+   *
+   * Optional — omitting it preserves the existing null-return contract
+   * exactly, so all existing tests that never pass this dep are unaffected.
+   */
+  onGateFailure?: (reason: 'no-server' | 'not-ready' | 'dispatch-error', elapsedS: string) => void;
 }
 
 // ─── Defaults (KD-9, KD-10) ────────────────────────────────────────────
@@ -392,6 +454,11 @@ export async function withReconciliationSession<T>(
   //   LanguageAdapter → use the supplied adapter (TS, Java, …).
   const adapter: LanguageAdapter | null =
     deps.adapter !== undefined ? deps.adapter : TYPESCRIPT_ADAPTER;
+  // WS-B / I-2d: gate-failure side-channel. Extract early so all failure
+  // branches below can call it. Callers that need per-reason funnel messages
+  // (e.g. pipeline.ts) pass this dep; others (existing unit tests) omit it —
+  // preserving the null-return contract exactly.
+  const onGateFailure = deps.onGateFailure;
   if (adapter === null) {
     // No supported language detected — skip the funnel cleanly.
     return null;
@@ -423,6 +490,8 @@ export async function withReconciliationSession<T>(
   const serverEntry = (discovered as Record<string, { path: string; version: string } | null | undefined>)[adapter.id] ?? null;
   if (!serverEntry) {
     // No server for this adapter's language. No client was created → no stop needed.
+    // I-2d: notify with 'no-server' so callers can emit the correct funnel message.
+    onGateFailure?.('no-server', '0.0');
     return null;
   }
   const serverVersion = deps.serverVersion ?? serverEntry.version;
@@ -441,6 +510,9 @@ export async function withReconciliationSession<T>(
     // start() threw (e.g. spawn failed). We have no client we
     // can stop — the client was either never constructed or
     // was torn down internally. Return null.
+    // I-2d: classify as 'no-server' (the server binary is unavailable or
+    // crashed on start — indistinguishable from "no binary found" at this level).
+    onGateFailure?.('no-server', '0.0');
     return null;
   }
 
@@ -454,10 +526,22 @@ export async function withReconciliationSession<T>(
   const probe = deps.probe ?? defaultProbe;
   const requestTimeoutMs = deps.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const handToEngine = deps.handToEngine ?? defaultHandToEngine;
-  const meta: SessionMeta = { serverVersion, requestTimeoutMs, cap };
+  // WI-8: external pre-filter seam. Defaults to () => false (never-skip)
+  // when not injected — preserving pre-WI-8 behaviour exactly.
+  const canSkipCandidate = deps.canSkipCandidate ?? (() => false);
+  // WI-5: probed/preFilteredExternal start at 0 and are incremented
+  // in the dispatch loop below. meta is built here so the fields
+  // exist; values are written before fn() is called.
+  const meta: SessionMeta = { serverVersion, requestTimeoutMs, cap, probed: 0, preFilteredExternal: 0 };
+  // Measure elapsed time from here so the not-ready message can carry
+  // a meaningful duration (the probe itself may spin for up to 600s on
+  // a slow jdtls workspace build).
+  const sessionStart = Date.now();
   try {
     const probeResult = await probe(client);
     if (!probeResult.ready) {
+      const elapsedS = ((Date.now() - sessionStart) / 1000).toFixed(1);
+      onGateFailure?.('not-ready', elapsedS);
       return null;
     }
     // Per-candidate dispatch loop. Each iteration issues ONE
@@ -492,8 +576,28 @@ export async function withReconciliationSession<T>(
       selected,
       CONCURRENT_DEFINITION_REQUESTS,
       async (candidate) => {
-        const locations = await fetchDefinitionForCandidate(client, candidate, requestTimeoutMs, uriCache, repo.repoPath);
-        await handToEngine(candidate, locations);
+        // WI-8: external pre-filter seam fires BEFORE the LSP request.
+        // Return true ONLY for provably-external correction candidates
+        // (I-2c: no false skips). Recall candidates must always probe.
+        if (canSkipCandidate(candidate)) {
+          meta.preFilteredExternal++;
+          // Do NOT call handToEngine — the candidate is excluded from
+          // the locations map; reconcileDecisions will see locs=[] →
+          // NO_NODE → keep (I-8-replay invariant preserved).
+          return;
+        }
+        const result = await fetchDefinitionForCandidate(client, candidate, requestTimeoutMs, uriCache, repo.repoPath);
+        if (result.preFiltered) {
+          // WI-5: isUnindexablePath pre-filter fired — count as
+          // preFilteredExternal (NOT probed).
+          meta.preFilteredExternal++;
+        } else {
+          // WI-5: a `textDocument/definition` request was actually
+          // issued (or would have been, before a position/URI error
+          // short-circuit — those are still not pre-filter).
+          meta.probed++;
+        }
+        await handToEngine(candidate, result.locations);
       },
     );
     return await fn(selected, meta, skipped);
@@ -503,6 +607,9 @@ export async function withReconciliationSession<T>(
     // crash must not abort the index — it must yield a coherent
     // heuristic result). The finally below still runs to stop
     // the client.
+    // I-2d: classify as 'dispatch-error' so callers can log the error path.
+    const elapsedS = ((Date.now() - sessionStart) / 1000).toFixed(1);
+    onGateFailure?.('dispatch-error', elapsedS);
     return null;
   } finally {
     // I-5: once we have a started client, we ALWAYS stop it on
@@ -648,13 +755,15 @@ async function fetchDefinitionForCandidate(
   // resolves against `process.cwd()` and the LSP server (rooted
   // at the repo) sees a non-existent / out-of-workspace path.
   repoRoot: string,
-): Promise<Location[]> {
+): Promise<{ locations: Location[]; preFiltered: boolean }> {
   // M8: validate the file path is one the engine would ever
   // index. Vendored / declaration / dist paths are
   // unindexable per the location-mapper's predicate; we
   // refuse before we spend a request budget.
+  // WI-5: callers that hit this branch are counted as
+  // `preFilteredExternal` (NOT `probed`) — see dispatch loop.
   if (isUnindexablePath(candidate.file)) {
-    return [];
+    return { locations: [], preFiltered: true };
   }
 
   // security-3 (polish MAJOR): gate `line` / `character`
@@ -671,13 +780,15 @@ async function fetchDefinitionForCandidate(
   // fractional floats, and string-encoded numbers. The
   // `< 0` clause rejects negative offsets. Both are
   // cheap (constant time) and run before any I/O.
+  // WI-5: bad-position candidates are NOT pre-filtered and
+  // NOT probed — they contribute to `refused` via NO_NODE.
   if (
     !Number.isInteger(candidate.line) ||
     !Number.isInteger(candidate.character) ||
     candidate.line < 0 ||
     candidate.character < 0
   ) {
-    return [];
+    return { locations: [], preFiltered: false };
   }
 
   // Build the `textDocument/definition` params. The file
@@ -720,7 +831,7 @@ async function fetchDefinitionForCandidate(
         // `pathToFileURL` can throw on bizarre inputs (e.g.
         // a relative path with a NUL byte). Refuse over
         // guess: skip the candidate.
-        return [];
+        return { locations: [], preFiltered: false };
       }
     }
   }
@@ -735,9 +846,9 @@ async function fetchDefinitionForCandidate(
     // belt-and-braces.
     raw = await client.request(TEXT_DOCUMENT_DEFINITION, params, timeoutMs);
   } catch {
-    return [];
+    return { locations: [], preFiltered: false };
   }
-  return normalizeLocations(raw);
+  return { locations: normalizeLocations(raw), preFiltered: false };
 }
 
 /**
@@ -987,6 +1098,24 @@ export interface ReconciliationReport {
   refused: number;
   /** Number of candidates skipped by the cap. */
   skipped: number;
+  /**
+   * Count of candidates for which a `textDocument/definition` request
+   * was actually issued (passed the `isUnindexablePath` pre-filter and
+   * the `line`/`character` bounds gate). The engine receives this from
+   * the pipeline via `ReconcileDecisionsDeps.probed`; `reconcileDecisions`
+   * itself always returns 0 (the dispatch is the session's concern).
+   * The pipeline builds `lspReport` by combining this value from the
+   * `SessionMeta` the work-fn received.
+   */
+  probed: number;
+  /**
+   * Count of candidates skipped by the `isUnindexablePath` pre-filter
+   * inside the dispatch loop. Distinct from `refused` (post-probe LSP
+   * refusal) and from `skipped` (cap-trimmed). Always 0 when returned
+   * by `reconcileDecisions` — populated by the pipeline from
+   * `SessionMeta.preFilteredExternal`.
+   */
+  preFilteredExternal: number;
   /**
    * NOTE: The engine does NOT carry the LSP server version — the
    * session passes it through `SessionMeta` and the pipeline
@@ -1926,6 +2055,12 @@ export async function reconcileDecisions(
     // threads the real count (feed.length − selected.length)
     // through `deps.skipped`. The engine never infers it.
     skipped,
+    // WI-5: `reconcileDecisions` does NOT perform the dispatch —
+    // probed/preFilteredExternal are always 0 here. The pipeline
+    // populates these from `SessionMeta` (returned by the work-fn)
+    // when assembling the final `lspReport`.
+    probed: 0,
+    preFilteredExternal: 0,
   };
 }
 

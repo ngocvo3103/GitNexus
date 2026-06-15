@@ -32,6 +32,7 @@ program
    .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
    .option('--lsp', 'Augment CALLS resolution with the TypeScript language server (TS-only, CALLS-only, confidence 0.70)')
    .option('--lsp-dry-run', 'Preview every LSP reconciliation decision and write nothing; implies --lsp')
+   .option('--lsp-budget <n>', 'Limit LSP candidate cap to n (positive integer; default 2000); requires --lsp', (v) => Number(v))
    .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 

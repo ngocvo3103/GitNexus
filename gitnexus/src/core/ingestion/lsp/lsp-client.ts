@@ -255,8 +255,8 @@ export class LspClient {
    * confirmed for gopls), so the matcher MUST look up the stored title from this
    * map — never read `end.title` directly.
    *
-   * Read by `GO_ADAPTER.awaitReady` (WI-2).  Cleared on each `spawnAndInitialize`
-   * call so restarts start with a clean buffer.
+   * Read by `GO_ADAPTER.awaitReady` and `JAVA_ADAPTER.awaitReady` (WI-2).
+   * Cleared on each `spawnAndInitialize` call so restarts start with a clean buffer.
    */
   readonly progressTokenTitles = new Map<string | number, string>();
 
@@ -267,6 +267,10 @@ export class LspClient {
    * `$/progress` handler.  `awaitReady` checks this set to detect a
    * begin+end pair that arrived BEFORE `awaitReady` was invoked (the
    * begin-before-awaitReady buffering guarantee).
+   *
+   * Populated for Go and Java (both set `workDoneProgress: true`).
+   * `undefined`-equivalent (empty) for TS/Python — their handlers never
+   * register, so this set is never populated from those code paths.
    */
   readonly progressEndedTokens = new Set<string | number>();
 
@@ -279,8 +283,8 @@ export class LspClient {
    * Cleared at the start of each `spawnAndInitialize` (restart-clean) along
    * with `progressTokenTitles` and `progressEndedTokens`.
    *
-   * Non-Go adapters never register the `$/progress` handler (capability-gated),
-   * so this set is never notified from their code paths.
+   * Only adapters with `clientCapabilities?.window?.workDoneProgress = true`
+   * (Go, Java) register the `$/progress` handler; TS/Python never notify this set.
    */
   private readonly _progressEndSubs = new Set<(token: string | number) => void>();
 
@@ -813,7 +817,7 @@ export class LspClient {
     // backstop (the #172 bug class). We MUST register before sending `initialize`.
     //
     // Capability-gated: only when `adapter.clientCapabilities?.window?.workDoneProgress`
-    // is truthy.  TS/Java/Python adapters omit `clientCapabilities` → they skip
+    // is truthy. Go and Java set this; TS/Python omit `clientCapabilities` → they skip
     // this block entirely → zero new handlers registered, zero wire-behavior change.
     if (this.adapter.clientCapabilities?.window?.workDoneProgress) {
       try {
@@ -948,10 +952,10 @@ export class LspClient {
     // leak into the caller), matching the surrounding handshake
     // discipline above.
     try {
-      // WI-2a: thread progress read-seam fields only for adapters that registered
+      // WI-2: thread progress read-seam fields only for adapters that registered
       // the $/progress handler (capability-gated: workDoneProgress === true).
-      // TS/Java/Python receive undefined for all three fields — their awaitReady
-      // implementations do not read them, so the ctx is structurally unchanged.
+      // Go and Java both set workDoneProgress: true and receive all three fields.
+      // TS/Python receive undefined — their awaitReady implementations do not read them.
       const progressSeam: Pick<AdapterReadyCtx, 'progressTokenTitles' | 'progressEndedTokens' | 'onProgressEnd'> =
         this.adapter.clientCapabilities?.window?.workDoneProgress
           ? {

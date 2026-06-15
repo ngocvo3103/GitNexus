@@ -69,6 +69,12 @@ export interface AnalyzeOptions {
    * decision but never mutates the graph.
    */
   lspDryRun?: boolean;
+  /**
+   * WI-6 (#159 P3): when set, overrides the default candidate cap (2000)
+   * passed to `withReconciliationSession`. Must be a positive integer.
+   * Requires `--lsp`; silently ignored (with a warning) when `lsp` is false.
+   */
+  lspBudget?: number;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -130,6 +136,26 @@ export const analyzeCommand = async (
 
   if (options?.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
+  }
+
+  // WI-6: validate --lsp-budget before any I/O. Commander passes option values
+  // as strings; Number() coerces them. We require a positive integer — zero,
+  // negative, fractional, and non-numeric values are all rejected here so no
+  // bad cap ever reaches withReconciliationSession.
+  // WS-B: validation is placed here in the action callback so it fires both
+  // from the CLI path (via commander) and from programmatic callers. This is
+  // the sole guard point; pipeline.ts receives only valid values.
+  if (options?.lspBudget !== undefined) {
+    const n = options.lspBudget;
+    if (!Number.isInteger(n) || n <= 0) {
+      console.error(`  Error: --lsp-budget must be a positive integer (got ${n})`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!options?.lsp && !options?.lspDryRun) {
+      // Warn but don't crash — the run proceeds without LSP.
+      console.warn('  Warning: --lsp-budget ignored: --lsp not enabled');
+    }
   }
 
   console.log('\n  GitNexus Analyzer\n');
@@ -302,6 +328,10 @@ export const analyzeCommand = async (
     lsp: {
       enabled: options?.lsp === true || options?.lspDryRun === true,
       dryRun: options?.lspDryRun === true,
+      // WI-6: thread the validated budget (positive integer) through to the
+      // session cap. undefined when --lsp-budget was not supplied; the
+      // pipeline falls back to DEFAULT_CANDIDATE_CAP=2000 via ?? fallback.
+      budget: options?.lspBudget,
     },
   });
 
