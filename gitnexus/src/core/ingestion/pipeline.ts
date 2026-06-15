@@ -19,7 +19,7 @@ import { extractDependencies } from './dependency-extractor.js';
 // WI-5 (#159 P3 Mode A): the reconciler is imported here — it lives at
 // `core/ingestion/mode-a-reconciler.ts` and mutates ONLY the in-memory
 // graph; it imports no direct-DB writer (I-7).
-import { withReconciliationSession, applyDecisions, reconcileDecisions, candidateLocationKey, type Candidate, type Location, type ReconciliationReport } from './mode-a-reconciler.js';
+import { withReconciliationSession, applyDecisions, reconcileDecisions, candidateLocationKey, DEFAULT_CANDIDATE_CAP, type Candidate, type Location, type ReconciliationReport, type SessionMeta } from './mode-a-reconciler.js';
 import { selectAdapter } from './lsp/language-adapter.js';
 import { mapLocationToNodeId } from './lsp/location-mapper.js';
 import { createInMemoryNodeQuery, type InMemoryNode } from './in-memory-node-query.js';
@@ -69,6 +69,18 @@ export interface PipelineOptions {
   lsp?: {
     enabled?: boolean;
     dryRun?: boolean;
+    /**
+     * WI-6 (#159 P3): override the candidate cap passed to
+     * `withReconciliationSession` (default: `DEFAULT_CANDIDATE_CAP=2000`).
+     * Must be a positive integer — the CLI validates this before the pipeline
+     * is called. The `??` fallback in the LSP block picks the default when
+     * `budget` is `undefined`.
+     *
+     * NOTE: `0 ?? DEFAULT_CANDIDATE_CAP` does NOT coalesce on zero — that
+     * case is rejected at the CLI validation layer (`n <= 0` guard) before
+     * it ever reaches this field.
+     */
+    budget?: number;
   };
 }
 
@@ -751,6 +763,17 @@ export const runPipelineFromRepo = async (
         dedupedCandidates.push(c);
       }
 
+      // WI-5: capture N (total deduped candidates) and B (budget cap) BEFORE
+      // withReconciliationSession so these values survive all exit paths —
+      // gate-failure (null), error (rethrow), and success — and the funnel
+      // line always has correct values even if the session never ran.
+      const lspN = dedupedCandidates.length;
+      // WI-6: use the CLI-supplied budget when present; fall back to the
+      // default 2000. The CLI validation layer guarantees `budget` is a
+      // positive integer when defined — the `??` fallback here correctly
+      // passes through `undefined` (not set) but NEVER `0` (rejected at CLI).
+      const lspB = options?.lsp?.budget ?? DEFAULT_CANDIDATE_CAP;
+
       // WI-6 (#159 P3): select the language adapter once for this
       // repo. `selectAdapter` performs an extension census (KD-4)
       // and returns the dominant adapter or `null` (no supported
@@ -800,7 +823,30 @@ export const runPipelineFromRepo = async (
         stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
       });
 
-      const sessionResult = await withReconciliationSession(
+      // WS-B / I-2d: capture gate-failure reason + elapsed via side-channel so
+      // pipeline.ts can emit the correct per-path funnel message when the session
+      // returns null. Two distinct cases:
+      //   'not-ready'  → 'LSP augmentation skipped: jdtls not ready after Xs'
+      //                  (no budget suffix, per C5-12 / WS-B spec).
+      //   'no-server'  → gate-failure format via buildLspSummaryLine (with suffix).
+      //   'dispatch-error' → already logged in the reconcileDecisions catch below;
+      //                  onGateFailure fires only when the session's own try/catch
+      //                  fires, NOT for errors in reconcileDecisions/applyDecisions.
+      let gateFailureReason: 'no-server' | 'not-ready' | 'dispatch-error' | null = null;
+      let gateFailureElapsedS = '0.0';
+
+      // I-8-replay: track candidate keys that canSkipCandidate pre-filtered so
+      // reconcileDecisions can exclude them. Without this, they replay as [] →
+      // NO_NODE → keep/refuse and inflate refused/kept counts incorrectly.
+      const preFilteredKeys = new Set<string>();
+
+      const sessionResult = await withReconciliationSession<{
+        meta: SessionMeta;
+        selectedCount: number;
+        skipped: number;
+        probed: number;
+        preFilteredExternal: number;
+      }>(
         { id: ctx.repoId ?? 'default', repoPath },
         dedupedCandidates,
         async (selected, meta, skipped) => {
@@ -808,9 +854,17 @@ export const runPipelineFromRepo = async (
           // `textDocument/definition` requests; the engine
           // seam is `handToEngine`. The session has already
           // populated `locations` by the time the work fn
-          // runs. We return the meta + skipped count so the
-          // outer code can report it.
-          return { meta, selectedCount: selected.length, skipped };
+          // runs. We return meta + skipped + the dispatch
+          // counters directly (WS-B work-fn payload spec).
+          // WI-5: meta.probed and meta.preFilteredExternal are set
+          // by the dispatch loop before this work-fn is called.
+          return {
+            meta,
+            selectedCount: selected.length,
+            skipped,
+            probed: meta.probed,
+            preFilteredExternal: meta.preFilteredExternal,
+          };
         },
         {
           // WI-6: pass the selected adapter (or null) so the
@@ -857,6 +911,66 @@ export const runPipelineFromRepo = async (
             // if the key shape ever evolves.
             locations.set(candidateLocationKey(candidate), responseLocs);
           },
+          // WI-6: pass the resolved budget as the session cap so
+          // withReconciliationSession uses the CLI-supplied value
+          // instead of its own DEFAULT_CANDIDATE_CAP default.
+          cap: lspB,
+          // WI-8: external pre-filter. Uses graph.getNode(oldTargetId)
+          // to detect correction candidates whose heuristic target is
+          // an external-zone node (NodeProperties.isExternal===true).
+          // EP-D (BLOCKER): an absent node must NOT be skipped — it could
+          // be a deleted workspace symbol that never had `isExternal` set.
+          // The conservative rule is: only skip when the node is PRESENT
+          // and isExternal===true; absent → probe (let the engine decide).
+          //
+          // I-8-replay invariant: when canSkipCandidate returns true, the
+          // candidate key is recorded in `preFilteredKeys` so it can be
+          // excluded from the reconcileDecisions replay set below. Without
+          // exclusion, the engine would see locs=[] → NO_NODE → keep/refuse
+          // and those outcomes would corrupt confirmed/corrected/recall/refused
+          // counts (the candidate was never probed — it must not score).
+          //
+          // Invariants (I-2c — no false skips):
+          //   - Recall candidates (no oldTargetId) → always false.
+          //   - oldTargetId present but node is undefined → false
+          //     (EP-D: conservative probe; a deleted workspace symbol must
+          //     not be silently skipped — probe and let the engine decide).
+          //   - oldTargetId present, node found, isExternal===true → true.
+          //   - oldTargetId present, node found, isExternal===false → false
+          //     (workspace-internal; must probe).
+          //   - oldTargetId present, node found, isExternal===undefined
+          //     (field absent) → false (conservative; probe).
+          //
+          // classifyUri is NOT used here — oldTargetId is a graph node id,
+          // not a URI. isUnindexablePath is NOT used here — candidate.file
+          // is the caller's .java source file, not the callee's location.
+          canSkipCandidate: (candidate) => {
+            if (!candidate.oldTargetId) {
+              // Recall candidate — always probe (I-2c).
+              return false;
+            }
+            const node = graph.getNode(candidate.oldTargetId);
+            if (node === undefined) {
+              // EP-D: node absent — could be a deleted workspace symbol.
+              // Conservative: probe so the engine can decide; no false skip.
+              return false;
+            }
+            // Node found: skip only when explicitly marked external.
+            // isExternal===undefined (field absent) → false (probe).
+            const skip = node.properties.isExternal === true;
+            if (skip) {
+              // I-8-replay: record the key so reconcileDecisions can skip it.
+              preFilteredKeys.add(candidateLocationKey(candidate));
+            }
+            return skip;
+          },
+          // WS-B / I-2d: gate-failure discriminator side-channel.
+          // pipeline.ts uses this to emit the correct funnel message per
+          // reason (not-ready vs no-server vs dispatch-error).
+          onGateFailure: (reason, elapsedS) => {
+            gateFailureReason = reason;
+            gateFailureElapsedS = elapsedS;
+          },
         },
       );
 
@@ -868,8 +982,15 @@ export const runPipelineFromRepo = async (
       // (`feed.length − selected.length`) — we thread it
       // into the engine report so the summary line is
       // truthful.
+      // WS-B: read probed/preFilteredExternal from the work-fn payload
+      // directly (not via meta) — aligns with the specified return shape
+      // {meta, selectedCount, skipped, probed, preFilteredExternal}.
       const serverVersion = sessionResult?.meta?.serverVersion ?? '';
       const sessionSkipped = sessionResult?.skipped ?? 0;
+      // WI-5: probed/preFilteredExternal from the session's dispatch
+      // loop (or 0 on gate-failure when the session returned null).
+      const sessionProbed = sessionResult?.probed ?? 0;
+      const sessionPreFiltered = sessionResult?.preFilteredExternal ?? 0;
 
       // ── Engine decision pass (per-candidate) ────────────────────
       // Replay every candidate through the decision table
@@ -877,43 +998,64 @@ export const runPipelineFromRepo = async (
       // Candidates the session refused (no Location entry)
       // fall through to the engine as `[]` → NO_NODE →
       // keep/refuse per the decision table.
-      const reconcileReport = await reconcileDecisions(
-        graph,
-        dedupedCandidates,
-        locations,
-        {
-          mapLocationToNodeId: (loc, repoId) =>
-            mapLocationToNodeId(loc, repoId, {
-              executeParameterized: inMemoryQuery,
-              repoPath,
-              resolvedRepoPath,
-              // KD-3: thread the adapter's URI classifier so jdt:// and
-              // classpath:// URIs returned by jdtls are explicitly refused as
-              // external (NO_NODE + external:true) rather than traversing the
-              // full DB-query path and returning a plain NO_NODE. For Java repos
-              // where 30–50% of CALLS target stdlib/Spring types, this avoids
-              // hundreds of avoidable in-memory Cypher queries per run and
-              // correctly flags each such refusal as an external one (not a
-              // recall-miss) in any downstream metric.
-              // Defensive null-guard: lspAdapter is non-null at this code path
-              // (the session gate above short-circuits when lspAdapter is null),
-              // but an optional-chain is cleaner than an assertion.
-              classifyUri: lspAdapter?.classifyUri.bind(lspAdapter),
-              // WI-5 (#159 P5): thread the adapter id so the mapper's
-              // out-of-repo containment guard can tag Python site-packages
-              // / stdlib `file://` URIs as `{ kind: 'NO_NODE', external: true }`
-              // rather than bare `NO_NODE`. TS/Java paths omit this field
-              // (lspAdapter?.id is 'typescript'/'java') — only 'python'
-              // activates the external:true gate.
-              adapterId: lspAdapter?.id,
-            }),
-          repoId: ctx.repoId ?? 'default',
-          skipped: sessionSkipped,
-        },
-      );
+      let reconcileReport: ReconciliationReport;
+      let applyResult: ReturnType<typeof applyDecisions>;
+      try {
+        // I-8-replay: exclude pre-filtered candidates so they do not
+        // re-enter the engine with locs=[] and corrupt count buckets.
+        const replayCandidates = preFilteredKeys.size > 0
+          ? dedupedCandidates.filter(c => !preFilteredKeys.has(candidateLocationKey(c)))
+          : dedupedCandidates;
+        reconcileReport = await reconcileDecisions(
+          graph,
+          replayCandidates,
+          locations,
+          {
+            mapLocationToNodeId: (loc, repoId) =>
+              mapLocationToNodeId(loc, repoId, {
+                executeParameterized: inMemoryQuery,
+                repoPath,
+                resolvedRepoPath,
+                // KD-3: thread the adapter's URI classifier so jdt:// and
+                // classpath:// URIs returned by jdtls are explicitly refused as
+                // external (NO_NODE + external:true) rather than traversing the
+                // full DB-query path and returning a plain NO_NODE. For Java repos
+                // where 30–50% of CALLS target stdlib/Spring types, this avoids
+                // hundreds of avoidable in-memory Cypher queries per run and
+                // correctly flags each such refusal as an external one (not a
+                // recall-miss) in any downstream metric.
+                // Defensive null-guard: lspAdapter is non-null at this code path
+                // (the session gate above short-circuits when lspAdapter is null),
+                // but an optional-chain is cleaner than an assertion.
+                classifyUri: lspAdapter?.classifyUri.bind(lspAdapter),
+                // WI-5 (#159 P5): thread the adapter id so the mapper's
+                // out-of-repo containment guard can tag Python site-packages
+                // / stdlib `file://` URIs as `{ kind: 'NO_NODE', external: true }`
+                // rather than bare `NO_NODE`. TS/Java paths omit this field
+                // (lspAdapter?.id is 'typescript'/'java') — only 'python'
+                // activates the external:true gate.
+                adapterId: lspAdapter?.id,
+              }),
+            repoId: ctx.repoId ?? 'default',
+            skipped: sessionSkipped,
+          },
+        );
 
-      // ── Apply (skip every mutation in dryRun) ───────────────────
-      const applyResult = applyDecisions(graph, reconcileReport.decisions, { dryRun });
+        // ── Apply (skip every mutation in dryRun) ───────────────────
+        applyResult = applyDecisions(graph, reconcileReport.decisions, { dryRun });
+      } catch (lspErr) {
+        // WI-5 (error path): reconcileDecisions or applyDecisions threw.
+        // Emit the funnel line BEFORE rethrowing so the log is preserved
+        // for triage. Use 0-sentinels for counters we never reached.
+        const lspElapsed = ((Date.now() - lspStart) / 1000).toFixed(1);
+        // eslint-disable-next-line no-console
+        console.log(buildLspSummaryLine(
+          'dispatch-error',
+          { confirmed: 0, corrected: 0, recall: 0, refused: 0, skipped: sessionSkipped, serverVersion: serverVersion || 'unknown', probed: sessionProbed },
+          { N: lspN, B: lspB, elapsedS: lspElapsed },
+        ));
+        throw lspErr;
+      }
 
       lspReport = {
         decisions: applyResult.decisions,
@@ -922,10 +1064,18 @@ export const runPipelineFromRepo = async (
         recall: reconcileReport.recall,
         refused: reconcileReport.refused,
         skipped: reconcileReport.skipped,
+        // WI-5: populated from SessionMeta (set by the dispatch loop).
+        probed: sessionProbed,
+        preFilteredExternal: sessionPreFiltered,
         serverVersion,
       };
 
       // ── Observability: dry-run report vs. summary line ──────────
+      // WI-5: budget suffix appended IN-PLACE on all non-error paths.
+      // Format: '(budget <B> of <N> candidates)'
+      // S = max(0, N − B) — number of candidates NOT probed due to cap.
+      const lspS = Math.max(0, lspN - lspB);
+      const budgetSuffix = ` (budget ${lspB} of ${lspN} candidates)`;
       if (dryRun) {
         // AC-6: print every {action, from→to, why} tuple, write nothing.
         //
@@ -956,15 +1106,31 @@ export const runPipelineFromRepo = async (
           );
         }
         // eslint-disable-next-line no-console
-        console.log(`  lsp-dry-run: ${lspReport.decisions.length} decision(s), 0 edges written`);
+        console.log(buildLspSummaryLine('dry-run', { ...lspReport, decisionCount: lspReport.decisions.length }, { N: lspN, B: lspB, elapsedS: '' }));
+      } else if (sessionResult === null) {
+        // WS-B (gate-failure path): session returned null — no work fn ran.
+        // Emit per-reason funnel message (I-2d discriminated outcome):
+        //   'not-ready'  → 'LSP augmentation skipped: jdtls not ready after Xs'
+        //                  NO budget suffix (C5-12 / WS-B spec).
+        //   'no-server'  → gate-failure format with budget suffix.
+        //   'dispatch-error' → covered by the reconcileDecisions catch above
+        //                  (that path calls console.log + rethrows; it never
+        //                  reaches this branch).
+        //   null (unknown reason) → fall back to gate-failure format.
+        if (gateFailureReason === 'not-ready') {
+          // C5-12: budget suffix NOT emitted on this path.
+          // eslint-disable-next-line no-console
+          console.log(`  LSP augmentation skipped: jdtls not ready after ${gateFailureElapsedS}s`);
+        } else {
+          // 'no-server' or unknown reason → gate-failure format with budget suffix.
+          const lspElapsed = gateFailureReason ? gateFailureElapsedS : ((Date.now() - lspStart) / 1000).toFixed(1);
+          // eslint-disable-next-line no-console
+          console.log(buildLspSummaryLine('gate-failure', { ...lspReport, serverVersion }, { N: lspN, B: lspB, elapsedS: lspElapsed }));
+        }
       } else {
         const lspElapsed = ((Date.now() - lspStart) / 1000).toFixed(1);
         // eslint-disable-next-line no-console
-        console.log(
-          `  lsp: confirmed ${lspReport.confirmed}, corrected ${lspReport.corrected}, ` +
-          `recall +${lspReport.recall}, refused ${lspReport.refused}, ` +
-          `skipped(cap) ${lspReport.skipped}, server <${lspReport.serverVersion || 'unknown'}> (${lspElapsed}s)`,
-        );
+        console.log(buildLspSummaryLine('success', lspReport, { N: lspN, B: lspB, elapsedS: lspElapsed }));
       }
     }
 
@@ -1142,6 +1308,63 @@ export function redactNodeId(id: string): string {
   const middle = parts.slice(1, -1).join(':');
   const redacted = middle.length > 8 ? `${middle.slice(0, 4)}…${middle.slice(-3)}` : middle;
   return `${label}:${redacted}:${tail}`;
+}
+
+/**
+ * WI-5: pure formatter for the LSP summary funnel line.
+ * Used by `runPipelineFromRepo` on all non-error exit paths, and
+ * exported so unit tests can assert the format without running the
+ * full pipeline.
+ *
+ * @param path - which log path: 'success', 'gate-failure', or 'dry-run'
+ * @param report - fields from lspReport (may be partial zeroes on gate-failure)
+ * @param opts - N (total deduped candidates), B (budget cap), elapsed seconds string,
+ *               plus dry-run decision count
+ */
+export function buildLspSummaryLine(
+  path: 'success' | 'gate-failure' | 'dry-run' | 'dispatch-error',
+  report: {
+    confirmed: number;
+    corrected: number;
+    recall: number;
+    refused: number;
+    skipped: number;
+    serverVersion: string;
+    decisionCount?: number;
+    /** probed count (dispatch-error path only) */
+    probed?: number;
+  },
+  opts: { N: number; B: number; elapsedS: string },
+): string {
+  const budgetSuffix = ` (budget ${opts.B} of ${opts.N} candidates)`;
+  const lspS = Math.max(0, opts.N - opts.B);
+  if (path === 'dry-run') {
+    return `  lsp-dry-run: ${report.decisionCount ?? 0} decision(s), 0 edges written${budgetSuffix}`;
+  }
+  if (path === 'gate-failure') {
+    return (
+      `  lsp: P=0 confirmed 0, corrected 0, recall +0, refused 0, ` +
+      `skipped(cap) ${lspS}, server <${report.serverVersion || 'unknown'}> (${opts.elapsedS}s)` +
+      budgetSuffix
+    );
+  }
+  if (path === 'dispatch-error') {
+    // reconcileDecisions or applyDecisions threw; use 0-sentinels for
+    // counters we never reached. sessionProbed is threaded via report.probed.
+    return (
+      `  lsp: dispatch-error P=${report.probed ?? 0} confirmed 0, corrected 0, ` +
+      `recall +0, refused 0, ` +
+      `skipped(cap) ${report.skipped}, server <${report.serverVersion || 'unknown'}> (${opts.elapsedS}s)` +
+      budgetSuffix
+    );
+  }
+  // success path
+  return (
+    `  lsp: confirmed ${report.confirmed}, corrected ${report.corrected}, ` +
+    `recall +${report.recall}, refused ${report.refused}, ` +
+    `skipped(cap) ${report.skipped}, server <${report.serverVersion || 'unknown'}> (${opts.elapsedS}s)` +
+    budgetSuffix
+  );
 }
 
 /**

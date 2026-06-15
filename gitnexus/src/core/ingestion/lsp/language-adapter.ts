@@ -95,13 +95,17 @@ export interface AdapterReadyCtx {
    */
   backstopProbe?: () => Promise<boolean>;
 
-  // ── WI-2a: progress read-seam (Go only) ──────────────────────────────
+  // ── WI-2: progress read-seam (Go + Java) ────────────────────────────
   //
-  // The three fields below are OPTIONAL. TS/Java/Python adapters receive an
+  // The three fields below are OPTIONAL. TS/Python adapters receive an
   // `AdapterReadyCtx` where all three are `undefined` — their `awaitReady`
-  // implementations must not touch them. Only `GO_ADAPTER.awaitReady` reads
-  // them; `LspClient.spawnAndInitialize` populates them by reference when the
-  // adapter has `clientCapabilities?.window?.workDoneProgress` set.
+  // implementations must not touch them. Both `GO_ADAPTER.awaitReady` and
+  // `JAVA_ADAPTER.awaitReady` read them; `LspClient.spawnAndInitialize`
+  // populates them by reference when the adapter has
+  // `clientCapabilities?.window?.workDoneProgress` set (truthy).
+  //
+  // Go: `workDoneProgress: true` (WI-2a — gopls progress gate).
+  // Java: `workDoneProgress: true` (WI-1 — jdtls settle-until-quiet gate).
   //
   // Design: threaded by reference (same Map/Set instance as `LspClient`) so
   // `awaitReady` can observe tokens buffered BEFORE it is called (the
@@ -113,8 +117,8 @@ export interface AdapterReadyCtx {
    * pre-`initialize` `$/progress` handler). Keys are progress token ids;
    * values are the stored `begin.value.title` strings.
    *
-   * Populated only for Go (Go adapter sets `clientCapabilities?.window?.workDoneProgress`).
-   * `undefined` for TS/Java/Python.
+   * Populated for Go and Java (both set `clientCapabilities?.window?.workDoneProgress`).
+   * `undefined` for TS/Python.
    */
   progressTokenTitles?: ReadonlyMap<string | number, string>;
 
@@ -123,7 +127,7 @@ export interface AdapterReadyCtx {
    * pre-`initialize` `$/progress` handler). Contains every token that has
    * received its `end` notification.
    *
-   * Populated only for Go. `undefined` for TS/Java/Python.
+   * Populated for Go and Java. `undefined` for TS/Python.
    */
   progressEndedTokens?: ReadonlySet<string | number>;
 
@@ -133,9 +137,9 @@ export interface AdapterReadyCtx {
    * processes a new `end` notification. The returned disposable removes `cb`
    * from the registry.
    *
-   * Populated only for Go. `undefined` for TS/Java/Python.
+   * Populated for Go and Java. `undefined` for TS/Python.
    *
-   * Usage pattern in `GO_ADAPTER.awaitReady`:
+   * Usage pattern in `GO_ADAPTER.awaitReady` / `JAVA_ADAPTER.awaitReady`:
    *   const sub = ctx.onProgressEnd?.((token) => { … });
    *   // …
    *   sub?.dispose();
@@ -423,142 +427,226 @@ export const JAVA_ADAPTER: LanguageAdapter = {
 
   initializationOptions: {},
 
+  /**
+   * WI-1: tells jdtls the client supports `$/progress` notifications,
+   * enabling the progress-based readiness heuristic used by the WI-4
+   * `awaitReady` implementation (ADR-002).
+   *
+   * This object is a FRESH literal — it does NOT reference or spread the
+   * module-private `TS_SERVER_CAPABILITIES` const (C0-2 / I-1 identity
+   * discipline). `lsp-client.ts` uses
+   * `adapter.clientCapabilities ?? TS_SERVER_CAPABILITIES` so adapters
+   * that omit this field still send the byte-identical TS payload.
+   */
+  clientCapabilities: { window: { workDoneProgress: true } },
+
   awaitReady(ctx: AdapterReadyCtx): Promise<boolean> {
-    // KD-1: wait for jdtls `language/status` / `ServiceReady` notification.
-    // On hard deadline: attempt one canary re-probe (KD-1 backstop).
-    // Contract: never rejects; always disposes the notification handler (no leak).
+    // WI-2: settle-until-quiet strategy for jdtls.
+    //
+    // Algorithm:
+    //   1. Register a no-op consumer for `language/status` — jdtls sends
+    //      `ServiceReady` here but we intentionally IGNORE it (I-2: ServiceReady
+    //      MUST NOT trigger settle(true)). The handler is registered to consume
+    //      the notification and prevent unhandled-message warnings; it disposes
+    //      on settle.
+    //   2. Subscribe to `ctx.onProgressEnd` (populated by lsp-client.ts because
+    //      JAVA_ADAPTER.clientCapabilities.window.workDoneProgress = true).
+    //      Each `$/progress end` event resets a JDTLS_QUIET_INTERVAL_MS (5 s)
+    //      quiet timer. When the quiet timer fires, run a canary probe:
+    //        - non-empty Location[] → settle(true)
+    //        - empty → keep waiting (reset pending next event)
+    //   3. Self-rescheduling periodic canary (fires at JDTLS_QUIET_INTERVAL_MS/2
+    //      intervals). Guards the zero-progress-events path: if jdtls never emits
+    //      any `$/progress end`, the canary still fires ≥2× before deadline,
+    //      allowing non-empty results to settle(true) without the quiet path.
+    //   4. Hard deadline: ctx.deadlineMs ?? JDTLS_READY_DEADLINE_MS → settle(false).
+    //
+    // All four resources {language/status handler, progressEnd sub, quiet timer,
+    // deadline timer, canary rescheduler} are disposed under a single `settled`
+    // guard on EVERY settle path (I-2e). The settled boolean prevents double-
+    // resolution on concurrent timer races.
+    //
+    // Never rejects — all throws caught; degrade to settle(false).
     //
     // Capture canary at call time (not via JAVA_ADAPTER self-reference) so
     // tests and clones can patch the adapter copy and observe the backstop.
     const capturedCanary = JAVA_ADAPTER.canary;
     const capturedWorkspaceRoot = ctx.workspaceRoot;
+    const conn = ctx.connection as MessageConnection;
 
     return new Promise<boolean>((resolve) => {
-      const deadline = ctx.deadlineMs ?? 120_000;
-      const conn = ctx.connection as MessageConnection;
+      const deadline = ctx.deadlineMs ?? JDTLS_READY_DEADLINE_MS;
+      const CANARY_INTERVAL_MS = JDTLS_QUIET_INTERVAL_MS / 2; // 2 500 ms
 
       let settled = false;
-      let handler: { dispose(): void } | null = null;
-      // Hoisted before `settle` to avoid TDZ when onNotification throws synchronously.
-      let timer: ReturnType<typeof setTimeout> | null = null;
+      let langStatusHandler: { dispose(): void } | null = null;
+      let progressSub: { dispose(): void } | null = null;
+      let quietTimer: ReturnType<typeof setTimeout> | null = null;
+      let canaryTimer: ReturnType<typeof setTimeout> | null = null;
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+
+      function dispose(): void {
+        if (langStatusHandler !== null) {
+          try { langStatusHandler.dispose(); } catch { /* ignore */ }
+          langStatusHandler = null;
+        }
+        if (progressSub !== null) {
+          try { progressSub.dispose(); } catch { /* ignore */ }
+          progressSub = null;
+        }
+        if (quietTimer !== null) { clearTimeout(quietTimer); quietTimer = null; }
+        if (canaryTimer !== null) { clearTimeout(canaryTimer); canaryTimer = null; }
+        if (deadlineTimer !== null) { clearTimeout(deadlineTimer); deadlineTimer = null; }
+      }
 
       function settle(value: boolean): void {
         if (settled) return;
         settled = true;
-        if (timer !== null) { clearTimeout(timer); timer = null; }
-        try {
-          handler?.dispose();
-        } catch {
-          // ignore dispose errors — best-effort cleanup
-        }
+        dispose();
         resolve(value);
       }
 
-      // Register a one-shot notification handler for language/status.
-      try {
-        handler = conn.onNotification(
-          'language/status',
-          (params: unknown) => {
-            // jdtls sends { type: 'ServiceReady', message: '...' } when ready.
-            // Accept any truthy ServiceReady type regardless of extra fields.
-            if (
-              params !== null &&
-              typeof params === 'object' &&
-              (params as Record<string, unknown>)['type'] === 'ServiceReady'
-            ) {
+      /**
+       * Run a single canary probe. Resolves settle(true) when the probe
+       * returns a non-empty result. Otherwise a no-op (caller decides what
+       * to do next — quiet path resets the timer; periodic path reschedules).
+       * Returns true iff the probe produced a non-empty result.
+       */
+      async function runCanary(): Promise<boolean> {
+        try {
+          if (ctx.backstopProbe) {
+            // Injected probe — used in tests to supply a controlled verdict.
+            const ready = await ctx.backstopProbe();
+            return ready;
+          }
+          // Inline probe: build samples + didOpen + textDocument/definition.
+          const samples = await buildCanarySamples(capturedWorkspaceRoot, {
+            strategy: capturedCanary,
+            maxFiles: 1,
+          });
+          if (samples.length === 0) return false;
+          const sample = samples[0];
+          // Open the file before requesting definition — jdtls requires an
+          // open document to resolve definitions (returns empty otherwise).
+          try {
+            let fileContent = '';
+            try {
+              fileContent = await fs.promises.readFile(
+                fileURLToPath(sample.textDocument.uri),
+                'utf8',
+              );
+            } catch { /* unreadable — send empty content */ }
+            await conn.sendNotification('textDocument/didOpen', {
+              textDocument: {
+                uri: sample.textDocument.uri,
+                languageId: JAVA_ADAPTER.languageId,
+                version: 1,
+                text: fileContent,
+              },
+            });
+          } catch { /* best-effort: proceed even if didOpen fails */ }
+          const result = await conn.sendRequest<unknown>(
+            'textDocument/definition',
+            { textDocument: sample.textDocument, position: sample.position },
+          );
+          return (
+            result !== null &&
+            result !== undefined &&
+            !(Array.isArray(result) && result.length === 0)
+          );
+        } catch {
+          return false;
+        }
+      }
+
+      /**
+       * Quiet-interval handler: fires JDTLS_QUIET_INTERVAL_MS after the last
+       * `$/progress end` event. Runs the canary; settles true on non-empty,
+       * otherwise waits for the next progress event (quiet timer not reset here
+       * — the progressEnd subscriber resets it on the next end event).
+       */
+      function onQuietInterval(): void {
+        quietTimer = null;
+        if (settled) return;
+        void runCanary().then((ready) => {
+          if (settled) return;
+          if (ready) {
+            settle(true);
+          }
+          // Empty canary — do not settle; wait for next $/progress end event
+          // or the periodic canary backstop.
+        });
+      }
+
+      /**
+       * Self-rescheduling periodic canary — guards the zero-progress-events path.
+       * Fires at CANARY_INTERVAL_MS intervals. On a non-empty probe result,
+       * settle(true). Otherwise reschedule.
+       */
+      function schedulePeriodicCanary(): void {
+        if (settled) return;
+        canaryTimer = setTimeout(() => {
+          canaryTimer = null;
+          if (settled) return;
+          void runCanary().then((ready) => {
+            if (settled) return;
+            if (ready) {
               settle(true);
+            } else {
+              // Reschedule — keep polling until deadline or quiet-path settles.
+              schedulePeriodicCanary();
             }
-            // Non-ready notifications (Starting, Error, etc.) are ignored;
-            // the handler stays registered until ready or deadline.
+          });
+        }, CANARY_INTERVAL_MS);
+        canaryTimer.unref?.();
+      }
+
+      // ── Step 1: no-op language/status consumer ─────────────────────────
+      // ServiceReady MUST NOT trigger settle (I-2). Register a consumer so
+      // jdtls's notification is acknowledged and not logged as unhandled.
+      try {
+        langStatusHandler = conn.onNotification(
+          'language/status',
+          (_params: unknown) => {
+            // Intentional no-op — ServiceReady must not settle awaitReady.
+            // All other types (Starting, Building, Error) also ignored here;
+            // the quiet-timer / canary path governs readiness.
           },
         );
       } catch {
-        // Connection already disposed or registration failed — degrade gracefully.
+        // Connection already disposed or registration failed — degrade.
         settle(false);
         return;
       }
 
-      // Hard deadline: fall back to one canary re-probe (KD-1 backstop).
-      timer = setTimeout(() => {
-        if (settled) return;
-        // KD-1 backstop: invoke the probe and settle based on its result.
-        // Never assume readiness without verification (AC-4 / Invariant I-2).
-        //
-        // Two paths to the probe — both must call settle() exactly once:
-        //
-        // (A) Injected probe via ctx.backstopProbe — used in unit tests to
-        //     supply a controlled readiness verdict without a real server.
-        //     The injected function is authoritative; if present, it is the
-        //     only probe invoked.
-        //
-        // (B) Inline probe via buildCanarySamples + conn.sendNotification +
-        //     conn.sendRequest — the production path when no injected probe is
-        //     provided. MUST send `textDocument/didOpen` before the definition
-        //     request: jdtls requires a file to be open in the workspace before
-        //     it will serve definitions for it; a request on an unopened file
-        //     returns an empty array, which we would incorrectly interpret as
-        //     not-ready even when the workspace IS indexed.
-        void (async () => {
-          try {
-            if (ctx.backstopProbe) {
-              // (A) Injected probe — caller is responsible for the full
-              // probe logic (build samples, issue definition request, etc.).
-              const ready = await ctx.backstopProbe();
-              settle(ready);
-              return;
-            }
-            // (B) Inline probe.
-            const samples = await buildCanarySamples(capturedWorkspaceRoot, {
-              strategy: capturedCanary,
-              maxFiles: 1,
-            });
-            if (samples.length === 0) {
-              // No candidate files found — cannot verify; degrade.
-              settle(false);
-              return;
-            }
-            const sample = samples[0];
-            // Open the file in the workspace BEFORE requesting its definition.
-            // jdtls will return an empty array for an unopened file, which
-            // would be misread as not-ready. Best-effort: if didOpen fails
-            // we still proceed with the definition request.
-            try {
-              let fileContent = '';
-              try {
-                fileContent = await fs.promises.readFile(
-                  fileURLToPath(sample.textDocument.uri),
-                  'utf8',
-                );
-              } catch { /* unreadable — send empty content */ }
-              await conn.sendNotification('textDocument/didOpen', {
-                textDocument: {
-                  uri: sample.textDocument.uri,
-                  languageId: JAVA_ADAPTER.languageId,
-                  version: 1,
-                  text: fileContent,
-                },
-              });
-            } catch { /* best-effort: proceed even if didOpen fails */ }
-            const result = await conn.sendRequest<unknown>(
-              'textDocument/definition',
-              { textDocument: sample.textDocument, position: sample.position },
-            );
-            // A non-null, non-empty response means the server resolved the
-            // definition — the workspace is ready.
-            const ready =
-              result !== null &&
-              result !== undefined &&
-              !(Array.isArray(result) && result.length === 0);
-            settle(ready);
-          } catch {
-            // Any error during the backstop probe — degrade gracefully.
-            settle(false);
-          }
-        })();
-      }, deadline);
+      // ── Step 2: subscribe to $/progress end events ─────────────────────
+      // Each end event resets the JDTLS_QUIET_INTERVAL_MS quiet timer.
+      if (ctx.onProgressEnd) {
+        try {
+          progressSub = ctx.onProgressEnd((_token) => {
+            if (settled) return;
+            // Reset the quiet timer — silence must persist for the full interval
+            // after the LAST end event before we probe.
+            if (quietTimer !== null) { clearTimeout(quietTimer); }
+            quietTimer = setTimeout(onQuietInterval, JDTLS_QUIET_INTERVAL_MS);
+            quietTimer.unref?.();
+          });
+        } catch {
+          // Subscribe failed — quiet path unavailable; periodic canary backstop
+          // will still fire ≥2× before deadline.
+        }
+      }
 
-      // Prevent the timer from keeping the Node.js event loop alive past teardown.
-      timer.unref?.();
+      // ── Step 3: periodic canary backstop ───────────────────────────────
+      // Fires at CANARY_INTERVAL_MS even when no progress events arrive.
+      // Ensures ≥2 canary invocations before the deadline (I-2b).
+      schedulePeriodicCanary();
+
+      // ── Step 4: hard deadline ──────────────────────────────────────────
+      deadlineTimer = setTimeout(() => {
+        settle(false);
+      }, deadline);
+      deadlineTimer.unref?.();
     });
   },
 
@@ -767,6 +855,31 @@ export const PYTHON_ADAPTER: LanguageAdapter = {
     return 'unmappable';
   },
 };
+
+// ─── JDTLS_READY_DEADLINE_MS / JDTLS_QUIET_INTERVAL_MS ──────────────
+
+/**
+ * Hard deadline for `JAVA_ADAPTER.awaitReady` (milliseconds from call time).
+ *
+ * 600 s (10 min) — jdtls performs Maven/Gradle workspace indexing on cold
+ * start which is significantly slower than other LSPs. ADR-002 spike data:
+ * Maven indexing runs to ~19.3 s on a mid-size repo; 600 s provides ample
+ * margin for large enterprise Java codebases.
+ *
+ * Exported so callers and tests can override via `AdapterReadyCtx.deadlineMs`.
+ */
+export const JDTLS_READY_DEADLINE_MS = 600_000;
+
+/**
+ * Quiet-interval for jdtls `$/progress` readiness heuristic (milliseconds).
+ *
+ * After the last `$/progress` end notification, jdtls is considered ready
+ * when no new progress events have arrived within this interval. 5 s is
+ * sufficient to distinguish the Maven-indexing burst from true idle.
+ *
+ * Exported for use by the WI-4 `awaitReady` implementation and its tests.
+ */
+export const JDTLS_QUIET_INTERVAL_MS = 5_000;
 
 // ─── GOPLS_READY_DEADLINE_MS ─────────────────────────────────────────
 
