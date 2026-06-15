@@ -127,8 +127,10 @@ import {
   JAVA_ADAPTER,
   PYTHON_ADAPTER,
   GO_ADAPTER,
+  RUST_ADAPTER,
   PYLSP_READY_DEADLINE_MS,
   GOPLS_READY_DEADLINE_MS,
+  RUST_ANALYZER_READY_DEADLINE_MS,
   selectAdapter,
   type LanguageAdapter,
   type LanguageCanaryStrategy,
@@ -1892,6 +1894,7 @@ describe('GOPLS_READY_DEADLINE_MS', () => {
 // behavior require the LspClient injection harness).
 
 import { type ClientCapabilities } from '../../../src/core/ingestion/lsp/language-adapter.js';
+import { RUST_CANARY_STRATEGY } from '../../../src/core/ingestion/lsp/canary-sampler.js';
 // TS_SERVER_CAPABILITIES is module-private in lsp-client.ts; we verify identity
 // indirectly: GO_ADAPTER.clientCapabilities must NOT === undefined and its
 // window.workDoneProgress must be true. The reference-inequality with any other
@@ -2434,5 +2437,786 @@ describe('GO_ADAPTER.awaitReady', () => {
     it('JAVA_ADAPTER.awaitReady: is a function (callable — did not lose its definition)', () => {
       expect(typeof JAVA_ADAPTER.awaitReady).toBe('function');
     });
+  });
+});
+
+// ─── Suite: RUST_ADAPTER — WI-1 type invariants ───────────────────────────────
+//
+// WI-1 adds 'rust' to the LanguageAdapter.id union and 'experimental' to
+// ClientCapabilities. These tests act as compile+runtime gates: if tsc rejects
+// any assignment below, the test file fails to compile (CI gate WI1-4).
+// The RUST_ADAPTER object is constructed inline here (not exported from
+// language-adapter.ts yet — that is WI-3b) to keep WI-1 scope minimal.
+//
+// Decision table (collapsed) — one representative per equivalence class:
+//   WI1-1: id literal === 'rust'           → union accepts new literal
+//   WI1-2: experimental.serverStatusNotification === true → new field accepted
+//   WI1-3: window.workDoneProgress === true → existing field not narrowed by new field
+
+describe('RUST_ADAPTER — WI-1 type invariants', () => {
+  // Minimal RUST_ADAPTER stub — satisfies LanguageAdapter structurally.
+  // WI-3b will export the real constant; this inline object is the compile gate.
+  const RUST_ADAPTER: LanguageAdapter = {
+    id: 'rust',
+    serverBinary: 'rust-analyzer',
+    languageId: 'rust',
+    clientCapabilities: {
+      window: { workDoneProgress: true },
+      experimental: { serverStatusNotification: true },
+    },
+    spawnArgs: (_ctx) => [],
+    initializationOptions: {},
+    awaitReady: async (_ctx) => true,
+    canary: {
+      isCandidateFile: (name) => name.endsWith('.rs'),
+      tryExtractSample: (_absPath, _content) => null,
+    },
+    classifyUri: (uri) => uri.startsWith('file://') ? 'workspace' : 'unmappable',
+  };
+
+  // WI1-1: id literal === 'rust' (union widened to include 'rust')
+  it('WI1-1: RUST_ADAPTER.id === "rust" (union widened to include literal)', () => {
+    expect(RUST_ADAPTER.id).toBe('rust');
+  });
+
+  // WI1-2: experimental.serverStatusNotification is accepted by the widened
+  // ClientCapabilities interface (I-13). If ClientCapabilities lacked the
+  // 'experimental' field, this file would fail to compile.
+  it('WI1-2: RUST_ADAPTER.clientCapabilities.experimental.serverStatusNotification === true', () => {
+    const caps = RUST_ADAPTER.clientCapabilities;
+    expect(caps).toBeDefined();
+    expect((caps!.experimental as Record<string, unknown>)['serverStatusNotification']).toBe(true);
+  });
+
+  // WI1-3: window.workDoneProgress is still boolean — not narrowed by the
+  // experimental addition (I-13 invariant: existing fields unchanged).
+  it('WI1-3: RUST_ADAPTER.clientCapabilities.window.workDoneProgress === true (existing field not narrowed)', () => {
+    const caps = RUST_ADAPTER.clientCapabilities;
+    expect(caps?.window?.workDoneProgress).toBe(true);
+  });
+
+  // Regression lock: existing adapters still compile with their existing shapes
+  // (no experimental field — backward-compatible optional).
+  it('regression: GO_ADAPTER.clientCapabilities has no experimental field (optional field is backward-compatible)', () => {
+    expect(GO_ADAPTER.clientCapabilities?.experimental).toBeUndefined();
+  });
+
+  it('regression: TYPESCRIPT_ADAPTER.clientCapabilities is undefined (optional field is backward-compatible)', () => {
+    expect(TYPESCRIPT_ADAPTER.clientCapabilities).toBeUndefined();
+  });
+});
+
+// ─── Suite: RUST_ADAPTER — WI-3 literal invariants ────────────────────────────
+//
+// Cases WI3-10..WI3-16 per plan §Test Strategy.
+//
+// Technique: Equivalence Partitioning + BVA + Adapter Literal Invariants.
+//
+// Isolation: RUST_ADAPTER is the real exported module-level singleton;
+//   no mocking required for literal/sync tests (awaitReady is a sync stub).
+//   RUST_CANARY_STRATEGY is imported directly from canary-sampler.ts to verify
+//   reference identity (the adapter must hold the same object, not a clone).
+
+describe('RUST_ADAPTER — WI-3 literal invariants', () => {
+  // WI3-10: id literal
+  it('WI3-10: RUST_ADAPTER.id === "rust"', () => {
+    expect(RUST_ADAPTER.id).toBe('rust');
+  });
+
+  // WI3-11: spawnArgs — always [] (fresh array, no shared reference)
+  it('WI3-11: spawnArgs({workspaceRoot:"/x"}) deep-equals [] (AC-13)', () => {
+    expect(RUST_ADAPTER.spawnArgs({ workspaceRoot: '/x' })).toEqual([]);
+  });
+
+  it('WI3-11 (I-2): spawnArgs returns a FRESH array on each call (no shared-reference mutation)', () => {
+    const a = RUST_ADAPTER.spawnArgs({ workspaceRoot: '/x' });
+    const b = RUST_ADAPTER.spawnArgs({ workspaceRoot: '/x' });
+    // Both calls return [] but must not be the same object reference.
+    expect(a).toEqual([]);
+    expect(b).toEqual([]);
+    expect(a).not.toBe(b);
+  });
+
+  // WI3-12: classifyUri — scheme-only (EP + BVA)
+  it('WI3-12: classifyUri("file:///some/path.rs") === "workspace" (AC-14)', () => {
+    expect(RUST_ADAPTER.classifyUri('file:///some/path.rs')).toBe('workspace');
+  });
+
+  it('WI3-12: classifyUri("other://something") === "unmappable" (AC-14)', () => {
+    expect(RUST_ADAPTER.classifyUri('other://something')).toBe('unmappable');
+  });
+
+  it('WI3-12: classifyUri("") === "unmappable" (empty-string edge case)', () => {
+    expect(RUST_ADAPTER.classifyUri('')).toBe('unmappable');
+  });
+
+  it('WI3-12: classifyUri("file://") === "workspace" (bare file:// scheme)', () => {
+    expect(RUST_ADAPTER.classifyUri('file://')).toBe('workspace');
+  });
+
+  it('WI3-12: classifyUri("https://crates.io/crates/serde") === "unmappable"', () => {
+    expect(RUST_ADAPTER.classifyUri('https://crates.io/crates/serde')).toBe('unmappable');
+  });
+
+  // WI3-13: canary is the real RUST_CANARY_STRATEGY singleton (reference identity)
+  it('WI3-13: RUST_ADAPTER.canary === RUST_CANARY_STRATEGY (real WI-2 export)', () => {
+    expect(RUST_ADAPTER.canary).toBe(RUST_CANARY_STRATEGY);
+  });
+
+  // WI3-14: initializationOptions deep-equals {}
+  it('WI3-14: initializationOptions deep-equals {} (spike-deferred safe default)', () => {
+    expect(RUST_ADAPTER.initializationOptions).toEqual({});
+  });
+
+  // WI3-15: clientCapabilities exact shape (I-13)
+  it('WI3-15: clientCapabilities.window.workDoneProgress === true', () => {
+    expect(RUST_ADAPTER.clientCapabilities?.window?.workDoneProgress).toBe(true);
+  });
+
+  it('WI3-15: clientCapabilities.experimental.serverStatusNotification === true (I-13)', () => {
+    const exp = RUST_ADAPTER.clientCapabilities?.experimental as Record<string, unknown> | undefined;
+    expect(exp?.['serverStatusNotification']).toBe(true);
+  });
+
+  it('WI3-15: clientCapabilities deep-equals { window: { workDoneProgress: true }, experimental: { serverStatusNotification: true } } (I-13 exact shape)', () => {
+    expect(RUST_ADAPTER.clientCapabilities).toEqual({
+      window: { workDoneProgress: true },
+      experimental: { serverStatusNotification: true },
+    });
+  });
+
+  it('WI3-15: clientCapabilities type-checks as ClientCapabilities (runtime shape)', () => {
+    // This assignment would fail to compile if ClientCapabilities did not
+    // include the `experimental` field (I-13 tsc gate).
+    const caps: ClientCapabilities = RUST_ADAPTER.clientCapabilities!;
+    expect(caps.window?.workDoneProgress).toBe(true);
+    expect((caps.experimental as Record<string, unknown>)['serverStatusNotification']).toBe(true);
+  });
+
+  // WI3-16: distinctness vs GO_ADAPTER and TYPESCRIPT_ADAPTER (I-1)
+  it('WI3-16 (I-1): RUST_ADAPTER !== GO_ADAPTER (distinct object)', () => {
+    expect(RUST_ADAPTER).not.toBe(GO_ADAPTER);
+  });
+
+  it('WI3-16 (I-1): RUST_ADAPTER !== TYPESCRIPT_ADAPTER (distinct object)', () => {
+    expect(RUST_ADAPTER).not.toBe(TYPESCRIPT_ADAPTER);
+  });
+
+  it('WI3-16 (I-1): RUST_ADAPTER !== JAVA_ADAPTER (distinct object)', () => {
+    expect(RUST_ADAPTER).not.toBe(JAVA_ADAPTER);
+  });
+
+  it('WI3-16 (I-1): RUST_ADAPTER !== PYTHON_ADAPTER (distinct object)', () => {
+    expect(RUST_ADAPTER).not.toBe(PYTHON_ADAPTER);
+  });
+
+  // RUST_ANALYZER_READY_DEADLINE_MS constant (I-12)
+  it('WI3-10 (I-12): RUST_ANALYZER_READY_DEADLINE_MS === 60_000 (exported; higher than GOPLS/PYLSP 30_000)', () => {
+    expect(RUST_ANALYZER_READY_DEADLINE_MS).toBe(60_000);
+  });
+
+  it('WI3-10 (I-12): RUST_ANALYZER_READY_DEADLINE_MS > GOPLS_READY_DEADLINE_MS (cold Cargo metadata load)', () => {
+    expect(RUST_ANALYZER_READY_DEADLINE_MS).toBeGreaterThan(GOPLS_READY_DEADLINE_MS);
+  });
+
+  it('WI3-10 (I-12): RUST_ANALYZER_READY_DEADLINE_MS > PYLSP_READY_DEADLINE_MS (rust-analyzer is slower cold)', () => {
+    expect(RUST_ANALYZER_READY_DEADLINE_MS).toBeGreaterThan(PYLSP_READY_DEADLINE_MS);
+  });
+
+  // awaitReady buffer-hit path (WI-3b3): updated from WI-3b1 stub to supply
+  // ctx.serverStatusLatest so the test stays fast (no 60 s deadline wait).
+  it('awaitReady resolves true immediately on buffer-hit {quiescent:true, health:"ok"} (WI-3b3)', async () => {
+    const ctx: AdapterReadyCtx = {
+      connection: {},
+      workspaceRoot: '/any/rust-workspace',
+      serverStatusLatest: { quiescent: true, health: 'ok' },
+    };
+    const result = await RUST_ADAPTER.awaitReady(ctx);
+    expect(result).toBe(true);
+  });
+
+  // Singleton identity
+  it('RUST_ADAPTER is a module-level singleton (same reference on every access)', () => {
+    const ref1 = RUST_ADAPTER;
+    const ref2 = RUST_ADAPTER;
+    expect(ref1).toBe(ref2);
+  });
+
+  // Interface compliance: all required fields present
+  it('RUST_ADAPTER satisfies the LanguageAdapter interface (all required fields)', () => {
+    expect(typeof RUST_ADAPTER.id).toBe('string');
+    expect(typeof RUST_ADAPTER.serverBinary).toBe('string');
+    expect(typeof RUST_ADAPTER.languageId).toBe('string');
+    expect(typeof RUST_ADAPTER.spawnArgs).toBe('function');
+    expect(typeof RUST_ADAPTER.awaitReady).toBe('function');
+    expect(typeof RUST_ADAPTER.classifyUri).toBe('function');
+    expect(RUST_ADAPTER.canary).toBeDefined();
+    expect(typeof RUST_ADAPTER.canary.isCandidateFile).toBe('function');
+    expect(typeof RUST_ADAPTER.canary.tryExtractSample).toBe('function');
+  });
+
+  it('RUST_ADAPTER.serverBinary === "rust-analyzer"', () => {
+    expect(RUST_ADAPTER.serverBinary).toBe('rust-analyzer');
+  });
+
+  it('RUST_ADAPTER.languageId === "rust"', () => {
+    expect(RUST_ADAPTER.languageId).toBe('rust');
+  });
+});
+
+// ─── Suite: RUST_ADAPTER.awaitReady (WI-3b3 cases) ──────────────────────────
+//
+// Technique: Equivalence Partitioning (health domain: ok/warning/error/absent) +
+//   BVA (quiescent true/false boundary) + Deadline branch coverage +
+//   Never-reject property + State Transition (idle→listening→settled).
+//
+// Cases:
+//   buffer-hit ok → true
+//   arrive-after warning → true
+//   health:'error' arrives → backstop (does not resolve on status)
+//   quiescent:false → keep waiting → deadline fires → backstop
+//   deadline + zero samples → true (deliberate Go deviation)
+//   deadline + samples + empty definition → false
+//   never rejects (every path resolves)
+//   timer.unref + settled double-resolution guard
+//
+// Isolation: all cases use AdapterReadyCtx seam injections (serverStatusLatest,
+//   onServerStatus, backstopProbe, deadlineMs) so no real rust-analyzer process
+//   or filesystem is required. makeRustFakeConn() provides a stub connection.
+//
+// Key design invariant: awaitReady does NOT register its own
+//   experimental/serverStatus handler (that lives in LspClient.spawnAndInitialize,
+//   WI-3b2). awaitReady only READS ctx.serverStatusLatest and subscribes via
+//   ctx.onServerStatus.
+
+type RustNotifHandler = (params: unknown) => void;
+type RustRequestHandler = (params: unknown) => unknown;
+
+interface RustFakeConn {
+  onNotification(method: string, handler: RustNotifHandler): { dispose(): void };
+  sendNotification(method: string, params: unknown): Promise<void>;
+  sendRequest<T>(method: string, params: unknown): Promise<T>;
+  notificationRegistrationCount(method: string): number;
+}
+
+function makeRustFakeConn(): RustFakeConn {
+  const notifCounts = new Map<string, number>();
+
+  return {
+    onNotification(method: string, _handler: RustNotifHandler) {
+      notifCounts.set(method, (notifCounts.get(method) ?? 0) + 1);
+      return {
+        dispose() {
+          notifCounts.set(method, Math.max(0, (notifCounts.get(method) ?? 1) - 1));
+        },
+      };
+    },
+    async sendNotification(_method: string, _params: unknown): Promise<void> { /* best-effort no-op */ },
+    async sendRequest<T>(_method: string, _params: unknown): Promise<T> {
+      return [] as unknown as T; // default: empty → not ready
+    },
+    notificationRegistrationCount(method: string): number {
+      return notifCounts.get(method) ?? 0;
+    },
+  };
+}
+
+describe('RUST_ADAPTER.awaitReady', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    mockDirEntries.clear();
+  });
+
+  // ── WI3b3-1: buffer-hit {quiescent:true, health:'ok'} → resolves true immediately
+  //
+  // Buffer-hit path: ctx.serverStatusLatest already has a quiescent+ok status
+  // that arrived BEFORE awaitReady is called. Must resolve true synchronously
+  // (before any timer fires). Uses settle() so the idempotency flag is set.
+
+  it('WI3b3-1: buffer-hit {quiescent:true, health:"ok"} → resolves true immediately', async () => {
+    const conn = makeRustFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 30_000,
+      serverStatusLatest: { quiescent: true, health: 'ok' },
+      onServerStatus: (_cb) => ({ dispose() {} }),
+    };
+
+    const startMs = Date.now();
+    const result = await RUST_ADAPTER.awaitReady(ctx);
+    const elapsedMs = Date.now() - startMs;
+
+    expect(result).toBe(true);
+    // Elapsed should be negligible (synchronous resolution, no timer wait).
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
+  // ── WI3b3-2: buffer-hit {quiescent:true, health:'warning'} → resolves true immediately
+  //
+  // health:'warning' IS ready (I-7, challenge #8). Same buffer-hit path as ok.
+
+  it('WI3b3-2: buffer-hit {quiescent:true, health:"warning"} → resolves true immediately (I-7)', async () => {
+    const conn = makeRustFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 30_000,
+      serverStatusLatest: { quiescent: true, health: 'warning' },
+      onServerStatus: (_cb) => ({ dispose() {} }),
+    };
+
+    const result = await RUST_ADAPTER.awaitReady(ctx);
+    expect(result).toBe(true);
+  });
+
+  // ── WI3b3-3: no buffer, {quiescent:true, health:'warning'} arrives via onServerStatus
+  //   → resolves true (subscription path)
+
+  it('WI3b3-3: no buffer; {quiescent:true, health:"warning"} arrives via onServerStatus → resolves true', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+
+    let statusCallback: ((payload: { quiescent: boolean; health: string }) => void) | null = null;
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 30_000,
+      onServerStatus: (cb) => {
+        statusCallback = cb;
+        return { dispose() { statusCallback = null; } };
+      },
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+
+    // Deliver warning status — must settle(true).
+    statusCallback?.({ quiescent: true, health: 'warning' });
+
+    const result = await promise;
+    expect(result).toBe(true);
+  });
+
+  // ── WI3b3-4: {quiescent:true, health:'ok'} arrives via onServerStatus → resolves true
+
+  it('WI3b3-4: no buffer; {quiescent:true, health:"ok"} arrives via onServerStatus → resolves true', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+
+    let statusCallback: ((payload: { quiescent: boolean; health: string }) => void) | null = null;
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 30_000,
+      onServerStatus: (cb) => {
+        statusCallback = cb;
+        return { dispose() { statusCallback = null; } };
+      },
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    statusCallback?.({ quiescent: true, health: 'ok' });
+
+    const result = await promise;
+    expect(result).toBe(true);
+  });
+
+  // ── WI3b3-5: {quiescent:true, health:'error'} arrives → does NOT resolve true
+  //   Falls through to deadline backstop.
+
+  it('WI3b3-5: {quiescent:true, health:"error"} arrives → does NOT resolve true; deadline fires canary path', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+
+    let statusCallback: ((payload: { quiescent: boolean; health: string }) => void) | null = null;
+    let settled = false;
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 200,
+      onServerStatus: (cb) => {
+        statusCallback = cb;
+        return { dispose() { statusCallback = null; } };
+      },
+      backstopProbe: async () => false, // canary: not ready
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    promise.then(() => { settled = true; });
+
+    // Deliver error status — must NOT settle.
+    statusCallback?.({ quiescent: true, health: 'error' });
+    await vi.advanceTimersByTimeAsync(0); // flush microtasks
+    expect(settled).toBe(false);
+
+    // Fire the deadline timer.
+    await vi.advanceTimersByTimeAsync(201);
+    const result = await promise;
+    // health:'error' did not settle; backstopProbe returned false → false.
+    expect(result).toBe(false);
+  });
+
+  // ── WI3b3-6: {quiescent:false, health:'ok'} arrives → does NOT resolve true
+  //   quiescent:false means server is still indexing — keep waiting.
+
+  it('WI3b3-6: {quiescent:false, health:"ok"} arrives → does NOT resolve true; falls to deadline', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+
+    let statusCallback: ((payload: { quiescent: boolean; health: string }) => void) | null = null;
+    let settled = false;
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 200,
+      onServerStatus: (cb) => {
+        statusCallback = cb;
+        return { dispose() { statusCallback = null; } };
+      },
+      backstopProbe: async () => false,
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    promise.then(() => { settled = true; });
+
+    // Deliver quiescent:false — must NOT settle.
+    statusCallback?.({ quiescent: false, health: 'ok' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(201);
+    const result = await promise;
+    expect(result).toBe(false);
+  });
+
+  // ── WI3b3-7: deadline fires, zero canary samples in workspace → resolves true
+  //   Deliberate Go deviation: zero-edges no-op, nothing to verify.
+
+  it('WI3b3-7: deadline fires; zero canary samples in workspace → resolves true (Go deviation: zero-edges no-op)', async () => {
+    vi.useFakeTimers();
+    // Empty workspace → buildCanarySamples returns [] → settle(true).
+    mockDirEntries.clear();
+    mockDirEntries.set('/fake/empty-rust-ws', []);
+
+    const conn = makeRustFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/empty-rust-ws',
+      deadlineMs: 100,
+      // No backstopProbe — exercises real buildCanarySamples → 0-samples path.
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+    const result = await promise;
+    expect(result).toBe(true);
+  });
+
+  // ── WI3b3-8: deadline fires + backstopProbe returns true → resolves true
+
+  it('WI3b3-8: deadline fires; backstopProbe returns true → resolves true', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 100,
+      backstopProbe: async () => true,
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+    const result = await promise;
+    expect(result).toBe(true);
+  });
+
+  // ── WI3b3-9: deadline fires + backstopProbe returns false → resolves false
+  //   Samples present + empty/null textDocument/definition response → false.
+
+  it('WI3b3-9: deadline fires; backstopProbe returns false → resolves false', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 100,
+      backstopProbe: async () => false,
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+    const result = await promise;
+    expect(result).toBe(false);
+  });
+
+  // ── WI3b3-10: never rejects — all branches resolve boolean (I-7)
+
+  it('WI3b3-10: awaitReady never rejects — backstopProbe throws → resolve false, not reject (I-7)', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 100,
+      backstopProbe: async () => { throw new Error('probe exploded'); },
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+
+    // Must resolve (not reject) even when backstopProbe throws.
+    await expect(promise).resolves.toBe(false);
+  });
+
+  // ── WI3b3-11: timer.unref + settled double-resolution guard
+  //   Fire status notification then deadline — only one resolve call.
+
+  it('WI3b3-11: settled guard prevents double-resolution (status fires then deadline fires)', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+
+    let statusCallback: ((payload: { quiescent: boolean; health: string }) => void) | null = null;
+    let resolveCount = 0;
+    let statusCallback2: ((payload: { quiescent: boolean; health: string }) => void) | null = null;
+
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 100,
+      onServerStatus: (cb) => {
+        statusCallback = cb;
+        return { dispose() { statusCallback = null; } };
+      },
+      backstopProbe: async () => {
+        resolveCount++;
+        return false;
+      },
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    statusCallback2 = statusCallback; // capture before firing
+
+    // Fire the status notification first → settle(true).
+    statusCallback2?.({ quiescent: true, health: 'ok' });
+    const result = await promise;
+    expect(result).toBe(true);
+
+    // Now advance past the deadline — backstopProbe must NOT be called
+    // because settled=true already disposed the timer.
+    await vi.advanceTimersByTimeAsync(200);
+    expect(resolveCount).toBe(0);
+  });
+
+  // ── WI3b3-12: deadline uses ctx.deadlineMs ?? RUST_ANALYZER_READY_DEADLINE_MS
+
+  it('WI3b3-12: deadline fires at ctx.deadlineMs (not at RUST_ANALYZER_READY_DEADLINE_MS=60_000)', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+    let probeCalledAt: number | null = null;
+
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 250,
+      backstopProbe: async () => {
+        probeCalledAt = Date.now();
+        return false;
+      },
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+
+    // Must NOT have fired yet at 249ms.
+    await vi.advanceTimersByTimeAsync(249);
+    expect(probeCalledAt).toBeNull();
+
+    // Must fire at or after 250ms.
+    await vi.advanceTimersByTimeAsync(2);
+    await promise;
+    expect(probeCalledAt).not.toBeNull();
+    // Constant assertion: RUST_ANALYZER_READY_DEADLINE_MS is 60_000, NOT what we used.
+    expect(RUST_ANALYZER_READY_DEADLINE_MS).toBe(60_000);
+  });
+
+  // ── WI3b3-13: onServerStatus undefined → skip subscription, fall to deadline backstop
+  //   Defensive path: if ctx.onServerStatus is absent, awaitReady must not throw.
+
+  it('WI3b3-13: ctx.onServerStatus undefined → skip subscription; falls to deadline backstop without throwing', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 100,
+      // No onServerStatus — exercises the defensive skip path.
+      backstopProbe: async () => true,
+    };
+
+    const promise = RUST_ADAPTER.awaitReady(ctx);
+    await vi.advanceTimersByTimeAsync(101);
+    const result = await promise;
+    expect(result).toBe(true);
+  });
+
+  // ── WI3b3-14: awaitReady does NOT register its own experimental/serverStatus handler
+  //   The handler lives in LspClient.spawnAndInitialize (WI-3b2); awaitReady only reads ctx.
+
+  it('WI3b3-14: awaitReady does NOT call conn.onNotification("experimental/serverStatus", ...) (lives in lsp-client.ts)', async () => {
+    vi.useFakeTimers();
+    const conn = makeRustFakeConn();
+
+    const ctx: AdapterReadyCtx = {
+      connection: conn,
+      workspaceRoot: '/fake/rust-ws',
+      deadlineMs: 50,
+      backstopProbe: async () => false,
+    };
+
+    await vi.runAllTimersAsync();
+    void RUST_ADAPTER.awaitReady(ctx);
+    await vi.runAllTimersAsync();
+
+    // Must be 0 — awaitReady never registers its own experimental/serverStatus handler.
+    expect(conn.notificationRegistrationCount('experimental/serverStatus')).toBe(0);
+  });
+});
+
+// ─── Suite: selectAdapter — Rust EP cases (WI-3a) ────────────────────────────
+//
+// Technique: Equivalence Partitioning (7 language-count partitions) +
+//   BVA (strict-dominance boundary: equal counts).
+// Cases: WI3-1 through WI3-9 per plan §WI-3a Tests.
+//
+// Isolation: fs.readdirSync mocked via vi.hoisted (same harness as all
+//   selectAdapter tests above). Each test calls setRootEntries() to plant
+//   exactly the extension counts the case requires. mockDirEntries is
+//   cleared in beforeEach/afterEach.
+
+describe('selectAdapter — Rust EP cases', () => {
+  beforeEach(() => {
+    mockDirEntries.clear();
+  });
+
+  afterEach(() => {
+    mockDirEntries.clear();
+  });
+
+  // WI3-1: pure Rust dominant → RUST_ADAPTER (AC-1, strict dominance)
+  it('WI3-1: {rs:100, ts:0, java:0, py:0, go:0} → RUST_ADAPTER (AC-1; strict dominance)', () => {
+    setRootEntries(Array.from({ length: 100 }, (_, i) => file(`src_${i}.rs`)));
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBe(RUST_ADAPTER);
+    expect(adapter!.id).toBe('rust');
+  });
+
+  // WI3-2: minimum non-zero Rust dominance → RUST_ADAPTER (BVA: boundary rs=1, all others=0)
+  it('WI3-2: {rs:1, ts:0, java:0, py:0, go:0} → RUST_ADAPTER (minimum non-zero strict dominance)', () => {
+    setRootEntries([file('main.rs')]);
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBe(RUST_ADAPTER);
+    expect(adapter!.id).toBe('rust');
+  });
+
+  // WI3-3: Go beats Rust → GO_ADAPTER (AC-2; Go strict dominance wins)
+  it('WI3-3: {rs:50, go:60, ts:0, java:0, py:0} → GO_ADAPTER (AC-2; Go wins, not Rust)', () => {
+    setRootEntries([
+      ...Array.from({ length: 50 }, (_, i) => file(`src_${i}.rs`)),
+      ...Array.from({ length: 60 }, (_, i) => file(`pkg_${i}.go`)),
+    ]);
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBe(GO_ADAPTER);
+    expect(adapter!.id).toBe('go');
+  });
+
+  // WI3-4: Rust ties with TS → TYPESCRIPT_ADAPTER (AC-3; tie goes to TS)
+  it('WI3-4: {rs:50, ts:50, java:0, py:0, go:0} → TYPESCRIPT_ADAPTER (AC-3; tie goes to TS)', () => {
+    setRootEntries([
+      ...Array.from({ length: 50 }, (_, i) => file(`src_${i}.rs`)),
+      ...Array.from({ length: 50 }, (_, i) => file(`index_${i}.ts`)),
+    ]);
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBe(TYPESCRIPT_ADAPTER);
+    expect(adapter!.id).toBe('typescript');
+  });
+
+  // WI3-5: Rust ties with Java → not RUST_ADAPTER (tie; existing TS/Java tie-break applies; TS wins 0>=50? no — ts=0,java=50 → JAVA wins)
+  it('WI3-5: {rs:50, java:50, ts:0, py:0, go:0} → JAVA_ADAPTER (tie; Rust does NOT win strict dominance)', () => {
+    setRootEntries([
+      ...Array.from({ length: 50 }, (_, i) => file(`src_${i}.rs`)),
+      ...Array.from({ length: 50 }, (_, i) => file(`Foo_${i}.java`)),
+    ]);
+    const adapter = selectAdapter(REPO);
+    expect(adapter).not.toBe(RUST_ADAPTER);
+    // ts=0, java=50 → 0 >= 50 is false → JAVA_ADAPTER
+    expect(adapter).toBe(JAVA_ADAPTER);
+  });
+
+  // WI3-6: all equal (rs=go=ts=java=py=5) → not RUST_ADAPTER (strict dominance requires rs > ALL others)
+  it('WI3-6: {rs:5, go:5, ts:5, java:5, py:5} → not RUST_ADAPTER (strict dominance requires rs > ALL)', () => {
+    setRootEntries([
+      file('a.rs'), file('b.rs'), file('c.rs'), file('d.rs'), file('e.rs'),
+      file('a.go'), file('b.go'), file('c.go'), file('d.go'), file('e.go'),
+      file('a.ts'), file('b.ts'), file('c.ts'), file('d.ts'), file('e.ts'),
+      file('A.java'), file('B.java'), file('C.java'), file('D.java'), file('E.java'),
+      file('a.py'), file('b.py'), file('c.py'), file('d.py'), file('e.py'),
+    ]);
+    const adapter = selectAdapter(REPO);
+    expect(adapter).not.toBe(RUST_ADAPTER);
+    // py NOT strictly dominant (equal counts). go NOT strictly dominant. rust NOT strictly dominant.
+    // ts=5 >= java=5 → TYPESCRIPT_ADAPTER
+    expect(adapter).toBe(TYPESCRIPT_ADAPTER);
+  });
+
+  // WI3-7: all-zero guard → null (NOT TYPESCRIPT_ADAPTER — challenge #16 guard)
+  it('WI3-7: {rs:0, ts:0, java:0, py:0, go:0} → null (all-zero guard; NOT TYPESCRIPT_ADAPTER)', () => {
+    setRootEntries([file('README.md'), file('Makefile'), file('.gitignore')]);
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBeNull();
+  });
+
+  // WI3-8: rustCount=0 but tsCount=1 → TYPESCRIPT_ADAPTER (existing behavior preserved)
+  it('WI3-8: {rs:0, ts:1, java:0, py:0, go:0} → TYPESCRIPT_ADAPTER (rustCount=0 does not win; existing behavior preserved)', () => {
+    setRootEntries([file('index.ts')]);
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBe(TYPESCRIPT_ADAPTER);
+    expect(adapter!.id).toBe('typescript');
+  });
+
+  // WI3-9: Python strictly beats Rust → PYTHON_ADAPTER (Python strict dominance wins over Rust; ordering check)
+  it('WI3-9: {rs:10, py:11, ts:0, java:0, go:0} → PYTHON_ADAPTER (Python strict dominance wins over Rust)', () => {
+    setRootEntries([
+      ...Array.from({ length: 10 }, (_, i) => file(`src_${i}.rs`)),
+      ...Array.from({ length: 11 }, (_, i) => file(`mod_${i}.py`)),
+    ]);
+    const adapter = selectAdapter(REPO);
+    expect(adapter).toBe(PYTHON_ADAPTER);
+    expect(adapter!.id).toBe('python');
+  });
+
+  // Regression lock: existing adapter selections are byte-identical for non-Rust repos (I-9)
+  it('regression (I-9): pure TS repo still returns TYPESCRIPT_ADAPTER', () => {
+    setRootEntries([file('index.ts'), file('utils.ts'), file('app.ts')]);
+    expect(selectAdapter(REPO)).toBe(TYPESCRIPT_ADAPTER);
+  });
+
+  it('regression (I-9): pure Java repo still returns JAVA_ADAPTER', () => {
+    setRootEntries([file('Foo.java'), file('Bar.java')]);
+    expect(selectAdapter(REPO)).toBe(JAVA_ADAPTER);
+  });
+
+  it('regression (I-9): pure Python repo still returns PYTHON_ADAPTER', () => {
+    setRootEntries([file('main.py'), file('utils.py'), file('app.py')]);
+    expect(selectAdapter(REPO)).toBe(PYTHON_ADAPTER);
+  });
+
+  it('regression (I-9): pure Go repo still returns GO_ADAPTER', () => {
+    setRootEntries([file('main.go'), file('router.go'), file('handler.go')]);
+    expect(selectAdapter(REPO)).toBe(GO_ADAPTER);
+  });
+
+  // RUST_ADAPTER singleton identity: selectAdapter returns the exact exported singleton
+  it('selectAdapter returns the exact RUST_ADAPTER singleton (same reference)', () => {
+    setRootEntries([file('main.rs'), file('lib.rs')]);
+    expect(selectAdapter(REPO)).toBe(RUST_ADAPTER);
   });
 });

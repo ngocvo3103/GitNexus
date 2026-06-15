@@ -1412,3 +1412,161 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// WI-4 (#159): isExternalRefusalAdapter — Rust (adapterId='rust')
+//
+// Decision Table (adapterId × URI-containment × file-existence):
+//   WI4-1  rust + out-of-repo file:// URI (~/.rustup/toolchains/... simulated) → {NO_NODE, external:true} (AC-7)
+//   WI4-2  rust + out-of-repo file:// URI (~/.cargo/registry/...  simulated) → {NO_NODE, external:true} (AC-8)
+//   WI4-3  rust + in-repo file:// URI                                         → normal node mapping (DB queried)
+//   WI4-4  rust + non-existent file:// URI (realpathSync throws)              → bare {NO_NODE} WITHOUT external:true (safety property, challenge #17)
+//   WI4-5  rust + non-file:// URI (https://crates.io/...)                     → bare {NO_NODE} (no external:true on non-file scheme)
+//   WI4-6  python + out-of-repo file:// URI                                   → {NO_NODE, external:true} (existing arm regression guard; I-6)
+//   WI4-7  go    + out-of-repo file:// URI                                    → {NO_NODE, external:true} (existing arm regression guard; I-6)
+//   WI4-8  typescript (no adapterId) + out-of-repo file://                    → bare {NO_NODE} (gate invisible for TS)
+//   WI4-9  java  + out-of-repo file:// URI                                    → bare {NO_NODE} (gate invisible for Java)
+//
+// Uses same real filesystem paths as Go block above:
+//   repoRoot      — gitnexus package dir
+//   outOfRepoFile — process.execPath (Node binary, outside repo)
+//   inRepoFile    — package.json inside repo
+// Platform note: Windows is Non-Goal for this PR (per plan §WI-4). POSIX paths only.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
+  // WI4-1: ~/.rustup/toolchains/... (simulated by process.execPath outside repoRoot) → AC-7
+  it('WI4-1: rust + out-of-repo URI (~/.rustup/toolchains simulated) → NO_NODE external:true (AC-7)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'rust-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'rust' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // WI4-2: ~/.cargo/registry/... (simulated by process.execPath outside repoRoot) → AC-8
+  it('WI4-2: rust + out-of-repo URI (~/.cargo/registry simulated) → NO_NODE external:true (AC-8)', async () => {
+    // Any real path outside repoRoot exercises the same containment predicate.
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'rust-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'rust' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // WI4-3: in-repo .rs URI → normal node mapping (DB is queried; returns node)
+  it('WI4-3: rust + in-repo file:// URI → normal node mapping (DB queried, not external:true)', async () => {
+    const uri = `file://${inRepoFile}`;
+    const nodeId = 'Function:package.json:main';
+    const { deps, execute } = makeDeps([
+      row({ id: nodeId, name: 'main', startLine: 0, endLine: 0, label: 'Function', filePath: inRepoRelPath }),
+    ]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'rust-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'rust' },
+    );
+    expect(result.kind).toBe('node');
+    expect((result as any).external).toBeUndefined();
+    expect(execute).toHaveBeenCalledTimes(1);
+    const params = execute.mock.calls[0][2];
+    expect(params.relPath).toBe(inRepoRelPath);
+  });
+
+  // WI4-4: realpathSync throws (non-existent file) + rust adapter → bare {NO_NODE}
+  // Safety property (challenge #17): MUST NOT tag external:true when containment is unknown.
+  it('WI4-4: rust + realpathSync throws (non-existent file) → bare NO_NODE without external:true (safety property, #17)', async () => {
+    const nonExistentUri = 'file:///tmp/__gitnexus_test_rust_nonexistent_wi4_4/lib.rs';
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(nonExistentUri, 0),
+      'rust-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'rust' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // WI4-5: non-file:// URI (https://crates.io/...) → classifyUri returns 'unmappable'
+  // KD-3 block returns bare NO_NODE; path-containment gate never fires for non-file scheme.
+  it('WI4-5: rust + non-file:// URI (https://crates.io/...) → NO_NODE without external:true', async () => {
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc('https://crates.io/crates/serde/1.0.0', 0),
+      'rust-repo',
+      {
+        ...deps,
+        repoPath: repoRoot,
+        adapterId: 'rust',
+        // Non-file:// URIs are unmappable for the Rust adapter — KD-3 → bare NO_NODE.
+        classifyUri: (u: string) => (u.startsWith('file://') ? 'workspace' : 'unmappable'),
+      },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // WI4-6: python + out-of-repo → external:true (existing arm regression guard; I-6)
+  it('WI4-6: python + out-of-repo file:// → NO_NODE external:true (existing Python arm regression guard; I-6)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'py-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'python' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // WI4-7: go + out-of-repo → external:true (existing arm regression guard; I-6)
+  it('WI4-7: go + out-of-repo file:// → NO_NODE external:true (existing Go arm regression guard; I-6)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'go-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'go' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // WI4-8: typescript (no adapterId) + out-of-repo → bare {NO_NODE} (gate invisible for TS)
+  it('WI4-8: typescript (no adapterId) + out-of-repo file:// → bare NO_NODE (gate invisible)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'ts-repo',
+      { ...deps, repoPath: repoRoot },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // WI4-9: java + out-of-repo → bare {NO_NODE} (gate invisible for Java)
+  it('WI4-9: java (adapterId=java) + out-of-repo file:// → bare NO_NODE (gate invisible)', async () => {
+    const uri = `file://${outOfRepoFile}`;
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc(uri, 0),
+      'java-repo',
+      { ...deps, repoPath: repoRoot, adapterId: 'java' },
+    );
+    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect((result as any).external).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+  });
+});

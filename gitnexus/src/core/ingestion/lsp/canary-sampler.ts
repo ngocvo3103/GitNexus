@@ -118,6 +118,9 @@ export const EXCLUDED_DIRS = new Set([
   '.eggs',
   // Go-specific (WI-3): vendor directory contains third-party deps, not canary targets
   'vendor',
+  // Rust/Maven-shared (WI-2/I-5): Cargo build output dir; also used by Maven as generated-sources
+  // parent — excluding it prevents scanning compiled artifacts and keeps canary walks fast
+  'target',
 ]);
 
 // ─── TypeScript regex patterns (priority order) ───────────────────────
@@ -1102,6 +1105,173 @@ export const JAVA_CANARY_STRATEGY: LanguageCanaryStrategy = {
       }
     }
 
+    return null;
+  },
+};
+
+
+// ─── Rust regex patterns (priority order) ─────────────────────────────
+
+/**
+ * Rust Priority 1 — `fn` declaration (free function or impl method):
+ *   fn function_name(
+ *   fn function_name<T>(
+ *   pub fn function_name(
+ *   async fn function_name(
+ *
+ * Captures the function name after `fn`. The leading `^[ \t]*` allows
+ * indented functions inside `impl` blocks (impl methods are priority 1
+ * because the spec treats them identically to free functions: the most
+ * reliable rust-analyzer probe target is any named `fn` declaration).
+ * Applied to safe (comment-blanked) text.
+ */
+const RE_RUST_FN =
+  /^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]/m;
+
+/**
+ * Rust Priority 2 — struct, enum, or trait declaration:
+ *   struct Config {
+ *   enum Kind {
+ *   trait Foo {
+ *   pub struct Config<T> {
+ *
+ * Captures the type/trait name. Applied after all `fn` checks so that a
+ * file with both `fn` and `struct` prioritises the `fn` (more reliable
+ * rust-analyzer resolution target). Applied to safe text.
+ */
+const RE_RUST_TYPE_DECL =
+  /^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\s*[{<(;]/m;
+
+/**
+ * Rust Priority 3 — call-site identifier (fallback when no fn/struct/enum/trait):
+ *   foo.bar()           → captures 'bar'  (method call on dotted receiver)
+ *   process(data)       → captures 'process'  (free function call)
+ *   result = compute()  → captures 'compute'
+ *
+ * Matches any identifier immediately followed by `(`, searching left-to-right
+ * so dotted method calls (`foo.bar()`) yield the method name (`bar`), not the
+ * receiver (`foo`), because the first `(` after an identifier is at `bar(`.
+ *
+ * Unlike the Go strategy, Rust method calls (`receiver.method()`) ARE useful
+ * rust-analyzer probe targets (the spec explicitly includes `foo.bar()` in
+ * WI2-12). No dotted-receiver exclusion is applied here.
+ *
+ * `use` statements do NOT produce a match: `use std::io;` has no `(` after
+ * an identifier. Macro invocations (`println!(…)`) are NOT matched because
+ * `!` separates the macro name from `(`, breaking the `IDENT\s*(` pattern.
+ *
+ * Applied to safe (comment-blanked) text.
+ */
+const RE_RUST_CALL =
+  /([A-Za-z_][A-Za-z0-9_]*)\s*\(/m;
+
+/**
+ * Rust identifier word-boundary continuation class.
+ * Rust identifiers do NOT include the dollar-sign (I-10, challenge #10).
+ * This is its own named constant — NOT aliased from `GO_IDENT_AFTER` —
+ * to avoid hidden cross-language coupling (WI-2 spec: "no alias to GO_IDENT_AFTER").
+ */
+export const RUST_IDENT_AFTER = new RegExp('[A-Za-z0-9_]');
+
+/**
+ * Rust reserved identifiers that RE_RUST_CALL would match but are NOT
+ * user-defined call-site identifiers. These are Rust keywords that can
+ * syntactically appear immediately before `(` without being user-defined
+ * function calls (e.g. `if (cond)`, `while (cond)`, `for (...)`,
+ * `fn (...)` anonymous closures).
+ */
+const RUST_RESERVED_WORDS_RE =
+  /^(?:if|while|for|loop|match|fn|mod|use|let|const|static|type|trait|struct|enum|impl|pub|async|await|move|unsafe|extern|return|where)\b/;
+
+// ─── Rust canary strategy ─────────────────────────────────────────────
+
+/**
+ * `RUST_CANARY_STRATEGY` — canary sampling for `.rs` source files (WI-2).
+ *
+ * Reuses blankUnsafeLines() (C-style // and slash-star block comments are
+ * identical to Rust's comment syntax). Rust raw string literals (r"…" and
+ * r#"…"#) are NOT handled by blankUnsafeLines — this is a known limitation
+ * (same as GO_CANARY_STRATEGY documents backtick strings).
+ * The multi-sample strategy (maxFiles > 1) mitigates the rare case where
+ * a raw-string-literal-shaped false match poisons one sample; in practice
+ * collision probability is near-zero (WI-2 spec R2-8(3) ledger option 3).
+ *
+ * NOTE on `use` declarations: `textDocument/definition` on a `use std`
+ * token empirically DOES resolve (rust-analyzer returns count=1). However,
+ * use-statement positions are unreliable canary anchors: they are module-
+ * path tokens whose resolution depends on workspace indexing state. The
+ * sampler intentionally excludes them (I-3 analogue) in favour of
+ * declaration and call-site positions that are universally reliable.
+ *
+ * Priority order (first match wins):
+ *   1. `fn` declaration (free function OR impl method) — most reliable;
+ *      rust-analyzer returns the declaration `Location` for a definition
+ *      request at the function name.
+ *   2. `struct` / `enum` / `trait` declaration — equally reliable.
+ *   3. Call-site identifier (fallback) — method calls (`foo.bar()`) and
+ *      free-function calls (`process(data)`) are both acceptable targets.
+ *      Macro calls (`println!(\u2026)`) are excluded (no `(` immediately after
+ *      the macro name token).
+ *   → null — use-only or empty files yield no sample (I-3 analogue).
+ *
+ * `isCandidateFile`: accepts `.rs` files only.
+ */
+export const RUST_CANARY_STRATEGY: LanguageCanaryStrategy = {
+  isCandidateFile(name: string): boolean {
+    return name.endsWith('.rs');
+  },
+
+  tryExtractSample(
+    absolutePath: string,
+    text: string,
+  ): { textDocument: { uri: string }; position: { line: number; character: number } } | null {
+    // Apply the comment-blanking pre-pass. Rust uses C-style comments
+    // (// and /* */), identical to the TS/Java/Go pre-pass — reuse as-is.
+    const safeText = blankUnsafeLines(text);
+    const lines = text.split('\n');
+
+    // Priority 1: fn declaration (free function or impl method).
+    // rust-analyzer resolves a definition request at the fn name to a
+    // non-empty Location[] — the most reliable "workspace is ready" signal.
+    const fnMatch = RE_RUST_FN.exec(safeText);
+    if (fnMatch) {
+      const name = fnMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(fnMatch[0]), RUST_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // Priority 2: struct / enum / trait declaration.
+    const typeMatch = RE_RUST_TYPE_DECL.exec(safeText);
+    if (typeMatch) {
+      const name = typeMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(typeMatch[0]), RUST_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // Priority 3: call-site identifier.
+    // Keyword guard: skip if the captured identifier is a Rust reserved word
+    // (e.g. `if`, `while`, `for`) that can syntactically appear before `(`
+    // without being a user-defined call-site.
+    const callMatch = RE_RUST_CALL.exec(safeText);
+    if (callMatch && !RUST_RESERVED_WORDS_RE.test(callMatch[1])) {
+      const name = callMatch[1];
+      const pos = findIdentifierPosition(
+        lines, name, safeText.indexOf(callMatch[0]), RUST_IDENT_AFTER,
+      );
+      if (pos !== null) {
+        return makeSample(absolutePath, pos.line, pos.character);
+      }
+    }
+
+    // use-only / empty files yield no sample (I-3 analogue — see strategy docstring).
     return null;
   },
 };
