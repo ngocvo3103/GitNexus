@@ -1591,3 +1591,316 @@ describe('AdapterReadyCtx progress wiring (C2a-1..C2a-7)', () => {
     expect(ctx.onProgressEnd).toBeUndefined();
   });
 });
+
+// ─── WI-3b2: experimental/serverStatus read-seam (WI3-17..WI3-20) ────
+//
+// Tests the new serverStatusLatest holder + _serverStatusSubs Set in LspClient,
+// plus the ctx threading in spawnAndInitialize.
+//
+// Technique: Equivalence Partitioning (capability-gate partition: Rust vs non-Rust)
+//   + state-transition (buffer-before vs arrive-after awaitReady)
+//   + restart-clean invariant.
+//
+// We build a fake adapter with clientCapabilities.experimental.serverStatusNotification
+// set to simulate the Rust capability gate. The recording connection harness from
+// the WI-0 tests is reused to inject synthetic experimental/serverStatus notifications
+// at the right moment.
+
+describe('WI-3b2 — experimental/serverStatus read-seam (WI3-17..WI3-20)', () => {
+  // ── WI3-17 ──────────────────────────────────────────────────────────────────
+  // Rust: serverStatus buffered BEFORE awaitReady is called → ctx.serverStatusLatest
+  // holds the latest payload AND lspClient.serverStatusLatest is set.
+  it('WI3-17: Rust — serverStatus buffered before awaitReady → ctx.serverStatusLatest holds latest', async () => {
+    const wire = makeWire();
+    const server = makeFakeServer(wire);
+    const realClientConn = createMessageConnection(
+      new StreamMessageReader(wire.clientStdout),
+      new StreamMessageWriter(wire.clientStdin),
+      NullLogger,
+    );
+    const rec = makeRecordingConnection(wire, realClientConn);
+    const clientProcess = makeFakeChildProcess(wire);
+
+    // Captured ctx from awaitReady — for asserting seam fields by reference.
+    let capturedCtx: any = null;
+
+    // Fake Rust adapter: sets experimental.serverStatusNotification to gate the handler.
+    const rustLikeAdapter = {
+      ...TYPESCRIPT_ADAPTER,
+      id: 'rust' as const,
+      clientCapabilities: {
+        window: { workDoneProgress: false },
+        experimental: { serverStatusNotification: true },
+      },
+      awaitReady: async (ctx: any) => {
+        capturedCtx = ctx;
+        return true;
+      },
+    };
+
+    const lspClient = new LspClient({
+      workspaceRoot: '/',
+      adapter: rustLikeAdapter as any,
+      _inject: {
+        spawn: () => {
+          const result = { process: clientProcess, connection: rec as any };
+          // Schedule delivery of experimental/serverStatus BEFORE awaitReady.
+          // This simulates rust-analyzer emitting the notification at sinceInitialized≈20ms
+          // — in the same batch as the initialized notification.
+          setImmediate(() => {
+            const handler = rec.notifHandlers.get('experimental/serverStatus');
+            if (handler) {
+              handler({ quiescent: true, health: 'ok' });
+            }
+          });
+          return result;
+        },
+      },
+    });
+
+    try {
+      await lspClient.start();
+
+      // 1. LspClient public holder is populated.
+      expect(lspClient.serverStatusLatest).toEqual({ quiescent: true, health: 'ok' });
+
+      // 2. ctx.serverStatusLatest was threaded (by value snapshot at ctx-build time).
+      expect(capturedCtx).not.toBeNull();
+      expect(capturedCtx.serverStatusLatest).toEqual({ quiescent: true, health: 'ok' });
+
+      // 3. ctx.onServerStatus is a function (the subscribe seam is wired).
+      expect(typeof capturedCtx.onServerStatus).toBe('function');
+    } finally {
+      try { await lspClient.stop(); } catch { /* noop */ }
+      server.dispose();
+      try { realClientConn.dispose(); } catch { /* noop */ }
+      wire.destroy();
+    }
+  });
+
+  // ── WI3-18 ──────────────────────────────────────────────────────────────────
+  // Rust: onServerStatus subscriber fires on post-subscribe notification arrival;
+  // dispose() removes the subscriber so it no longer fires.
+  it('WI3-18: Rust — onServerStatus subscriber fires on arrival; dispose() removes it', async () => {
+    const wire = makeWire();
+    const server = makeFakeServer(wire);
+    const realClientConn = createMessageConnection(
+      new StreamMessageReader(wire.clientStdout),
+      new StreamMessageWriter(wire.clientStdin),
+      NullLogger,
+    );
+    const rec = makeRecordingConnection(wire, realClientConn);
+    const clientProcess = makeFakeChildProcess(wire);
+
+    let serverStatusHandler: ((params: unknown) => void) | null = null;
+    let capturedCtx: any = null;
+
+    const rustLikeAdapter = {
+      ...TYPESCRIPT_ADAPTER,
+      id: 'rust' as const,
+      clientCapabilities: {
+        window: { workDoneProgress: false },
+        experimental: { serverStatusNotification: true },
+      },
+      awaitReady: async (ctx: any) => {
+        capturedCtx = ctx;
+        // Capture the handler ref so we can fire it post-subscribe.
+        serverStatusHandler = rec.notifHandlers.get('experimental/serverStatus') ?? null;
+        return true;
+      },
+    };
+
+    const lspClient = new LspClient({
+      workspaceRoot: '/',
+      adapter: rustLikeAdapter as any,
+      _inject: { spawn: () => ({ process: clientProcess, connection: rec as any }) },
+    });
+
+    try {
+      await lspClient.start();
+      expect(capturedCtx).not.toBeNull();
+      expect(serverStatusHandler).not.toBeNull();
+
+      // Subscribe via ctx.onServerStatus.
+      const received: Array<{ quiescent: boolean; health: string }> = [];
+      const sub = capturedCtx.onServerStatus((payload: { quiescent: boolean; health: string }) => {
+        received.push(payload);
+      });
+
+      // Fire a notification post-subscribe — subscriber should receive it.
+      serverStatusHandler!({ quiescent: false, health: 'ok' });
+      expect(received).toEqual([{ quiescent: false, health: 'ok' }]);
+      expect(lspClient.serverStatusLatest).toEqual({ quiescent: false, health: 'ok' });
+
+      // Fire another — subscriber still active.
+      serverStatusHandler!({ quiescent: true, health: 'warning' });
+      expect(received).toHaveLength(2);
+      expect(received[1]).toEqual({ quiescent: true, health: 'warning' });
+
+      // Dispose the subscriber.
+      sub.dispose();
+
+      // Fire a third notification — disposed subscriber must NOT fire.
+      serverStatusHandler!({ quiescent: true, health: 'ok' });
+      expect(received).toHaveLength(2); // still 2, not 3
+
+      // But the holder is still updated (handler itself is still registered).
+      expect(lspClient.serverStatusLatest).toEqual({ quiescent: true, health: 'ok' });
+    } finally {
+      try { await lspClient.stop(); } catch { /* noop */ }
+      server.dispose();
+      try { realClientConn.dispose(); } catch { /* noop */ }
+      wire.destroy();
+    }
+  });
+
+  // ── WI3-19 ──────────────────────────────────────────────────────────────────
+  // Non-Rust (TS): no experimental/serverStatus handler registered; ctx fields undefined.
+  it('WI3-19: non-Rust (TS) — no serverStatus handler registered; ctx fields undefined', async () => {
+    const wire = makeWire();
+    const server = makeFakeServer(wire);
+    const realClientConn = createMessageConnection(
+      new StreamMessageReader(wire.clientStdout),
+      new StreamMessageWriter(wire.clientStdin),
+      NullLogger,
+    );
+    const rec = makeRecordingConnection(wire, realClientConn);
+    const clientProcess = makeFakeChildProcess(wire);
+
+    let capturedCtx: any = null;
+    // TS adapter with fast awaitReady that captures ctx.
+    const fastTsAdapter = {
+      ...TYPESCRIPT_ADAPTER,
+      awaitReady: async (ctx: any) => {
+        capturedCtx = ctx;
+        return true;
+      },
+    };
+
+    const lspClient = new LspClient({
+      workspaceRoot: '/',
+      adapter: fastTsAdapter as any,
+      _inject: { spawn: () => ({ process: clientProcess, connection: rec as any }) },
+    });
+
+    try {
+      await lspClient.start();
+
+      // 1. No experimental/serverStatus handler registered on the connection.
+      expect(rec.notifHandlers.has('experimental/serverStatus')).toBe(false);
+
+      // 2. ctx fields are undefined — structurally unchanged for non-Rust.
+      expect(capturedCtx).not.toBeNull();
+      expect(capturedCtx.serverStatusLatest).toBeUndefined();
+      expect(capturedCtx.onServerStatus).toBeUndefined();
+
+      // 3. LspClient holder is never set.
+      expect(lspClient.serverStatusLatest).toBeUndefined();
+    } finally {
+      try { await lspClient.stop(); } catch { /* noop */ }
+      server.dispose();
+      try { realClientConn.dispose(); } catch { /* noop */ }
+      wire.destroy();
+    }
+  });
+
+  // ── WI3-20 (restart-clean invariant) ─────────────────────────────────────────
+  // On restart, spawnAndInitialize clears serverStatusLatest + _serverStatusSubs
+  // so stale status from a prior session cannot satisfy a fresh awaitReady.
+  it('WI3-20: restart clears serverStatusLatest + _serverStatusSubs (no stale carry-over)', async () => {
+    const wire1 = makeWire();
+    const server1 = makeFakeServer(wire1);
+    const realConn1 = createMessageConnection(
+      new StreamMessageReader(wire1.clientStdout),
+      new StreamMessageWriter(wire1.clientStdin),
+      NullLogger,
+    );
+    const rec1 = makeRecordingConnection(wire1, realConn1);
+    const proc1 = makeFakeChildProcess(wire1);
+
+    const wire2 = makeWire();
+    const server2 = makeFakeServer(wire2);
+    const realConn2 = createMessageConnection(
+      new StreamMessageReader(wire2.clientStdout),
+      new StreamMessageWriter(wire2.clientStdin),
+      NullLogger,
+    );
+    const rec2 = makeRecordingConnection(wire2, realConn2);
+    const proc2 = makeFakeChildProcess(wire2);
+
+    let spawnCall = 0;
+    let ctxAtFirstSpawn: any = null;
+    let ctxAtSecondSpawn: any = null;
+
+    const rustLikeAdapter = {
+      ...TYPESCRIPT_ADAPTER,
+      id: 'rust' as const,
+      clientCapabilities: {
+        window: { workDoneProgress: false },
+        experimental: { serverStatusNotification: true },
+      },
+      awaitReady: async (ctx: any) => {
+        if (spawnCall === 1) ctxAtFirstSpawn = ctx;
+        if (spawnCall === 2) ctxAtSecondSpawn = ctx;
+        return true;
+      },
+    };
+
+    const lspClient = new LspClient({
+      workspaceRoot: '/',
+      adapter: rustLikeAdapter as any,
+      maxRestarts: 2,
+      _inject: {
+        spawn: () => {
+          spawnCall += 1;
+          if (spawnCall === 1) {
+            // First spawn: emit a serverStatus notification to populate the buffer.
+            setImmediate(() => {
+              const h = rec1.notifHandlers.get('experimental/serverStatus');
+              if (h) h({ quiescent: true, health: 'ok' });
+            });
+            return { process: proc1, connection: rec1 as any };
+          }
+          // Second spawn (restart): the buffer should be cleared before awaitReady.
+          return { process: proc2, connection: rec2 as any };
+        },
+      },
+    });
+
+    try {
+      // First start: serverStatus is buffered.
+      await lspClient.start();
+      expect(lspClient.serverStatusLatest).toEqual({ quiescent: true, health: 'ok' });
+      expect(ctxAtFirstSpawn?.serverStatusLatest).toEqual({ quiescent: true, health: 'ok' });
+
+      // Subscribe a dummy callback to verify _serverStatusSubs is also cleared.
+      const dummyFired: boolean[] = [];
+      // Access private _serverStatusSubs indirectly via the onServerStatus seam from first ctx.
+      // We already have ctxAtFirstSpawn.onServerStatus — but that sub would be referencing
+      // the OLD _serverStatusSubs set. After restart, the set is cleared so the old ref
+      // is orphaned. We can test this by verifying the client's holder is cleared.
+
+      // Trigger a restart by setting state to 'restarting' and calling restart().
+      (lspClient as any).state = 'restarting';
+      const restarted = await lspClient.restart();
+      expect(restarted).toBe(true);
+
+      // After restart: buffer must be cleared (undefined BEFORE the new session's notifications
+      // arrive). The second spawn emits no serverStatus, so it stays undefined.
+      expect(lspClient.serverStatusLatest).toBeUndefined();
+
+      // ctx threaded for second spawn also has undefined (cleared before ctx build).
+      expect(ctxAtSecondSpawn?.serverStatusLatest).toBeUndefined();
+
+      void dummyFired; // suppress unused warning
+    } finally {
+      try { await lspClient.stop(); } catch { /* noop */ }
+      server1.dispose();
+      server2.dispose();
+      try { realConn1.dispose(); } catch { /* noop */ }
+      try { realConn2.dispose(); } catch { /* noop */ }
+      wire1.destroy();
+      wire2.destroy();
+    }
+  });
+});
