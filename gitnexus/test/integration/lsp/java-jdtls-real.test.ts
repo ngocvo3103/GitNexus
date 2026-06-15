@@ -14,8 +14,11 @@
  *   AC-3  `LspClient` spawns jdtls with `-data <per-run dir>` (via
  *         `JAVA_ADAPTER.spawnArgs`) and reaches state `ready`.
  *
- *   AC-4  `awaitReady` (the `language/status`/ServiceReady gate) resolves
- *         within the 120s deadline so `start()` completes successfully.
+ *   AC-4  `awaitReady` (settle-until-quiet gate) resolves within the
+ *         JDTLS_READY_DEADLINE_MS (600 s) deadline so `start()` completes
+ *         successfully. Readiness is confirmed ONLY after $/progress goes
+ *         quiet for JDTLS_QUIET_INTERVAL_MS (5 s) AND a canary probe
+ *         returns non-empty — NOT on the first language/status ServiceReady.
  *
  *   AC-4b NO pre-ready definition is published: a `request()` call
  *         racing the warm-up gate resolves `null` — the #172 class
@@ -49,9 +52,11 @@
  *
  * Timeout budget:
  *   beforeAll  — 10s  (discovery only; no server spawned)
- *   warm-up it — 180s (cold jdtls index; 30–90s typical; 180s headroom)
+ *   warm-up it — 300s (settle-until-quiet: 19s indexing + 5s quiet interval
+ *               + canary + headroom; 300 s covers JDTLS_READY_DEADLINE_MS
+ *               plus scheduling overhead)
  *   def its    —  30s each (server already warm; <2s typical)
- *   pre-ready  —  15s (no server; immediate null return)
+ *   pre-ready  — 300s (concurrent race spawns jdtls; budget matches warm-up)
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -62,7 +67,7 @@ import { spawnSync } from 'node:child_process';
 
 import { discoverServers } from '../../../src/core/ingestion/lsp/server-discovery.js';
 import { LspClient } from '../../../src/core/ingestion/lsp/lsp-client.js';
-import { JAVA_ADAPTER } from '../../../src/core/ingestion/lsp/language-adapter.js';
+import { JAVA_ADAPTER, JDTLS_READY_DEADLINE_MS, JDTLS_QUIET_INTERVAL_MS } from '../../../src/core/ingestion/lsp/language-adapter.js';
 import { mapLocationToNodeId } from '../../../src/core/ingestion/lsp/location-mapper.js';
 import { buildCanarySamples } from '../../../src/core/ingestion/lsp/canary-sampler.js';
 import { probeWorkspaceReadiness } from '../../../src/core/ingestion/lsp/workspace-readiness-probe.js';
@@ -227,16 +232,27 @@ describe('jdtls real-binary smoke (WI-8 — guarded)', () => {
 
   /**
    * AC-3 + AC-4: LspClient warms jdtls on the fixture with a per-run
-   * `-data` dir; `awaitReady` resolves within the 120s deadline.
+   * `-data` dir; `awaitReady` (settle-until-quiet) resolves within
+   * JDTLS_READY_DEADLINE_MS (600 000 ms).
    *
    * This is the hot-path test: proves the full
-   * spawn → initialize → awaitReady(ServiceReady) → ready cycle works
+   * spawn → initialize → awaitReady(settle-until-quiet) → ready cycle works
    * end-to-end with a real jdtls binary.
    *
-   * Timeout: 180s to account for cold-start jdtls indexing
-   * (typical 30–90s; budget is 2× the upper bound).
+   * AC34-2 (quiet-path assertion): readiness is reached via the
+   * settle-until-quiet path, NOT instantly on the first language/status
+   * ServiceReady notification. We assert elapsed >= JDTLS_QUIET_INTERVAL_MS
+   * as a wall-clock proxy: jdtls sends ServiceReady within the first few
+   * seconds; a resolution time >= 5 s proves awaitReady waited past the
+   * ServiceReady event for a quiet interval before declaring ready.
+   *
+   * AC34-3: resolution must occur within JDTLS_READY_DEADLINE_MS (600 000 ms).
+   *
+   * Timeout: 300 000 ms — covers JDTLS_READY_DEADLINE_MS (600 s ceiling)
+   * plus scheduling overhead; typical settle time is ~24 s (19 s indexing
+   * + 5 s quiet interval) on this small fixture.
    */
-  it('client warms and reaches state=ready within deadline (AC-3, AC-4)', async () => {
+  it('client warms and reaches state=ready via quiet path within deadline (AC-3, AC-4, AC34-2, AC34-3)', async () => {
     if (!jdtlsBinary) return; // guarded skip
 
     const client = new LspClient({
@@ -245,17 +261,32 @@ describe('jdtls real-binary smoke (WI-8 — guarded)', () => {
       adapter: JAVA_ADAPTER,
     });
 
+    const startedAt = Date.now();
     try {
-      // start() completes only after awaitReady resolves (KD-1).
-      // If the ServiceReady notification never arrives within 120s,
-      // awaitReady returns false → start() throws → this test fails.
+      // AC34-1: start() completes + getState() === 'ready' (KD-1).
+      // awaitReady uses settle-until-quiet: it resolves only after
+      // $/progress goes quiet for JDTLS_QUIET_INTERVAL_MS AND a canary
+      // probe returns non-empty. If awaitReady returns false (deadline
+      // exceeded without a successful canary), start() throws → test fails.
       await client.start();
+      const elapsed = Date.now() - startedAt;
+
+      // AC34-1: state must be 'ready' after start().
       expect(client.getState()).toBe('ready');
+
+      // AC34-2: quiet-path proof — elapsed >= JDTLS_QUIET_INTERVAL_MS (5 000 ms).
+      // ServiceReady arrives within the first few seconds; a resolution time
+      // of at least 5 s proves awaitReady did NOT resolve on ServiceReady
+      // alone but waited for the quiet interval to expire before settling.
+      expect(elapsed).toBeGreaterThanOrEqual(JDTLS_QUIET_INTERVAL_MS);
+
+      // AC34-3: resolution within JDTLS_READY_DEADLINE_MS (600 000 ms).
+      expect(elapsed).toBeLessThan(JDTLS_READY_DEADLINE_MS);
     } finally {
       await client.stop();
       expect(client.getState()).toBe('stopped');
     }
-  }, 180_000);
+  }, 300_000);
 
   /**
    * AC-4 + intra-project definition shape:
@@ -499,7 +530,7 @@ describe('jdtls real-binary smoke (WI-8 — guarded)', () => {
       expect(earlyResult).toBeNull();
       await raceClient.stop();
     }
-  }, 180_000);
+  }, 300_000);
 
   /**
    * I-5 / #175 — `-data` dir isolation:

@@ -131,6 +131,8 @@ import {
   PYLSP_READY_DEADLINE_MS,
   GOPLS_READY_DEADLINE_MS,
   RUST_ANALYZER_READY_DEADLINE_MS,
+  JDTLS_READY_DEADLINE_MS,
+  JDTLS_QUIET_INTERVAL_MS,
   selectAdapter,
   type LanguageAdapter,
   type LanguageCanaryStrategy,
@@ -1930,9 +1932,11 @@ describe('WI-0 clientCapabilities seam', () => {
     expect(TYPESCRIPT_ADAPTER.clientCapabilities).toBeUndefined();
   });
 
-  // C0-4: JAVA_ADAPTER.clientCapabilities === undefined
-  it('C0-4: JAVA_ADAPTER.clientCapabilities === undefined (absent → uses TS_SERVER_CAPABILITIES)', () => {
-    expect(JAVA_ADAPTER.clientCapabilities).toBeUndefined();
+  // C0-4: JAVA_ADAPTER.clientCapabilities deep-equals { window: { workDoneProgress: true } }
+  // Updated by WI-1: Java now declares clientCapabilities so lsp-client.ts activates
+  // the $/progress seam for Java sessions (ADR-002).
+  it('C0-4: JAVA_ADAPTER.clientCapabilities deep-equals { window: { workDoneProgress: true } }', () => {
+    expect(JAVA_ADAPTER.clientCapabilities).toStrictEqual({ window: { workDoneProgress: true } });
   });
 
   // C0-5: PYTHON_ADAPTER.clientCapabilities === undefined
@@ -1968,6 +1972,70 @@ describe('WI-0 clientCapabilities seam', () => {
     // window.workDoneProgress to be the literal type `false`.
     const caps: ClientCapabilities = GO_ADAPTER.clientCapabilities!;
     expect(caps.window?.workDoneProgress).toBe(true);
+  });
+});
+
+// ─── Suite: WI-1 — JDTLS constants + JAVA_ADAPTER.clientCapabilities ──────
+//
+// Technique: EP (value classes) + identity assertion for C0-2/I-1 invariant.
+// Cases C1-1..C1-9: additive assertions; C1-10 lives in lsp-client.test.ts.
+//
+// I-1 invariant: JAVA_ADAPTER.clientCapabilities is a FRESH object literal;
+// it must NOT be the same reference as any other adapter's capabilities
+// (including the module-private TS_SERVER_CAPABILITIES which is unreachable
+// from tests — we assert via Object.is against peer adapters that ARE accessible).
+
+describe('WI-1 JDTLS constants and JAVA_ADAPTER.clientCapabilities', () => {
+  // C1-1: JDTLS_READY_DEADLINE_MS exported and === 600_000
+  it('C1-1: JDTLS_READY_DEADLINE_MS === 600_000 (exported, numeric exact-equal)', () => {
+    expect(JDTLS_READY_DEADLINE_MS).toBe(600_000);
+  });
+
+  // C1-2: JDTLS_QUIET_INTERVAL_MS exported and === 5_000
+  it('C1-2: JDTLS_QUIET_INTERVAL_MS === 5_000 (exported, numeric exact-equal)', () => {
+    expect(JDTLS_QUIET_INTERVAL_MS).toBe(5_000);
+  });
+
+  // C1-3: JAVA_ADAPTER.clientCapabilities deep-equals { window: { workDoneProgress: true } }
+  it('C1-3: JAVA_ADAPTER.clientCapabilities deep-equals { window: { workDoneProgress: true } }', () => {
+    expect(JAVA_ADAPTER.clientCapabilities).toStrictEqual({ window: { workDoneProgress: true } });
+  });
+
+  // C1-4: JAVA_ADAPTER.clientCapabilities is NOT the same object as GO_ADAPTER.clientCapabilities
+  // (I-1 / C0-2 identity discipline — each adapter owns a distinct fresh literal).
+  // TS_SERVER_CAPABILITIES is module-private; we use GO_ADAPTER as the accessible peer.
+  it('C1-4: JAVA_ADAPTER.clientCapabilities is NOT the same object reference as GO_ADAPTER.clientCapabilities (I-1)', () => {
+    expect(Object.is(JAVA_ADAPTER.clientCapabilities, GO_ADAPTER.clientCapabilities)).toBe(false);
+  });
+
+  // C1-5: JAVA_ADAPTER.clientCapabilities has exactly { window } — no extra keys
+  it('C1-5: JAVA_ADAPTER.clientCapabilities has no extra keys beyond { window } (toStrictEqual shape)', () => {
+    // toStrictEqual (used in C1-3) already enforces no extra keys, but this test
+    // makes the structural constraint explicit and self-documenting.
+    const caps = JAVA_ADAPTER.clientCapabilities!;
+    expect(Object.keys(caps)).toEqual(['window']);
+    expect(Object.keys(caps.window!)).toEqual(['workDoneProgress']);
+  });
+
+  // C1-6: GO_ADAPTER.clientCapabilities unchanged — regression guard
+  it('C1-6: GO_ADAPTER.clientCapabilities unchanged — still { window: { workDoneProgress: true } }', () => {
+    expect(GO_ADAPTER.clientCapabilities).toStrictEqual({ window: { workDoneProgress: true } });
+  });
+
+  // C1-7: TYPESCRIPT_ADAPTER.clientCapabilities is undefined — other adapters unaffected
+  it('C1-7: TYPESCRIPT_ADAPTER.clientCapabilities is undefined (unaffected by WI-1)', () => {
+    expect(TYPESCRIPT_ADAPTER.clientCapabilities).toBeUndefined();
+  });
+
+  // C1-8: RUST_ADAPTER.clientCapabilities is unchanged (has window + experimental — not narrowed)
+  it('C1-8: RUST_ADAPTER.clientCapabilities is unchanged by WI-1 (still has window + experimental)', () => {
+    expect(RUST_ADAPTER.clientCapabilities?.window?.workDoneProgress).toBe(true);
+    expect(RUST_ADAPTER.clientCapabilities?.experimental?.serverStatusNotification).toBe(true);
+  });
+
+  // C1-9: PYTHON_ADAPTER.clientCapabilities is undefined — other adapters unaffected
+  it('C1-9: PYTHON_ADAPTER.clientCapabilities is undefined (unaffected by WI-1)', () => {
+    expect(PYTHON_ADAPTER.clientCapabilities).toBeUndefined();
   });
 });
 
