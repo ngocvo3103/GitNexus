@@ -28,9 +28,11 @@ vi.mock('node:path', () => ({
   default: {
     join: vi.fn((...args: string[]) => args.join('/')),
     resolve: vi.fn((...args: string[]) => args.join('/').replace(/^([a-z]:)/i, '$1/')),
+    sep: '/',
   },
   join: vi.fn((...args: string[]) => args.join('/')),
   resolve: vi.fn((...args: string[]) => args.join('/').replace(/^([a-z]:)/i, '$1/')),
+  sep: '/',
 }));
 
 // Mock LocalBackend constructor to return our mock instance

@@ -31,7 +31,7 @@ import { getGlobalDir } from '../../../storage/repo-manager.js';
 import { TYPESCRIPT_LANGUAGE_SERVER_BIN } from './server-discovery.js';
 // WI-2: import canary strategies. canary-sampler.ts only `import type`s from this
 // file (LanguageCanaryStrategy), so the import is erased at runtime — no cycle.
-import { TS_CANARY_STRATEGY, JAVA_CANARY_STRATEGY, PYTHON_CANARY_STRATEGY, GO_CANARY_STRATEGY, buildCanarySamples } from './canary-sampler.js';
+import { TS_CANARY_STRATEGY, JAVA_CANARY_STRATEGY, PYTHON_CANARY_STRATEGY, GO_CANARY_STRATEGY, RUST_CANARY_STRATEGY, buildCanarySamples } from './canary-sampler.js';
 
 // ─── Forward-declared types (filled in by WI-2/WI-4) ─────────────────
 
@@ -141,6 +141,50 @@ export interface AdapterReadyCtx {
    *   sub?.dispose();
    */
   onProgressEnd?: (cb: (token: string | number) => void) => { dispose(): void };
+
+  // ── WI-3b2: experimental/serverStatus read-seam (Rust only) ──────────────
+  //
+  // The two fields below are OPTIONAL. TS/Java/Python/Go adapters receive an
+  // `AdapterReadyCtx` where both are `undefined` — their `awaitReady`
+  // implementations must not touch them. Only `RUST_ADAPTER.awaitReady` reads
+  // them; `LspClient.spawnAndInitialize` populates them by reference when the
+  // adapter has `clientCapabilities?.experimental?.serverStatusNotification`
+  // set (truthy).
+  //
+  // Design: threaded by reference (same holder/Set instance as `LspClient`) so
+  // `awaitReady` can observe a notification buffered BEFORE it is called (the
+  // begin-before-awaitReady timing class, #172). The `onServerStatus` subscribe
+  // seam lets `awaitReady` be notified when a new status arrives after it starts.
+
+  /**
+   * Latest `experimental/serverStatus` payload buffered by the pre-`initialize`
+   * handler (registered in `spawnAndInitialize`). Shape: `{ quiescent: boolean;
+   * health: string }`. `undefined` until the first notification arrives.
+   *
+   * Populated only for Rust (Rust adapter sets
+   * `clientCapabilities?.experimental?.serverStatusNotification`).
+   * `undefined` for TS/Java/Python/Go.
+   *
+   * `awaitReady` reads this field first (buffer-hit path): if the notification
+   * already arrived before `awaitReady` is called, it can resolve immediately
+   * without subscribing.
+   */
+  serverStatusLatest?: { quiescent: boolean; health: string };
+
+  /**
+   * Subscribe to future `experimental/serverStatus` notifications. The callback
+   * `cb` is invoked with the latest `{ quiescent, health }` payload each time
+   * the pre-`initialize` handler processes a new notification. The returned
+   * disposable removes `cb` from the registry.
+   *
+   * Populated only for Rust. `undefined` for TS/Java/Python/Go.
+   *
+   * Usage pattern in `RUST_ADAPTER.awaitReady`:
+   *   const sub = ctx.onServerStatus?.((payload) => { … });
+   *   // …
+   *   sub?.dispose();
+   */
+  onServerStatus?: (cb: (payload: { quiescent: boolean; health: string }) => void) => { dispose(): void };
 }
 
 // ─── ClientCapabilities ───────────────────────────────────────────────
@@ -162,11 +206,24 @@ export interface AdapterReadyCtx {
  * `ClientCapabilities` back from `lsp-client.ts` would create a cycle that
  * leaves one side `undefined` at module init time in Node.js.  `lsp-client.ts`
  * re-exports this type for callers that need to import from there.
+ *
+ * Expand-contract rule: add new optional fields here; never remove or rename
+ * existing fields. Callers may depend on any field being present by name —
+ * removing one is a breaking change even if all current callers are updated
+ * (downstream tools may consume serialised JSON). Widen additively instead.
  */
 export interface ClientCapabilities {
   textDocument?: Record<string, unknown>;
   workspace?: Record<string, unknown>;
   window?: { workDoneProgress?: boolean };
+  /**
+   * Experimental capabilities negotiated outside the LSP core spec.
+   * Language servers that advertise `serverStatusNotification` (e.g.
+   * rust-analyzer) read this field from the initialize request.
+   * Typed as `Record<string, unknown>` to remain open for future keys
+   * without requiring interface updates (I-13).
+   */
+  experimental?: Record<string, unknown>;
 }
 
 // ─── LanguageAdapter interface ────────────────────────────────────────
@@ -176,8 +233,16 @@ export interface ClientCapabilities {
  * threaded through all LSP-stack entry points.
  */
 export interface LanguageAdapter {
-  /** Closed union; widened additively — no switch/discriminant over .id in production. */
-  readonly id: 'typescript' | 'java' | 'python' | 'go';
+  /**
+   * Discriminant for the adapter instance.
+   *
+   * Expand-contract rule: widen this union additively (add a new literal);
+   * NEVER add an exhaustive switch/discriminant over `.id` in production code.
+   * Union members must only be added, never removed or renamed — callers may
+   * hold string-typed adapter ids at runtime (e.g. from serialised config) and
+   * a removed literal would silently produce a type error on assignment.
+   */
+  readonly id: 'typescript' | 'java' | 'python' | 'go' | 'rust';
 
   /**
    * Binary basename passed to server discovery.
@@ -900,6 +965,238 @@ export const GO_ADAPTER: LanguageAdapter = {
   },
 };
 
+// ─── RUST_ANALYZER_READY_DEADLINE_MS ─────────────────────────────
+
+/**
+ * Hard deadline for `RUST_ADAPTER.awaitReady` (milliseconds from call time).
+ *
+ * 60 s — deliberately higher than the 30_000 ms GOPLS/PYLSP constants because
+ * rust-analyzer performs a cold metadata load (Cargo workspace, proc-macro
+ * expansion) that is significantly slower than gopls or pylsp on first startup.
+ * Spike-deferred; will be tuned in WI-3b3 once real cold-start data is
+ * available.
+ *
+ * Exported so callers and tests can override via `AdapterReadyCtx.deadlineMs`.
+ */
+export const RUST_ANALYZER_READY_DEADLINE_MS = 60_000;
+
+// ─── RUST_ADAPTER ─────────────────────────────────────────────────
+
+/**
+ * Rust language adapter (WI-3b1 literal surface; `awaitReady` stubbed for WI-3b3).
+ *
+ * `id`: `'rust'` — already admitted by the `LanguageAdapter.id` union (line 201).
+ *
+ * `spawnArgs`: always returns `[]` (fresh array literal per call). rust-analyzer
+ *   uses stdio by default — no `--stdio` flag is required (spike-deferred;
+ *   WI-3b3 will confirm on a real Rust workspace). Each call returns a new
+ *   array so two successive calls never share a reference (I-2).
+ *
+ * `classifyUri`: scheme-only signal mirroring GO_ADAPTER exactly.
+ *   `file://` → `'workspace'`; anything else → `'unmappable'`.
+ *   No `.rs`/cargo-registry/sysroot special-casing here — out-of-repo
+ *   containment is gated in `location-mapper.ts` (ruling R2-13 / ADR-001).
+ *
+ * `initializationOptions`: `{}` — spike-deferred safe default. rust-analyzer
+ *   accepts the LSP default; server-specific options (e.g. `cargo.features`)
+ *   will be wired in a later WI if needed.
+ *
+ * `clientCapabilities`: distinct literal (C0-2 discipline — does NOT reference
+ *   the module-private `TS_SERVER_CAPABILITIES` const). Tells rust-analyzer the
+ *   client supports both progress notifications and the experimental
+ *   `serverStatusNotification` (I-13). Type-compatible with `ClientCapabilities`
+ *   (lines 170-182) which carries both `window` and `experimental` optional fields.
+ *
+ * `awaitReady`: stubbed — returns `true` immediately. WI-3b3 will replace this
+ *   with the real rust-analyzer `experimental/serverStatus` notification wait.
+ *
+ * `canary`: `RUST_CANARY_STRATEGY` (real WI-2 export from canary-sampler.ts).
+ */
+export const RUST_ADAPTER: LanguageAdapter = {
+  id: 'rust',
+  serverBinary: 'rust-analyzer',
+  languageId: 'rust',
+
+  spawnArgs(_ctx: { workspaceRoot: string }): string[] {
+    // rust-analyzer uses stdio by default (no --stdio flag required).
+    // Returns a fresh array literal on every call so successive calls never
+    // share a reference (I-2 invariant; mirrors PYTHON_ADAPTER / GO_ADAPTER).
+    return [];
+  },
+
+  initializationOptions: {},
+
+  /**
+   * WI-3b1 stub: resolves `true` immediately.
+   * WI-3b3 will replace this with the `experimental/serverStatus` wait.
+   * The stub satisfies the `LanguageAdapter` contract and prevents any
+   * caller that constructs a `RUST_ADAPTER` session from hanging.
+   */
+  awaitReady(ctx: AdapterReadyCtx): Promise<boolean> {
+    // WI-3b3: real experimental/serverStatus notification-wait pattern.
+    //
+    // Algorithm:
+    //   1. Check the pre-buffered ctx.serverStatusLatest. If quiescent:true
+    //      and health:'ok' or health:'warning', resolve true immediately.
+    //      (uses settle() so the idempotency flag is set before return)
+    //   2. Subscribe via ctx.onServerStatus for future status events.
+    //      Resolve true on {quiescent:true, health:'ok'|'warning'}.
+    //      {quiescent:true, health:'error'} is NOT ready — keep waiting.
+    //      {quiescent:false, any health} is NOT ready — keep waiting.
+    //   3. On hard deadline: fall back to canary backstop.
+    //      Zero samples in workspace → true (deliberate GO_ADAPTER deviation:
+    //      zero-edges no-op, nothing to verify, proceed with ingestion).
+    //      Samples present + empty/null textDocument/definition → false.
+    //      ctx.backstopProbe if injected → delegate entirely to it.
+    //   Any path: never rejects (I-7) — settle(false) on any throw.
+    //
+    // No $/progress arm (WI-0 spike: rust-analyzer has no single
+    // load-complete progress title; serverStatus is the sole readiness signal).
+    //
+    // serverStatus handler is NOT registered here. It lives in
+    // LspClient.spawnAndInitialize (WI-3b2). awaitReady only READS
+    // ctx.serverStatusLatest and subscribes via ctx.onServerStatus.
+
+    function isReady(payload: { quiescent: boolean; health: string }): boolean {
+      return payload.quiescent === true &&
+        (payload.health === 'ok' || payload.health === 'warning');
+    }
+
+    const capturedCanary = RUST_ADAPTER.canary;
+    const capturedWorkspaceRoot = ctx.workspaceRoot;
+    const conn = ctx.connection as MessageConnection;
+
+    return new Promise<boolean>((resolve) => {
+      const deadline = ctx.deadlineMs ?? RUST_ANALYZER_READY_DEADLINE_MS;
+
+      let settled = false;
+      let statusSub: { dispose(): void } | null = null;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      function settle(value: boolean): void {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        try { statusSub?.dispose(); } catch { /* ignore */ }
+        resolve(value);
+      }
+
+      // Step 1: check buffer for an already-arrived quiescent status.
+      // Use settle() — not resolve() directly — so the idempotency guard
+      // (settled flag) is set before returning. If an onServerStatus callback
+      // fires synchronously on the same microtask tick after this point it
+      // will see settled=true and short-circuit, preventing double-resolution.
+      if (ctx.serverStatusLatest !== undefined) {
+        if (isReady(ctx.serverStatusLatest)) {
+          settle(true);
+          return; // settled synchronously — no timer, no sub needed
+        }
+      }
+
+      // Step 2: subscribe to future serverStatus events.
+      if (ctx.onServerStatus !== undefined) {
+        try {
+          statusSub = ctx.onServerStatus((payload) => {
+            if (settled) return;
+            if (isReady(payload)) {
+              settle(true);
+            }
+            // health:'error' or quiescent:false → keep waiting (fall to deadline)
+          });
+        } catch {
+          // Subscribe failed — fall through to deadline backstop.
+        }
+      }
+
+      // Step 3: deadline backstop — canary probe (mirrors GO_ADAPTER path B,
+      // but zero samples → true is a deliberate deviation from GO_ADAPTER).
+      timer = setTimeout(() => {
+        if (settled) return;
+        void (async () => {
+          try {
+            if (ctx.backstopProbe) {
+              const ready = await ctx.backstopProbe();
+              settle(ready);
+              return;
+            }
+            // Inline canary probe: build samples + didOpen + definition.
+            const samples = await buildCanarySamples(capturedWorkspaceRoot, {
+              strategy: capturedCanary,
+              maxFiles: 1,
+            });
+            // Zero samples: deliberate deviation from GO_ADAPTER (which returns
+            // false). Zero samples in a Rust workspace means nothing to verify —
+            // proceed with no-op augmentation rather than blocking ingestion.
+            if (samples.length === 0) { settle(true); return; }
+            const sample = samples[0];
+            try {
+              let fileContent = '';
+              try {
+                fileContent = await fs.promises.readFile(
+                  fileURLToPath(sample.textDocument.uri),
+                  'utf8',
+                );
+              } catch { /* unreadable — send empty content */ }
+              await conn.sendNotification('textDocument/didOpen', {
+                textDocument: {
+                  uri: sample.textDocument.uri,
+                  languageId: RUST_ADAPTER.languageId,
+                  version: 1,
+                  text: fileContent,
+                },
+              });
+            } catch { /* best-effort */ }
+            const result = await conn.sendRequest<unknown>(
+              'textDocument/definition',
+              { textDocument: sample.textDocument, position: sample.position },
+            );
+            const ready =
+              result !== null &&
+              result !== undefined &&
+              !(Array.isArray(result) && result.length === 0);
+            settle(ready);
+          } catch {
+            settle(false);
+          }
+        })();
+      }, deadline);
+
+      // Prevent the timer from keeping the Node.js event loop alive past teardown.
+      timer.unref?.();
+    });
+  },
+
+  /**
+   * WI-3b1: real RUST_CANARY_STRATEGY from canary-sampler.ts.
+   * `isCandidateFile` accepts `.rs` files; `tryExtractSample` extracts
+   * fn/struct/enum/trait declarations and call-site positions.
+   */
+  canary: RUST_CANARY_STRATEGY,
+
+  /**
+   * Distinct literal — does NOT reference the module-private
+   * `TS_SERVER_CAPABILITIES` const (C0-2 discipline).
+   *
+   * `window.workDoneProgress: true` — rust-analyzer supports LSP progress
+   * notifications (WI-3b3 will use them for readiness detection).
+   * `experimental.serverStatusNotification: true` — tells rust-analyzer
+   * the client handles `experimental/serverStatus` (I-13).
+   */
+  clientCapabilities: {
+    window: { workDoneProgress: true },
+    experimental: { serverStatusNotification: true },
+  },
+
+  classifyUri(uri: string): 'workspace' | 'external' | 'unmappable' {
+    // Scheme-only signal — mirrors GO_ADAPTER exactly (ruling R2-13 / ADR-001).
+    // Out-of-repo containment (cargo-registry, sysroot, toolchain dirs) is
+    // path-containment gated on adapterId in location-mapper.ts.
+    // Do NOT add cargo-registry or sysroot special-casing here.
+    if (uri.startsWith('file://')) return 'workspace';
+    return 'unmappable';
+  },
+};
+
 // ─── Extension census for KD-4 adapter selection ─────────────────────
 
 /** Extensions that indicate a TypeScript/JavaScript LSP project. */
@@ -913,6 +1210,9 @@ const PY_EXTENSIONS = new Set(['.py']);
 
 /** Extensions that indicate a Go LSP project. */
 const GO_EXTENSIONS = new Set(['.go']);
+
+/** Extensions that indicate a Rust LSP project. */
+const RUST_EXTENSIONS = new Set(['.rs']);
 
 /**
  * Directories to skip during the extension census walk. Skipping
@@ -953,13 +1253,14 @@ const CENSUS_FILE_LIMIT = 2_000;
  * Walk `dir` recursively, counting LSP-relevant file extensions.
  * Bails out once `CENSUS_FILE_LIMIT` files have been inspected.
  *
- * Returns `{ tsCount, javaCount, pyCount }`.
+ * Returns `{ tsCount, javaCount, pyCount, goCount, rustCount }`.
  */
-function censusExtensions(dir: string): { tsCount: number; javaCount: number; pyCount: number; goCount: number } {
+function censusExtensions(dir: string): { tsCount: number; javaCount: number; pyCount: number; goCount: number; rustCount: number } {
   let tsCount = 0;
   let javaCount = 0;
   let pyCount = 0;
   let goCount = 0;
+  let rustCount = 0;
   let inspected = 0;
 
   function walk(current: string): void {
@@ -998,13 +1299,15 @@ function censusExtensions(dir: string): { tsCount: number; javaCount: number; py
           pyCount++;
         } else if (GO_EXTENSIONS.has(ext)) {
           goCount++;
+        } else if (RUST_EXTENSIONS.has(ext)) {
+          rustCount++;
         }
       }
     }
   }
 
   walk(dir);
-  return { tsCount, javaCount, pyCount, goCount };
+  return { tsCount, javaCount, pyCount, goCount, rustCount };
 }
 
 /**
@@ -1028,29 +1331,37 @@ function censusExtensions(dir: string): { tsCount: number; javaCount: number; py
  *          was detected.
  */
 export function selectAdapter(repoPath: string): LanguageAdapter | null {
-  const { tsCount, javaCount, pyCount, goCount } = censusExtensions(repoPath);
+  const { tsCount, javaCount, pyCount, goCount, rustCount } = censusExtensions(repoPath);
 
-  if (tsCount === 0 && javaCount === 0 && pyCount === 0 && goCount === 0) {
+  if (tsCount === 0 && javaCount === 0 && pyCount === 0 && goCount === 0 && rustCount === 0) {
     // No supported LSP language detected — funnel not entered.
     return null;
   }
 
-  // Python strict dominance: must beat TS, Java, AND Go counts.
-  // Checked BEFORE the Go branch and the TS/Java tie-break — otherwise a
+  // Python strict dominance: must beat TS, Java, Go, AND Rust counts.
+  // Checked BEFORE the Go/Rust branches and the TS/Java tie-break — otherwise a
   // pure-Python repo (tsCount=0, javaCount=0, pyCount=N) short-circuits to TS
   // via 0 >= 0. The goCount guard ensures Python cannot steal a Go-dominant
   // repo (e.g. 8 .go / 3 .py / 2 .ts / 2 .java → Go wins, not Python).
-  if (pyCount > tsCount && pyCount > javaCount && pyCount > goCount) {
+  if (pyCount > tsCount && pyCount > javaCount && pyCount > goCount && pyCount > rustCount) {
     return PYTHON_ADAPTER;
   }
 
-  // Go strict dominance: must beat ALL other counts (TS, Java, Python).
+  // Go strict dominance: must beat ALL other counts (TS, Java, Python, Rust).
   // Positioned AFTER Python strict-dominance (so a Python-dominant repo is
-  // never swallowed by this branch) and BEFORE the TS/Java tie-break (so a
-  // pure-Go repo does not short-circuit to TS via the 0 >= 0 guard — I-14).
+  // never swallowed by this branch) and BEFORE the Rust and TS/Java tie-break
+  // (so a pure-Go repo does not short-circuit to TS via the 0 >= 0 guard — I-14).
   // Ties go to the next branch (TS default), consistent with Python's contract.
-  if (goCount > tsCount && goCount > javaCount && goCount > pyCount) {
+  if (goCount > tsCount && goCount > javaCount && goCount > pyCount && goCount > rustCount) {
     return GO_ADAPTER;
+  }
+
+  // Rust strict dominance: must beat ALL other counts (TS, Java, Python, Go).
+  // Positioned AFTER Python and Go strict-dominance checks, BEFORE the TS/Java
+  // tie-break. Ties go to the next branch (TS default), consistent with the
+  // strict-dominance contract shared by Python and Go.
+  if (rustCount > tsCount && rustCount > javaCount && rustCount > pyCount && rustCount > goCount) {
+    return RUST_ADAPTER;
   }
 
   // Ties (including tsCount === pyCount) go to TS (safe default — TS adapter

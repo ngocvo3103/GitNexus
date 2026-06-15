@@ -40,6 +40,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import path from 'node:path';
+import os from 'node:os';
 
 // ─── Hoisted mock state ────────────────────────────────────────────────
 //
@@ -139,6 +140,35 @@ vi.mock('fs/promises', () => {
       fileContents.set(String(absPath), content);
     }),
     realpath,
+  };
+});
+
+// ─── Mock node:fs (realpathSync) ──────────────────────────────────────
+//
+// `uriToRepoRelative` (in reference-provider.ts) calls `realpathSync`
+// from `node:fs` directly (not injected). The existing tests use the
+// fake repo root `/repo` which does not exist on disk, so `realpathSync`
+// throws → uriToRepoRelative returns null → A1-A4/S1/C1/C1b all fail.
+//
+// The mock makes `realpathSync` an identity fn for non-existent paths,
+// mirroring the pre-fix behaviour (no symlink resolution). The security
+// regression test for the real symlink escape lives in the separate file
+// `uri-symlink-containment.test.ts` where node:fs is NOT mocked so the
+// real realpathSync resolves real symlinks.
+
+vi.mock('node:fs', async (importOriginal) => {
+  const original = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...original,
+    realpathSync: vi.fn((p: string) => {
+      try {
+        return original.realpathSync(p);
+      } catch {
+        // Path does not exist — return as-is (identity). This matches the
+        // pre-fix behaviour for tests that use synthetic /repo paths.
+        return p;
+      }
+    }),
   };
 });
 
@@ -899,3 +929,81 @@ describe('applyPreciseEdits — symlink-redirect TOCTOU guard (F1)', () => {
     expect(writeFile).toHaveBeenCalledWith(inRepoReal, 'AAA\n');
   });
 });
+
+// ─── TOCTOU fix: no-content fallback path in applyPreciseEdits ───────────
+//
+// Security regression for the fix in reference-provider.ts:applyPreciseEdits.
+//
+// The original code in the `no-content` branch (change.content undefined):
+//   1. readFile(abs)          ← read from the raw lexical path
+//   2. checkRealpath(…)       ← containment check AFTER the read
+//   3. if null → skip
+//
+// A TOCTOU window existed between the read and the realpath call: if a symlink
+// was swapped to point outside the repo AFTER the read but BEFORE the check,
+// the data had already been read (data-exposure). The fix reorders to:
+//   1. checkRealpath(…)       ← containment check FIRST
+//   2. if null → skip (readFile never called)
+//   3. readFile(realAbs)      ← read from the RESOLVED real path
+//
+// The test below asserts the fixed ordering: when realpath returns an
+// out-of-repo path, readFile is NEVER called. Without the fix (old order),
+// readFile would be called before the realpath check fires — the mock would
+// record the call and the assertion `expect(readFile).not.toHaveBeenCalled()`
+// would fail, catching any revert.
+
+describe('applyPreciseEdits — TOCTOU fix: no-content path (security regression)', () => {
+  it('F-TOCTOU: realpath-outside-repo aborts BEFORE readFile is called', async () => {
+    // Build a change with NO `content` field — this forces the no-content
+    // fallback branch where the TOCTOU fix lives (pre-parallel pass skips
+    // the read; the serial pass must do realpath → read, not read → realpath).
+    const outsideReal = path.join(os.tmpdir(), 'toctou-escape-target');
+    const readFile = vi.fn(async (_abs: string): Promise<string> => {
+      // This must NEVER be called — the realpath check should short-circuit.
+      return 'secret content';
+    });
+    const writeFile = vi.fn(async () => undefined);
+    const realpath = vi.fn(async (abs: string) => {
+      // Simulate a symlink whose real path escapes the repo.
+      if (abs.includes('symlink-escape')) return outsideReal;
+      return abs;
+    });
+
+    const changes: ApplierChangesFile[] = [
+      {
+        file_path: 'symlink-escape',  // no `content` → hits the no-content branch
+        edits: [{
+          line: 1, old_text: 'x', new_text: 'X', newText: 'X', confidence: 'lsp',
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+        }],
+        // content is deliberately omitted — forces the no-content fallback path
+      },
+    ];
+
+    const result = await applyPreciseEdits(changes, {
+      repoPath: REPO,
+      dryRun: false,
+      deps: { readFile, writeFile, realpath },
+    });
+
+    // Edit must be skipped (out-of-repo realpath).
+    expect(result.written).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    // realpath must have been called (the containment check ran).
+    expect(realpath).toHaveBeenCalled();
+
+    // readFile must NOT have been called — it comes after realpath in the
+    // fixed code. If this assertion fails, the old read-then-realpath order
+    // has been restored, re-opening the TOCTOU window.
+    expect(readFile).not.toHaveBeenCalled();
+
+    // writeFile must not have been called (nothing written outside repo).
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+});
+
+// Note: the uriToRepoRelative symlink regression test lives in the
+// companion file `uri-symlink-containment.test.ts` — that file does NOT
+// mock node:fs so the real realpathSync resolves real symlinks on disk.
+

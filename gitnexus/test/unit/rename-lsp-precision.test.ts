@@ -166,6 +166,47 @@ vi.mock('node:fs/promises', () => {
   };
 });
 
+// ─── Mock node:fs (realpathSync) ──────────────────────────────────────
+//
+// `uriToRepoRelative` (in reference-provider.ts) calls `realpathSync`
+// from `node:fs` directly (not via dependency injection). The tests use
+// synthetic /tmp/test-project paths that do not exist on disk, so
+// the new TOCTOU fix (realpathSync before read) causes ENOENT →
+// uriToRepoRelative returns null → workspaceEditToApplierChanges/
+// workspaceEditToChanges return null → D1/D6/D7 fail.
+//
+// The mock makes `realpathSync` an identity fn for non-existent paths,
+// mirroring the pre-fix behaviour (no symlink resolution in tests).
+// The security regression test for the real symlink escape lives in
+// `uri-symlink-containment.test.ts` where node:fs is NOT mocked so
+// the real realpathSync resolves real symlinks on disk.
+vi.mock('node:fs', async (importOriginal) => {
+  const original = await importOriginal<typeof import('node:fs')>();
+  // The identity wrapper: try the real realpathSync; if the path does not
+  // exist on disk, return the input unchanged. This matches pre-fix behaviour
+  // for tests that use synthetic /tmp/test-project paths which don't exist.
+  const identityRealpathSync = (p: string): string => {
+    try {
+      return original.realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  // Preserve the `.native` sub-property (used by assertSafePathForRepo in
+  // local-backend.ts) with the same identity fallback semantics.
+  (identityRealpathSync as any).native = (p: string): string => {
+    try {
+      return original.realpathSync.native(p);
+    } catch {
+      return p;
+    }
+  };
+  return {
+    ...original,
+    realpathSync: vi.fn(identityRealpathSync),
+  };
+});
+
 // Mock the reference-provider module so the funnel can be
 // controlled per-test. The real `withReferenceProvider` does
 // subprocess lifecycle; here we replace it with a `vi.fn()` the

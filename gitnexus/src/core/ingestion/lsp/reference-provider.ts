@@ -71,6 +71,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { readFile as fsReadFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import * as path from 'node:path';
 
 import { LspClient } from './lsp-client.js';
@@ -1247,21 +1248,27 @@ export async function applyPreciseEdits(
       // no-content fallback: re-read on the serial path. The
       // pre-parallel pass deliberately skipped the read so the
       // fast path doesn't double-read.
+      //
+      // TOCTOU fix: resolve realpath FIRST, verify containment,
+      // then read from the resolved realAbs. The original order
+      // (read → realpath) allowed a symlink swapped between the
+      // read and the realpath call to expose data from outside
+      // the repo before the containment check fires.
       const abs = path.resolve(repoPath, change.file_path);
-      let readContent: string;
-      try {
-        readContent = await readFile(abs);
-      } catch {
-        skipped += pre.editCount;
-        continue;
-      }
-      content = readContent;
       const resolved = await checkRealpath(abs, repoPath, realpath);
       if (resolved === null) {
         skipped += pre.editCount;
         continue;
       }
       realAbs = resolved;
+      let readContent: string;
+      try {
+        readContent = await readFile(realAbs);
+      } catch {
+        skipped += pre.editCount;
+        continue;
+      }
+      content = readContent;
     }
 
     // KD-2: sort edits DESCENDING by (line, character). On a
@@ -1381,6 +1388,25 @@ function uriToRepoRelative(uri: string, repoPath: string): string | null {
     // Some servers emit bare absolute paths; treat them as abs.
     abs = uri;
   }
+
+  // 1b) Symlink resolution: resolve the real path before any
+  //     containment check. A malicious LSP server can return a
+  //     URI whose lexical path is inside the repo (e.g.
+  //     file:///repo/symlink-to-outside) but whose symlink target
+  //     is outside. realpathSync resolves the chain so the
+  //     containment check operates on the true filesystem
+  //     location, not the lexical path. This mirrors the pattern
+  //     applied in lsp-client.ts:maybeDidOpenForDefinition and
+  //     server-discovery.ts:findNearestNodeModulesBin.
+  //     If the path does not exist (dangling symlink or the LSP
+  //     server returned a phantom path) realpathSync throws —
+  //     treat that as a refuse condition.
+  try {
+    abs = realpathSync(abs);
+  } catch {
+    return null;
+  }
+
   // Normalize to forward slashes for the containment check
   // (path.resolve on Windows produces backslashes, but our
   // repo-relative emit uses POSIX slashes).

@@ -119,6 +119,7 @@ import {
   JDTLS_BIN,
   PYLSP_BIN,
   GOPLS_BIN,
+  RUST_ANALYZER_BIN,
 } from '../../../src/core/ingestion/lsp/server-discovery.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -1117,6 +1118,136 @@ describe('server-discovery', () => {
       expect(result).toEqual({
         typescript: { path: projectNmBin, version: '4.3.3' },
       });
+    });
+  });
+
+  // ─── WI-5: rust-analyzer discovery ───────────────────────────────────────
+  //
+  // EP (binary presence × PATH × timeout partitions) +
+  // State Transition (discovery result: found / absent / slow-version)
+  // Cases WI5-1 through WI5-7 as specified.
+  //
+  // Invariants verified:
+  //   I-10: rust key absent (not null) when rust-analyzer not found.
+  //   I-10: discoverServers() never throws — all failure modes → absent rust key.
+  //   Additive widening: typescript key always present in result.
+
+  describe('discoverServers — rust-analyzer (WI-5)', () => {
+    // WI5-1: RUST_ANALYZER_BIN constant
+    it('WI5-1: exports RUST_ANALYZER_BIN constant === "rust-analyzer"', () => {
+      expect(RUST_ANALYZER_BIN).toBe('rust-analyzer');
+    });
+
+    // WI5-2: rust-analyzer on PATH → servers.rust non-null with truthy path + version (AC-15)
+    it('WI5-2 (AC-15): rust-analyzer on PATH → servers.rust non-null with truthy path and version', async () => {
+      const rustBin = '/usr/local/bin/rust-analyzer';
+      stageBinary(rustBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === RUST_ANALYZER_BIN) return `${rustBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      registerSpawn(rustBin, () => 'rust-analyzer 2024-05-20\n');
+
+      const result = await discoverServers();
+
+      expect(result.rust).not.toBeNull();
+      expect(result.rust).not.toBeUndefined();
+      expect(result.rust!.path).toBeTruthy();
+      expect(result.rust!.version).toBeTruthy();
+      expect(result.rust!.path).toBe(rustBin);
+      // version string must be non-empty/non-unknown to be "truthy" per AC-15
+      expect(result.rust!.version).not.toBe('');
+    });
+
+    // WI5-3: rust-analyzer absent (ENOENT) → servers.rust is undefined (not null) — I-10 / AC
+    it('WI5-3: rust-analyzer absent (ENOENT spawn) → servers.rust key absent (undefined, not null)', async () => {
+      // Stage only a TS binary; no rust-analyzer on PATH or anywhere.
+      const tsBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      stageBinary(tsBin);
+      registerSpawn(tsBin, () => 'typescript-language-server 4.3.3\n');
+      // No rust-analyzer staged, no which handler.
+
+      const result = await discoverServers();
+
+      // I-10: absent → undefined, NOT null (mirrors go? optional pattern)
+      expect(result.rust).toBeUndefined();
+      // Strict check: the key must not be present (not even as null)
+      expect(Object.prototype.hasOwnProperty.call(result, 'rust')).toBe(false);
+    });
+
+    // WI5-4: rust-analyzer times out on --version → servers.rust = {ran:true, path, version:'unknown'} (slow-version tolerance)
+    it('WI5-4: rust-analyzer --version times out → servers.rust present with truthy path and version "unknown"', async () => {
+      const rustBin = '/usr/local/bin/rust-analyzer';
+      stageBinary(rustBin);
+      const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      registerSpawn(whichCmd, (args) => {
+        if (args[0] === RUST_ANALYZER_BIN) return `${rustBin}\n`;
+        throw Object.assign(new Error('not found'), { code: 'ENOENT', status: 1 });
+      });
+      // Simulate ETIMEDOUT — binary was spawned but killed (not absent).
+      registerSpawn(rustBin, () => {
+        throw Object.assign(new Error('spawnSync rust-analyzer ETIMEDOUT'), {
+          code: 'ETIMEDOUT',
+        });
+      });
+
+      const result = await discoverOne(RUST_ANALYZER_BIN, { cwd: '/nonexistent/empty' });
+
+      // Must be kept with 'unknown' — slow --version must NOT drop the binary.
+      expect(result).not.toBeNull();
+      expect(result!.path).toBeTruthy();
+      expect(result!.path).toBe(rustBin);
+      expect(result!.version).toBe('unknown');
+    });
+
+    // WI5-5: all binaries absent → no rust key; typescript still present (additive widening invariant)
+    it('WI5-5: all binaries absent → result has no rust key; typescript key still present', async () => {
+      // Stage a TS binary only so typescript is present; no rust-analyzer.
+      const tsBin = path.join(
+        process.cwd(),
+        'node_modules',
+        '.bin',
+        TYPESCRIPT_LANGUAGE_SERVER_BIN,
+      );
+      stageBinary(tsBin);
+      registerSpawn(tsBin, () => 'typescript-language-server 4.3.3\n');
+
+      const result = await discoverServers();
+
+      // Additive widening: adding rust must not remove any required key.
+      expect(result.typescript).not.toBeUndefined();
+      // rust key must be absent (not present at all).
+      expect(result.rust).toBeUndefined();
+    });
+
+    // WI5-6: edge case — servers.rust key absent (not null) when ENOENT (optional-field convention)
+    it('WI5-6 (I-10, edge): rust key absent when ENOENT — undefined not null, matches go? pattern', async () => {
+      // Strictly no rust-analyzer anywhere — discoverOne(RUST_ANALYZER_BIN) returns null.
+      const result = await discoverOne(RUST_ANALYZER_BIN, {
+        cwd: '/nonexistent/empty',
+      });
+
+      // discoverOne returns null when absent (per existing contract).
+      expect(result).toBeNull();
+
+      // discoverServers() must omit the key (not include rust: null).
+      // Verify by running discoverServers with nothing staged.
+      const serverResult = await discoverServers();
+      expect(serverResult.rust).toBeUndefined();
+      // toEqual should not see a rust key — matches go? pattern.
+      expect(serverResult).toEqual({ typescript: null });
+    });
+
+    // WI5-7: discoverServers() never throws when rust-analyzer is absent (I-10)
+    it('WI5-7 (I-10): discoverServers() never throws when rust-analyzer absent', async () => {
+      // Nothing staged — all discovery paths return null/absent.
+      await expect(discoverServers()).resolves.toBeDefined();
     });
   });
 });
