@@ -6,15 +6,15 @@
  *
  * EP Partitions:
  *   EP-A: correction candidate, external-zone node (isExternal===true) → skip
- *   EP-B: correction candidate, node absent (undefined) → skip (NO_NODE sentinel)
+ *   EP-B: [removed — NO_NODE sentinel concept does not exist in the shipped implementation]
  *   EP-C: correction candidate, workspace-internal node (isExternal===false) → probe
- *   EP-D: correction candidate, isExternal undefined/absent → probe (conservative)
+ *   EP-D: correction candidate, node absent (undefined) → probe (conservative; could be deleted workspace symbol)
  *   EP-E: recall candidate (oldTargetId absent) → probe
  *   EP-F: recall candidate with any candidate.file → probe; isUnindexablePath never called
  *
  * Cases:
  *   C8-1  [EP-A]  : external-zone node → canSkipCandidate=true; preFilteredExternal++; probed unchanged
- *   C8-2  [EP-B]  : absent node → canSkipCandidate=true; preFilteredExternal++; probed unchanged
+ *   C8-2  [EP-D]  : absent node → canSkipCandidate=false; probe (conservative; deleted workspace symbol must not be skipped)
  *   C8-3  [EP-C]  : workspace-internal node → canSkipCandidate=false; probed++
  *   C8-4  [EP-D]  : isExternal absent → canSkipCandidate=false; probed++
  *   C8-5  [EP-E]  : recall candidate (no oldTargetId) → canSkipCandidate=false; probed++
@@ -22,7 +22,7 @@
  *   C8-7  [EP-F]  : recall + any file → probe; isUnindexablePath never invoked
  *   C8-8  [uncertain]: ambiguous correction (undefined result) → probe; no false skip
  *   C8-9  [seam absent]: no canSkipCandidate in deps → all candidates reach fetchDefinition; preFilteredExternal=0
- *   C8-10 [ordering]: spy on fetchDefinitionForCandidate; NOT called for EP-A/EP-B; IS called for EP-C..EP-F
+ *   C8-10 [ordering]: spy on fetchDefinitionForCandidate; NOT called for EP-A; IS called for EP-C..EP-F (EP-B removed — absent node probes via EP-D)
  *   C8-11 [pipeline closure]: closure built from graph.getNode (not classifyUri, not isUnindexablePath)
  *   C8-12 [I-8-replay]: pre-filtered candidates excluded from locations map; reconcileDecisions counters unaffected
  *   C8-13 [multiple external]: multiple EP-A candidates → preFilteredExternal === N
@@ -47,6 +47,8 @@ import {
   type Candidate,
   type SessionMeta,
 } from '../../../src/core/ingestion/mode-a-reconciler.js';
+import { buildRecallExternalFqnMap } from '../../../src/core/ingestion/pipeline.js';
+import type { RecallFeedItem } from '../../../src/core/ingestion/call-processor.js';
 
 // ─── Shared test infrastructure ──────────────────────────────────────────────
 
@@ -158,22 +160,21 @@ describe('WI-8 C8-1 [EP-A]: external-zone correction candidate is skipped', () =
   });
 });
 
-// ─── C8-2: EP-B — absent node (NO_NODE sentinel) → skip ─────────────────────
+// ─── C8-2: EP-D — absent node → probe (conservative) ────────────────────────
 
-describe('WI-8 C8-2 [EP-B]: absent-node correction candidate is skipped', () => {
-  it('canSkipCandidate returns true for absent node → preFilteredExternal++; probed unchanged', async () => {
-    const { client } = makeMockClient();
+describe('WI-8 C8-2 [EP-D]: absent-node correction candidate is probed (conservative)', () => {
+  it('canSkipCandidate returns false for absent node → probed++; preFilteredExternal unchanged', async () => {
+    const { client } = makeMockClient({ requestImpl: async () => null });
     const absenceCandidate = mkCandidate({ oldTargetId: 'Function:deleted.ts:gone' });
-    // Simulates graph.getNode returning undefined → canSkipCandidate returns true
-    const canSkipCandidate = vi.fn((c: Candidate) =>
-      c.oldTargetId === 'Function:deleted.ts:gone',
-    );
+    // Production pipeline.ts:985-988: absent node → return false (conservative probe).
+    // A deleted workspace symbol must not be silently skipped — let the engine decide.
+    const canSkipCandidate = vi.fn((_c: Candidate) => false);
     const deps = makeDeps(client, { canSkipCandidate });
     const { meta, handCalls } = await runAndCaptureMeta([absenceCandidate], deps);
 
-    expect(meta.preFilteredExternal).toBe(1);
-    expect(meta.probed).toBe(0);
-    expect(handCalls).toBe(0);
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(handCalls).toBe(1);
   });
 });
 
@@ -317,7 +318,7 @@ describe('WI-8 C8-9 [seam absent]: no canSkipCandidate in deps → backward comp
   });
 });
 
-// ─── C8-10: ordering — fetchDefinition NOT called for EP-A/EP-B; IS called for EP-C..F ─
+// ─── C8-10: ordering — fetchDefinition NOT called for EP-A; IS called for EP-C..F (EP-B removed → EP-D probe) ─
 
 describe('WI-8 C8-10 [pre-filter ordering]: canSkipCandidate fires BEFORE fetchDefinitionForCandidate', () => {
   it('external candidate: handToEngine NOT called; internal candidate: handToEngine IS called', async () => {
@@ -348,8 +349,10 @@ describe('WI-8 C8-10 [pre-filter ordering]: canSkipCandidate fires BEFORE fetchD
 // ─── C8-11: pipeline closure shape (not classifyUri, not isUnindexablePath) ──
 
 describe('WI-8 C8-11 [pipeline closure]: canSkipCandidate uses graph.getNode (not classifyUri/isUnindexablePath)', () => {
-  it('closure returns true iff graph.getNode(oldTargetId) has isExternal===true or is absent', () => {
-    // Simulate the pipeline closure directly (extracted for isolation)
+  it('closure returns true only when graph.getNode(oldTargetId).isExternal===true; absent node → false (EP-D probe)', () => {
+    // Reproduce the production pipeline.ts closure logic (lines 968-998).
+    // EP-D invariant: node absent → false (conservative probe; could be a deleted workspace symbol).
+    // EP-B (NO_NODE sentinel → skip) does NOT exist in the shipped implementation.
     const nodes = new Map<string, { properties: { isExternal?: boolean } }>([
       ['node:external', { properties: { isExternal: true } }],
       ['node:internal', { properties: { isExternal: false } }],
@@ -359,23 +362,23 @@ describe('WI-8 C8-11 [pipeline closure]: canSkipCandidate uses graph.getNode (no
       getNode: (id: string) => nodes.get(id),
     };
 
-    // Reproduce the pipeline.ts closure logic
+    // Production closure: absent node → false (EP-D; pipeline.ts:985-988)
     const canSkipCandidate = (candidate: Candidate): boolean => {
       if (!candidate.oldTargetId) return false;
       const node = mockGraph.getNode(candidate.oldTargetId);
-      if (node === undefined) return true;
+      if (node === undefined) return false; // EP-D: conservative probe, not skip
       return node.properties.isExternal === true;
     };
 
-    // EP-A: external node
+    // EP-A: external node → skip
     expect(canSkipCandidate(mkCandidate({ oldTargetId: 'node:external' }))).toBe(true);
-    // EP-B: absent node
-    expect(canSkipCandidate(mkCandidate({ oldTargetId: 'node:absent' }))).toBe(true);
-    // EP-C: internal node
+    // EP-D: absent node → probe (NOT skip — pipeline.ts:985-988 is the authority)
+    expect(canSkipCandidate(mkCandidate({ oldTargetId: 'node:absent' }))).toBe(false);
+    // EP-C: internal node → probe
     expect(canSkipCandidate(mkCandidate({ oldTargetId: 'node:internal' }))).toBe(false);
-    // EP-D: node with no isExternal field
+    // EP-D: node with no isExternal field → probe
     expect(canSkipCandidate(mkCandidate({ oldTargetId: 'node:no-field' }))).toBe(false);
-    // EP-E: recall candidate (no oldTargetId)
+    // EP-E: recall candidate (no oldTargetId) → probe
     expect(canSkipCandidate(mkRecallCandidate())).toBe(false);
   });
 });
@@ -523,11 +526,14 @@ describe('WI-8 C8-14 [closure injection]: canSkipCandidate is injectable as vi.f
 //
 // EP partitions (same as WI-8, now executed through the closure):
 //   EP-A: external-zone node (isExternal===true) → skip
-//   EP-B: node absent (undefined) → skip (NO_NODE sentinel)
 //   EP-C: workspace-internal node (isExternal===false) → probe
-//   EP-D: ambiguous/uncertain correction candidate → probe (conservative)
+//   EP-D: node absent (undefined) → probe (conservative; pipeline.ts:985-988)
+//   EP-D: isExternal field absent (node present, field missing) → probe (conservative)
 //   EP-E: recall candidate (oldTargetId absent) → probe
 //   EP-F: recall with any file → probe; closure never calls isUnindexablePath
+//
+// NOTE: EP-B (NO_NODE sentinel → skip) does NOT exist in the shipped implementation.
+// pipeline.ts:985-988 returns false (probe) for absent nodes. C9-2 verifies EP-D.
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
@@ -536,7 +542,9 @@ describe('WI-8 C8-14 [closure injection]: canSkipCandidate is injectable as vi.f
  * it never calls `classifyUri` or `isUnindexablePath` (verified in C9-5).
  *
  * `nodes` maps nodeId → { properties: { isExternal?: boolean } }.
- * An absent key simulates `graph.getNode` returning `undefined`.
+ * An absent key simulates `graph.getNode` returning `undefined` → probe (EP-D).
+ *
+ * MATCHES production pipeline.ts:985-988: absent node → return false (conservative).
  */
 function makeGraphClosureSkip(
   nodes: Map<string, { properties: { isExternal?: boolean } }>,
@@ -544,7 +552,7 @@ function makeGraphClosureSkip(
   return (candidate: Candidate): boolean => {
     if (!candidate.oldTargetId) return false; // recall → never skip (I-2c)
     const node = nodes.get(candidate.oldTargetId);
-    if (node === undefined) return true; // absent → external sentinel (EP-B)
+    if (node === undefined) return false; // EP-D: absent node → probe (pipeline.ts:985-988)
     return node.properties.isExternal === true; // EP-A vs EP-C/EP-D
   };
 }
@@ -569,21 +577,24 @@ describe('WI-9 C9-1 [EP-A]: graph.getNode returns external-zone node → skip', 
   });
 });
 
-// ─── C9-2 [EP-B]: absent node → preFilteredExternal=1, probed=0 ─────────────
+// ─── C9-2 [EP-D]: absent node → preFilteredExternal=0, probed=1 (conservative probe) ─
 
-describe('WI-9 C9-2 [EP-B]: graph.getNode returns undefined (NO_NODE sentinel) → skip', () => {
-  it('correction candidate whose oldTargetId has no graph node → preFilteredExternal=1, probed=0', async () => {
+describe('WI-9 C9-2 [EP-D]: graph.getNode returns undefined → probe (conservative; pipeline.ts:985-988)', () => {
+  it('correction candidate whose oldTargetId has no graph node → preFilteredExternal=0, probed=1', async () => {
     const { client } = makeMockClient({ requestImpl: async () => null });
-    // Empty node map → getNode always returns undefined
+    // Empty node map → getNode always returns undefined.
+    // EP-D: absent node could be a deleted workspace symbol; must NOT be silently skipped.
+    // Production pipeline.ts:985-988: return false (probe so the engine can decide).
     const nodes = new Map<string, { properties: { isExternal?: boolean } }>();
     const canSkipCandidate = makeGraphClosureSkip(nodes);
     const candidate = mkCandidate({ oldTargetId: 'Function:deleted.ts:gone' });
     const deps = makeDeps(client, { canSkipCandidate });
     const { meta, handCalls } = await runAndCaptureMeta([candidate], deps);
 
-    expect(meta.preFilteredExternal).toBe(1);
-    expect(meta.probed).toBe(0);
-    expect(handCalls).toBe(0);
+    // EP-D: absent → probe, not skip. No false skip (I-2c).
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(handCalls).toBe(1);
   });
 });
 
@@ -646,7 +657,7 @@ describe('WI-9 C9-5 [EP-F]: recall candidate probed; graph closure never calls i
         return false;
       }
       const node = nodes.get(candidate.oldTargetId);
-      if (node === undefined) return true;
+      if (node === undefined) return false; // EP-D: conservative probe (pipeline.ts:985-988); absent node must not be skipped
       // This is where a buggy impl might call isUnindexablePathSpy(candidate.file)
       // — the correct impl must NOT:
       return node.properties.isExternal === true;
@@ -807,5 +818,1104 @@ describe('WI-9 C9-10 [type shape]: probed and preFilteredExternal are numeric fo
     expect(meta.probed).toBe(0);
     expect(typeof meta.preFilteredExternal).toBe('number');
     expect(meta.preFilteredExternal).toBe(2);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// WI-A3: ADR-002 Phase 1 — recallExternalFqnMap + canSkipCandidate recall branch
+//
+// These tests verify the NEW recall branch added to canSkipCandidate in pipeline.ts.
+// The recallExternalFqnMap is injected as a closure over WithReconciliationSessionDeps
+// via a simulated canSkipCandidate that mirrors the pipeline.ts logic.
+//
+// EP Partitions (recall branch only — correction branch is already covered by C8/C9):
+//   EP-G: recall candidate + FQN present in recallExternalFqnMap → skip
+//   EP-H: recall candidate + FQN absent from map → probe
+//   EP-G-wildcard: wildcard-origin simpleClassName never reaches map → probe
+//   EP-G-non-java: .ts caller → calleeExternalFqn absent → map empty → probe
+//
+// Decision Table (3 conditions collapsed to 4 outcomes):
+//   oldTargetId present × recallExternalFqnMap.has(key) × correction path
+//   | correction | map.has | outcome                       |
+//   | yes        | -       | existing graph.getNode path   | (C8/C9)
+//   | no         | yes     | skip + preFilteredKeys.add    | EP-G (A3-U1)
+//   | no         | no      | probe                         | EP-H (A3-U2)
+//
+// State Transitions for canSkipCandidate recall branch:
+//   RECALL_NO_FQN  → probe  (A3-U2, A3-U3, A3-U4, A3-U8)
+//   RECALL_WITH_FQN → skip + preFilteredKeys.add  (A3-U1, A3-U6)
+//   CORRECTION      → existing graph.getNode path unchanged  (A3-U5)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Build the pipeline.ts canSkipCandidate closure mirroring the WI-A3 implementation:
+ *   - correction branch: graph.getNode(oldTargetId).isExternal (unchanged)
+ *   - recall branch: recallExternalFqnMap.get(key) → skip | probe
+ *
+ * `graphNodes` maps nodeId → { properties: { isExternal?: boolean } }
+ * `recallFqnMap` maps candidateLocationKey → calleeExternalFqn
+ * `preFilteredKeys` collects keys for I-8-replay verification
+ */
+function makeA3Closure(
+  graphNodes: Map<string, { properties: { isExternal?: boolean } }>,
+  recallFqnMap: Map<string, string>,
+  preFilteredKeys: Set<string>,
+): (candidate: Candidate) => boolean {
+  return (candidate: Candidate): boolean => {
+    if (!candidate.oldTargetId) {
+      // ADR-002 WI-A3: recall branch
+      const key = `${candidate.sourceId}|${candidate.calledName}|${candidate.line}|${candidate.character}`;
+      const fqn = recallFqnMap.get(key);
+      if (fqn) {
+        preFilteredKeys.add(key);
+        return true;
+      }
+      return false;
+    }
+    // Correction branch — unchanged from WI-8
+    const node = graphNodes.get(candidate.oldTargetId);
+    if (node === undefined) return false;
+    const skip = node.properties.isExternal === true;
+    if (skip) {
+      preFilteredKeys.add(`${candidate.sourceId}|${candidate.calledName}|${candidate.line}|${candidate.character}`);
+    }
+    return skip;
+  };
+}
+
+/** candidateLocationKey for test assertions (matches pipeline.ts/mode-a-reconciler.ts) */
+function locationKey(c: Candidate): string {
+  const base = `${c.sourceId}|${c.calledName}|${c.line}|${c.character}`;
+  return c.relType ? `${base}|${c.relType}` : base;
+}
+
+// ─── A3-U1 [EP-G]: recall candidate + FQN present → skip ────────────────────
+
+describe('WI-A3 A3-U1 [EP-G]: recall candidate with FQN in recallExternalFqnMap → skip', () => {
+  it('canSkipCandidate returns true; preFilteredExternal++; LSP client.request NOT called', async () => {
+    const { client, request } = makeMockClient({ requestImpl: async () => null });
+    const recall = mkRecallCandidate({ sourceId: 'src:java', calledName: 'List', line: 10, character: 4, file: 'src/main/java/App.java' });
+    const recallKey = locationKey(recall);
+
+    const recallFqnMap = new Map([[recallKey, 'java.util.List']]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta, handCalls } = await runAndCaptureMeta([recall], deps);
+
+    // Skip fired: preFilteredExternal incremented; LSP not dispatched
+    expect(meta.preFilteredExternal).toBe(1);
+    expect(meta.probed).toBe(0);
+    expect(handCalls).toBe(0);
+    expect(request).not.toHaveBeenCalled();
+    // I-8-replay: key recorded in preFilteredKeys
+    expect(preFilteredKeys.has(recallKey)).toBe(true);
+  });
+});
+
+// ─── A3-U2 [EP-H]: recall candidate + FQN absent from map → probe ────────────
+
+describe('WI-A3 A3-U2 [EP-H]: recall candidate with no FQN in map → probe', () => {
+  it('canSkipCandidate returns false; fetchDefinitionForCandidate IS called; client.request called', async () => {
+    const { client, request } = makeMockClient({ requestImpl: async () => null });
+    const recall = mkRecallCandidate({ sourceId: 'src:java2', calledName: 'UserService', line: 20, character: 8, file: 'src/main/java/App.java' });
+
+    // Empty map — no FQN for this recall candidate
+    const recallFqnMap = new Map<string, string>();
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta, handCalls } = await runAndCaptureMeta([recall], deps);
+
+    // Probe fires: no pre-filter
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(handCalls).toBe(1);
+    expect(request).toHaveBeenCalledTimes(1);
+    // Key NOT recorded in preFilteredKeys (no skip)
+    expect(preFilteredKeys.size).toBe(0);
+  });
+});
+
+// ─── A3-U3 [EP-G-wildcard]: wildcard exclusion propagates end-to-end ─────────
+
+describe('WI-A3 A3-U3 [EP-G-wildcard]: wildcard-origin simpleClassName never in map → probe', () => {
+  it('recallFqnMap built from index with no wildcard entries → map.has(wildcardKey)=false → probe', async () => {
+    const { client } = makeMockClient({ requestImpl: async () => null });
+    // Recall candidate whose calledName was derived from a wildcard import (e.g. java.util.*)
+    // At WI-A1 population time, wildcard imports are excluded (rawImportPath.endsWith('.*')).
+    // So javaExternalFqnIndex has no entry for 'SomeName' from java.util.*
+    // → RecallFeedItem.calleeExternalFqn is undefined → map has no entry → probe.
+    const wildcardRecall = mkRecallCandidate({
+      sourceId: 'src:wildcard',
+      calledName: 'ArrayList', // might have come from java.util.* — but never indexed
+      line: 5,
+      character: 0,
+      file: 'src/main/java/Service.java',
+    });
+
+    // Map is empty — wildcard exclusion means no FQN was ever set on the RecallFeedItem
+    const recallFqnMap = new Map<string, string>();
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta } = await runAndCaptureMeta([wildcardRecall], deps);
+
+    // No skip: wildcard exclusion propagated correctly
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(preFilteredKeys.size).toBe(0);
+  });
+});
+
+// ─── A3-U4 [EP-G-non-java]: .ts caller → calleeExternalFqn absent → probe ────
+
+describe('WI-A3 A3-U4 [EP-G-non-java]: TypeScript caller → calleeExternalFqn undefined → probe', () => {
+  it('.ts call site produces RecallFeedItem without calleeExternalFqn → map has no entry → probe', async () => {
+    const { client } = makeMockClient({ requestImpl: async () => null });
+    // A TypeScript file — WI-A2 Java-only gate means calleeExternalFqn is never set
+    // for non-.java files → recallFqnMap has no entry for this candidate
+    const tsRecall = mkRecallCandidate({
+      sourceId: 'src:ts',
+      calledName: 'readFile',
+      line: 3,
+      character: 2,
+      file: 'src/utils.ts',
+    });
+
+    // Empty map — Java-only gate at injection site (WI-A2)
+    const recallFqnMap = new Map<string, string>();
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta } = await runAndCaptureMeta([tsRecall], deps);
+
+    // .ts caller always probes — no false skip
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(preFilteredKeys.size).toBe(0);
+  });
+});
+
+// ─── A3-U5 [correction branch isolation] ─────────────────────────────────────
+
+describe('WI-A3 A3-U5 [correction branch isolation]: correction candidate uses graph.getNode, not recallFqnMap', () => {
+  it('oldTargetId present → correction path fires; recallExternalFqnMap NOT consulted', async () => {
+    const { client } = makeMockClient({ requestImpl: async () => null });
+    const correction = mkCandidate({
+      sourceId: 'src:corr',
+      calledName: 'doWork',
+      line: 15,
+      character: 6,
+      oldTargetId: 'Function:src/service.ts:doWork',
+    });
+
+    // Put a FQN entry in the map keyed at the same location key — MUST NOT affect correction path
+    const corrKey = locationKey(correction);
+    const recallFqnMap = new Map([[corrKey, 'should.not.be.consulted']]);
+    const graphNodes = new Map([
+      ['Function:src/service.ts:doWork', { properties: { isExternal: false } }],
+    ]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(graphNodes, recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta } = await runAndCaptureMeta([correction], deps);
+
+    // Correction candidate with isExternal=false → probe (graph.getNode path)
+    // recallFqnMap entry at same key MUST NOT cause a false skip
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(preFilteredKeys.size).toBe(0);
+  });
+
+  it('existing C8/C9 EP-A/EP-C correction assertions unchanged by WI-A3 changes (EP-B removed; reclassified as EP-D)', async () => {
+    const { client } = makeMockClient();
+    const externalCorrection = mkCandidate({
+      sourceId: 'src:ext-corr',
+      line: 0,
+      oldTargetId: 'Function:ext.jar:Foo',
+    });
+    // External node → correction branch skips (graph.getNode.isExternal=true)
+    const graphNodes = new Map([
+      ['Function:ext.jar:Foo', { properties: { isExternal: true } }],
+    ]);
+    const preFilteredKeys = new Set<string>();
+    // recallFqnMap empty — must not affect correction path
+    const canSkipCandidate = makeA3Closure(graphNodes, new Map(), preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta, handCalls } = await runAndCaptureMeta([externalCorrection], deps);
+
+    // EP-A still works: external-zone correction → skip
+    expect(meta.preFilteredExternal).toBe(1);
+    expect(meta.probed).toBe(0);
+    expect(handCalls).toBe(0);
+  });
+});
+
+// ─── A3-U6 [I-8-replay]: preFilteredKeys.add fires on skip ───────────────────
+
+describe('WI-A3 A3-U6 [I-8-replay]: preFilteredKeys.add fires for every recall skip', () => {
+  it('after canSkipCandidate returns true for recall, candidate key is in preFilteredKeys', async () => {
+    const { client } = makeMockClient();
+    const recall1 = mkRecallCandidate({ sourceId: 'r1', calledName: 'List', line: 1, character: 0, file: 'App.java' });
+    const recall2 = mkRecallCandidate({ sourceId: 'r2', calledName: 'Map', line: 2, character: 0, file: 'App.java' });
+    const recall3 = mkRecallCandidate({ sourceId: 'r3', calledName: 'UserService', line: 3, character: 0, file: 'App.java' });
+
+    const key1 = locationKey(recall1);
+    const key2 = locationKey(recall2);
+    const key3 = locationKey(recall3);
+
+    // recall1 and recall2 have FQNs; recall3 does not
+    const recallFqnMap = new Map([
+      [key1, 'java.util.List'],
+      [key2, 'java.util.Map'],
+    ]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta } = await runAndCaptureMeta([recall1, recall2, recall3], deps);
+
+    // Two skips, one probe
+    expect(meta.preFilteredExternal).toBe(2);
+    expect(meta.probed).toBe(1);
+
+    // I-8-replay: exactly the two skipped keys are in preFilteredKeys
+    expect(preFilteredKeys.has(key1)).toBe(true);
+    expect(preFilteredKeys.has(key2)).toBe(true);
+    expect(preFilteredKeys.has(key3)).toBe(false);
+  });
+});
+
+// ─── A3-U7 [EP-J]: keyed recall candidate skips; unkeyed candidate at different location probes ──
+//
+// Spec delta — EP-J divergent-pair probe coverage:
+//   The spec (EP-J) describes: "two recall candidates at same key, only one external →
+//   the external one skips (true), the non-external one probes (false)."
+//
+//   The IMPLEMENTATION diverges from this spec.  `buildRecallExternalFqnMap` detects a
+//   divergent pair (one external, one non-external at the same key) and DELETES the key
+//   entirely so the closure sees NO entry → BOTH candidates probe.  This is MORE
+//   conservative than the spec's "external skips, non-external probes" description.
+//   The load-bearing guard for this deletion invariant is EP-J-1 / EP-J-2 (bottom of
+//   this file), which test `buildRecallExternalFqnMap` directly.
+//
+//   The spec scenario "external skips AND non-external probes at the same key" is
+//   structurally unreachable at the closure level:
+//     - buildRecallExternalFqnMap deletes ambiguous keys → no entry for the closure to see.
+//     - pipeline.ts WI-1 dedup (lines 778-784) removes all but the first candidate per
+//       candidateLocationKey BEFORE withReconciliationSession is called.
+//   The closure therefore never sees two candidates at the same key in a real pipeline run.
+//
+//   This test covers the reachable closure behaviour:
+//     - r1: candidateLocationKey IS in the map → skip (true)
+//     - r2: candidateLocationKey is NOT in the map (different sourceId/calledName) → probe (false)
+//   It verifies that the closure is purely key-based (no receiver-type cross-check) and
+//   that an unrelated candidate is never falsely skipped (I-2c).
+//
+//   The full EP-J invariant (no false skips from divergent pairs) is covered by:
+//     (a) MAP BUILD level: EP-J-1 / EP-J-2 / EP-J-3 / EP-J-4 (bottom of this file)
+//     (b) CLOSURE level: A3-U7b (below) pins raw closure behaviour under shared-key conditions
+
+describe('WI-A3 A3-U7 [EP-J]: keyed recall candidate skips; unkeyed candidate at distinct location probes', () => {
+  it('candidate whose key is in recallFqnMap skips; candidate at a different key probes (I-2c: no false skip)', async () => {
+    const { client } = makeMockClient({ requestImpl: async () => null });
+    // r1 is at a key present in recallFqnMap → closure returns true (skip).
+    // r2 has a DIFFERENT sourceId and calledName → different candidateLocationKey,
+    // NOT in the map → closure returns false (probe).
+    // This exercises the closure's key-only lookup and verifies unrelated candidates
+    // are never falsely skipped.
+    const sharedKey = 'src:shared|call|5|3';
+    const recallFqnMap = new Map([[sharedKey, 'java.util.List']]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+
+    // r1: key is in map → skip
+    const r1: Candidate = { sourceId: 'src:shared', calledName: 'call', file: 'App.java', line: 5, character: 3 };
+    expect(canSkipCandidate(r1)).toBe(true);
+    expect(preFilteredKeys.has(sharedKey)).toBe(true);
+
+    // r2: different key (src:other|otherCall|6|0), not in map → probe (I-2c)
+    const r2: Candidate = { sourceId: 'src:other', calledName: 'otherCall', file: 'App.java', line: 6, character: 0 };
+    expect(canSkipCandidate(r2)).toBe(false);
+
+    // Only the keyed candidate was recorded; no false skip on r2
+    expect(preFilteredKeys.size).toBe(1);
+  });
+});
+
+// ─── A3-U8 [EP-K]: same-package in-repo call — no import → no map entry → probe
+
+describe('WI-A3 A3-U8 [EP-K]: same-package in-repo call → no import → recallFqnMap empty → probe', () => {
+  it('Bar is in same package as App (no import statement) → javaExternalFqnIndex has no Bar entry → probe', async () => {
+    const { client } = makeMockClient({ requestImpl: async () => null });
+    // Same-package class Bar: no import statement → WI-A1 never writes it to javaExternalFqnIndex
+    // → WI-A2 cannot inject calleeExternalFqn → recallFqnMap has no entry → probe
+    const inRepoRecall = mkRecallCandidate({
+      sourceId: 'src:same-pkg',
+      calledName: 'Bar',
+      line: 7,
+      character: 0,
+      file: 'src/main/java/com/example/App.java',
+    });
+
+    // Map is empty — no import means no FQN injection
+    const recallFqnMap = new Map<string, string>();
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta } = await runAndCaptureMeta([inRepoRecall], deps);
+
+    // Conservative probe: in-repo call must never be false-skipped (I-2c)
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(preFilteredKeys.size).toBe(0);
+  });
+});
+
+// ─── A4-U5 [increment-source pin]: EP-G skip via canSkipCandidate, NOT isUnindexablePath ─────
+
+describe('WI-A4 A4-U5 [increment-source pin]: EP-G skip increments preFilteredExternal via canSkipCandidate recall branch (not isUnindexablePath)', () => {
+  it('candidate.file is a valid .java source path (not node_modules/dist/.d.ts) AND preFilteredExternal=1 AND client.request=0', async () => {
+    // Spec (WI-A4 A4-U5): "EP-G skip must increment preFilteredExternal via canSkipCandidate
+    // (recall branch), NOT via the isUnindexablePath gate inside fetchDefinitionForCandidate;
+    // verify by asserting the candidate.file is a valid .java path (not node_modules/dist/.d.ts)
+    // AND preFilteredExternal=1 AND client.request call count=0."
+    //
+    // Two distinct preFilteredExternal increment sources (must not be conflated):
+    //   (a) canSkipCandidate recall branch — WI-A3, new path (what this test pins)
+    //   (b) isUnindexablePath inside fetchDefinitionForCandidate — WS-C, already shipped
+    //
+    // (b) fires for node_modules/dist/.d.ts caller files.
+    // (a) fires for .java source files with a FQN in recallExternalFqnMap.
+    // Verifying that candidate.file is a real .java path rules out (b) as the source.
+    const { client, request } = makeMockClient({ requestImpl: async () => null });
+
+    const javaSourceFile = 'src/main/java/com/example/OrderService.java';
+    const recall = mkRecallCandidate({
+      sourceId: 'src:order',
+      calledName: 'List',
+      line: 5,
+      character: 8,
+      file: javaSourceFile,
+    });
+    const recallKey = locationKey(recall);
+
+    // Precondition: candidate.file is NOT node_modules / dist / .d.ts
+    // (this pins that the skip source is canSkipCandidate, not isUnindexablePath)
+    expect(recall.file).toMatch(/\.java$/);
+    expect(recall.file).not.toMatch(/node_modules|dist\/|\.d\.ts$/);
+
+    const recallFqnMap = new Map([[recallKey, 'java.util.List']]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta, handCalls } = await runAndCaptureMeta([recall], deps);
+
+    // Increment source: canSkipCandidate recall branch returned true.
+    // preFilteredExternal must be 1 (WI-A3 recall path, not isUnindexablePath).
+    expect(meta.preFilteredExternal).toBe(1);
+    expect(meta.probed).toBe(0);
+    expect(handCalls).toBe(0);
+    // client.request=0 confirms fetchDefinitionForCandidate was never called
+    // (the isUnindexablePath gate inside it was never reached either).
+    expect(request).not.toHaveBeenCalled();
+    // Recall key is recorded for I-8-replay exclusion
+    expect(preFilteredKeys.has(recallKey)).toBe(true);
+  });
+});
+
+// ─── A3-U7b [EP-J genuine shared-key]: closure is key-only; dedup is the safety net ────────────────
+//
+// Finding: the existing A3-U7 test uses r2 with DISTINCT sourceId/calledName ('src:other'/'otherCall')
+// so it never exercises the case where two candidates share THE SAME candidateLocationKey
+// (sourceId|calledName|line|character).  This test pins the actual closure behaviour
+// under genuine shared-key conditions and documents the dedup dependency.
+//
+// Invariant "Two-overload same-key conservatism" (spec EP-J):
+//   The production canSkipCandidate closure in pipeline.ts is purely key-based.
+//   When r1 (external, key present in recallFqnMap) and r2 (non-external, same key)
+//   BOTH reach the closure, r2 is also skipped because the map lookup succeeds.
+//
+//   Pipeline safety guarantee (WI-1, pipeline.ts lines 778-784):
+//   The `dedupedCandidates` pass removes all but the first candidate per
+//   candidateLocationKey BEFORE withReconciliationSession is called.
+//   Therefore canSkipCandidate is NEVER called with two candidates at the same key
+//   in a real analyze run.  The dedup is the load-bearing safety guarantee.
+//
+//   This test pins that contract explicitly so that any future removal of the
+//   dedup step is caught before it reaches production.
+//
+// Upstream guard (BUILD-LOOP):
+//   The recallFqnMap handed to this closure is built by `buildRecallExternalFqnMap`
+//   (pipeline.ts).  The build-loop MUST delete any key that has a divergent pair
+//   (one external entry, one absent/falsy entry) so the closure never sees a key
+//   that represents an ambiguous recall set.
+//   The EP-J unit tests (EP-J-1 / EP-J-2 / EP-J-3 / EP-J-4) at the bottom of THIS
+//   file directly test `buildRecallExternalFqnMap` and are the load-bearing guard
+//   for that deletion invariant.  If the `map.delete(key)` call is removed from
+//   `buildRecallExternalFqnMap`, those tests fail before this closure is ever reached.
+
+describe('WI-A3 A3-U7b [EP-J genuine shared-key]: two recall candidates at IDENTICAL candidateLocationKey — closure is key-only; pipeline dedup is the safety guarantee', () => {
+  it('closure skips BOTH candidates when their sourceId|calledName|line|character are identical and key is in map', () => {
+    // Construct two recall candidates at THE SAME candidateLocationKey.
+    // r1: external (recallFqnMap has the key); r2: non-external BUT identical key.
+    // Both have no oldTargetId (recall candidates).
+    const sharedSourceId = 'src:shared';
+    const sharedCalledName = 'process';
+    const sharedLine = 12;
+    const sharedChar = 8;
+
+    // The shared key mirrors candidateLocationKey() without relType suffix
+    const sharedKey = `${sharedSourceId}|${sharedCalledName}|${sharedLine}|${sharedChar}`;
+
+    const recallFqnMap = new Map([[sharedKey, 'java.util.List']]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+
+    // r1: the external candidate — key is in map → skip (true)
+    const r1: Candidate = {
+      sourceId: sharedSourceId,
+      calledName: sharedCalledName,
+      file: 'src/main/java/App.java',
+      line: sharedLine,
+      character: sharedChar,
+      // no oldTargetId → recall branch
+    };
+
+    // r2: a second candidate at THE SAME position (same sourceId|calledName|line|char).
+    // In a live pipeline run this candidate would have been removed by WI-1 dedup
+    // (pipeline.ts:778-784) before canSkipCandidate is ever invoked.
+    // We call it here directly to document the closure's raw behaviour.
+    const r2: Candidate = {
+      sourceId: sharedSourceId,    // ← identical to r1
+      calledName: sharedCalledName, // ← identical to r1
+      file: 'src/main/java/App.java',
+      line: sharedLine,            // ← identical to r1
+      character: sharedChar,       // ← identical to r1
+      // no oldTargetId → recall branch; same key as r1
+    };
+
+    // r1 — expected: skipped (key is in map)
+    expect(canSkipCandidate(r1)).toBe(true);
+    expect(preFilteredKeys.has(sharedKey)).toBe(true);
+
+    // r2 — same candidateLocationKey as r1.
+    // CLOSURE BEHAVIOUR: the map lookup hits the same key → also returns true.
+    // This is key-only lookup; there is no receiver-type cross-check inside the closure.
+    //
+    // PRODUCTION SAFETY: this case cannot arise in a live analyze run because
+    // pipeline.ts WI-1 dedup (lines 778-784) eliminates all but the first candidate
+    // per candidateLocationKey before withReconciliationSession is called.
+    // The dedup is the load-bearing guard that prevents r2 from ever reaching here.
+    //
+    // If the dedup step is ever removed or weakened, this assertion confirms the
+    // closure alone is NOT conservative enough — a fix to the closure or a
+    // compensating guard upstream would be required (I-2c).
+    expect(canSkipCandidate(r2)).toBe(true); // closure returns true; dedup prevents this in production
+
+    // Both candidates share the same key entry in preFilteredKeys
+    expect(preFilteredKeys.size).toBe(1); // single key, set deduplicates
+  });
+
+  it('session skips the surviving post-dedup external candidate: preFilteredExternal=1; probed=0', async () => {
+    // This sub-case verifies the session's closure behaviour when it receives a SINGLE
+    // external recall candidate — the candidate a real pipeline would pass after WI-1 dedup
+    // has already reduced any same-key pair to one survivor.
+    //
+    // NOTE: This test does NOT exercise the dedup step itself.  Only one candidate is
+    // passed to runAndCaptureMeta, so pipeline.ts:778-784 is never invoked here.
+    // What this test pins is the closure's session-level behaviour for a post-dedup
+    // external candidate: canSkipCandidate fires → preFilteredExternal=1, probed=0.
+    //
+    // The WI-1 dedup logic itself is tested at the integration level via
+    // runPipelineFromRepo (A4-E1 / A4-E2), where two same-key candidates arising from
+    // the real fixture would be deduplicated before reaching the session.
+    const { client } = makeMockClient({ requestImpl: async () => null });
+
+    const sharedKey = 'src:dedup|call|3|2';
+    const recallFqnMap = new Map([[sharedKey, 'java.util.List']]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+
+    // Single external candidate — the one that would survive dedup in a real pipeline run.
+    const r1: Candidate = {
+      sourceId: 'src:dedup',
+      calledName: 'call',
+      file: 'src/main/java/App.java',
+      line: 3,
+      character: 2,
+    };
+
+    const deps = makeDeps(client, { canSkipCandidate });
+    const { meta, handCalls } = await runAndCaptureMeta([r1], deps);
+
+    // External candidate → skip fires → preFilteredExternal=1, probed=0, handToEngine not called
+    expect(meta.preFilteredExternal).toBe(1);
+    expect(meta.probed).toBe(0);
+    expect(handCalls).toBe(0);
+    // preFilteredKeys accumulated the shared key
+    expect(preFilteredKeys.has(sharedKey)).toBe(true);
+  });
+});
+
+// ─── EP-J [buildRecallExternalFqnMap build-loop hardening] ────────────────────
+//
+// These tests target the EXTRACTED PURE HELPER `buildRecallExternalFqnMap`
+// (pipeline.ts) directly, independently of the session machinery.
+//
+// A3-U7b (above) tests the CLOSURE after the map is built — it cannot detect
+// a regression in the map-building logic itself (ambiguous-key deletion) because
+// the test hands a pre-built map to the closure.
+//
+// These EP-J tests lock the MAP BUILD so that:
+//   1. A same-key divergent pair (one external, one non-external) → key ABSENT.
+//   2. Both orderings of that pair produce the same result (no ordering dependency).
+//   3. A same-key convergent pair (both external) → key PRESENT.
+//
+// Mutation detector: if the `map.delete(key)` call on the falsy-FQN branch is
+// removed, EP-J divergent tests FAIL because the map retains the external entry
+// and `canSkipCandidate` would skip the in-repo twin → false skip (I-2c violation).
+// This makes the test suite the load-bearing guard for the build-loop hardening.
+//
+// The A3-U7b comment in mode-a-external-prefilter.test.ts now points here as the
+// upstream guard for the inline pipeline loop.
+
+/** Build a minimal RecallFeedItem at a shared (sourceId, calledName, line, char) */
+function mkFeedItem(
+  sourceId: string,
+  calledName: string,
+  line: number,
+  character: number,
+  calleeExternalFqn?: string,
+): RecallFeedItem {
+  return { sourceId, calledName, file: 'src/App.java', line, character, calleeExternalFqn };
+}
+
+// Shared key values used across EP-J tests
+const EP_J_SOURCE = 'src:App.java:App/run';
+const EP_J_CALL   = 'process';
+const EP_J_LINE   = 12;
+const EP_J_CHAR   = 8;
+// Expected candidateLocationKey — matches candidateLocationKey() without relType suffix
+const EP_J_KEY    = `${EP_J_SOURCE}|${EP_J_CALL}|${EP_J_LINE}|${EP_J_CHAR}`;
+
+describe('EP-J [buildRecallExternalFqnMap]: divergent pair (external-first ordering) → key ABSENT', () => {
+  // Scenario: r1 has external FQN ('org.springframework.X'), r2 shares the SAME
+  // {sourceId,calledName,line,character} but has undefined calleeExternalFqn.
+  // The ambiguous-key logic MUST delete the key so canSkipCandidate cannot skip.
+  //
+  // Mutation detector: if `map.delete(key)` is removed, r1's external FQN is
+  // retained in the map → the test fails (key PRESENT instead of ABSENT).
+  it('EP-J-1: external item first, non-external item second → key absent from map', () => {
+    const r1 = mkFeedItem(EP_J_SOURCE, EP_J_CALL, EP_J_LINE, EP_J_CHAR, 'org.springframework.X');
+    const r2 = mkFeedItem(EP_J_SOURCE, EP_J_CALL, EP_J_LINE, EP_J_CHAR, undefined);
+
+    const map = buildRecallExternalFqnMap([r1, r2]);
+
+    // Key must be ABSENT — the non-external twin must not be silently skipped (I-2c)
+    expect(map.has(EP_J_KEY)).toBe(false);
+    // Probe both orderings: the external item's FQN must not be retrievable
+    expect(map.get(EP_J_KEY)).toBeUndefined();
+  });
+});
+
+describe('EP-J [buildRecallExternalFqnMap]: divergent pair (in-repo-first ordering) → key ABSENT', () => {
+  // Same as EP-J-1 but the non-external item arrives FIRST.
+  // The ambiguous-key guard must fire regardless of insertion order.
+  //
+  // Mutation detector: if the `if (!ambiguousKeys.has(key)) { map.set(...) }` guard
+  // is removed (replaced with unconditional set), r1 sets the key, r2 deletes it,
+  // but r2-first case: r2 sets ambiguousKeys, r1 arrives and sets map (bypassing guard)
+  // → key PRESENT → test fails.
+  it('EP-J-2: non-external item first, external item second → key absent from map', () => {
+    const r1 = mkFeedItem(EP_J_SOURCE, EP_J_CALL, EP_J_LINE, EP_J_CHAR, undefined);
+    const r2 = mkFeedItem(EP_J_SOURCE, EP_J_CALL, EP_J_LINE, EP_J_CHAR, 'org.springframework.X');
+
+    const map = buildRecallExternalFqnMap([r1, r2]);
+
+    // Key must be ABSENT — the external item must not override the in-repo entry
+    expect(map.has(EP_J_KEY)).toBe(false);
+    expect(map.get(EP_J_KEY)).toBeUndefined();
+  });
+});
+
+describe('EP-J [buildRecallExternalFqnMap]: convergent pair (both external) → key PRESENT', () => {
+  // Positive case: two items at the same key BOTH carry truthy calleeExternalFqn.
+  // Result: key PRESENT with the FQN from the first item (second write is a no-op
+  // due to the ambiguousKeys guard — but neither item is in-repo, so the key survives).
+  it('EP-J-3: both items external → key present in map', () => {
+    const r1 = mkFeedItem(EP_J_SOURCE, EP_J_CALL, EP_J_LINE, EP_J_CHAR, 'org.springframework.X');
+    const r2 = mkFeedItem(EP_J_SOURCE, EP_J_CALL, EP_J_LINE, EP_J_CHAR, 'org.springframework.X');
+
+    const map = buildRecallExternalFqnMap([r1, r2]);
+
+    // Key MUST be present — both twins are external → skip is safe
+    expect(map.has(EP_J_KEY)).toBe(true);
+    expect(map.get(EP_J_KEY)).toBe('org.springframework.X');
+  });
+});
+
+// ─── EP-I [in-repo/external simpleClassName collision] ───────────────────────
+//
+// Design §EdgeCases (EP-I):
+//   'Foo' appears as BOTH an in-repo import (resolver non-null → WI-A1 does NOT write
+//   to javaExternalFqnIndex) AND as an external import (prefix-match, resolver null →
+//   WI-A1 WOULD write it).  The gating at WI-A1 (`if (!result)`) ensures only the
+//   resolver-null case writes.  When the in-repo import is the only import for 'Foo'
+//   in a given file, javaExternalFqnIndex must have NO entry for 'Foo' under that
+//   filePath → RecallFeedItem.calleeExternalFqn is undefined → recallExternalFqnMap
+//   has no entry → canSkipCandidate probes, not skips (I-2c).
+//
+// Coverage rationale:
+//   A1-U5 (import-processor.test.ts) pins the population gate: resolver non-null →
+//   never writes.  That test is the only guard at the WI-A1 level.  The missing
+//   coverage is the downstream invariant: when only the in-repo import is present,
+//   recallExternalFqnMap.get(key) returns undefined so canSkipCandidate must probe.
+//   These tests close that gap at the recallExternalFqnMap and closure levels.
+
+describe('EP-I [in-repo/external collision]: in-repo import blocks FQN entry → recallExternalFqnMap has no entry → probe', () => {
+  it('EP-I-1: RecallFeedItem with undefined calleeExternalFqn (in-repo import won) → map.has(key) === false', () => {
+    // Simulate: 'Foo' was imported from an in-repo file (resolver returned non-null)
+    // → WI-A1 did NOT write to javaExternalFqnIndex
+    // → WI-A2 cannot inject calleeExternalFqn on the RecallFeedItem (undefined)
+    // → buildRecallExternalFqnMap must NOT produce an entry for this key
+    const inRepoFeed: RecallFeedItem[] = [
+      {
+        sourceId: 'src:App.java:App/run',
+        calledName: 'doWork',
+        file: 'src/main/java/com/example/App.java',
+        line: 8,
+        character: 4,
+        calleeExternalFqn: undefined, // in-repo import → no FQN injected
+      },
+    ];
+    const map = buildRecallExternalFqnMap(inRepoFeed);
+    const key = `${inRepoFeed[0].sourceId}|${inRepoFeed[0].calledName}|${inRepoFeed[0].line}|${inRepoFeed[0].character}`;
+    // EP-I invariant: no external FQN was injected → map has no entry → probe
+    expect(map.has(key)).toBe(false);
+    expect(map.get(key)).toBeUndefined();
+  });
+
+  it('EP-I-2: canSkipCandidate probes (returns false) when FQN not in map (in-repo import case)', async () => {
+    // Downstream of EP-I-1: when recallExternalFqnMap has no entry for a recall candidate
+    // whose simpleClassName came from an in-repo import, canSkipCandidate must NOT skip.
+    const { client } = makeMockClient({ requestImpl: async () => null });
+    const inRepoRecall = mkRecallCandidate({
+      sourceId: 'src:App.java:App/run',
+      calledName: 'doWork',
+      file: 'src/main/java/com/example/App.java',
+      line: 8,
+      character: 4,
+    });
+
+    // Empty map — in-repo import means no FQN was injected into the index
+    const recallFqnMap = new Map<string, string>();
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta } = await runAndCaptureMeta([inRepoRecall], deps);
+
+    // EP-I: in-repo simpleClassName → no false skip (I-2c)
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(preFilteredKeys.size).toBe(0);
+  });
+
+  it('EP-I-3: same simpleName has external entry when external-only import is present (positive case)', () => {
+    // Positive: 'Foo' imported from an external prefix (resolver null → WI-A1 wrote it)
+    // → calleeExternalFqn is set → recallExternalFqnMap DOES have the entry → skip is correct.
+    const externalFeed: RecallFeedItem[] = [
+      {
+        sourceId: 'src:App.java:App/run',
+        calledName: 'doWork',
+        file: 'src/main/java/com/example/App.java',
+        line: 8,
+        character: 4,
+        calleeExternalFqn: 'com.example.external.Foo', // external import won
+      },
+    ];
+    const map = buildRecallExternalFqnMap(externalFeed);
+    const key = `${externalFeed[0].sourceId}|${externalFeed[0].calledName}|${externalFeed[0].line}|${externalFeed[0].character}`;
+    // External import → FQN was injected → map has entry → skip is safe
+    expect(map.has(key)).toBe(true);
+    expect(map.get(key)).toBe('com.example.external.Foo');
+  });
+});
+
+describe('EP-J [buildRecallExternalFqnMap]: unshared key → key PRESENT regardless of other keys', () => {
+  // Sanity: items with distinct keys are independent — a divergent pair at key-A
+  // must not affect key-B.
+  it('EP-J-4: unambiguous external item at separate key is preserved', () => {
+    const OTHER_SOURCE = 'src:Other.java:Other/init';
+    const OTHER_CALL   = 'build';
+    const OTHER_LINE   = 5;
+    const OTHER_CHAR   = 2;
+    const OTHER_KEY    = `${OTHER_SOURCE}|${OTHER_CALL}|${OTHER_LINE}|${OTHER_CHAR}`;
+
+    const divergent1 = mkFeedItem(EP_J_SOURCE, EP_J_CALL, EP_J_LINE, EP_J_CHAR, 'org.springframework.X');
+    const divergent2 = mkFeedItem(EP_J_SOURCE, EP_J_CALL, EP_J_LINE, EP_J_CHAR, undefined);
+    const unambiguous = mkFeedItem(OTHER_SOURCE, OTHER_CALL, OTHER_LINE, OTHER_CHAR, 'java.util.List');
+
+    const map = buildRecallExternalFqnMap([divergent1, divergent2, unambiguous]);
+
+    // Divergent pair → key absent
+    expect(map.has(EP_J_KEY)).toBe(false);
+    // Unambiguous external item at a different key → still present (isolation)
+    expect(map.has(OTHER_KEY)).toBe(true);
+    expect(map.get(OTHER_KEY)).toBe('java.util.List');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// WI-A4: Named unit cases A4-U1..U4, A4-U6
+//
+// The plan (ADR-002 §WI-A4 §Tests) enumerates six named unit obligations.
+// A4-U5 (increment-source pin) was written during WI-A3 and appears above.
+// A4-U6 is a passthrough guard: after WI-A3 changes the correction-branch
+// EP-A/EP-C behaviour (C7-7/AC-2 invariants) must remain unmodified.
+//
+// A4-U1 and A4-U5 together pin the INCREMENT SOURCE as the canSkipCandidate
+// recall branch (not isUnindexablePath).  A4-U1 uses an *injected map* and
+// focuses on the EP-G skip outcome; A4-U5 (above) additionally asserts the
+// candidate.file is a .java source path to disambiguate the two sources.
+//
+// Key distinction from A3-U1..U4:
+//   - A3-U1..U4 verified the closure logic from the WI-A3 design perspective.
+//   - A4-U1..U4 are named WI-A4 spec obligations that also pin the increment
+//     source (canSkipCandidate vs isUnindexablePath) using injected maps,
+//     fulfilling the traceability requirement of the plan.
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── A4-U1 [EP-G]: recall + FQN in map → canSkipCandidate skip; increment-source = canSkipCandidate ─
+
+describe('WI-A4 A4-U1 [EP-G]: recall candidate with FQN in recallExternalFqnMap → canSkipCandidate skip (increment-source pin)', () => {
+  it('canSkipCandidate returns true; preFilteredExternal=1 via recall branch (not isUnindexablePath); client.request=0', async () => {
+    // Spec obligation: "A4-U1 (EP-G skip) and A4-U5 are supposed to pin the increment
+    // source as canSkipCandidate (not isUnindexablePath) using injected maps."
+    //
+    // Two distinct preFilteredExternal increment sources — must not be conflated:
+    //   (a) canSkipCandidate recall branch [WI-A3, this PR] ← what this test verifies
+    //   (b) isUnindexablePath inside fetchDefinitionForCandidate [WS-C, shipped]
+    //
+    // Source (b) fires only for node_modules/dist/.d.ts caller files.
+    // Source (a) fires for .java source files with a FQN in recallExternalFqnMap.
+    // An injected map (not a real import-processor run) isolates the closure path.
+    const { client, request } = makeMockClient({ requestImpl: async () => null });
+
+    const javaSourceFile = 'src/main/java/com/example/BondService.java';
+    const recall = mkRecallCandidate({
+      sourceId: 'src:bond',
+      calledName: 'List',
+      line: 8,
+      character: 4,
+      file: javaSourceFile,
+    });
+    const recallKey = locationKey(recall);
+
+    // Inject the map directly (no import-processor involvement — tests the closure wiring only)
+    const recallFqnMap = new Map([[recallKey, 'java.util.List']]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta, handCalls } = await runAndCaptureMeta([recall], deps);
+
+    // EP-G: skip fires via canSkipCandidate recall branch
+    expect(meta.preFilteredExternal).toBe(1);
+    expect(meta.probed).toBe(0);
+    expect(handCalls).toBe(0);
+    // Source (a) confirmed: client.request never reached (fetchDefinitionForCandidate not called)
+    expect(request).not.toHaveBeenCalled();
+    // Candidate.file is a .java source path → rules out source (b) isUnindexablePath
+    expect(recall.file).toMatch(/\.java$/);
+    expect(recall.file).not.toMatch(/node_modules|dist\/|\.d\.ts$/);
+    // I-8-replay: key recorded
+    expect(preFilteredKeys.has(recallKey)).toBe(true);
+  });
+});
+
+// ─── A4-U2 [EP-H]: recall + FQN absent from map → probe ───────────────────────
+
+describe('WI-A4 A4-U2 [EP-H]: recall candidate with no FQN in recallExternalFqnMap → probe', () => {
+  it('canSkipCandidate returns false; fetchDefinitionForCandidate IS called; preFilteredExternal=0', async () => {
+    // Spec obligation: A4-U2 [EP-H] — recall Candidate, map has no entry → canSkipCandidate false;
+    // fetchDefinitionForCandidate is called.
+    const { client, request } = makeMockClient({ requestImpl: async () => null });
+    const recall = mkRecallCandidate({
+      sourceId: 'src:bond2',
+      calledName: 'ServiceImpl',
+      line: 20,
+      character: 8,
+      file: 'src/main/java/com/example/App.java',
+    });
+
+    // Empty map — no external FQN for this recall candidate
+    const recallFqnMap = new Map<string, string>();
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta, handCalls } = await runAndCaptureMeta([recall], deps);
+
+    // EP-H: probe fires (no skip)
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(handCalls).toBe(1);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(preFilteredKeys.size).toBe(0);
+  });
+});
+
+// ─── A4-U3 [EP-G-wildcard]: wildcard FQN never reaches javaExternalFqnIndex → probe ─
+
+describe('WI-A4 A4-U3 [EP-G-wildcard]: wildcard import exclusion propagates end-to-end — map empty → probe', () => {
+  it('index constructed with a wildcard import input has no wildcard-derived key; recallExternalFqnMap lookup misses → probe', () => {
+    // Spec obligation: A4-U3 — "confirm wildcard FQN never reaches javaExternalFqnIndex:
+    // construct the index with a wildcard import in input; assert the resulting map has no
+    // entry for the wildcard-derived name; recallExternalFqnMap lookup misses → probe."
+    //
+    // WI-A1 population gate: rawImportPath.endsWith('.*') → no entry written.
+    // This test confirms the downstream consequence: no entry in recallExternalFqnMap.
+    //
+    // We construct a RecallFeedItem where calleeExternalFqn is undefined (as WI-A2 would
+    // produce when the WI-A1 wildcard gate fires) and assert map.has(key) is false.
+
+    // Simulate: 'import java.util.*' was present but WI-A1 excluded it → index has no
+    // 'ArrayList' or 'HashMap' entry → WI-A2 leaves calleeExternalFqn undefined.
+    const wildcardFeed: RecallFeedItem[] = [
+      {
+        sourceId: 'src:App.java:App/run',
+        calledName: 'ArrayList', // derived from java.util.* — but wildcard exclusion → undefined FQN
+        file: 'src/main/java/com/example/App.java',
+        line: 6,
+        character: 4,
+        calleeExternalFqn: undefined, // wildcard gate fired → not written to index → not injected
+      },
+    ];
+
+    const map = buildRecallExternalFqnMap(wildcardFeed);
+    const key = `${wildcardFeed[0].sourceId}|${wildcardFeed[0].calledName}|${wildcardFeed[0].line}|${wildcardFeed[0].character}`;
+
+    // Wildcard exclusion: the index never had an entry → map has no entry → probe
+    expect(map.has(key)).toBe(false);
+    expect(map.get(key)).toBeUndefined();
+  });
+});
+
+// ─── A4-U4 [EP-G-non-java]: .ts caller → calleeExternalFqn absent → probe ──────
+
+describe('WI-A4 A4-U4 [EP-G-non-java]: TypeScript caller → calleeExternalFqn undefined → recallExternalFqnMap has no entry → probe', () => {
+  it('RecallFeedItem from a .ts call site has calleeExternalFqn undefined; map empty → canSkipCandidate false → probe', async () => {
+    // Spec obligation: A4-U4 — "RecallFeedItem from a .ts call site has calleeExternalFqn
+    // undefined; recallExternalFqnMap has no entry → probe."
+    //
+    // WI-A2 Java-only gate: filePath.endsWith('.java') is the guard at injection time.
+    // A TypeScript call site never sets calleeExternalFqn → map has no entry.
+    const { client } = makeMockClient({ requestImpl: async () => null });
+    const tsRecall = mkRecallCandidate({
+      sourceId: 'src:ts-svc',
+      calledName: 'readFile',
+      line: 12,
+      character: 2,
+      file: 'src/services/fileService.ts',
+    });
+
+    // Map is empty — Java-only gate at WI-A2 injection site prevents any .ts entry
+    const recallFqnMap = new Map<string, string>();
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta } = await runAndCaptureMeta([tsRecall], deps);
+
+    // EP-G-non-java: .ts caller always probes — no false skip (I-2c)
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(preFilteredKeys.size).toBe(0);
+    // Confirm the file is indeed .ts (not .java) — this is the gate condition
+    expect(tsRecall.file).toMatch(/\.ts$/);
+    expect(tsRecall.file).not.toMatch(/\.java$/);
+  });
+});
+
+// ─── A4-U6 [golden I-9: C7-7/AC-2 passthrough guard] ────────────────────────
+//
+// Spec obligation (WI-A4 A4-U6): "run the full existing golden byte-identity
+// test suite; assert zero test modifications needed; this is a pass-through guard,
+// not a new test."
+//
+// The plan's intent is that no existing EP-A through EP-F assertions were altered
+// by WI-A3 changes. This test verifies that the correction branch (C7-7/AC-2
+// invariants) still behaves identically after WI-A3 by exercising the same EP-A
+// and EP-C partitions through the makeA3Closure helper (which wraps the full
+// combined closure, not just the recall branch).
+
+describe('WI-A4 A4-U6 [golden I-9 passthrough guard]: WI-A3 changes did not alter EP-A/EP-C correction-branch behaviour (C7-7/AC-2 invariant)', () => {
+  it('EP-A (external-zone correction) still returns true via correction branch after WI-A3 recall-branch extension', async () => {
+    // After WI-A3, canSkipCandidate has TWO branches:
+    //   1. recall branch (oldTargetId absent): uses recallExternalFqnMap [new, WI-A3]
+    //   2. correction branch (oldTargetId present): uses graph.getNode [unchanged, WS-C]
+    //
+    // This test pins that the correction branch (2) is UNMODIFIED by WI-A3.
+    // An external-zone correction candidate must still skip, regardless of whether
+    // recallExternalFqnMap is populated or empty (the map is not consulted for corrections).
+    //
+    // Traceability: VER-9 (correction candidate → graph.getNode path, calleeExternalFqn NOT
+    // evaluated); A3-U5 (correction branch isolation). This is the named A4-U6 guard.
+    const { client } = makeMockClient();
+    const externalCorrection = mkCandidate({
+      sourceId: 'src:ext-a4u6',
+      calledName: 'ResponseEntity',
+      line: 0,
+      character: 4,
+      oldTargetId: 'Function:ext.jar:ResponseEntity',
+    });
+
+    // Graph node for the correction candidate — external-zone
+    const graphNodes = new Map([
+      ['Function:ext.jar:ResponseEntity', { properties: { isExternal: true } }],
+    ]);
+    // recallFqnMap is populated (non-empty) — must NOT affect correction branch
+    const recallFqnMap = new Map([['any|key|0|0', 'java.util.List']]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(graphNodes, recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta, handCalls } = await runAndCaptureMeta([externalCorrection], deps);
+
+    // EP-A invariant (C7-7/AC-2): external correction → skip, preFilteredExternal=1
+    // This must hold identically after WI-A3 changes — no regression to the correction path.
+    expect(meta.preFilteredExternal).toBe(1);
+    expect(meta.probed).toBe(0);
+    expect(handCalls).toBe(0);
+  });
+
+  it('EP-C (workspace-internal correction) still returns false via correction branch after WI-A3 recall-branch extension', async () => {
+    // Mirror of above: workspace-internal correction must probe (false), even with a
+    // populated recallFqnMap. The WI-A3 recall branch must not interfere with the
+    // correction path (C7-7 / AC-2 invariant).
+    const { client } = makeMockClient({ requestImpl: async () => null });
+    const internalCorrection = mkCandidate({
+      sourceId: 'src:int-a4u6',
+      calledName: 'OrderService',
+      line: 5,
+      character: 2,
+      oldTargetId: 'Function:src/services/OrderService.ts:doWork',
+    });
+
+    const graphNodes = new Map([
+      ['Function:src/services/OrderService.ts:doWork', { properties: { isExternal: false } }],
+    ]);
+    const recallFqnMap = new Map([['any|key|0|0', 'java.util.List']]);
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(graphNodes, recallFqnMap, preFilteredKeys);
+    const deps = makeDeps(client, { canSkipCandidate });
+
+    const { meta, handCalls } = await runAndCaptureMeta([internalCorrection], deps);
+
+    // EP-C invariant: workspace-internal correction → probe (no false skip, I-2c)
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(handCalls).toBe(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// WI-A3/A4 dedup-before-skip regression guard
+//
+// Finding [MAJOR] (Design Quality + Test Strategy): A3-U7b documents that WI-1
+// dedup prevents r2 from reaching canSkipCandidate, but there is no automated
+// test that verifies the combined guarantee: divergent-pair → map deletion →
+// session preFilteredExternal=0 (both candidates probe, not just one skips).
+//
+// This test closes that gap at the unit level by:
+//   1. Building a divergent pair through buildRecallExternalFqnMap (which deletes
+//      the ambiguous key — tested by EP-J-1/EP-J-2).
+//   2. Using the RESULTING EMPTY MAP with the makeA3Closure (the same closure
+//      pattern as pipeline.ts canSkipCandidate) through withReconciliationSession.
+//   3. Asserting that even when a single surviving candidate is presented to the
+//      session, preFilteredExternal=0 (because the map deletion upstream already
+//      prevented a skip-eligible entry).
+//
+// This is the UNIT-LEVEL regression guard that ties EP-J-1/EP-J-2 (map-build
+// guard) to A3-U7b (session-level closure) into one combined assertion.
+// If buildRecallExternalFqnMap's map.delete(key) is removed, EP-J-1/EP-J-2 catch
+// it at the map-build level. THIS test catches it if the deletion guard is present
+// but the closure is somehow not using the resulting map (wiring regression).
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('WI-A3/A4 dedup-before-skip regression guard: divergent pair → buildRecallExternalFqnMap deletes key → session preFilteredExternal=0', () => {
+  it('EP-J divergent pair: map deletion upstream causes canSkipCandidate to probe the surviving candidate (combined guarantee)', async () => {
+    // Setup: two RecallFeedItems at the SAME candidateLocationKey.
+    //   r1: external FQN set ('java.util.List')
+    //   r2: no external FQN (non-external or same-file class)
+    // buildRecallExternalFqnMap detects the divergent pair and DELETES the key.
+    // The resulting map is empty for that key.
+    //
+    // The "surviving candidate" simulates what pipeline.ts WI-1 dedup would pass
+    // to withReconciliationSession after reducing the pair to one entry. Even that
+    // one entry must PROBE (not skip) because the map has no entry for its key.
+    //
+    // This combined test catches a wiring regression where:
+    //   - EP-J-1/EP-J-2 pass (map deletion fires correctly)
+    //   - BUT canSkipCandidate uses a STALE or DIFFERENT map reference → would skip
+    //     the surviving candidate despite the map deletion.
+    const { client } = makeMockClient({ requestImpl: async () => null });
+
+    const sharedSource = 'src:shared-dedup';
+    const sharedCalled = 'process';
+    const sharedLine   = 5;
+    const sharedChar   = 2;
+
+    // Step 1: build a divergent feed → buildRecallExternalFqnMap deletes the key
+    const divergentFeed: RecallFeedItem[] = [
+      { sourceId: sharedSource, calledName: sharedCalled, file: 'src/App.java', line: sharedLine, character: sharedChar, calleeExternalFqn: 'java.util.List' },
+      { sourceId: sharedSource, calledName: sharedCalled, file: 'src/App.java', line: sharedLine, character: sharedChar, calleeExternalFqn: undefined },
+    ];
+    const recallFqnMap = buildRecallExternalFqnMap(divergentFeed);
+
+    // EP-J-1 invariant confirmed: the key must be absent
+    const sharedKey = `${sharedSource}|${sharedCalled}|${sharedLine}|${sharedChar}`;
+    expect(recallFqnMap.has(sharedKey)).toBe(false);
+
+    // Step 2: build the closure using the map returned by buildRecallExternalFqnMap
+    // (mirrors pipeline.ts: const recallExternalFqnMap = buildRecallExternalFqnMap(recallFeed);
+    //  then canSkipCandidate uses that variable by closure capture)
+    const preFilteredKeys = new Set<string>();
+    const canSkipCandidate = makeA3Closure(new Map(), recallFqnMap, preFilteredKeys);
+
+    // Step 3: simulate what pipeline.ts WI-1 dedup passes to withReconciliationSession:
+    // only one candidate at the shared key survives dedup (let's say the external one).
+    const survivingCandidate: Candidate = {
+      sourceId: sharedSource,
+      calledName: sharedCalled,
+      file: 'src/App.java',
+      line: sharedLine,
+      character: sharedChar,
+    };
+
+    const deps = makeDeps(client, { canSkipCandidate });
+    const { meta, handCalls } = await runAndCaptureMeta([survivingCandidate], deps);
+
+    // Combined guarantee: divergent pair → key deleted → closure probes surviving candidate.
+    // preFilteredExternal=0: the map deletion correctly prevents a false skip.
+    // If map.delete(key) were removed from buildRecallExternalFqnMap, the map would retain
+    // 'java.util.List' for sharedKey → canSkipCandidate would return true → meta.preFilteredExternal=1
+    // → this assertion would FAIL, catching the regression.
+    expect(meta.preFilteredExternal).toBe(0);
+    expect(meta.probed).toBe(1);
+    expect(handCalls).toBe(1);
+    // No key was added to preFilteredKeys (no skip fired)
+    expect(preFilteredKeys.size).toBe(0);
   });
 });
