@@ -7,7 +7,7 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutesWithRepoId, processExpoRouterNavigations, processDecoratorRoutesWithRepoId, processPHPRoutesWithRepoId, processNextjsRoutesWithRepoId, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted, type ProcessCallsOpts, type CorrectionFeedItem, type RecallFeedItem } from './call-processor.js';
+import { processCalls, processCallsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutesWithRepoId, processExpoRouterNavigations, processDecoratorRoutesWithRepoId, processPHPRoutesWithRepoId, processNextjsRoutesWithRepoId, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted, buildRefusedFqnHistogram, type ProcessCallsOpts, type CorrectionFeedItem, type RecallFeedItem } from './call-processor.js';
 import type { ExtractedRoute, ExtractedExpoNav, ExtractedORMQuery, ExtractedDecoratorRoute, ExtractedFetchCall, ExtractedToolDef } from './workers/parse-worker.js';
 import type { CrossRepoRegistry } from './cross-repo-registry.js';
 import { processHeritage, processHeritageFromExtracted, type ProcessHeritageOpts, type HeritageFeedItem } from './heritage-processor.js';
@@ -326,8 +326,16 @@ export const runPipelineFromRepo = async (
     // single merged feed.
     const correctionFeed: CorrectionFeedItem[] = [];
     const recallFeed: RecallFeedItem[] = [];
+
+    // ADR-002 Phase 1: javaExternalFqnIndex is allocated ONCE under the opts.lsp gate
+    // and passed by reference to both import-processor paths (population) and both
+    // call-processor paths via ProcessCallsOpts (consumption).  Not allocated on the
+    // default (non-LSP) analyze path so I-9 byte-identity is preserved by construction.
+    const javaExternalFqnIndex: Map<string, Map<string, string>> | undefined =
+      options?.lsp?.enabled ? new Map() : undefined;
+
     const lspFeedsOpt: ProcessCallsOpts | undefined = options?.lsp?.enabled
-      ? { lsp: true, correctionFeed, recallFeed }
+      ? { lsp: true, correctionFeed, recallFeed, javaExternalFqnIndex }
       : undefined;
 
     // WI-4 / WI-6 (#159 P3 Mode A — heritage feed): the
@@ -390,7 +398,7 @@ export const runPipelineFromRepo = async (
               detail: `${current}/${total} files`,
               stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
             });
-          }, repoPath, importCtx, options?.crossRepoRegistry);
+          }, repoPath, importCtx, options?.crossRepoRegistry, javaExternalFqnIndex);
           // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
           // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
           // and the single-threaded event loop prevents races between synchronous addRelationship calls.
@@ -472,7 +480,7 @@ export const runPipelineFromRepo = async (
         } else {
           // Sequential path: processImports adds symbols, then heritage/calls are resolved
           // in the sequential fallback loop below (lines 351-365)
-          await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths, options?.crossRepoRegistry);
+          await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths, options?.crossRepoRegistry, javaExternalFqnIndex);
           sequentialChunkPaths.push(chunkPaths);
           sequentialChunkRoutes.push(chunkWorkerData.routes ?? []);
           // Accumulate expoNavCalls and ormQueries for sequential path too
@@ -701,6 +709,20 @@ export const runPipelineFromRepo = async (
           character: c.character,
         });
       }
+
+      // ADR-002 Phase 1 WI-A3: map from candidateLocationKey → calleeExternalFqn for
+      // recall candidates that carry a provably-external Java FQN.  Populated here from
+      // RecallFeedItem.calleeExternalFqn (injected by WI-A2 at recall-push time).
+      // canSkipCandidate consults this map to skip LSP dispatch for confirmed-external
+      // recall candidates.  Empty map on the default (non-LSP) analyze path: I-9 preserved.
+      //
+      // EP-J / I-2c (no false skips): the buildRecallExternalFqnMap helper enforces
+      // that a key is present ONLY if EVERY recall item at that key carries a truthy
+      // calleeExternalFqn.  Divergent pairs (one truthy, one absent) result in key
+      // deletion so canSkipCandidate returns false → both twins probed → no internal
+      // CALLS edge dropped.  See buildRecallExternalFqnMap JSDoc for the guard invariant.
+      // EP-J unit tests (A3-U7b) target buildRecallExternalFqnMap directly; this comment
+      // is the upstream pointer — see test/unit/lsp/mode-a-external-prefilter.test.ts.
       for (const r of recallFeed) {
         candidates.push({
           sourceId: r.sourceId,
@@ -710,6 +732,10 @@ export const runPipelineFromRepo = async (
           character: r.character,
         });
       }
+      // Build the FQN map after the candidate-push loop (candidates.push is kept above
+      // because the heritage loop and dedup follow immediately; extraction of just the
+      // map-build logic keeps the push ordering stable — I-9 preserved).
+      const recallExternalFqnMap = buildRecallExternalFqnMap(recallFeed);
 
       // WI-6 (#159 P3 Mode A — pipeline merge): concat the
       // heritage feed into the same `Candidate[]` stream.
@@ -946,7 +972,18 @@ export const runPipelineFromRepo = async (
           // is the caller's .java source file, not the callee's location.
           canSkipCandidate: (candidate) => {
             if (!candidate.oldTargetId) {
-              // Recall candidate — always probe (I-2c).
+              // ADR-002 Phase 1 WI-A3: recall candidate — check recallExternalFqnMap
+              // before defaulting to probe.  If the FQN was populated by import-processor
+              // (via RecallFeedItem.calleeExternalFqn) the callee is provably external and
+              // we can skip LSP dispatch entirely.  I-8-replay: record the key so
+              // reconcileDecisions excludes this candidate from its replay set.
+              // I-2c: absent FQN → return false (conservative probe — never guess).
+              const key = candidateLocationKey(candidate);
+              const fqn = recallExternalFqnMap.get(key);
+              if (fqn) {
+                preFilteredKeys.add(key);
+                return true;
+              }
               return false;
             }
             const node = graph.getNode(candidate.oldTargetId);
@@ -1071,11 +1108,6 @@ export const runPipelineFromRepo = async (
       };
 
       // ── Observability: dry-run report vs. summary line ──────────
-      // WI-5: budget suffix appended IN-PLACE on all non-error paths.
-      // Format: '(budget <B> of <N> candidates)'
-      // S = max(0, N − B) — number of candidates NOT probed due to cap.
-      const lspS = Math.max(0, lspN - lspB);
-      const budgetSuffix = ` (budget ${lspB} of ${lspN} candidates)`;
       if (dryRun) {
         // AC-6: print every {action, from→to, why} tuple, write nothing.
         //
@@ -1125,12 +1157,43 @@ export const runPipelineFromRepo = async (
           // 'no-server' or unknown reason → gate-failure format with budget suffix.
           const lspElapsed = gateFailureReason ? gateFailureElapsedS : ((Date.now() - lspStart) / 1000).toFixed(1);
           // eslint-disable-next-line no-console
-          console.log(buildLspSummaryLine('gate-failure', { ...lspReport, serverVersion }, { N: lspN, B: lspB, elapsedS: lspElapsed }));
+          // lspReport is null on the gate-failure path (never assigned before this branch).
+          // Spreading null yields {} at runtime; pass an explicit zero-sentinel instead so
+          // the type contract is sound and a future change to buildLspSummaryLine that reads
+          // any numeric field on this path cannot silently produce NaN output.
+          console.log(buildLspSummaryLine('gate-failure', { confirmed: 0, corrected: 0, recall: 0, refused: 0, skipped: 0, probed: 0, serverVersion }, { N: lspN, B: lspB, elapsedS: lspElapsed }));
         }
       } else {
+        // lspReport is guaranteed non-null on the success path: it is assigned
+        // unconditionally before this else-branch is reached (sessionResult !== null
+        // and no exception was thrown).  Narrow here so that any future early-return
+        // inserted above cannot silently produce a runtime TypeError at the call sites below.
+        if (lspReport === null) throw new Error('[pipeline] invariant violation: lspReport is null on success path');
         const lspElapsed = ((Date.now() - lspStart) / 1000).toFixed(1);
         // eslint-disable-next-line no-console
         console.log(buildLspSummaryLine('success', lspReport, { N: lspN, B: lspB, elapsedS: lspElapsed }));
+        // A4-I2 / VER-14: residual refused-FQN package histogram.
+        // Uses the call-processor version which keys on probed Java recall items
+        // that were NOT pre-filtered (calleeExternalFqn absent). This surfaces
+        // under-coverage from Lombok, SLF4J, Apache Commons, Guava, etc. — exactly
+        // the items that the FQN-based pipeline-internal helper (buildFqnPackageHistogram)
+        // cannot reach because those items have no FQN entry in recallExternalFqnMap.
+        // ADR-002 Phase 1: emit preFilteredExternal count for observability and E2E
+        // test measurement (A4-E1 reads "lsp-prefiltered-external: N" from stdout).
+        // Always emitted on the success path so E2E assertions don't need special flags.
+        // eslint-disable-next-line no-console
+        console.log(`  lsp-prefiltered-external: ${lspReport.preFilteredExternal}`);
+        const histogram = buildRefusedFqnHistogram(recallFeed);
+        if (histogram.size > 0) {
+          // eslint-disable-next-line no-console
+          console.log('  lsp-refused-method:');
+          for (const [method, count] of histogram) {
+            // eslint-disable-next-line no-console
+            // FIX #2 (log injection): method derives from user-controlled Java method names;
+            // strip CR/LF to prevent forged log lines. Mirrors the dry-run path guard.
+            console.log(`    ${method.replace(/[\r\n]+/g, ' ')}: ${count}`);
+          }
+        }
       }
     }
 
@@ -1282,6 +1345,53 @@ export const runPipelineFromRepo = async (
     throw error;
   }
 };
+
+/**
+ * ADR-002 Phase 1 WI-A3 — EP-J (build-loop hardening).
+ *
+ * Build the `recallExternalFqnMap` from a `RecallFeedItem[]` feed.
+ *
+ * A key is added ONLY when EVERY recall item at that `candidateLocationKey`
+ * carries a truthy `calleeExternalFqn`.  If any item at a key is absent/falsy
+ * (callee is in-repo or unknown), the key is DELETED from the map so
+ * `canSkipCandidate` returns false and both twins are probed — no internal
+ * CALLS edge is dropped (I-2c conservative guarantee).
+ *
+ * This logic mirrors the inline loop in `runPipelineFromRepo` (pipeline.ts
+ * ~lines 725-751) and is extracted here so that the EP-J unit tests can
+ * exercise the ambiguous-key deletion in isolation, independent of the
+ * session machinery.
+ *
+ * Invariant: if the `ambiguousKeys` delete logic is removed (i.e. the
+ * `map.delete(key)` call on the falsy-FQN branch is elided), the test
+ * "EP-J divergent-pair: external-first ordering → key ABSENT" will FAIL
+ * because the map will retain the first external entry even when a later
+ * non-external item shares the same key — producing a false skip (I-2c
+ * violation).
+ */
+export function buildRecallExternalFqnMap(recallFeed: RecallFeedItem[]): Map<string, string> {
+  const map = new Map<string, string>();
+  const ambiguousKeys = new Set<string>();
+  for (const r of recallFeed) {
+    const key = candidateLocationKey({
+      sourceId: r.sourceId,
+      calledName: r.calledName,
+      file: r.file,
+      line: r.line,
+      character: r.character,
+    } as Candidate);
+    if (r.calleeExternalFqn) {
+      if (!ambiguousKeys.has(key)) {
+        map.set(key, r.calleeExternalFqn);
+      }
+    } else {
+      // Absent/falsy FQN: mark key ambiguous and remove any prior external entry.
+      ambiguousKeys.add(key);
+      map.delete(key);
+    }
+  }
+  return map;
+}
 
 /**
  * Redact a graph node id for log lines.

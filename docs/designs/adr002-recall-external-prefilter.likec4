@@ -1,0 +1,90 @@
+// Solution-design structural model — ADR-002 Phase 1: Recall External Pre-filter
+// Single work-stream (Java-only):
+//   WI-A1: javaExternalFqnIndex in import-processor.ts (both import paths)
+//   WI-A2: calleeExternalFqn threaded via ProcessCallsOpts → RecallFeedItem
+//   WI-A3: recallExternalFqnMap closure + canSkipCandidate recall branch in pipeline.ts
+//   WI-A4: unit tests EP-G, EP-H (mode-a-external-prefilter.test.ts)
+//
+// Change-coding: light-yellow = updated [~], green = new [N].
+// No container or system is added or removed — pure modification at C3 component level
+// EXCEPT: one new component (javaExternalFqnIndex) is added to the ingestion pipeline.
+// The C3 ingestion view is embedded once (add/remove rule).
+//
+// NOTE: element names carry _r suffix to avoid collision with
+// adr002-java-large-repo-augmentation.likec4 and adr002-p0-lsp-large-repo-readiness.likec4
+// in the shared docs/designs/ LikeC4 workspace.
+//
+// Specification block intentionally omitted — uses the workspace-level spec from
+// 159-p4-go-gopls.likec4 (system/container/component/store,
+// color lightyellow #FDE68A, tag new/updated/removed).
+
+model {
+  gitnexus_r = system 'GitNexus' {
+
+    ingestion_r = container 'Ingestion pipeline' {
+      #updated
+      style { color lightyellow }
+      description '[~] import-processor.ts gains JAVA_EXTERNAL_PACKAGE_PREFIXES constant and index-population logic in both import paths. ProcessCallsOpts gains javaExternalFqnIndex field. RecallFeedItem gains calleeExternalFqn field. pipeline.ts recall branch of canSkipCandidate gains FQN pre-filter via recallExternalFqnMap closure.'
+
+      importProcessor_r = component 'import-processor.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] JAVA_EXTERNAL_PACKAGE_PREFIXES readonly constant [N]: 5 prefixes (java./javax./jakarta./org.springframework./com.fasterxml.). processImports(graph, files, astCache, ctx, onProgress?, repoRoot?, allPaths?, crossRepoRegistry?, javaExternalFqnIndex?) and processImportsFromExtracted(extractedImports, prebuiltCtx, opts, crossRepoRegistry?, javaExternalFqnIndex?) each accept javaExternalFqnIndex as new trailing optional. Population hooks into the existing if(!result) branch at :407 (slow) and :499 (fast) — provider.importResolver is NOT re-invoked. Slow path: language=getLanguageFromFilename loop-local; fast path: imp.language enum. Wildcard imports (endsWith .*) EXCLUDED. In-repo results (result non-null) EXCLUDED — in-repo wins by construction.'
+        link ./adr002-recall-external-prefilter.html#sd-index-build 'Sequence: index build — To-be'
+      }
+
+      javaExternalFqnIndex_r = component 'javaExternalFqnIndex' {
+        #new
+        style { color green }
+        description '[N] Map<callerFilePath, Map<simpleClassName, rawFqn>>. Built in pipeline.ts as a local variable only when opts.lsp is true; passed as out-parameter to processImports / processImportsFromExtracted. Population IS gated on opts.lsp (sole consumer is the lsp-gated calleeExternalFqn-injection path; default analyze path never allocates this map). Wildcard imports excluded. Non-Java files excluded at the language gate. O(1) lookup at call-emission time; no file I/O at skip time. In-repo imports never written (populated only in the if(!result) branch).'
+        link ./adr002-recall-external-prefilter.html#sd-index-build 'Sequence: index build — To-be'
+        link ./adr002-recall-external-prefilter.html#sd-recall-prefilter 'Sequence: recall pre-filter — To-be'
+      }
+
+      callProcessor_r = component 'call-processor.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] RecallFeedItem gains calleeExternalFqn?: string field. ProcessCallsOpts gains javaExternalFqnIndex?: Map<string, Map<string, string>> field. At both recall-push sites (processCallsFromExtracted ~line 1574 and processCalls ~line 658), inside the existing opts?.lsp && opts.recallFeed gate: if filePath.endsWith(.java) and receiverTypeName present, look up opts.javaExternalFqnIndex?.get(filePath)?.get(receiverTypeName); if truthy, set calleeExternalFqn on pushed item. Heritage feed NOT patched (IMPLEMENTS/EXTENDS always resolve to repo symbol table).'
+        link ./adr002-recall-external-prefilter.html#sd-recall-prefilter 'Sequence: recall pre-filter — To-be'
+      }
+
+      recallExternalFqnMap_r = component 'recallExternalFqnMap closure' {
+        #new
+        style { color green }
+        description '[N] Map<candidateLocationKey, rawFqn> built INSIDE the for(const r of recallFeed) loop in pipeline.ts where r and the just-constructed Candidate are both in hand. If r.calleeExternalFqn is truthy, set recallExternalFqnMap.set(candidateLocationKey(candidate), r.calleeExternalFqn). No recallCandidates[] array — recall items go into the shared candidates[]. canSkipCandidate recall branch: const key = candidateLocationKey(candidate); const fqn = recallExternalFqnMap.get(key); if (fqn) { preFilteredKeys.add(key); return true; } return false. Correction branch completely unchanged. Candidate interface NOT extended (closure-local map is invisible to sort).'
+        link ./adr002-recall-external-prefilter.html#sd-recall-prefilter 'Sequence: recall pre-filter — To-be'
+      }
+
+      pipeline_r = component 'pipeline.ts' {
+        #updated
+        style { color lightyellow }
+        description '[~] When opts.lsp true: allocates javaExternalFqnIndex and passes it as trailing optional to both import-processor functions (real 8+1-arg signatures). Threads javaExternalFqnIndex via ProcessCallsOpts.javaExternalFqnIndex to call-processor. Builds recallExternalFqnMap INSIDE the for(const r of recallFeed) loop after candidate construction. Extends canSkipCandidate recall branch with FQN pre-filter (preFilteredKeys.add + return true). Correction branch (oldTargetId present, graph.getNode path) unchanged. Two preFilteredExternal increment sources: canSkipCandidate recall branch [new] and isUnindexablePath inside fetchDefinitionForCandidate [WS-C, shipped].'
+        link ./adr002-recall-external-prefilter.html#sd-index-build 'Sequence: index build — To-be'
+        link ./adr002-recall-external-prefilter.html#sd-recall-prefilter 'Sequence: recall pre-filter — To-be'
+      }
+
+      modeAReconciler_r = component 'mode-a-reconciler.ts' {
+        description 'No changes this PR. canSkipCandidate seam (WithReconciliationSessionDeps), preFilteredExternal counter, and preFilteredKeys.add pattern are already shipped (WS-C). Reconciler consumes new recall pre-filter behavior via the existing seam — zero reconciler edits needed.'
+        link ./adr002-recall-external-prefilter.html#sd-recall-prefilter 'Sequence: recall pre-filter — To-be'
+      }
+    }
+  }
+
+  // ── relationships ─────────────────────────────────────────────────────────
+  importProcessor_r -> javaExternalFqnIndex_r 'populates (out-parameter): filePath → simpleClassName → rawFqn'
+  pipeline_r -> importProcessor_r 'passes javaExternalFqnIndex as out-parameter to both import paths'
+  pipeline_r -> javaExternalFqnIndex_r 'allocates; passes to processImports/processImportsFromExtracted'
+  pipeline_r -> callProcessor_r 'threads javaExternalFqnIndex via ProcessCallsOpts.javaExternalFqnIndex'
+  callProcessor_r -> javaExternalFqnIndex_r 'O(1) lookup: .get(filePath)?.get(receiverTypeName)'
+  pipeline_r -> recallExternalFqnMap_r 'builds from recallFeed.calleeExternalFqn entries'
+  recallExternalFqnMap_r -> modeAReconciler_r 'injected as canSkipCandidate closure; recall branch FQN pre-filter'
+}
+
+views {
+  // C3 — Ingestion pipeline (two new components added → embed this view)
+  view c3_ingestion_r of ingestion_r {
+    title 'C3 — Ingestion pipeline (recall external pre-filter)'
+    description 'javaExternalFqnIndex [N] and recallExternalFqnMap closure [N]; import-processor + call-processor + pipeline [~]; mode-a-reconciler unchanged (no edits this PR).'
+    include *
+  }
+}
