@@ -1,10 +1,10 @@
-<!-- version: 1.3.0 -->
+<!-- version: 1.4.0 -->
 <!--
   Metadata: version, last reviewed, scope, model policy, reference docs, changelog.
-  Last updated: 2026-06-12
+  Last updated: 2026-06-20
 -->
 
-Last reviewed: 2026-06-12
+Last reviewed: 2026-06-20
 
 **Project:** GitNexus · **Environment:** dev · **Maintainer:** repository maintainers (see GitHub)
 
@@ -12,11 +12,13 @@ Follow **AGENTS.md** for the canonical rules; this file adds Claude Code–speci
 
 ## Branch Policy
 
-**The working main branch of this repository is `main-afk`** (not `main`).
+**The working main branch of this repository is `main`** (the repository's default branch).
 
-- All new work MUST branch off `main-afk` and merge back into `main-afk`.
-- Target PRs at `main-afk`. Do not base branches on, or merge into, `main` unless the user explicitly instructs it.
-- `git diff`/`detect_changes` comparisons against "main" should use `main-afk` as the base ref.
+- All new work branches off `main` and merges back into `main`.
+- Target PRs at `main`.
+- `git diff`/`detect_changes` comparisons use `main` as the base ref.
+
+> The former `main-afk` working branch was removed on 2026-06-20 — its history is fully contained in `main`. Do not recreate it.
 
 ## Scope
 
@@ -49,6 +51,7 @@ If always-on instructions grow, load deep conventions via conditional reads (e.g
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-06-20 | 1.4.0 | Removed the `main-afk` working branch (local + remote); reverted Branch Policy + scope-guard `BASE_REF` to `main`, the default branch. |
 | 2026-06-12 | 1.3.0 | Added Branch Policy: `main-afk` is the working main branch; all work branches off and merges back into it. |
 | 2026-03-24 | 1.2.0 | Removed duplicated gitnexus:start block and scope table; replaced with pointers to AGENTS.md. |
 | 2026-03-23 | 1.1.0 | Updated agent instructions to match AGENTS.md. |

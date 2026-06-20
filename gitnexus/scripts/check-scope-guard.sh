@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Scope guard — LSP Read-Only Foundation (WI-9, Invariant 8)
 #
-# Asserts that the current branch (relative to origin/main-afk) has NOT
+# Asserts that the current branch (relative to origin/main) has NOT
 # modified any file under `gitnexus-web/`. The LSP cycle is supposed to
 # be totally isolated to `gitnexus/src/core/ingestion/lsp/` + `cli/{lsp,verify}.ts`
 # + the new commands' registrations in `cli/index.ts`. If this script
@@ -9,8 +9,8 @@
 # PR should be reviewed before merging.
 #
 # Usage:
-#   ./gitnexus/scripts/check-scope-guard.sh           # diff vs origin/main-afk
-#   BASE_REF=origin/main ./gitnexus/scripts/check-scope-guard.sh
+#   ./gitnexus/scripts/check-scope-guard.sh           # diff vs origin/main
+#   BASE_REF=origin/<branch> ./gitnexus/scripts/check-scope-guard.sh
 #
 # Exit codes:
 #   0 — no diff under gitnexus-web/ (gate passes)
@@ -18,7 +18,7 @@
 #   2 — git error (e.g. base ref not found)
 #
 # Notes:
-#   - We compare against the BASE_REF env var (default `origin/main-afk`).
+#   - We compare against the BASE_REF env var (default `origin/main`).
 #     CI can override this to point at any base.
 #   - This script is intentionally tiny: no JSON parsing, no jq, no
 #     dependency on the analyzer. It runs in <100ms on a clean tree.
@@ -34,7 +34,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 cd "${REPO_ROOT}"
 
-BASE_REF="${BASE_REF:-origin/main-afk}"
+BASE_REF="${BASE_REF:-origin/main}"
 TARGET_PATH="${TARGET_PATH:-gitnexus-web/}"
 
 # Verify the base ref exists. `git rev-parse --verify` returns non-zero
