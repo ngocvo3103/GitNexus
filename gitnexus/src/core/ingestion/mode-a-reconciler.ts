@@ -276,21 +276,38 @@ export interface WithReconciliationSessionDeps {
    */
   serverVersion?: string;
   /**
-   * External pre-filter seam (WI-8).
+   * External pre-filter seam (WI-8 / ADR-002 WI-A3).
    *
    * Called once per candidate BEFORE `fetchDefinitionForCandidate`.
-   * Return `true` ONLY when the candidate is PROVABLY EXTERNAL via
-   * a graph node-lookup — i.e. `graph.getNode(candidate.oldTargetId)`
-   * returns a node with `properties.isExternal === true`, OR the node
-   * is absent (undefined) for a correction candidate whose oldTargetId
-   * targets a known external-zone node id.
+   * Return `true` when the candidate is PROVABLY EXTERNAL and LSP
+   * dispatch can be safely skipped.  Two branches apply:
+   *
+   * **Correction candidates** (`oldTargetId` present — original WI-8):
+   *   Return `true` only when `graph.getNode(candidate.oldTargetId)`
+   *   returns a node with `properties.isExternal === true`.
+   *
+   * **Recall candidates** (`oldTargetId` absent — ADR-002 WI-A3):
+   *   Return `true` when the candidate's `candidateLocationKey` is
+   *   present in the `recallExternalFqnMap` populated by
+   *   import-processor (via `RecallFeedItem.calleeExternalFqn`).
+   *   A non-null entry means the callee was provably external at
+   *   import-analysis time; skipping LSP dispatch is safe.
+   *   Return `false` when the key is absent (conservative probe —
+   *   never guess on missing FQN evidence).
    *
    * Invariants (I-2c — no false skips):
-   *   - MUST return `false` for recall candidates (no `oldTargetId`).
+   *   - NOTE (WI-8 correction branch only): the original contract
+   *     stated recall candidates MUST return `false`.  That invariant
+   *     still holds for the *correction* code path and for any recall
+   *     candidate whose FQN is absent from `recallExternalFqnMap`.
    *   - MUST return `false` for ambiguous/uncertain correction candidates.
    *   - MUST return `false` when the lookup result is inconclusive.
-   *   - Return `true` only for correction candidates with a graph node
-   *     that is definitively external-zone.
+   *   - MUST return `false` for recall candidates whose
+   *     `candidateLocationKey` is absent from `recallExternalFqnMap`.
+   *   - Return `true` for correction candidates with a graph node
+   *     that is definitively external-zone (WI-8).
+   *   - Return `true` for recall candidates whose FQN is present in
+   *     `recallExternalFqnMap` (ADR-002 WI-A3 recall pre-filter).
    *
    * When absent from the deps bag, the session defaults to `() => false`
    * (never-skip) — preserving pre-WI-8 behaviour exactly (backward compat).

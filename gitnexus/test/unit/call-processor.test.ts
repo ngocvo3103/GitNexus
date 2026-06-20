@@ -5,8 +5,10 @@ import {
   seedCrossFileReceiverTypes,
   extractConsumerAccessedKeys,
   processNextjsFetchRoutes,
+  buildRefusedFqnHistogram,
   type CorrectionFeedItem,
   type RecallFeedItem,
+  type ProcessCallsOpts,
 } from '../../src/core/ingestion/call-processor.js';
 import { extractReturnTypeName } from '../../src/core/ingestion/type-extractors/shared.js';
 import { createResolutionContext, type ResolutionContext } from '../../src/core/ingestion/resolution-context.js';
@@ -2334,5 +2336,316 @@ describe('hook-destructuring unnamed-import guard (B1)', () => {
       expect(rel.reason).toBe('global');
       expect(rel.confidence).toBe(0.5);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WI-A2 — RecallFeedItem.calleeExternalFqn injection
+//
+// Tests cover both call-processor paths:
+//  • Fast path: processCallsFromExtracted (A2-U1..U5, A2-U7)
+//  • Slow path: processCalls (A2-U6)
+//
+// Equivalence partitions:
+//  1. .java + receiverTypeName + FQN in index           → calleeExternalFqn set
+//  2. .java + receiverTypeName + FQN NOT in index       → calleeExternalFqn undefined
+//  3. .java + receiverTypeName absent                   → calleeExternalFqn absent (safe no-op)
+//  4. non-.java file                                    → calleeExternalFqn absent (gate fires)
+//  5. opts.lsp absent                                   → recall push never entered; feed empty
+// ─────────────────────────────────────────────────────────────────────────────
+describe('RecallFeedItem.calleeExternalFqn injection', () => {
+  let graph: ReturnType<typeof createKnowledgeGraph>;
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    graph = createKnowledgeGraph();
+    ctx = createResolutionContext();
+  });
+
+  // ── Fast path (processCallsFromExtracted) ──────────────────────────────────
+
+  // A2-U1 [EP: .java + receiverTypeName present + FQN in index]
+  it('A2-U1 (fast): .java call with receiverTypeName in index → calleeExternalFqn set', async () => {
+    // No symbol registered → site is unresolved → hits recall push
+    const filePath = 'src/OrderService.java';
+    const javaExternalFqnIndex = new Map<string, Map<string, string>>();
+    javaExternalFqnIndex.set(filePath, new Map([['List', 'java.util.List']]));
+
+    const calls: ExtractedCall[] = [{
+      filePath,
+      calledName: 'add',
+      receiverTypeName: 'List',
+      receiverName: 'items',
+      sourceId: 'Method:src/OrderService.java:OrderService/placeOrder',
+      callForm: 'member',
+      line: 10,
+      character: 12,
+    }];
+
+    const recallFeed: RecallFeedItem[] = [];
+    const opts: ProcessCallsOpts = { lsp: true, correctionFeed: [], recallFeed, javaExternalFqnIndex };
+
+    await processCallsFromExtracted(graph, calls, ctx, undefined, undefined, undefined, opts);
+
+    expect(recallFeed).toHaveLength(1);
+    expect(recallFeed[0].calleeExternalFqn).toBe('java.util.List');
+    expect(recallFeed[0].calledName).toBe('add');
+    expect(recallFeed[0].file).toBe(filePath);
+  });
+
+  // A2-U2 [EP: .java + receiverTypeName present + FQN NOT in index]
+  it('A2-U2 (fast): .java call with receiverTypeName absent from index → calleeExternalFqn undefined', async () => {
+    const filePath = 'src/OrderService.java';
+    const javaExternalFqnIndex = new Map<string, Map<string, string>>();
+    // No entry for 'OrderService' — it's an in-repo class, not external
+    javaExternalFqnIndex.set(filePath, new Map([['List', 'java.util.List']]));
+
+    const calls: ExtractedCall[] = [{
+      filePath,
+      calledName: 'process',
+      receiverTypeName: 'OrderService',
+      receiverName: 'svc',
+      sourceId: 'Method:src/OrderService.java:Main/run',
+      callForm: 'member',
+      line: 20,
+      character: 8,
+    }];
+
+    const recallFeed: RecallFeedItem[] = [];
+    const opts: ProcessCallsOpts = { lsp: true, correctionFeed: [], recallFeed, javaExternalFqnIndex };
+
+    await processCallsFromExtracted(graph, calls, ctx, undefined, undefined, undefined, opts);
+
+    expect(recallFeed).toHaveLength(1);
+    expect(recallFeed[0].calleeExternalFqn).toBeUndefined();
+    expect(recallFeed[0].calledName).toBe('process');
+  });
+
+  // A2-U3 [EP: .java + receiverTypeName absent (undefined)]
+  it('A2-U3 (fast): .java call with undefined receiverTypeName → calleeExternalFqn absent (no crash)', async () => {
+    const filePath = 'src/OrderService.java';
+    const javaExternalFqnIndex = new Map<string, Map<string, string>>();
+    javaExternalFqnIndex.set(filePath, new Map([['List', 'java.util.List']]));
+
+    const calls: ExtractedCall[] = [{
+      filePath,
+      calledName: 'freeCall',
+      // receiverTypeName intentionally absent (undefined)
+      sourceId: 'Method:src/OrderService.java:OrderService/run',
+      callForm: 'free',
+      line: 5,
+      character: 4,
+    }];
+
+    const recallFeed: RecallFeedItem[] = [];
+    const opts: ProcessCallsOpts = { lsp: true, correctionFeed: [], recallFeed, javaExternalFqnIndex };
+
+    await processCallsFromExtracted(graph, calls, ctx, undefined, undefined, undefined, opts);
+
+    // May or may not push (depends on resolution), but must not throw.
+    // If pushed, calleeExternalFqn must be absent.
+    for (const item of recallFeed) {
+      expect(item.calleeExternalFqn).toBeUndefined();
+    }
+  });
+
+  // A2-U4 [EP: non-.java file (.ts)]
+  it('A2-U4 (fast): non-.java file → calleeExternalFqn absent regardless of index contents', async () => {
+    const filePath = 'src/Service.ts';
+    const javaExternalFqnIndex = new Map<string, Map<string, string>>();
+    // Put an entry in the index keyed on the .ts path — should be ignored
+    javaExternalFqnIndex.set(filePath, new Map([['List', 'java.util.List']]));
+
+    const calls: ExtractedCall[] = [{
+      filePath,
+      calledName: 'phantom',
+      receiverTypeName: 'List',
+      receiverName: 'items',
+      sourceId: 'Function:src/Service.ts:run',
+      callForm: 'member',
+      line: 3,
+      character: 6,
+    }];
+
+    const recallFeed: RecallFeedItem[] = [];
+    const opts: ProcessCallsOpts = { lsp: true, correctionFeed: [], recallFeed, javaExternalFqnIndex };
+
+    await processCallsFromExtracted(graph, calls, ctx, undefined, undefined, undefined, opts);
+
+    for (const item of recallFeed) {
+      expect(item.calleeExternalFqn).toBeUndefined();
+    }
+  });
+
+  // A2-U5 [EP: opts.lsp absent / recallFeed absent]
+  it('A2-U5 (fast): opts.lsp absent → recall push not entered; recallFeed stays empty', async () => {
+    const filePath = 'src/OrderService.java';
+    const javaExternalFqnIndex = new Map<string, Map<string, string>>();
+    javaExternalFqnIndex.set(filePath, new Map([['List', 'java.util.List']]));
+
+    const calls: ExtractedCall[] = [{
+      filePath,
+      calledName: 'add',
+      receiverTypeName: 'List',
+      receiverName: 'items',
+      sourceId: 'Method:src/OrderService.java:OrderService/run',
+      callForm: 'member',
+      line: 10,
+      character: 5,
+    }];
+
+    const recallFeed: RecallFeedItem[] = [];
+    // opts.lsp absent — javaExternalFqnIndex present but gate never reached
+    const opts: ProcessCallsOpts = { correctionFeed: [], recallFeed, javaExternalFqnIndex };
+
+    await processCallsFromExtracted(graph, calls, ctx, undefined, undefined, undefined, opts);
+
+    expect(recallFeed).toHaveLength(0);
+  });
+
+  // ── Slow path (processCalls) ───────────────────────────────────────────────
+
+  // A2-U6 [slow site path: processCalls uses file.path — positive case]
+  it('A2-U6 (slow): processCalls — .java call with receiverTypeName in index → calleeExternalFqn set', async () => {
+    // tree-sitter-java IS available in the unit test environment (tree-sitter-java is a
+    // direct dependency, not optional). This test exercises the real Java parser to verify
+    // the slow-site injection at call-processor.ts:661-664 is actually patched.
+    //
+    // The slow site uses `file.path` (not `filePath`) and the bare local `receiverTypeName`
+    // variable — verifying this path is a structural guarantee that A2-U1 (fast path) cannot
+    // provide, since they are independent code paths.
+    //
+    // receiverTypeName propagation in the slow path:
+    //   The fallback at call-processor.ts:587-594 sets receiverTypeName = receiverName when
+    //   ctx.resolve(receiverName) returns a Class/Interface. We register ResponseEntity as a
+    //   Class in ctx.symbols so this fallback fires for ResponseEntity.ok() calls.
+    //   The call remains unresolved (no ok() in ctx) → pushed to recallFeed.
+    const filePath = 'src/Handler.java';
+    const localCtx = createResolutionContext();
+    // Register ResponseEntity as a Class so the static-call fallback sets receiverTypeName
+    localCtx.symbols.add(filePath, 'ResponseEntity', 'Class:src/Handler.java:ResponseEntity', 'Class');
+
+    const javaExternalFqnIndex = new Map<string, Map<string, string>>();
+    javaExternalFqnIndex.set(filePath, new Map([['ResponseEntity', 'org.springframework.http.ResponseEntity']]));
+
+    // Valid Java content: ResponseEntity.ok() static call.
+    // tree-sitter-java parses this as a member call with receiverName='ResponseEntity'.
+    // The ok() method is not in ctx → unresolved → pushed to recallFeed.
+    const javaContent = [
+      'import org.springframework.http.ResponseEntity;',
+      'public class Handler {',
+      '    public ResponseEntity<String> handle() {',
+      '        return ResponseEntity.ok("hello");',
+      '    }',
+      '}',
+    ].join('\n');
+
+    const files = [{ path: filePath, content: javaContent }];
+    const recallFeed: RecallFeedItem[] = [];
+    const opts: ProcessCallsOpts = {
+      lsp: true,
+      correctionFeed: [],
+      recallFeed,
+      javaExternalFqnIndex,
+    };
+
+    await processCalls(createKnowledgeGraph(), files, createASTCache(files.length), localCtx,
+      undefined, undefined, undefined, undefined, undefined, opts);
+
+    // The Java parser extracts ResponseEntity.ok() as a member call with receiverName='ResponseEntity'.
+    // ctx.resolve('ResponseEntity') returns the Class registered above → receiverTypeName='ResponseEntity'.
+    // ok() is not in ctx → unresolved → pushed to recallFeed with calleeExternalFqn set.
+    const okItem = recallFeed.find(r => r.calledName === 'ok' && r.file === filePath);
+    // Positive assertion: slow-site WI-A2 injection must have fired
+    expect(okItem).toBeDefined();
+    expect(okItem!.calleeExternalFqn).toBe('org.springframework.http.ResponseEntity');
+    expect(okItem!.file).toBe(filePath);
+    expect(okItem!.file).toMatch(/\.java$/);
+  });
+
+  // A2-U6b [slow site path: .ts file via processCalls → calleeExternalFqn absent]
+  it('A2-U6b (slow): processCalls — .ts file with index entry → calleeExternalFqn absent (Java gate fires)', async () => {
+    const filePath = 'src/Service.ts';
+    const javaExternalFqnIndex = new Map<string, Map<string, string>>();
+    javaExternalFqnIndex.set(filePath, new Map([['List', 'java.util.List']]));
+
+    // ghostFn is not in the symbol table → unresolved → recall push
+    const files = [{ path: filePath, content: 'export function main() { ghostFn(); }\n' }];
+    const recallFeed: RecallFeedItem[] = [];
+    const opts: ProcessCallsOpts = {
+      lsp: true,
+      correctionFeed: [],
+      recallFeed,
+      javaExternalFqnIndex,
+    };
+
+    await processCalls(graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined, opts);
+
+    expect(recallFeed).toHaveLength(1);
+    expect(recallFeed[0].calledName).toBe('ghostFn');
+    expect(recallFeed[0].calleeExternalFqn).toBeUndefined();
+  });
+
+  // A2-U7 [I-2c: calleeExternalFqn absent → probe, never skip]
+  it('A2-U7 (fast): item pushed with calleeExternalFqn=undefined is a probe, not a skip (field contract)', async () => {
+    const filePath = 'src/Foo.java';
+    const javaExternalFqnIndex = new Map<string, Map<string, string>>();
+    // No entry → undefined FQN → item should be probed by downstream consumer
+    const calls: ExtractedCall[] = [{
+      filePath,
+      calledName: 'doSomething',
+      receiverTypeName: 'InternalClass',
+      receiverName: 'obj',
+      sourceId: 'Method:src/Foo.java:Foo/run',
+      callForm: 'member',
+      line: 7,
+      character: 9,
+    }];
+
+    const recallFeed: RecallFeedItem[] = [];
+    const opts: ProcessCallsOpts = { lsp: true, correctionFeed: [], recallFeed, javaExternalFqnIndex };
+
+    await processCallsFromExtracted(graph, calls, ctx, undefined, undefined, undefined, opts);
+
+    // Item IS pushed (recall path) and calleeExternalFqn is absent — this signals
+    // "probe via LSP" to the downstream canSkipCandidate (I-2c conservative default).
+    expect(recallFeed).toHaveLength(1);
+    expect(recallFeed[0].calleeExternalFqn).toBeUndefined();
+    // Downstream consumer must treat undefined as "do NOT skip"
+    const item = recallFeed[0];
+    // canSkipCandidate returns false when fqn is falsy — verified structurally here
+    expect(item.calleeExternalFqn ?? null).toBeNull();
+  });
+});
+
+describe('buildRefusedFqnHistogram (WI-A4 observability — pure helper)', () => {
+  const item = (over: Partial<RecallFeedItem>): RecallFeedItem => ({
+    sourceId: 'CONTAINER:src/App.java:App',
+    calledName: 'doThing',
+    file: 'src/App.java',
+    line: 10,
+    character: 4,
+    ...over,
+  });
+
+  it('empty calledName on a .java file → key NOT added (empty histogram)', () => {
+    // Guards against synthetic/AST-error nodes that would accumulate a misleading empty key.
+    const h = buildRefusedFqnHistogram([item({ calledName: '' })]);
+    expect(h.size).toBe(0);
+  });
+
+  it("dot-qualified calledName 'a.b.c' → key is 'a.b.c' verbatim (no dot-stripping)", () => {
+    // calledName is a method name, never a FQN — dot-stripping produces a semantically
+    // meaningless key that conflates unrelated methods. The raw calledName is the key.
+    const h = buildRefusedFqnHistogram([item({ calledName: 'a.b.c', calleeExternalFqn: undefined })]);
+    expect(h.get('a.b.c')).toBe(1);
+    expect(h.has('a.b')).toBe(false);
+    expect(h.has('a')).toBe(false);
+  });
+
+  it('non-.java caller file → excluded from the residual histogram', () => {
+    const h = buildRefusedFqnHistogram([item({ file: 'src/App.kt', calledName: 'doThing', calleeExternalFqn: undefined })]);
+    expect(h.size).toBe(0);
   });
 });

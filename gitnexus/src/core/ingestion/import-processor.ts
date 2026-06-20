@@ -19,7 +19,35 @@ import type { NamedBinding } from './named-bindings/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
 import type { CrossRepoRegistry } from './cross-repo-registry.js';
 import { extractPackagePrefix } from './type-extractors/shared.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 
+/** Seven JVM/Spring/library package prefixes whose imports are provably external
+ *  (no definition in-repo).  Extend here to add more; Maven pom.xml scanning is
+ *  deferred to Phase 2.  Used by processImports / processImportsFromExtracted to
+ *  populate javaExternalFqnIndex when opts.lsp is active. */
+export const JAVA_EXTERNAL_PACKAGE_PREFIXES: readonly string[] = [
+  'java.',
+  'javax.',
+  'jakarta.',
+  'org.springframework.',
+  'com.fasterxml.',
+  'org.slf4j.',
+  'io.opentelemetry.',
+];
+
+/**
+ * Single regex compiled once at module load from JAVA_EXTERNAL_PACKAGE_PREFIXES.
+ * O(1) per check vs O(n_prefixes) for Array.some(); matters when the prefix set
+ * grows in Phase 2 and import counts reach 1M+.
+ * Use isJavaExternalImport() instead of JAVA_EXTERNAL_PACKAGE_PREFIXES.some() in
+ * per-import hot loops.
+ */
+const _JAVA_EXTERNAL_RE = new RegExp(
+  `^(?:${JAVA_EXTERNAL_PACKAGE_PREFIXES.map(p => p.replace(/\./g, '\\.')).join('|')})`,
+);
+export function isJavaExternalImport(rawImportPath: string): boolean {
+  return _JAVA_EXTERNAL_RE.test(rawImportPath);
+}
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -298,6 +326,7 @@ export const processImports = async (
   repoRoot?: string,
   allPaths?: string[],
   crossRepoRegistry?: CrossRepoRegistry,
+  javaExternalFqnIndex?: Map<string, Map<string, string>>,
 ) => {
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
@@ -407,6 +436,21 @@ export const processImports = async (
         if (!result && crossRepoRegistry) {
           applyCrossRepoImport(graph, file.path, rawImportPath, crossRepoRegistry);
         }
+        // ADR-002 Phase 1: populate javaExternalFqnIndex for provably-external Java imports.
+        // NEW SIBLING block — independent of crossRepoRegistry (which is undefined on
+        // single-repo runs); nesting inside that branch would silently no-op the feature.
+        if (
+          !result &&
+          javaExternalFqnIndex &&
+          language === SupportedLanguages.Java &&
+          !rawImportPath.endsWith('.*') &&
+          isJavaExternalImport(rawImportPath)
+        ) {
+          const simple = rawImportPath.split('.').at(-1)!;
+          let fileMap = javaExternalFqnIndex.get(file.path);
+          if (!fileMap) { fileMap = new Map(); javaExternalFqnIndex.set(file.path, fileMap); }
+          fileMap.set(simple, rawImportPath);
+        }
       }
 
       // ---- Language-specific call-as-import routing (Ruby require, etc.) ----
@@ -454,6 +498,7 @@ export const processImportsFromExtracted = async (
   repoRoot?: string,
   prebuiltCtx?: ImportResolutionContext,
   crossRepoRegistry?: CrossRepoRegistry,
+  javaExternalFqnIndex?: Map<string, Map<string, string>>,
 ) => {
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
@@ -498,6 +543,21 @@ export const processImportsFromExtracted = async (
       // #50: unresolved local import that maps to an indexed dependency repo.
       if (!result && crossRepoRegistry) {
         applyCrossRepoImport(graph, filePath, imp.rawImportPath, crossRepoRegistry);
+      }
+      // ADR-002 Phase 1: populate javaExternalFqnIndex for provably-external Java imports.
+      // NEW SIBLING block — independent of crossRepoRegistry; uses imp.language (enum)
+      // directly since the fast path does not call getLanguageFromFilename.
+      if (
+        !result &&
+        javaExternalFqnIndex &&
+        imp.language === SupportedLanguages.Java &&
+        !imp.rawImportPath.endsWith('.*') &&
+        isJavaExternalImport(imp.rawImportPath)
+      ) {
+        const simple = imp.rawImportPath.split('.').at(-1)!;
+        let fileMap = javaExternalFqnIndex.get(filePath);
+        if (!fileMap) { fileMap = new Map(); javaExternalFqnIndex.set(filePath, fileMap); }
+        fileMap.set(simple, imp.rawImportPath);
       }
     }
   }

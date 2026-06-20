@@ -655,12 +655,20 @@ export const processCalls = async (
         // this site is a real call target with no heuristic winner.
         // Gated by opts?.lsp so default analyze stays byte-identical.
         if (opts?.lsp && opts.recallFeed) {
+          // WI-A2 — inject calleeExternalFqn when the receiver type is a provably-external
+          // Java class. Slow site uses `file.path` (not `filePath`) and the bare local
+          // variable `receiverTypeName` (not effectiveCall — not in scope here).
+          const calleeExternalFqn =
+            file.path.endsWith('.java') && receiverTypeName
+              ? opts.javaExternalFqnIndex?.get(file.path)?.get(receiverTypeName)
+              : undefined;
           opts.recallFeed.push({
             sourceId,
             calledName,
             file: file.path,
             line: nameNode.startPosition.row,
             character: nameNode.startPosition.column,
+            ...(calleeExternalFqn !== undefined && { calleeExternalFqn }),
           });
         }
         return;
@@ -1389,6 +1397,49 @@ export interface RecallFeedItem {
   file: string;
   line: number;
   character: number;
+  /**
+   * WI-A2 — Present only when the callee receiver type resolves to a provably-external
+   * Java class (JDK/Spring/Jackson prefix). Undefined means "probe via LSP" (I-2c).
+   * Non-Java files and absent receiverTypeName always leave this field absent.
+   */
+  calleeExternalFqn?: string;
+}
+
+/**
+ * WI-A4 observability: build a histogram keyed by calledName for Java recall items
+ * that were NOT pre-filtered by the canSkipCandidate recall branch (i.e.
+ * RecallFeedItem.calleeExternalFqn is absent).
+ *
+ * These are probed items where the caller-side import did not resolve to a known
+ * external FQN prefix — the under-coverage population dominated by Lombok,
+ * Apache Commons, Guava, SLF4J, etc. The histogram makes this under-coverage visible
+ * rather than silently burying it in the `refused` counter. A non-empty result after
+ * a run indicates call targets that are candidates for future prefix expansion.
+ *
+ * Note: calledName is a method name ('build', 'info', 'add'), not a FQN. The key
+ * is the raw calledName — no dot-stripping. Dot-qualified chained-call artifacts
+ * (e.g. 'Foo.bar') are kept verbatim rather than truncated to 'Foo'; truncating
+ * would collapse structurally unrelated methods under the same key. For items with
+ * no calleeExternalFqn the method name is the best available signal for grouping
+ * under-coverage; there is no package information to extract.
+ *
+ * Returns Map<calledName, count>.
+ */
+export function buildRefusedFqnHistogram(recallFeed: RecallFeedItem[]): Map<string, number> {
+  const histogram = new Map<string, number>();
+  for (const item of recallFeed) {
+    // Only Java caller files that were NOT pre-filtered contribute to the residual histogram
+    if (!item.file.endsWith('.java') || item.calleeExternalFqn !== undefined) continue;
+    // Skip synthetic/AST-error nodes that produce an empty calledName; an empty key
+    // would accumulate silently and produce a misleading lsp-refused-method log line.
+    if (!item.calledName) continue;
+    // Key on the raw calledName (a method name such as 'build', 'info', 'add').
+    // No dot-stripping: calledName is never a qualified type name, so splitting on
+    // the last dot yields a semantically meaningless key (e.g. 'Foo.bar' → 'Foo'
+    // conflates unrelated methods that happen to share a chained-call prefix).
+    histogram.set(item.calledName, (histogram.get(item.calledName) ?? 0) + 1);
+  }
+  return histogram;
 }
 
 /**
@@ -1402,6 +1453,12 @@ export interface ProcessCallsOpts {
   correctionFeed?: CorrectionFeedItem[];
   /** Sink for unresolved/ambiguous recall candidates. */
   recallFeed?: RecallFeedItem[];
+  /**
+   * WI-A2 — Index built by import-processor at LSP-analysis time.
+   * Maps filePath → simpleClassName → fullyQualifiedName for provably-external Java imports.
+   * Absent on the default analyze path (I-9: default path stays byte-identical).
+   */
+  javaExternalFqnIndex?: Map<string, Map<string, string>>;
 }
 
 /**
@@ -1571,6 +1628,13 @@ export const processCallsFromExtracted = async (
         // feeds are only touched when the flag is on, so the default path stays
         // byte-identical).
         if (opts?.lsp && opts.recallFeed) {
+          // WI-A2 — inject calleeExternalFqn when the receiver type is a provably-external
+          // Java class (JDK/Spring/Jackson). Gate: .java file + receiverTypeName present.
+          // ?.get(undefined) is safe — Map.get(undefined) returns undefined without error.
+          const calleeExternalFqn =
+            effectiveCall.filePath.endsWith('.java') && effectiveCall.receiverTypeName
+              ? opts.javaExternalFqnIndex?.get(effectiveCall.filePath)?.get(effectiveCall.receiverTypeName)
+              : undefined;
           opts.recallFeed.push({
             sourceId: effectiveCall.sourceId,
             calledName: effectiveCall.calledName,
@@ -1579,6 +1643,7 @@ export const processCallsFromExtracted = async (
             // not capture a call.name node (older emitters, synthetic calls).
             line: effectiveCall.line ?? 0,
             character: effectiveCall.character ?? 0,
+            ...(calleeExternalFqn !== undefined && { calleeExternalFqn }),
           });
         }
         continue;
