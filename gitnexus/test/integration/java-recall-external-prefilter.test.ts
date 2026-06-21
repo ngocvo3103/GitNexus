@@ -963,10 +963,13 @@ const BOND_RECALL_FLOOR    = 30;
 
 /**
  * tcbs-bond-trading deterministic counters (cap-stable).
- * confirmed=60, recall=7 are stable across runs (same 2K candidates selected).
+ * confirmed=165, recall=7 are stable across runs (same 2K candidates selected).
+ * Roadmap lever 4 raised confirmed 60→165: the heritage feed is now un-gated
+ * for Java, so IMPLEMENTS/EXTENDS candidates (≈114 LSP-confirmed) join the
+ * deterministic candidate prefix alongside CALLS (≈51 confirmed).
  * node/edge counts vary due to cap non-determinism (11,995–11,999 / 33,629–33,633).
  */
-const TCBS_CONFIRMED = 60;
+const TCBS_CONFIRMED = 165;
 const TCBS_RECALL    = 7;
 
 // ─── Guard: resolve jdtls once for all E2E tests ─────────────────────────────

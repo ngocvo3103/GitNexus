@@ -22,6 +22,22 @@ export const getCurrentCommit = (repoPath: string): string => {
 };
 
 /**
+ * True when the working tree has NO uncommitted changes (tracked or untracked).
+ * Used by the LSP definition cache (lever 14) to gate caching: only a clean
+ * checkout guarantees the on-disk files match the HEAD commit, so cached
+ * definition results are valid. Any error (not a repo, git missing) → false
+ * (treat as dirty → caching disabled, the safe default).
+ */
+export const isWorkingTreeClean = (repoPath: string): boolean => {
+  try {
+    const out = execSync('git status --porcelain', { cwd: repoPath }).toString();
+    return out.trim().length === 0;
+  } catch {
+    return false;
+  }
+};
+
+/**
  * Find the git repository root from any path inside the repo
  */
 export const getGitRoot = (fromPath: string): string | null => {

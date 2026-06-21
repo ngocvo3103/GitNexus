@@ -49,6 +49,12 @@ import { normalizeFilePath } from '../../lib/utils.js';
 // (or NO_NODE / AMBIGUOUS — both skipped). See design doc
 // `## Contracts` (impact) + KD-5.
 import { mapLocationToNodeId, type MapperResult } from '../../core/ingestion/lsp/location-mapper.js';
+// Roadmap lever 8: real Mode B readiness probe (the default funnel probe
+// refuses on empty samples, so `precision:'lsp'` never fires without this).
+import { selectAdapter } from '../../core/ingestion/lsp/language-adapter.js';
+import { buildCanarySamples } from '../../core/ingestion/lsp/canary-sampler.js';
+import { probeWorkspaceReadiness } from '../../core/ingestion/lsp/workspace-readiness-probe.js';
+import type { WithReferenceProviderDeps } from '../../core/ingestion/lsp/reference-provider.js';
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -70,6 +76,31 @@ export function isTestFilePath(filePath: string): boolean {
 // Source of truth lives in core/ingestion/lsp/node-labels.ts to avoid a
 // circular ESM import (location-mapper.ts → local-backend.ts → TDZ crash).
 import { VALID_NODE_LABELS } from '../../core/ingestion/lsp/node-labels.js';
+
+/**
+ * Roadmap lever 8: build the `withReferenceProvider` deps with a REAL
+ * readiness probe. The Mode B funnel's default probe is called with an
+ * empty sample list and returns `{ready:false}`, so `precision:'lsp'`
+ * (rename / impact) can never return an LSP answer. Here we select the
+ * repo's language adapter, build canary samples from real source, and
+ * return a probe that runs `probeWorkspaceReadiness` — mirroring the
+ * Mode C / analyze setup. No adapter (unsupported language) or any
+ * failure ⇒ empty deps ⇒ the funnel keeps its safe default-refuse.
+ */
+async function buildModeBProbeDeps(repoPath: string): Promise<WithReferenceProviderDeps> {
+  try {
+    const adapter = selectAdapter(repoPath);
+    if (!adapter) return {};
+    const samples = await buildCanarySamples(repoPath, { strategy: adapter.canary });
+    if (!samples || samples.length === 0) return {};
+    return {
+      probe: async (client: any) =>
+        probeWorkspaceReadiness(client, samples, { perRequestTimeoutMs: 3000 }),
+    };
+  } catch {
+    return {};
+  }
+}
 /** Valid LadybugDB node labels for safe Cypher query construction */
 export { VALID_NODE_LABELS };
 
@@ -3533,6 +3564,7 @@ export class LocalBackend {
         // redundant read in exchange for not having to
         // hand-project the applier shape back to the public
         // shape (S-14 + S-30: remove the hand-projection).
+        const modeBDeps = await buildModeBProbeDeps(repo.repoPath); // lever 8
         const lspResult = await withReferenceProvider(repo, targetUri, async (provider) => {
           // KD-4: pin the identifier position via `workspace/symbol`.
           const loc = await provider.resolveSymbol(oldName, sym.filePath);
@@ -3550,7 +3582,7 @@ export class LocalBackend {
           const lspChanges = await workspaceEditToApplierChanges(edit, repo.repoPath);
           if (!publicChanges || !lspChanges) return null;
           return { publicChanges, lspChanges };
-        });
+        }, modeBDeps);
         if (lspResult) {
           const { publicChanges, lspChanges } = lspResult;
           // KD-2: apply via the precise per-edit applier (NOT the
@@ -4136,6 +4168,7 @@ export class LocalBackend {
           }
           return ids;
         },
+        await buildModeBProbeDeps(repo.repoPath), // lever 8: real readiness probe
       );
       // `lspIds` is `Set<string> | null` — the funnel returns
       // `null` on any gate failure and the fn's resolved value

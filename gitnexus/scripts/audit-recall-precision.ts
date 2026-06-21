@@ -2,8 +2,9 @@
  * scripts/audit-recall-precision.ts — #159 backlog: recall-precision check
  *
  * Produces INDEPENDENT structural corroboration of `lsp-recall` edges
- * (source='lsp-recall', confidence 0.70) WITHOUT re-invoking the LSP oracle
- * that created them (which would be circular).
+ * (source='lsp-recall'; confidence is per-language — default 0.90, with
+ * weak-recall languages lowered below the 0.85 impact floor) WITHOUT
+ * re-invoking the LSP oracle that created them (which would be circular).
  *
  * Methodology:
  *   For each `lsp-recall` edge, we check two things structurally:
@@ -564,18 +565,25 @@ export function renderMarkdownReport(results: AuditResult[]): string {
   // Recommendation
   lines.push('## Recommendation');
   lines.push('');
+  // Calibration check against the CURRENT model: recall confidence is now
+  // per-language (default `LSP_RECALL_CONFIDENCE` = 0.90; the language
+  // adapter may set a lower `recallConfidence`, e.g. TS 0.75 / Python 0.6),
+  // and uncorroborated recalls are name-gated out at index time (roadmap
+  // levers 1+2). The 0.85 WILL_BREAK impact floor is the decision boundary:
+  // a language whose measured corroboration justifies clearing it should
+  // sit ≥ 0.90; otherwise keep it below 0.85.
   const pct = aggRate * 100;
   let rec: string;
   let targetConf: string;
   if (pct >= 95) {
-    rec = `Corroboration rate ${pct.toFixed(1)}% ≥ 95%: **recommend promoting LSP_RECALL_CONFIDENCE 0.70 → 0.90**.`;
+    rec = `Corroboration rate ${pct.toFixed(1)}% ≥ 95%: recall is reliable — **0.90 is justified** (clears the 0.85 WILL_BREAK floor).`;
     targetConf = '0.90';
   } else if (pct >= 85) {
-    rec = `Corroboration rate ${pct.toFixed(1)}% ∈ [85%, 95%): **recommend promoting LSP_RECALL_CONFIDENCE 0.70 → 0.80**.`;
+    rec = `Corroboration rate ${pct.toFixed(1)}% ∈ [85%, 95%): borderline — **cap at 0.80** (just below the 0.85 impact floor).`;
     targetConf = '0.80';
   } else {
-    rec = `Corroboration rate ${pct.toFixed(1)}% < 85%: **hold LSP_RECALL_CONFIDENCE at 0.70**. Further investigation needed.`;
-    targetConf = '0.70 (no change)';
+    rec = `Corroboration rate ${pct.toFixed(1)}% < 85%: weak — **keep well below 0.85** (e.g. TS 0.75 / Python 0.6). Single-method recall is unreliable for this language/repo.`;
+    targetConf = '< 0.85 (per-language floor)';
   }
   lines.push(rec);
   lines.push('');

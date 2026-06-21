@@ -65,9 +65,23 @@ export type Location = {
   range: { start: { line: number; character: number } };
 };
 
+/**
+ * Why a Location was dropped (NO_NODE). Diagnostic-only — consumers switch on
+ * `kind`, never on `dropReason`, so it is purely additive (0-edge lever).
+ *   - `external`   → resolved outside the repo for an external-refusal adapter
+ *                    (stdlib / site-packages / mod-cache). Pairs with `external:true`.
+ *   - `out-of-repo`→ containment guard refused (path rebased outside repoPath)
+ *                    for a non-external adapter (TS/Java sub-root / symlink case).
+ *   - `db-miss`    → mapped to a repo-relative path but no graph node covers the line
+ *                    (DB error, no rows, or no line-containing candidate).
+ *   - `unmappable` → URI/line could not be interpreted (malformed URI, classifyUri
+ *                    'unmappable', non-integer line).
+ */
+export type DropReason = 'external' | 'out-of-repo' | 'db-miss' | 'unmappable';
+
 export type MapperResult =
   | { kind: 'node'; nodeId: string }
-  | { kind: 'NO_NODE'; external?: boolean }
+  | { kind: 'NO_NODE'; external?: boolean; dropReason?: DropReason }
   | { kind: 'AMBIGUOUS' };
 
 /**
@@ -437,10 +451,10 @@ export async function mapLocationToNodeId(
     const rawUri = loc?.uri ?? '';
     const uriClass = resolvedDeps.classifyUri(rawUri);
     if (uriClass === 'external') {
-      return { kind: 'NO_NODE', external: true };
+      return { kind: 'NO_NODE', external: true, dropReason: 'external' };
     }
     if (uriClass === 'unmappable') {
-      return { kind: 'NO_NODE' };
+      return { kind: 'NO_NODE', dropReason: 'unmappable' };
     }
     // uriClass === 'workspace' → fall through to normal file:// handling.
   }
@@ -500,7 +514,7 @@ export async function mapLocationToNodeId(
       // at the else-branch below (the "wrong-node door" — ruling R2-4).
       // For TS/Java or no adapter, fall through to scheme-strip as before.
       if (isExternalRefusalAdapter) {
-        return { kind: 'NO_NODE' };
+        return { kind: 'NO_NODE', dropReason: 'unmappable' };
       }
       absPath = '';
     }
@@ -524,7 +538,7 @@ export async function mapLocationToNodeId(
         // refuse bare {NO_NODE} here instead of falling through to scheme-strip
         // (ruling R2-4).
         if (isExternalRefusalAdapter) {
-          return { kind: 'NO_NODE' };
+          return { kind: 'NO_NODE', dropReason: 'unmappable' };
         }
         realAbsPath = '';
       }
@@ -603,9 +617,9 @@ export async function mapLocationToNodeId(
     // node_modules) keep the pre-existing bare {NO_NODE} even for these
     // adapters — they are vendored in the repo, not stdlib/site-packages.
     if (isExternalRefusalAdapter && isOutOfRepo) {
-      return { kind: 'NO_NODE', external: true };
+      return { kind: 'NO_NODE', external: true, dropReason: 'external' };
     }
-    return { kind: 'NO_NODE' };
+    return { kind: 'NO_NODE', dropReason: 'unmappable' };
   }
 
   // Outside-repo paths after rebase start with `..` or are absolute.
@@ -613,9 +627,9 @@ export async function mapLocationToNodeId(
   // adapter (Python or Go) is active.
   if (isOutOfRepo) {
     if (isExternalRefusalAdapter) {
-      return { kind: 'NO_NODE', external: true };
+      return { kind: 'NO_NODE', external: true, dropReason: 'external' };
     }
-    return { kind: 'NO_NODE' };
+    return { kind: 'NO_NODE', dropReason: 'out-of-repo' };
   }
 
   // ── 1a) Sanity: query line must be a non-negative integer ─────────
@@ -624,7 +638,7 @@ export async function mapLocationToNodeId(
   // (refuse over guess) rather than letting the DB silently miss.
   const line = loc?.range?.start?.line;
   if (typeof line !== 'number' || !Number.isInteger(line) || line < 0) {
-    return { kind: 'NO_NODE' };
+    return { kind: 'NO_NODE', dropReason: 'unmappable' };
   }
 
   // ── 2) Query candidates ───────────────────────────────────────────
@@ -644,11 +658,11 @@ export async function mapLocationToNodeId(
     // timeout, etc.), refuse rather than guess. The spec's "no
     // graph writes" invariant is preserved because `executeParameterized`
     // cannot mutate state, and we never write anything here.
-    return { kind: 'NO_NODE' };
+    return { kind: 'NO_NODE', dropReason: 'db-miss' };
   }
 
   if (!Array.isArray(rows) || rows.length === 0) {
-    return { kind: 'NO_NODE' };
+    return { kind: 'NO_NODE', dropReason: 'db-miss' };
   }
 
   // ── 3) Project to Candidate[] + post-filter on line containment ──
@@ -670,7 +684,7 @@ export async function mapLocationToNodeId(
     .filter((c: Candidate) => c.startLine <= line && c.endLine >= line);
 
   if (candidates.length === 0) {
-    return { kind: 'NO_NODE' };
+    return { kind: 'NO_NODE', dropReason: 'db-miss' };
   }
 
   // ── 4) Single-candidate fast path ─────────────────────────────────

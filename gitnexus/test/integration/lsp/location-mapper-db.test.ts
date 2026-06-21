@@ -111,7 +111,7 @@ withTestLbugDB('location-mapper', (handle) => {
         handle.repoId,
       );
       // hash starts at 1, so line 0 doesn't enclose it.
-      expect(result).toEqual({ kind: 'NO_NODE' });
+      expect(result).toMatchObject({ kind: 'NO_NODE' });
     });
 
     it('BVA: line == endLine + 1 → NO_NODE', async () => {
@@ -120,7 +120,7 @@ withTestLbugDB('location-mapper', (handle) => {
         handle.repoId,
       );
       // hash ends at 8, so line 9 doesn't enclose it.
-      expect(result).toEqual({ kind: 'NO_NODE' });
+      expect(result).toMatchObject({ kind: 'NO_NODE' });
     });
   });
 
@@ -159,7 +159,7 @@ withTestLbugDB('location-mapper', (handle) => {
         loc('file:///repo/node_modules/lodash/index.d.ts', 0),
         handle.repoId,
       );
-      expect(result).toEqual({ kind: 'NO_NODE' });
+      expect(result).toMatchObject({ kind: 'NO_NODE' });
     });
 
     it('a .d.ts URI → NO_NODE', async () => {
@@ -167,7 +167,7 @@ withTestLbugDB('location-mapper', (handle) => {
         loc('file:///repo/types/express/index.d.ts', 0),
         handle.repoId,
       );
-      expect(result).toEqual({ kind: 'NO_NODE' });
+      expect(result).toMatchObject({ kind: 'NO_NODE' });
     });
 
     it('dist/ URI → NO_NODE', async () => {
@@ -175,7 +175,7 @@ withTestLbugDB('location-mapper', (handle) => {
         loc('file:///src/dist/bundle.js', 0),
         handle.repoId,
       );
-      expect(result).toEqual({ kind: 'NO_NODE' });
+      expect(result).toMatchObject({ kind: 'NO_NODE' });
     });
 
     it('empty graph (no Function at the queried filePath) → NO_NODE', async () => {
@@ -184,7 +184,7 @@ withTestLbugDB('location-mapper', (handle) => {
         loc('file:///src/empty.ts', 0),
         handle.repoId,
       );
-      expect(result).toEqual({ kind: 'NO_NODE' });
+      expect(result).toMatchObject({ kind: 'NO_NODE' });
     });
   });
 
@@ -228,7 +228,7 @@ withTestLbugDB('location-mapper', (handle) => {
           handle.repoId,
           { classifyUri: jdtClassify },
         );
-        expect(result).toEqual({ kind: 'NO_NODE', external: true });
+        expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
       });
 
       it('jdt:// URI at a non-zero line → still external refusal (no DB call attempted)', async () => {
@@ -240,7 +240,7 @@ withTestLbugDB('location-mapper', (handle) => {
           handle.repoId,
           { classifyUri: jdtClassify },
         );
-        expect(result).toEqual({ kind: 'NO_NODE', external: true });
+        expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
         // Confirm no node was returned — I-3 (refuse-over-guess)
         expect(result.kind).toBe('NO_NODE');
         if (result.kind === 'NO_NODE') {
@@ -258,7 +258,7 @@ withTestLbugDB('location-mapper', (handle) => {
           { classifyUri: jdtClassify },
         );
         // Strict: external must be boolean true, not just truthy
-        expect(result).toStrictEqual({ kind: 'NO_NODE', external: true });
+        expect(result).toStrictEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
       });
     });
 
@@ -306,7 +306,7 @@ withTestLbugDB('location-mapper', (handle) => {
           loc('file:///src/nonexistent-file.ts', 0),
           handle.repoId,
         );
-        expect(result).toEqual({ kind: 'NO_NODE' });
+        expect(result).toMatchObject({ kind: 'NO_NODE' });
         // Confirm: external must be absent (undefined), not true
         if (result.kind === 'NO_NODE') {
           expect(result.external).toBeUndefined();
@@ -318,7 +318,7 @@ withTestLbugDB('location-mapper', (handle) => {
           loc('file:///repo/node_modules/lodash/index.d.ts', 0),
           handle.repoId,
         );
-        expect(result).toEqual({ kind: 'NO_NODE' });
+        expect(result).toMatchObject({ kind: 'NO_NODE' });
         if (result.kind === 'NO_NODE') {
           expect(result.external).toBeUndefined();
         }
@@ -338,7 +338,7 @@ withTestLbugDB('location-mapper', (handle) => {
           handle.repoId,
           { classifyUri: customClassify },
         );
-        expect(result).toEqual({ kind: 'NO_NODE' });
+        expect(result).toMatchObject({ kind: 'NO_NODE' });
         // No external flag — unmappable is not the same as external
         if (result.kind === 'NO_NODE') {
           expect(result.external).toBeUndefined();

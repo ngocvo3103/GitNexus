@@ -174,11 +174,26 @@ export class CrossRepoRegistry {
     this.reverseDepMap.clear();
 
     const globalRegistryPath = this.getGlobalRegistryPath();
-    let globalRegistry: GlobalRegistry;
+    // Normalized to `{repoId, path}[]`. The on-disk format (#159 Bug-2) is a
+    // BARE ARRAY `[{name, path, storagePath, ...}]` written by
+    // repo-manager.writeRegistry — NOT the `{repos: [{repoId, path}]}` shape
+    // this loader originally assumed (which silently loaded zero repos). Accept
+    // both: bare array (derive repoId from `name`, falling back to the path
+    // basename to match `initialize()`'s repoId convention) and the wrapped form.
+    let repos: Array<{ repoId: string; path: string }> = [];
 
     try {
       const content = await fs.readFile(globalRegistryPath, 'utf-8');
-      globalRegistry = JSON.parse(content);
+      const parsed: unknown = JSON.parse(content);
+      const rawList: any[] = Array.isArray(parsed)
+        ? parsed
+        : ((parsed as GlobalRegistry)?.repos ?? []);
+      repos = rawList
+        .filter((e) => e && typeof e.path === 'string')
+        .map((e) => ({
+          repoId: e.repoId ?? e.name ?? path.basename(e.path),
+          path: e.path,
+        }));
     } catch {
       // Global registry doesn't exist or is invalid — empty registry
       this.loaded = true;
@@ -186,7 +201,7 @@ export class CrossRepoRegistry {
     }
 
     // Load each repo's manifest
-    for (const entry of globalRegistry.repos || []) {
+    for (const entry of repos) {
       const { repoId, path: repoPath } = entry;
 
       // Load manifest from repo directory
@@ -224,7 +239,7 @@ export class CrossRepoRegistry {
     // WI-1: Build reverse map for artifactId -> repoName matching
     // When artifactId matches a registered repo name, map to that PROVIDER repo
     // (not the consumer repo that declares the dependency)
-    for (const entry of globalRegistry.repos || []) {
+    for (const entry of repos) {
       const manifest = this.entries.get(entry.repoId)?.manifest;
       if (manifest) {
         for (const dep of manifest.dependencies) {
@@ -250,7 +265,7 @@ export class CrossRepoRegistry {
 
     // Build reverse dependency map: provider repoId -> set of consumer repoIds
     this.reverseDepMap.clear();
-    for (const entry of globalRegistry.repos || []) {
+    for (const entry of repos) {
       const manifest = this.entries.get(entry.repoId)?.manifest;
       if (manifest) {
         for (const dep of manifest.dependencies) {
@@ -272,22 +287,60 @@ export class CrossRepoRegistry {
   }
   /**
    * Resolve a Maven artifactId to a registered provider repoId (#46).
-   * Maven artifactIds frequently differ from the GitNexus repo name by a prefix
-   * (artifactId `exception-handler` vs repo `bond-exception-handler`). Exact
-   * match wins; otherwise a UNIQUE boundary-suffix match (repo name ends with
-   * `-<artifactId>` or `.<artifactId>`). Ambiguous (>1 candidate) or no match
-   * returns null, so we never remap a dependency to a guessed wrong repo.
+   * Maven artifactIds frequently differ from the GitNexus repo name. Resolution
+   * is strictly LAYERED, most-specific first, and each layer is ADDITIVE — a
+   * later layer is consulted only when every earlier layer returns nothing, so
+   * a coordinate that already resolved keeps its exact answer:
+   *   1. exact: artifactId == repoId.
+   *   2. unique boundary-suffix: repo ends with `-<artifactId>` / `.<artifactId>`
+   *      (e.g. `exception-handler` → `bond-exception-handler`).
+   *   3. unique token-subsequence (#159): split both on `[-._]` and accept a repo
+   *      whose token list contains the artifactId's tokens in order (e.g.
+   *      `matching-client` → `matching-engine-client`, `tcbs-amqp-message` →
+   *      `tcbs-bond-amqp-message`). Covers infix/prefix-differing names the
+   *      suffix rule misses.
+   * Every layer requires a UNIQUE candidate; ambiguous (>1) or none returns null,
+   * so we never remap a dependency to a guessed wrong repo.
    */
   private resolveArtifactToRepo(artifactId: string): string | null {
     if (!artifactId) return null;
-    if (this.entries.has(artifactId)) return artifactId; // exact — unchanged fast path
-    const candidates: string[] = [];
+    if (this.entries.has(artifactId)) return artifactId; // (1) exact — unchanged fast path
+
+    // (2) unique boundary-suffix — unchanged behavior; preserves every prior match.
+    const suffixHits: string[] = [];
     for (const repoId of this.entries.keys()) {
       if (repoId.endsWith('-' + artifactId) || repoId.endsWith('.' + artifactId)) {
-        candidates.push(repoId);
+        suffixHits.push(repoId);
       }
     }
-    return candidates.length === 1 ? candidates[0] : null;
+    if (suffixHits.length === 1) return suffixHits[0];
+    if (suffixHits.length > 1) return null; // ambiguous suffix — never guess
+
+    // (3) unique token-subsequence fallback — only reached when (1) and (2) found
+    // nothing, so this is purely additive for previously-unresolved coordinates.
+    const artTokens = this.tokenize(artifactId);
+    if (artTokens.length === 0) return null;
+    const subseqHits: string[] = [];
+    for (const repoId of this.entries.keys()) {
+      if (this.isTokenSubsequence(artTokens, this.tokenize(repoId))) {
+        subseqHits.push(repoId);
+      }
+    }
+    return subseqHits.length === 1 ? subseqHits[0] : null;
+  }
+
+  /** Split a Maven artifactId / repo name into lowercase tokens on `-._`. */
+  private tokenize(s: string): string[] {
+    return s.toLowerCase().split(/[-._]+/).filter(Boolean);
+  }
+
+  /** True iff `needle` appears as an order-preserving subsequence of `hay`. */
+  private isTokenSubsequence(needle: string[], hay: string[]): boolean {
+    let i = 0;
+    for (const tok of hay) {
+      if (i < needle.length && needle[i] === tok) i++;
+    }
+    return i === needle.length;
   }
 
   /**

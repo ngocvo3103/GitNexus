@@ -22,6 +22,7 @@ import { extractDependencies } from './dependency-extractor.js';
 import { withReconciliationSession, applyDecisions, reconcileDecisions, candidateLocationKey, DEFAULT_CANDIDATE_CAP, type Candidate, type Location, type ReconciliationReport, type SessionMeta } from './mode-a-reconciler.js';
 import { selectAdapter } from './lsp/language-adapter.js';
 import { mapLocationToNodeId } from './lsp/location-mapper.js';
+import type { DefinitionCache } from './lsp-definition-cache.js';
 import { createInMemoryNodeQuery, type InMemoryNode } from './in-memory-node-query.js';
 import { writeManifest } from '../../storage/repo-manifest.js';
 import { createResolutionContext, type ResolutionContext } from './resolution-context.js';
@@ -81,6 +82,33 @@ export interface PipelineOptions {
      * it ever reaches this field.
      */
     budget?: number;
+    /**
+     * Lever 12 spot-check: sample rate in [0,1] for re-checking import-scoped
+     * (0.90) CALLS edges via LSP. 0/undefined (default) leaves the feed exactly
+     * as before (global tier only) — byte-identical. The CLI validates the range.
+     */
+    highTierSampleRate?: number;
+    /**
+     * Lever 13: max concurrent in-flight LSP requests. 1/undefined (default)
+     * keeps the serial single-flight queue (byte-identical). > 1 lets the
+     * server answer N definition requests concurrently. The CLI validates it.
+     */
+    pipeline?: number;
+    /**
+     * Lever 15 (incremental-only LSP): repo-relative POSIX paths of files
+     * changed since a base ref. When non-empty, the LSP candidate feed is
+     * scoped to call/heritage sites in these files only. Absent/empty → the
+     * full feed is reconciled (byte-identical to today). Built by the CLI from
+     * `git diff --name-only <ref>`.
+     */
+    changedFiles?: Set<string>;
+    /**
+     * Lever 14: a pre-built persisted definition cache. When present, the
+     * reconciler consults it before each live request and stores results;
+     * the pipeline flushes it after the session. Built by the CLI (which owns
+     * the git/commit/clean-tree checks). Absent → no caching.
+     */
+    definitionCache?: DefinitionCache;
   };
 }
 
@@ -335,7 +363,13 @@ export const runPipelineFromRepo = async (
       options?.lsp?.enabled ? new Map() : undefined;
 
     const lspFeedsOpt: ProcessCallsOpts | undefined = options?.lsp?.enabled
-      ? { lsp: true, correctionFeed, recallFeed, javaExternalFqnIndex }
+      ? {
+          lsp: true,
+          correctionFeed,
+          recallFeed,
+          javaExternalFqnIndex,
+          highTierSampleRate: options.lsp.highTierSampleRate,
+        }
       : undefined;
 
     // WI-4 / WI-6 (#159 P3 Mode A — heritage feed): the
@@ -789,11 +823,32 @@ export const runPipelineFromRepo = async (
         dedupedCandidates.push(c);
       }
 
+      // Lever 15 (incremental-only LSP): when a changed-file set is supplied
+      // (`--lsp-changed-since <ref>`), scope the candidate feed to call/heritage
+      // sites in changed files only, removing the unchanged majority from the
+      // serial dispatch. `candidate.file` and the git-diff paths are both
+      // repo-relative POSIX. Default (no set / empty) → no filtering, the feed
+      // is byte-identical to a full run.
+      // `undefined` → feature off (full feed). A Set (even empty) → feature
+      // ON: scope to it, so "nothing changed since ref" reconciles nothing
+      // rather than falling back to a full run.
+      const changedFiles = options?.lsp?.changedFiles;
+      const scopedCandidates =
+        changedFiles !== undefined
+          ? dedupedCandidates.filter((c) => changedFiles.has(c.file))
+          : dedupedCandidates;
+      if (changedFiles !== undefined) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `  lsp-incremental: ${scopedCandidates.length} of ${dedupedCandidates.length} candidates in ${changedFiles.size} changed files`,
+        );
+      }
+
       // WI-5: capture N (total deduped candidates) and B (budget cap) BEFORE
       // withReconciliationSession so these values survive all exit paths —
       // gate-failure (null), error (rethrow), and success — and the funnel
       // line always has correct values even if the session never ran.
-      const lspN = dedupedCandidates.length;
+      const lspN = scopedCandidates.length;
       // WI-6: use the CLI-supplied budget when present; fall back to the
       // default 2000. The CLI validation layer guarantees `budget` is a
       // positive integer when defined — the `??` fallback here correctly
@@ -874,7 +929,7 @@ export const runPipelineFromRepo = async (
         preFilteredExternal: number;
       }>(
         { id: ctx.repoId ?? 'default', repoPath },
-        dedupedCandidates,
+        scopedCandidates,
         async (selected, meta, skipped) => {
           // The session's own per-candidate loop drives the
           // `textDocument/definition` requests; the engine
@@ -941,6 +996,10 @@ export const runPipelineFromRepo = async (
           // withReconciliationSession uses the CLI-supplied value
           // instead of its own DEFAULT_CANDIDATE_CAP default.
           cap: lspB,
+          // Lever 13: request pipelining (default 1 = serial, byte-identical).
+          maxInFlight: options?.lsp?.pipeline,
+          // Lever 14: persisted definition cache (undefined → no caching).
+          definitionCache: options?.lsp?.definitionCache,
           // WI-8: external pre-filter. Uses graph.getNode(oldTargetId)
           // to detect correction candidates whose heuristic target is
           // an external-zone node (NodeProperties.isExternal===true).
@@ -1041,8 +1100,8 @@ export const runPipelineFromRepo = async (
         // I-8-replay: exclude pre-filtered candidates so they do not
         // re-enter the engine with locs=[] and corrupt count buckets.
         const replayCandidates = preFilteredKeys.size > 0
-          ? dedupedCandidates.filter(c => !preFilteredKeys.has(candidateLocationKey(c)))
-          : dedupedCandidates;
+          ? scopedCandidates.filter(c => !preFilteredKeys.has(candidateLocationKey(c)))
+          : scopedCandidates;
         reconcileReport = await reconcileDecisions(
           graph,
           replayCandidates,
@@ -1079,7 +1138,13 @@ export const runPipelineFromRepo = async (
         );
 
         // ── Apply (skip every mutation in dryRun) ───────────────────
-        applyResult = applyDecisions(graph, reconcileReport.decisions, { dryRun });
+        // Roadmap lever 2: pass the per-language recall confidence so weak
+        // single-method recall (TS/Python) is stamped below the WILL_BREAK
+        // floor. Undefined ⇒ applyDecisions defaults to LSP_RECALL_CONFIDENCE.
+        applyResult = applyDecisions(graph, reconcileReport.decisions, {
+          dryRun,
+          recallConfidence: lspAdapter?.recallConfidence,
+        });
       } catch (lspErr) {
         // WI-5 (error path): reconcileDecisions or applyDecisions threw.
         // Emit the funnel line BEFORE rethrowing so the log is preserved
@@ -1104,6 +1169,8 @@ export const runPipelineFromRepo = async (
         // WI-5: populated from SessionMeta (set by the dispatch loop).
         probed: sessionProbed,
         preFilteredExternal: sessionPreFiltered,
+        // 0-edge diagnostic: mapped-vs-dropped tally from the engine.
+        dropReasons: reconcileReport.dropReasons,
         serverVersion,
       };
 
@@ -1183,6 +1250,28 @@ export const runPipelineFromRepo = async (
         // Always emitted on the success path so E2E assertions don't need special flags.
         // eslint-disable-next-line no-console
         console.log(`  lsp-prefiltered-external: ${lspReport.preFilteredExternal}`);
+        // 0-edge diagnostic: mapped-vs-dropped funnel. Makes a 253s/0-edge run
+        // attributable (out-of-repo dominant = path-mapping bug; external dominant
+        // = benign; db-miss dominant = index gap; probed≈0 = probe never fired).
+        const dr = lspReport.dropReasons;
+        if (dr) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `  lsp-map-funnel: mapped=${dr.mapped} no-loc=${dr.noLocation} ambiguous=${dr.ambiguous} ` +
+              `external=${dr.external} out-of-repo=${dr.outOfRepo} db-miss=${dr.dbMiss} unmappable=${dr.unmappable}`,
+          );
+        }
+        // Lever 14: persist the definition cache for the next re-index and
+        // report hit/miss/store counts. dryRun writes nothing, so skip there.
+        const defCache = options?.lsp?.definitionCache;
+        if (defCache) {
+          defCache.flush();
+          const cs = defCache.stats;
+          if (cs.hits + cs.misses + cs.stores > 0) {
+            // eslint-disable-next-line no-console
+            console.log(`  lsp-def-cache: hits=${cs.hits} misses=${cs.misses} stored=${cs.stores}`);
+          }
+        }
         const histogram = buildRefusedFqnHistogram(recallFeed);
         if (histogram.size > 0) {
           // eslint-disable-next-line no-console

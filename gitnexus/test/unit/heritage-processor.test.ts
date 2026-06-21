@@ -664,9 +664,11 @@ describe('processHeritageFromExtracted', () => {
       expect(feed).toEqual([]);
     });
 
-    it('gate[4] lsp:true + unresolved Go parent → no feed (language gate: Go is not TS-family)', async () => {
-      // Unresolved Go implements → global tier (0.5), but Go is
-      // not in the TS family so the feed gate refuses.
+    it('gate[4] lsp:true + unresolved Go parent → feed fires (Go is now an LSP-heritage language, roadmap lever 4)', async () => {
+      // Roadmap lever 4: the heritage feed is gated to languages with an
+      // LSP adapter (TS/JS/Java/Python/Go/Rust), not just TS/JS. An
+      // unresolved Go `implements` (global tier 0.5) at a known position
+      // is now fed for LSP re-resolution.
       const heritage: ExtractedHeritage[] = [{
         filePath: 'src/iface.go',
         className: 'UserRepo',
@@ -679,10 +681,28 @@ describe('processHeritageFromExtracted', () => {
 
       await processHeritageFromExtracted(graph, heritage, ctx, undefined, { lsp: true, heritageFeed: feed });
 
-      // The edge IS emitted (heuristic still works), but the feed stays empty.
-      expect(feed).toEqual([]);
+      // The heuristic edge is emitted AND the candidate is now fed.
+      expect(feed).toHaveLength(1);
+      expect(feed[0].relType).toBe('IMPLEMENTS');
       const rels = graph.relationships.filter(r => r.type === 'IMPLEMENTS');
       expect(rels).toHaveLength(1);
+    });
+
+    it('gate[4b] lsp:true + unresolved C# parent → no feed (language gate: C# has no LSP adapter)', async () => {
+      // A language WITHOUT an LSP adapter is still refused by the gate.
+      const heritage: ExtractedHeritage[] = [{
+        filePath: 'src/iface.cs',
+        className: 'UserRepo',
+        parentName: 'IUserRepo',
+        kind: 'implements',
+        line: 8,
+        character: 14,
+      }];
+      const feed: HeritageFeedItem[] = [];
+
+      await processHeritageFromExtracted(graph, heritage, ctx, undefined, { lsp: true, heritageFeed: feed });
+
+      expect(feed).toEqual([]);
     });
 
     it('gate[5] lsp:true + position-less record (Ruby include) → no feed (position gate)', async () => {

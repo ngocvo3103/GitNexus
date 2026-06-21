@@ -333,6 +333,17 @@ export interface LanguageAdapter {
    * `location-mapper.ts:451-493` for the canonical guard.
    */
   classifyUri(uri: string): 'workspace' | 'external' | 'unmappable';
+
+  /**
+   * Roadmap lever 2: confidence to stamp on single-method `lsp-recall`
+   * edges for this language. The structural recall audit measured recall
+   * correctness at ~100% (Go/Java), 94% (Rust), 65.5% (TS), 28.6%
+   * (Python). Languages whose single-method recall is unreliable set this
+   * below the 0.85 WILL_BREAK impact floor so weak recall edges are kept
+   * (for navigation) but do NOT drive impact/clustering as if confirmed.
+   * Omitted ⇒ `LSP_RECALL_CONFIDENCE` (0.90), preserving prior behavior.
+   */
+  readonly recallConfidence?: number;
 }
 
 // ─── TS initialization options ────────────────────────────────────────
@@ -371,6 +382,10 @@ export const TYPESCRIPT_ADAPTER: LanguageAdapter = {
   id: 'typescript',
   serverBinary: TYPESCRIPT_LANGUAGE_SERVER_BIN,
   languageId: 'typescript',
+  // Roadmap lever 2: single-method recall corroborated at only 65.5% on
+  // real TS (barrel re-exports / import aliases) — below the 0.85
+  // WILL_BREAK floor so weak recall edges don't drive impact analysis.
+  recallConfidence: 0.75,
 
   spawnArgs(_ctx: { workspaceRoot: string }): string[] {
     return ['--stdio'];
@@ -398,8 +413,16 @@ export const TYPESCRIPT_ADAPTER: LanguageAdapter = {
 /**
  * Java language adapter (WI-4c implementation).
  *
- * `spawnArgs`: returns `['-data', <per-run metadata dir>]` where the dir
- * is derived under the per-fork `GITNEXUS_HOME` (I-5 / #175 isolation).
+ * `spawnArgs`: returns `['-data', <jdtls workspace dir>]`. Lever 17 (warm-index
+ * lifecycle): in PRODUCTION this dir is STABLE across runs — `getGlobalDir()`
+ * resolves to `~/.gitnexus` (or `$GITNEXUS_HOME`), and the test suite is the
+ * ONLY thing that sets a per-fork `GITNEXUS_HOME` (I-5 / #175 isolation). So
+ * jdtls's on-disk index persists and is reused on the next `analyze` of the
+ * same workspace — a free warm-start. This dir is NOT cleaned up by GitNexus
+ * and MUST NOT be wiped per-run: doing so would discard the warm index and
+ * re-pay the full jdtls indexing cost every run. (The remaining lever-17 work —
+ * an early-settle fast path in `awaitReady` when the index is already warm, and
+ * a persistent cross-run daemon — needs live-jdtls timing validation.)
  *
  * `awaitReady`: waits for the jdtls `language/status`/`ServiceReady`
  * notification (KD-1). Falls back to canary re-probe on hard deadline
@@ -416,10 +439,13 @@ export const JAVA_ADAPTER: LanguageAdapter = {
   languageId: 'java',
 
   spawnArgs(ctx: { workspaceRoot: string }): string[] {
-    // Derive a per-run metadata dir under the per-fork GITNEXUS_HOME (I-5 / #175).
-    // getGlobalDir() reads process.env.GITNEXUS_HOME which is unique per fork/run.
-    // The workspaceRoot SHA-1 prefix makes the path filesystem-safe while keeping
-    // it workspace-specific (avoids collisions between concurrent repos).
+    // Lever 17: derive the jdtls workspace dir under getGlobalDir(). In
+    // production getGlobalDir() is STABLE (~/.gitnexus), so this dir — and the
+    // jdtls index inside it — is REUSED across runs (warm start). Only the test
+    // suite sets a per-fork GITNEXUS_HOME for isolation (I-5 / #175). The
+    // workspaceRoot SHA-1 prefix makes the path filesystem-safe while keeping
+    // it workspace-specific (avoids collisions between concurrent repos, and
+    // keeps each workspace's warm index separate). Do NOT add per-run cleanup.
     const wsHash = crypto.createHash('sha1').update(ctx.workspaceRoot).digest('hex').slice(0, 16);
     const dataDir = path.join(getGlobalDir(), 'jdtls', wsHash);
     return ['-data', dataDir];
@@ -703,6 +729,10 @@ export const PYTHON_ADAPTER: LanguageAdapter = {
   id: 'python',
   serverBinary: 'pylsp',
   languageId: 'python',
+  // Roadmap lever 2: single-method recall corroborated at only 28.6% on
+  // real Python (dynamic dispatch defeats static definition) — well below
+  // the 0.85 WILL_BREAK floor.
+  recallConfidence: 0.6,
 
   spawnArgs(_ctx: { workspaceRoot: string }): string[] {
     // pylsp uses stdio transport by default (no --stdio flag required or accepted).

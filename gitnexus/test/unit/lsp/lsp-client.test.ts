@@ -110,6 +110,7 @@ interface FakeServerHandle {
     initializeParams: any[];
     didOpenUris: string[];
     definitions: Array<{ params: any }>;
+    implementations: Array<{ params: any }>;
     shutdownCount: number;
     exitCount: number;
   };
@@ -155,6 +156,7 @@ function makeFakeServer(wire: Wire): FakeServerHandle {
     initializeParams: [] as any[],
     didOpenUris: [] as string[],
     definitions: [] as Array<{ params: any }>,
+    implementations: [] as Array<{ params: any }>,
     shutdownCount: 0,
     exitCount: 0,
   };
@@ -200,6 +202,15 @@ function makeFakeServer(wire: Wire): FakeServerHandle {
       await new Promise<void>((r) => setTimeout(r, delay));
     }
     return state.definitionResult;
+  });
+  connection.onRequest('textDocument/implementation', (params) => {
+    log.implementations.push({ params });
+    return [
+      {
+        uri: 'file:///impl.ts',
+        range: { start: { line: 7, character: 0 }, end: { line: 7, character: 1 } },
+      },
+    ];
   });
   connection.onRequest('shutdown', () => {
     log.shutdownCount += 1;
@@ -269,7 +280,7 @@ interface ClientFixture {
   dispose(): Promise<void>;
 }
 
-function makeFixture(opts?: { maxRestarts?: number }): ClientFixture {
+function makeFixture(opts?: { maxRestarts?: number; maxInFlight?: number }): ClientFixture {
   const wire = makeWire();
   const server = makeFakeServer(wire);
   const clientProcess = makeFakeChildProcess(wire);
@@ -284,6 +295,7 @@ function makeFixture(opts?: { maxRestarts?: number }): ClientFixture {
   );
   const client = new LspClient({
     maxRestarts: opts?.maxRestarts,
+    maxInFlight: opts?.maxInFlight,
     // Set workspaceRoot to `/` so the M7 path-validation
     // guard (in `maybeDidOpenForDefinition`) accepts
     // absolute `file://` URIs in the test fixture. The
@@ -774,6 +786,96 @@ describe('LspClient', () => {
     // a tick to land in the log.
     await new Promise<void>((r) => setTimeout(r, 50));
     expect(fx.server.log.didOpenUris).toEqual(['file:///x.ts']);
+  });
+});
+
+// ─── Lever 13: request pipelining (maxInFlight > 1) ───────────────────
+//
+// Correctness focus: when N requests run concurrently the per-URI didOpen
+// barrier must still send exactly ONE didOpen per file (the old non-atomic
+// check-then-await would send N), and responses must not cross (vscode-jsonrpc
+// correlates by id). Wall-clock overlap is a perf property validated on real
+// repos, not unit-asserted (it would be timing-flaky).
+describe('Lever 13 — pipelined requests (maxInFlight > 1)', () => {
+  it('concurrent definitions for the SAME unopened file → didOpen sent exactly once', async () => {
+    const fx = makeFixture({ maxInFlight: 4 });
+    try {
+      await fx.client.start();
+      // Widen the in-flight window so a broken barrier would actually race.
+      fx.server.slowNextDefinition(100);
+      const uri = 'file:///workspace/src/shared.ts';
+      const reqs = [0, 1, 2, 3].map((i) =>
+        fx.client.request<any[]>(
+          'textDocument/definition',
+          { textDocument: { uri }, position: { line: i, character: 0 } },
+          5_000,
+        ),
+      );
+      const results = await Promise.all(reqs);
+      // All four resolved to the (array) definition result — no nulls, no cross-talk.
+      for (const r of results) expect(Array.isArray(r)).toBe(true);
+      // The barrier collapsed four concurrent opens into one notification.
+      expect(fx.server.log.didOpenUris).toEqual([uri]);
+      // All four definition requests still reached the server.
+      expect(fx.server.log.definitions.length).toBe(4);
+    } finally {
+      await fx.dispose();
+    }
+  });
+
+  it('concurrent definitions for DIFFERENT files → each file opened once, all resolve', async () => {
+    const fx = makeFixture({ maxInFlight: 3 });
+    try {
+      await fx.client.start();
+      const uris = ['file:///workspace/a.ts', 'file:///workspace/b.ts', 'file:///workspace/c.ts'];
+      const results = await Promise.all(
+        uris.map((uri) =>
+          fx.client.request<any[]>(
+            'textDocument/definition',
+            { textDocument: { uri }, position: { line: 0, character: 0 } },
+            5_000,
+          ),
+        ),
+      );
+      for (const r of results) expect(Array.isArray(r)).toBe(true);
+      expect(fx.server.log.didOpenUris.slice().sort()).toEqual(uris.slice().sort());
+      expect(fx.server.log.definitions.length).toBe(3);
+    } finally {
+      await fx.dispose();
+    }
+  });
+});
+
+// ─── Lever 16: textDocument/implementation ────────────────────────────
+describe('Lever 16 — textDocument/implementation', () => {
+  it('declares the implementation client capability in the initialize handshake', async () => {
+    const fx = makeFixture();
+    try {
+      await fx.client.start();
+      const caps = fx.server.log.initializeParams[0].capabilities;
+      expect(caps.textDocument.implementation).toEqual({ dynamicRegistration: false });
+    } finally {
+      await fx.dispose();
+    }
+  });
+
+  it('implementation() dispatches the request and opens the file first', async () => {
+    const fx = makeFixture();
+    try {
+      await fx.client.start();
+      const uri = 'file:///workspace/src/iface.ts';
+      const res = await fx.client.implementation<any[]>(
+        { textDocument: { uri }, position: { line: 1, character: 0 } },
+        5_000,
+      );
+      expect(Array.isArray(res)).toBe(true);
+      expect((res as any[])[0].uri).toBe('file:///impl.ts');
+      expect(fx.server.log.implementations.length).toBe(1);
+      // didOpen-on-demand fired for the implementation request too.
+      expect(fx.server.log.didOpenUris).toEqual([uri]);
+    } finally {
+      await fx.dispose();
+    }
   });
 });
 

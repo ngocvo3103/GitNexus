@@ -127,17 +127,31 @@ export interface ProcessHeritageOpts {
 /**
  * WI-4 (#159 P3 Mode A — heritage feed) — TS-family gate.
  *
- * Heritage feed entries are ONLY pushed for TypeScript and
- * JavaScript files. The heritage LSP reconciliation is
- * TypeScript-only per the design (P3 of #159); a future slice
- * can extend this to other tree-sitter languages. The check is
- * a strict equality against the enum (not a regex on the
- * filename) so a non-TS-family language CANNOT accidentally
- * fall into the feed even when a file has a `.ts` extension
- * but parses as a different language.
+ * Roadmap lever 4: the heritage LSP feed is gated to languages that have
+ * a working `LanguageAdapter` (TS/JS, Java, Python, Go, Rust) — not just
+ * TS/JS as in #159 P3. Heritage extraction is general (the same capture
+ * path mints IMPLEMENTS/EXTENDS for every language), so un-gating lets
+ * the reconciler re-resolve Java `implements`/`extends`, Python class
+ * bases, etc. via `textDocument/definition`. Safe-by-refusal: the
+ * reconciler's `HERITAGE_TARGET_LABELS` gate (lever 5) keeps the
+ * heuristic edge whenever the LSP-resolved target's label is not a
+ * contract/supertype, and a language whose file is queried against a
+ * different repo-selected server simply gets NO_NODE → kept. The check
+ * is a strict enum membership (not a filename regex). NOTE: Go
+ * duck-typing IMPLEMENTS and Rust trait impls are produced by separate
+ * passes that do not push to this feed yet — extending those is a
+ * follow-up (roadmap lever 16, textDocument/implementation).
  */
-const isTsFamilyLanguage = (language: SupportedLanguages): boolean =>
-  language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript;
+const LSP_HERITAGE_LANGUAGES: ReadonlySet<SupportedLanguages> = new Set([
+  SupportedLanguages.TypeScript,
+  SupportedLanguages.JavaScript,
+  SupportedLanguages.Java,
+  SupportedLanguages.Python,
+  SupportedLanguages.Go,
+  SupportedLanguages.Rust,
+]);
+const isLspHeritageLanguage = (language: SupportedLanguages): boolean =>
+  LSP_HERITAGE_LANGUAGES.has(language);
 
 /**
  * Type-1 (polish MAJOR) — narrow the
@@ -150,7 +164,7 @@ const isTsFamilyLanguage = (language: SupportedLanguages): boolean =>
  * producer is typed to mint) and refuses anything that
  * does not conform — the future-drift call site gets a
  * `tsc` error rather than a runtime surprise. The
- * guard is co-located near `isTsFamilyLanguage`; the
+ * guard is co-located near `isLspHeritageLanguage`; the
  * `GoCrossFileImplementsHeritageItem` interface itself
  * is in `workers/go-relationships.ts` (no need to move
  * it — it's the producer's contract).
@@ -334,7 +348,7 @@ export const processHeritage = async (
             opts?.lsp &&
             opts.heritageFeed &&
             parent.confidence === TIER_CONFIDENCE['global'] &&
-            isTsFamilyLanguage(language) &&
+            isLspHeritageLanguage(language) &&
             extendsNode.startPosition
           ) {
             opts.heritageFeed.push({
@@ -379,7 +393,7 @@ export const processHeritage = async (
             opts?.lsp &&
             opts.heritageFeed &&
             iface.confidence === TIER_CONFIDENCE['global'] &&
-            isTsFamilyLanguage(language) &&
+            isLspHeritageLanguage(language) &&
             implementsNode.startPosition
           ) {
             opts.heritageFeed.push({
@@ -467,7 +481,7 @@ export const processHeritage = async (
       // silent field-read of `undefined.className` that
       // would crash the ingestion with a confusing
       // message downstream. The guard is co-located
-      // with `isTsFamilyLanguage` above; see its doc.
+      // with `isLspHeritageLanguage` above; see its doc.
       for (const it of crossFileItems.filter(isGoCrossFileImplementsHeritageItem)) {
         const child = resolveHeritageId(it.className, file.path, ctx, 'Struct', `${file.path}:${it.className}`);
         const iface = resolveHeritageId(it.parentName, it.parentFilePath, ctx, 'Interface', `${it.parentFilePath}:${it.parentName}`);
@@ -565,7 +579,7 @@ export const processHeritageFromExtracted = async (
           opts?.lsp &&
           opts.heritageFeed &&
           parent.confidence === TIER_CONFIDENCE['global'] &&
-          isTsFamilyLanguage(fileLanguage) &&
+          isLspHeritageLanguage(fileLanguage) &&
           h.line !== undefined
         ) {
           opts.heritageFeed.push({
@@ -603,7 +617,7 @@ export const processHeritageFromExtracted = async (
           opts.heritageFeed &&
           iface.confidence === TIER_CONFIDENCE['global'] &&
           fileLanguage !== undefined &&
-          isTsFamilyLanguage(fileLanguage) &&
+          isLspHeritageLanguage(fileLanguage) &&
           h.line !== undefined
         ) {
           opts.heritageFeed.push({

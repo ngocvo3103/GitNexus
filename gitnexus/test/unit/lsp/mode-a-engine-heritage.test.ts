@@ -261,12 +261,13 @@ describe('WI-5 — decideForCandidate: CALLS path decisions are byte-identical v
 // ─── HERITAGE_TARGET_LABELS contract ───────────────────────────────────
 
 describe('WI-5 — HERITAGE_TARGET_LABELS contract', () => {
-  it('IMPLEMENTS gate is { Interface }', () => {
-    expect(HERITAGE_TARGET_LABELS.IMPLEMENTS).toEqual(new Set(['Interface']));
+  // Roadmap lever 5: gate generalized for the multi-language heritage feed.
+  it('IMPLEMENTS gate is { Interface, Trait }', () => {
+    expect(HERITAGE_TARGET_LABELS.IMPLEMENTS).toEqual(new Set(['Interface', 'Trait']));
   });
 
-  it('EXTENDS gate is { Class }', () => {
-    expect(HERITAGE_TARGET_LABELS.EXTENDS).toEqual(new Set(['Class']));
+  it('EXTENDS gate is { Class, Interface }', () => {
+    expect(HERITAGE_TARGET_LABELS.EXTENDS).toEqual(new Set(['Class', 'Interface']));
   });
 });
 
@@ -418,16 +419,16 @@ describe('WI-5 — reconcileDecisions: heritage decision table', () => {
     expect(d.to).toBeNull();
   });
 
-  it('EXTENDS keeps when LSP target is an Interface (label gate refuses)', async () => {
-    // `class B extends SomeInterface` is legal TS but the
-    // EXTENDS gate is { Class } only — an Interface hit is
-    // refused; the heuristic edge is kept.
+  it('EXTENDS keeps when LSP target is a Struct (label gate refuses)', async () => {
+    // Roadmap lever 5: the EXTENDS gate is { Class, Interface } (a class
+    // extends a class; an interface extends an interface). A Struct hit is
+    // still outside the gate — refused; the heuristic edge is kept.
     const graph = createKnowledgeGraph();
     graph.addNode({ id: 'Class:src/b.ts:B', label: 'Class', properties: { name: 'B' } });
-    graph.addNode({ id: 'Interface:src/some.ts:IFoo', label: 'Interface', properties: { name: 'IFoo' } });
+    graph.addNode({ id: 'Struct:src/some.ts:SFoo', label: 'Struct', properties: { name: 'SFoo' } });
     const cand = mkExtendsCandidate({
       sourceId: 'Class:src/b.ts:B',
-      oldTargetId: 'Interface:src/some.ts:IFoo',
+      oldTargetId: 'Struct:src/some.ts:SFoo',
     });
     const heuristic = heuristicExtendsRel(cand.sourceId, cand.oldTargetId!);
     graph.addRelationship(heuristic);
@@ -435,7 +436,7 @@ describe('WI-5 — reconcileDecisions: heritage decision table', () => {
     const locs = new Map<string, Location[]>();
     locs.set(keyOf(cand), [mkLoc()]);
 
-    const mapFn = async () => ({ kind: 'node' as const, nodeId: 'Interface:src/some.ts:IFoo' });
+    const mapFn = async () => ({ kind: 'node' as const, nodeId: 'Struct:src/some.ts:SFoo' });
 
     const report = await reconcileDecisions(
       graph,
@@ -516,7 +517,10 @@ describe('WI-5 — reconcileDecisions: heritage decision table', () => {
     );
     expect(report.decisions[0].action).toBe('keep');
     expect(report.decisions[0].reason).toBe('ambiguous');
-    expect(calls).toBe(0);
+    // Roadmap lever 9: each Location IS now mapped to attempt name-based
+    // disambiguation (was a blanket refuse without mapping). Both map to
+    // NO_NODE here → nothing corroborates → still AMBIGUOUS → keep.
+    expect(calls).toBe(2);
   });
 
   it('IMPLEMENTS refuses on NO_NODE (no heuristic edge → refuse)', async () => {

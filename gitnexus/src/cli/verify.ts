@@ -45,6 +45,7 @@
 import { writeSync, realpathSync } from 'node:fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { runModeCVerify } from '../core/ingestion/lsp/mode-c-verifier.js';
+import { recommendHighTierSampleRate } from '../core/ingestion/calibration.js';
 import { probeWorkspaceReadiness } from '../core/ingestion/lsp/workspace-readiness-probe.js';
 import { buildCanarySamples } from '../core/ingestion/lsp/canary-sampler.js';
 import { discoverServers } from '../core/ingestion/lsp/server-discovery.js';
@@ -58,6 +59,19 @@ export interface VerifyCommandOptions {
   strict?: boolean;
   sample?: string;
   repo?: string;
+  /**
+   * Roadmap lever 3: CI gate. A number in [0,1]; when the overall
+   * false-confident rate exceeds it, `verify` exits non-zero. Turns the
+   * already-measured fc-rate into a regression signal (it gated nothing
+   * before). Omitted ⇒ no gate (exit reflects only LSP availability).
+   */
+  maxFcRate?: string;
+  /**
+   * Calibrate (Mode C → A loop): print a recommended `--lsp-high-tier-sample`
+   * rate derived from the measured import-scoped fc-rate. Off by default so
+   * existing `verify` output is unchanged; advisory only (never auto-applied).
+   */
+  calibrate?: boolean;
 }
 
 /**
@@ -319,8 +333,48 @@ export async function verifyCommand(options?: VerifyCommandOptions): Promise<voi
       serverVersion: serverEntry.version,
     });
 
-    // ── 8) Render the report + exit 0 ───────────────────────────
+    // ── 8) Render the report ────────────────────────────────────
     renderReport(report);
+
+    // ── 8b) Calibrate (Mode C → A loop): advisory recommendation ──
+    // Maps the measured import-scoped fc-rate to a suggested
+    // `--lsp-high-tier-sample` rate for the next analyze (lever 12). Printed
+    // only under `--calibrate`; never auto-applied (the loop stays auditable).
+    if (options?.calibrate) {
+      const imp = report.perTier['import-scoped'];
+      if (imp && imp.n > 0) {
+        const rec = recommendHighTierSampleRate(imp.falseConfidentRate);
+        out('');
+        out(`calibrate: ${rec.reason}`);
+      } else {
+        out('');
+        out('calibrate: no import-scoped sample this run; no recommendation');
+      }
+    }
+
+    // ── 9) Roadmap lever 3: optional false-confident-rate CI gate ──
+    // The fc-rate is already computed and printed; without a gate a
+    // rising rate is silent. When `--max-fc-rate` is set, exceed ⇒ exit 1
+    // (consistent with `--strict`, which also `process.exit`s here).
+    if (options?.maxFcRate !== undefined) {
+      const threshold = Number.parseFloat(options.maxFcRate);
+      if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+        out('Error: --max-fc-rate must be a number in [0,1]');
+        process.exit(1);
+      }
+      const fc = report.overall.falseConfidentRate;
+      if (fc > threshold) {
+        out(
+          `FAIL: overall false-confident rate ${(fc * 100).toFixed(1)}% ` +
+            `exceeds --max-fc-rate ${(threshold * 100).toFixed(1)}%`,
+        );
+        process.exit(1);
+      }
+      out(
+        `OK: false-confident rate ${(fc * 100).toFixed(1)}% within ` +
+          `--max-fc-rate ${(threshold * 100).toFixed(1)}%`,
+      );
+    }
   } finally {
     // The LspClient's stop is idempotent + non-throwing; the
     // try/finally guarantees we never leak a subprocess even

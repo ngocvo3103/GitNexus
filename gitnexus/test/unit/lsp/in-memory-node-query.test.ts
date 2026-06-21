@@ -147,7 +147,7 @@ describe('in-memory-node-query — adapter plugs into the real mapper unchanged'
       'test-repo',
       { executeParameterized: execute },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
   });
 
   it('returns NO_NODE for an unindexable path (node_modules / .d.ts / dist)', async () => {
@@ -164,7 +164,7 @@ describe('in-memory-node-query — adapter plugs into the real mapper unchanged'
       'test-repo',
       { executeParameterized: execute },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
   });
 
   it('returns AMBIGUOUS when tie-breaker chain cannot reduce (>1 distinct overloads)', async () => {

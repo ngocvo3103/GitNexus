@@ -79,11 +79,14 @@ export function withTestLbugDB(
 
   const setup = async () => {
     // Get shared DB path from globalSetup (created once with full schema).
-    // `inject()` is unreliable for the `lbug-db` sub-project's forks in a
-    // full-suite run on vitest 4.x; fall back to the env var globalSetup sets
-    // in the main process (inherited by every fork). Either yields the SAME
-    // shared DB path. Fail loudly if neither is present (globalSetup skipped).
-    const dbPath = inject<'lbugDbPath'>('lbugDbPath') ?? process.env.LBUG_DB_PATH;
+    // SUPPORTED CHANNEL (gh #167): `process.env.LBUG_DB_PATH`, set by
+    // globalSetup in the main process and inherited by every fork. This is
+    // the mechanism the suite relies on, because `provide()`→`inject()` does
+    // not reliably reach the `lbug-db` sub-project's forks on vitest 4.x
+    // (root `globalSetup` + `projects` + fork pool). `inject()` is kept only
+    // as a vestigial fallback; both yield the SAME shared DB path. Fail
+    // loudly if neither is present (globalSetup skipped).
+    const dbPath = process.env.LBUG_DB_PATH ?? inject<'lbugDbPath'>('lbugDbPath');
     if (!dbPath) {
       throw new Error(
         '[test-indexed-db] lbugDbPath unavailable from both inject() and ' +
