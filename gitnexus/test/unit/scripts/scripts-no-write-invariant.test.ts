@@ -392,6 +392,13 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
   let smokeSubprocessAvailable = true;
   let analyzeSucceeded = false;
   let harnessSucceeded = false;
+  // The Mode C harness leg measures heuristic edges AGAINST an LSP oracle,
+  // so it needs an LSP server (typescript-language-server for this TS
+  // fixture). CI does not install LSP servers; without one the harness
+  // exits 0 but produces no usable Mode C artifact. Probe PATH up front
+  // and SKIP the two harness-dependent tests when absent — a visible skip,
+  // not a green pass that exercised nothing (#166 vacuity pattern).
+  let lspServerAvailable = false;
   // Review fix (silent-green smoke): every degrade site records
   // WHY the smoke block is unavailable, the reason is logged once
   // in beforeAll, and the gated tests call `ctx.skip()` instead of
@@ -421,6 +428,15 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
       return;
     }
 
+    // Probe whether an LSP server is on PATH — the harness leg needs one.
+    const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+    lspServerAvailable =
+      spawnSync(whichCmd, ['typescript-language-server'], { stdio: 'pipe' }).status === 0;
+    if (!lspServerAvailable && smokeSkipReason === null) {
+      smokeSkipReason =
+        'no LSP server (typescript-language-server) on PATH — Mode C harness leg needs one';
+    }
+
     // 2. Copy the canonical fixture into a fresh tmpdir.
     smokeTmp = mkdtempSync(join(tmpdir(), 'wi-v-smoke-'));
     cpSync(fixtureRoot, smokeTmp, { recursive: true });
@@ -430,6 +446,18 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     // guarantees a true "fresh analyze" run on the copy; the
     // canonical fixture is never touched.
     rmSync(join(smokeTmp, '.gitnexus'), { recursive: true, force: true });
+    // Strip GENERATED / gitignored pollution (agent files + .claude +
+    // .gitignore) so the indexed-file count is deterministic across
+    // environments — the fixture's AGENTS.md/CLAUDE.md/.claude are
+    // GitNexus-generated and gitignored, present on dev disks but absent
+    // from a clean CI checkout (9 indexed files locally vs 7 in CI).
+    // See test/integration/regression/lsp-zero-config.test.ts for the
+    // full rationale. The committed fixture is the 7 .ts files.
+    for (const entry of readdirSync(smokeTmp)) {
+      if (entry === '.claude' || entry === '.gitignore' || entry.endsWith('.md')) {
+        rmSync(join(smokeTmp, entry), { recursive: true, force: true });
+      }
+    }
 
     // 3. Init a git repo so analyze's getCurrentCommit works.
     const gitEnv = {
@@ -566,12 +594,12 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
     expect(smokeMeta).not.toBeNull();
     expect(smokeMeta!.stats).toBeDefined();
     expect(typeof smokeMeta!.stats.nodes).toBe('number');
-    // Per the committed baseline, mini-repo has 35 nodes.
+    // Per the committed baseline, mini-repo (7 tracked .ts files) has 33 nodes.
     expect(smokeMeta!.stats.nodes).toBeGreaterThan(0);
   });
 
   it('harness produced a schema-valid JSON artifact with overall.n>0, precision∈[0,1], sampledCap≤50', (ctx) => {
-    if (!smokeSubprocessAvailable || !harnessSucceeded) {
+    if (!smokeSubprocessAvailable || !harnessSucceeded || !lspServerAvailable) {
       // The harness is allowed to fail on machines without an
       // LSP server (the discovery gate enforces this; per I-5,
       // LSP absent is an environment constraint, not a harness
@@ -640,7 +668,7 @@ describe('WI-V — Mini-repo smoke (Behavior block)', () => {
   });
 
   it('identical re-run produces a byte-identical artifact file (AC-5)', (ctx) => {
-    if (!smokeSubprocessAvailable || !harnessSucceeded) {
+    if (!smokeSubprocessAvailable || !harnessSucceeded || !lspServerAvailable) {
       ctx.skip(`smoke/harness unavailable: ${smokeSkipReason ?? 'unknown'}`);
       return;
     }
