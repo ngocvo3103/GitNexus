@@ -14,8 +14,10 @@ import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReuse
 // loaded when embeddings are not requested. This avoids crashes on Node
 // versions whose ABI is not yet supported by the native binary (#89).
 // disposeEmbedder intentionally not called — ONNX Runtime segfaults on cleanup (see #38)
-import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, cleanupOldKuzuFiles } from '../storage/repo-manager.js';
-import { getCurrentCommit, getGitRoot, hasGitDir } from '../storage/git.js';
+import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, cleanupOldKuzuFiles, getGlobalDir } from '../storage/repo-manager.js';
+import { getCurrentCommit, getGitRoot, hasGitDir, isWorkingTreeClean } from '../storage/git.js';
+import { getChangedFilesSince } from '../lib/git-changed-files.js';
+import { buildDefinitionCache } from '../core/ingestion/lsp-definition-cache.js';
 import { SCHEMA_VERSION } from '../core/lbug/schema.js';
 // (#108) generateAIContextFiles is no longer called from analyze. It still
 // runs from `gitnexus setup` (always) and from `gitnexus analyze --skills`
@@ -75,6 +77,27 @@ export interface AnalyzeOptions {
    * Requires `--lsp`; silently ignored (with a warning) when `lsp` is false.
    */
   lspBudget?: number;
+  /**
+   * Lever 12 spot-check: fraction [0,1] of import-scoped (0.90) CALLS edges to
+   * re-check via LSP. Default 0 (off → byte-identical). Requires `--lsp`.
+   */
+  lspHighTierSample?: number;
+  /**
+   * Lever 13: max concurrent in-flight LSP requests (default 1 = serial).
+   * Speeds up dispatch on servers that handle concurrency (jdtls). Requires `--lsp`.
+   */
+  lspPipeline?: number;
+  /**
+   * Lever 15: base git ref. When set, the LSP candidate feed is scoped to call/
+   * heritage sites in files changed since this ref (`git diff --name-only`).
+   * Requires `--lsp`. A bad ref warns and falls back to a full run.
+   */
+  lspChangedSince?: string;
+  /**
+   * Lever 14: cache `textDocument/definition` results across runs. Only active
+   * on a clean working tree (results are keyed to the HEAD commit). Requires `--lsp`.
+   */
+  lspCache?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -155,6 +178,32 @@ export const analyzeCommand = async (
     if (!options?.lsp && !options?.lspDryRun) {
       // Warn but don't crash — the run proceeds without LSP.
       console.warn('  Warning: --lsp-budget ignored: --lsp not enabled');
+    }
+  }
+
+  // Lever 12: validate --lsp-high-tier-sample (a fraction in [0,1]).
+  if (options?.lspHighTierSample !== undefined) {
+    const r = options.lspHighTierSample;
+    if (typeof r !== 'number' || Number.isNaN(r) || r < 0 || r > 1) {
+      console.error(`  Error: --lsp-high-tier-sample must be a number in [0,1] (got ${r})`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!options?.lsp && !options?.lspDryRun) {
+      console.warn('  Warning: --lsp-high-tier-sample ignored: --lsp not enabled');
+    }
+  }
+
+  // Lever 13: validate --lsp-pipeline (a positive integer concurrency).
+  if (options?.lspPipeline !== undefined) {
+    const n = options.lspPipeline;
+    if (!Number.isInteger(n) || n <= 0) {
+      console.error(`  Error: --lsp-pipeline must be a positive integer (got ${n})`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!options?.lsp && !options?.lspDryRun) {
+      console.warn('  Warning: --lsp-pipeline ignored: --lsp not enabled');
     }
   }
 
@@ -313,6 +362,40 @@ export const analyzeCommand = async (
     }
   }
 
+  // Lever 15 (incremental-only LSP): resolve the changed-file set ONCE here so
+  // a bad ref fails loudly before the (expensive) pipeline starts. `undefined`
+  // → feature off (full feed). On a git error we warn and stay off (a full run
+  // is safe — it does more work, never less).
+  let lspChangedFiles: Set<string> | undefined;
+  if (options?.lspChangedSince) {
+    try {
+      lspChangedFiles = getChangedFilesSince(repoPath, options.lspChangedSince);
+    } catch (err: any) {
+      console.warn(
+        `  Warning: --lsp-changed-since '${options.lspChangedSince}' failed (${err?.message ?? err}); running full LSP feed.`,
+      );
+      lspChangedFiles = undefined;
+    }
+  }
+
+  // Lever 14 (definition cache): build a commit-namespaced, clean-tree-gated
+  // cache when --lsp-cache is set. buildDefinitionCache returns a safe no-op
+  // cache whenever caching would be unsound (dirty tree / unknown commit), so
+  // a stale hit is impossible by construction.
+  const lspDefinitionCache =
+    options?.lspCache && (options?.lsp || options?.lspDryRun)
+      ? buildDefinitionCache({
+          enabled: true,
+          commit: getCurrentCommit(repoPath) || null,
+          treeClean: isWorkingTreeClean(repoPath),
+          globalDir: getGlobalDir(),
+          repoId: repoPath,
+        })
+      : undefined;
+  if (options?.lspCache && !options?.lsp && !options?.lspDryRun) {
+    console.warn('  Warning: --lsp-cache ignored: --lsp not enabled');
+  }
+
   // ── Phase 1: Full Pipeline (0–60%) ─────────────────────────────────
   // WI-5 (#159 P3 Mode A): thread `lsp` + `lspDryRun` through to
   // `PipelineOptions.lsp`. The pipeline runs the reconciler over
@@ -332,6 +415,14 @@ export const analyzeCommand = async (
       // session cap. undefined when --lsp-budget was not supplied; the
       // pipeline falls back to DEFAULT_CANDIDATE_CAP=2000 via ?? fallback.
       budget: options?.lspBudget,
+      // Lever 12: validated spot-check rate (undefined → off in the pipeline).
+      highTierSampleRate: options?.lspHighTierSample,
+      // Lever 13: validated request-pipelining concurrency (undefined → serial).
+      pipeline: options?.lspPipeline,
+      // Lever 15: changed-file scoping set (undefined → full feed).
+      changedFiles: lspChangedFiles,
+      // Lever 14: definition cache (undefined → no caching).
+      definitionCache: lspDefinitionCache,
     },
   });
 

@@ -30,9 +30,13 @@ program
   .option('--skills', 'Generate repo-specific skill files from detected communities')
   .option('--skip-git', 'Index a folder without requiring a .git directory')
    .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
-   .option('--lsp', 'Augment CALLS resolution with the TypeScript language server (TS-only, CALLS-only, confidence 0.70)')
+   .option('--lsp', 'Augment CALLS resolution via the language server (TS/Java/Go/Python/Rust; CALLS confirm/correct/recall; confidence 0.90, per-language recall floor)')
    .option('--lsp-dry-run', 'Preview every LSP reconciliation decision and write nothing; implies --lsp')
    .option('--lsp-budget <n>', 'Limit LSP candidate cap to n (positive integer; default 2000); requires --lsp', (v) => Number(v))
+   .option('--lsp-high-tier-sample <rate>', 'Spot-check fraction [0,1] of import-scoped (0.90) CALLS edges via LSP to catch confidently-wrong edges (default 0 = off); requires --lsp', (v) => Number(v))
+   .option('--lsp-pipeline <n>', 'Allow n LSP requests in flight concurrently (default 1 = serial); speeds up dispatch on jdtls/tsserver; requires --lsp', (v) => Number(v))
+   .option('--lsp-changed-since <ref>', 'Scope LSP augmentation to call/heritage sites in files changed since <ref> (git diff); requires --lsp')
+   .option('--lsp-cache', 'Cache textDocument/definition results across runs (clean working tree only); speeds re-indexing; requires --lsp')
    .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
@@ -178,6 +182,8 @@ program
   .option('--strict', 'Exit non-zero when LSP is unavailable')
   .option('--sample <n>', 'Sample size (default: 200)', '200')
   .option('-r, --repo <name>', 'Target repository')
+  .option('--max-fc-rate <rate>', 'CI gate: exit non-zero if overall false-confident rate exceeds this (0..1)')
+  .option('--calibrate', 'Print a recommended --lsp-high-tier-sample rate derived from the measured import-scoped fc-rate (advisory; Mode C → A loop)')
   .action(createLazyAction(() => import('./verify.js'), 'verifyCommand'));
 
 program.parse(process.argv);

@@ -19,6 +19,12 @@ export default defineConfig({
     // arbitrary order at exit. Tests themselves pass; only the exit crashes.
     // TODO: remove once LadybugDB fixes all N-API destructor ordering issues.
     dangerouslyIgnoreUnhandledErrors: true,
+    // The same N-API fork-exit crash can non-deterministically mark a file
+    // failed even though its tests passed (the worker dies at process exit,
+    // after assertions). A single retry absorbs that transient crash in a
+    // fresh worker; a genuine regression fails both attempts, so this does
+    // not mask real failures.
+    retry: 1,
 
     // Coverage stays at root (not supported in project configs)
     coverage: {

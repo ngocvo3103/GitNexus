@@ -275,4 +275,92 @@ describe('CrossRepoRegistry — reverseDepMap & findConsumers', () => {
     expect(registry.findConsumers('a-handler')).toEqual([]);
     expect(registry.findConsumers('b-handler')).toEqual([]);
   });
+
+  // ─── T-CR-10: token-subsequence fallback for infix/prefix-differing names (#159) ───
+  it('T-CR-10: artifactId resolves via token-subsequence when the suffix rule misses, without regressing the suffix layer', async () => {
+    // Real bond-set shapes the unique-suffix rule could NOT resolve:
+    //   matching-client      → matching-engine-client   (infix "engine" inserted)
+    //   tcbs-amqp-message    → tcbs-bond-amqp-message    (infix "bond" inserted)
+    // And a suffix-priority case that MUST stay unique despite the new layer:
+    //   bond-amqp            → tcbs-bond-amqp            (NOT tcbs-bond-amqp-message)
+    readManifestMock.mockImplementation(async (path: string) => {
+      switch (path) {
+        case '/repos/tcbs-bond-trading':
+          return manifest('tcbs-bond-trading', [
+            'com.tcbs.matching.client:matching-client',
+            'com.tcbs.bond.trading:tcbs-amqp-message',
+            'com.tcbs.bond.trading:bond-amqp',
+          ]);
+        case '/repos/matching-engine-client':
+          return manifest('matching-engine-client', []);
+        case '/repos/tcbs-bond-amqp-message':
+          return manifest('tcbs-bond-amqp-message', []);
+        case '/repos/tcbs-bond-amqp':
+          return manifest('tcbs-bond-amqp', []);
+        default:
+          return null;
+      }
+    });
+
+    await registry.initialize([
+      { repoId: 'tcbs-bond-trading', repoPath: '/repos/tcbs-bond-trading' },
+      { repoId: 'matching-engine-client', repoPath: '/repos/matching-engine-client' },
+      { repoId: 'tcbs-bond-amqp-message', repoPath: '/repos/tcbs-bond-amqp-message' },
+      { repoId: 'tcbs-bond-amqp', repoPath: '/repos/tcbs-bond-amqp' },
+    ]);
+
+    // Subsequence layer resolves the two coordinates the suffix rule missed.
+    expect(registry.findDepRepo('com.tcbs.matching.client:matching-client')).toBe('matching-engine-client');
+    expect(registry.findDepRepo('com.tcbs.bond.trading:tcbs-amqp-message')).toBe('tcbs-bond-amqp-message');
+    expect(registry.findConsumers('matching-engine-client')).toEqual(['tcbs-bond-trading']);
+    expect(registry.findConsumers('tcbs-bond-amqp-message')).toEqual(['tcbs-bond-trading']);
+
+    // Suffix layer still wins and stays unique: bond-amqp → tcbs-bond-amqp only,
+    // never the longer tcbs-bond-amqp-message (which the new layer must not steal).
+    expect(registry.findDepRepo('com.tcbs.bond.trading:bond-amqp')).toBe('tcbs-bond-amqp');
+    expect(registry.findConsumers('tcbs-bond-amqp')).toEqual(['tcbs-bond-trading']);
+  });
+
+  // ─── T-CR-11: load() accepts the real bare-array registry format (#159 Bug-2) ───
+  it('T-CR-11: load() reads the bare-array ~/.gitnexus/registry.json shape', async () => {
+    const os = await import('node:os');
+    const fsp = await import('node:fs/promises');
+    const nodePath = await import('node:path');
+    const home = await fsp.mkdtemp(nodePath.join(os.tmpdir(), 'gn-reg-'));
+    const prevHome = process.env.GITNEXUS_HOME;
+    process.env.GITNEXUS_HOME = home;
+    try {
+      // The on-disk shape repo-manager.writeRegistry actually produces: a BARE
+      // ARRAY with `name`/`path` (NOT `{repos:[{repoId,path}]}`).
+      await fsp.writeFile(
+        nodePath.join(home, 'registry.json'),
+        JSON.stringify([
+          { name: 'tcbs-bond-trading', path: '/repos/tcbs-bond-trading', storagePath: '/repos/tcbs-bond-trading/.gitnexus' },
+          { name: 'tcbs-bond-trading-core', path: '/repos/tcbs-bond-trading-core', storagePath: '/repos/tcbs-bond-trading-core/.gitnexus' },
+        ]),
+      );
+      readManifestMock.mockImplementation(async (path: string) => {
+        if (path === '/repos/tcbs-bond-trading') {
+          return manifest('tcbs-bond-trading', ['com.tcbs.bond.trading:tcbs-bond-trading-core']);
+        }
+        if (path === '/repos/tcbs-bond-trading-core') {
+          return manifest('tcbs-bond-trading-core', []);
+        }
+        return null;
+      });
+
+      await registry.load();
+
+      // Before the fix, load() read `globalRegistry.repos` (undefined) → zero
+      // repos. Now both entries load and the dependency resolves.
+      expect(registry.listRepos().map((r) => r.repoId).sort()).toEqual([
+        'tcbs-bond-trading', 'tcbs-bond-trading-core',
+      ]);
+      expect(registry.findConsumers('tcbs-bond-trading-core')).toEqual(['tcbs-bond-trading']);
+    } finally {
+      if (prevHome === undefined) delete process.env.GITNEXUS_HOME;
+      else process.env.GITNEXUS_HOME = prevHome;
+      await fsp.rm(home, { recursive: true, force: true });
+    }
+  });
 });

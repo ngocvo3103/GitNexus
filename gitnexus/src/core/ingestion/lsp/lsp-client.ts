@@ -94,6 +94,15 @@ export interface LspClientOptions {
    */
   adapter?: LanguageAdapter;
   /**
+   * Lever 13 (request pipelining). Max number of JSON-RPC requests allowed
+   * in flight concurrently. Default 1 = the historical strict single-flight
+   * queue (byte-identical). A value > 1 lets the server answer N requests
+   * concurrently; `didOpen` ordering stays correct via a per-URI barrier
+   * (`maybeDidOpenForDefinition`). Only worth raising for servers that handle
+   * concurrent `textDocument/definition` well (jdtls, tsserver, gopls).
+   */
+  maxInFlight?: number;
+  /**
    * Optional factory hook used by tests to inject a fake
    * subprocess + a fake JSON-RPC connection. Production code
    * leaves this undefined. When set, the client does not
@@ -112,6 +121,9 @@ export interface LspClientOptions {
 /** Default restart budget per the WI spec. */
 export const MAX_RESTARTS = 2;
 
+/** Lever 16: LSP method for the inverse interface→implementor query. */
+export const IMPLEMENTATION_METHOD = 'textDocument/implementation';
+
 /** Standard TS server capabilities the client requests. */
 const TS_SERVER_CAPABILITIES = {
   // The client side declares a small subset — enough to receive
@@ -126,6 +138,13 @@ const TS_SERVER_CAPABILITIES = {
     },
     publishDiagnostics: {
       relatedInformation: false,
+    },
+    // Lever 16: declare `textDocument/implementation` so servers that support
+    // it (gopls, rust-analyzer, jdtls) answer the inverse interface→impl query
+    // (Go duck-typing, Rust trait impls). Purely additive — declaring the
+    // capability changes nothing unless a caller actually issues the request.
+    implementation: {
+      dynamicRegistration: false,
     },
   },
   workspace: {
@@ -238,6 +257,22 @@ export class LspClient {
    * Invariant 1).
    */
   private queue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Lever 13: max concurrent in-flight requests (1 = serial queue above).
+   * `slots`/`waiters` form a counting semaphore used only when > 1.
+   */
+  private readonly maxInFlight: number;
+  private slots: number;
+  private readonly waiters: Array<() => void> = [];
+
+  /**
+   * Lever 13: per-URI `didOpen` barrier. When pipelining, concurrent
+   * `definition` requests for the same not-yet-opened file must share ONE
+   * `didOpen` (sent once, awaited by all) so the open is on the wire before
+   * any definition for that file. Key = URI, value = the in-flight didOpen.
+   */
+  private readonly didOpenInFlight = new Map<string, Promise<void>>();
 
   /** Bounded-restart counter. Reset only by explicit `start()`. */
   private restartCount = 0;
@@ -356,6 +391,26 @@ export class LspClient {
     this.maxRestarts = opts.maxRestarts ?? MAX_RESTARTS;
     this.inject = opts._inject;
     this.adapter = opts.adapter ?? TYPESCRIPT_ADAPTER;
+    // Lever 13: clamp to a sane positive integer; default 1 (serial).
+    this.maxInFlight = Math.max(1, Math.floor(opts.maxInFlight ?? 1));
+    this.slots = this.maxInFlight;
+  }
+
+  /** Lever 13: acquire one concurrency slot (resolves immediately if free). */
+  private async acquireSlot(): Promise<void> {
+    if (this.slots > 0) {
+      this.slots--;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    // A releaser handed us its slot directly (slots not incremented).
+  }
+
+  /** Lever 13: release a slot, handing it to the next waiter if any. */
+  private releaseSlot(): void {
+    const next = this.waiters.shift();
+    if (next) next();
+    else this.slots++;
   }
 
   // ─── Public API ─────────────────────────────────────────────────
@@ -423,8 +478,10 @@ export class LspClient {
       // mid-prior-job may have flipped us to restarting/degraded.
       if (this.state !== 'ready' || !this.connection) return null;
 
-      // didOpen-on-demand (KD-4) — best-effort, no throw.
-      if (method === 'textDocument/definition') {
+      // didOpen-on-demand (KD-4) — best-effort, no throw. Lever 16:
+      // `textDocument/implementation` resolves against the same open document
+      // as `definition`, so it needs the same open-before-request guarantee.
+      if (method === 'textDocument/definition' || method === 'textDocument/implementation') {
         await this.maybeDidOpenForDefinition(params);
         // The maybe- didOpen is a notification; it went through
         // the connection's outgoing queue so ordering is fine.
@@ -478,12 +535,36 @@ export class LspClient {
       }
     };
 
-    // Append to the serialization chain. If the job itself
-    // throws (it shouldn't — the inner `try/catch` swallows),
-    // we still keep the chain alive by linking a no-op resolve.
-    const next = this.queue.then(() => job(), () => job());
-    this.queue = next.catch(() => undefined);
-    return next;
+    // Lever 13: serial (default) vs pipelined dispatch.
+    if (this.maxInFlight <= 1) {
+      // Append to the serialization chain. If the job itself
+      // throws (it shouldn't — the inner `try/catch` swallows),
+      // we still keep the chain alive by linking a no-op resolve.
+      const next = this.queue.then(() => job(), () => job());
+      this.queue = next.catch(() => undefined);
+      return next;
+    }
+    // Pipelined: bound concurrency with the semaphore. `job()` swallows its
+    // own errors (returns null), and the per-URI didOpen barrier preserves
+    // open-before-definition ordering, so concurrent jobs are safe.
+    await this.acquireSlot();
+    try {
+      return await job();
+    } finally {
+      this.releaseSlot();
+    }
+  }
+
+  /**
+   * Lever 16: convenience wrapper for `textDocument/implementation` — the
+   * inverse interface→implementor query (Go duck-typing, Rust trait impls,
+   * Java interface→impl) that `textDocument/definition` cannot answer.
+   * Returns `Location | Location[] | null` exactly as the server replies;
+   * callers normalise (the result is one-to-MANY, unlike definition). Goes
+   * through the same `request` path → didOpen-on-demand + timeout + pipelining.
+   */
+  async implementation<T>(params: any, timeoutMs: number): Promise<T | null> {
+    return this.request<T>(IMPLEMENTATION_METHOD, params, timeoutMs);
   }
 
   /**
@@ -1112,6 +1193,31 @@ export class LspClient {
     const td = params.textDocument;
     if (!td || typeof td.uri !== 'string') return;
     const uri = td.uri;
+    if (this.openFiles.has(uri)) return;
+
+    // Lever 13: per-URI barrier. Under pipelining, two concurrent definition
+    // requests for the same not-yet-opened file must not both send `didOpen`
+    // (protocol violation) nor send `definition` before `didOpen` is on the
+    // wire. The first caller registers the in-flight didOpen synchronously;
+    // concurrent callers await the SAME promise. Under the serial path
+    // (maxInFlight=1) at most one entry ever exists, so behaviour is identical.
+    const pending = this.didOpenInFlight.get(uri);
+    if (pending) {
+      await pending;
+      return;
+    }
+    const work = this.doDidOpenForDefinition(uri);
+    this.didOpenInFlight.set(uri, work);
+    try {
+      await work;
+    } finally {
+      this.didOpenInFlight.delete(uri);
+    }
+  }
+
+  /** Lever 13: the actual didOpen body for a definition target (one per URI). */
+  private async doDidOpenForDefinition(uri: string): Promise<void> {
+    if (this.state !== 'ready' || !this.connection) return;
     if (this.openFiles.has(uri)) return;
 
     // M7: refuse to read files outside the workspace root.

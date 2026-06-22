@@ -54,6 +54,7 @@
 import { LspClient } from './lsp/lsp-client.js';
 import type { ProbeResult, Sample } from './lsp/workspace-readiness-probe.js';
 import { type MapperResult, isUnindexablePath } from './lsp/location-mapper.js';
+import { definitionCacheKey, type DefinitionCache } from './lsp-definition-cache.js';
 import { type LanguageAdapter, TYPESCRIPT_ADAPTER } from './lsp/language-adapter.js';
 import type { DiscoveredServers } from './lsp/server-discovery.js';
 import type { GraphRelationship, KnowledgeGraph, EdgeSource } from '../graph/types.js';
@@ -269,6 +270,19 @@ export interface WithReconciliationSessionDeps {
   /** Override the candidate cap (default 2000). */
   cap?: number;
   /**
+   * Lever 13: max concurrent in-flight LSP requests (default 1 = serial).
+   * Threaded into the default `LspClient` factory. Ignored when the caller
+   * supplies its own `createLspClient`.
+   */
+  maxInFlight?: number;
+  /**
+   * Lever 14: persisted definition cache. When present, the dispatch consults
+   * it before each `textDocument/definition` request and stores live results.
+   * The cache owns its own correctness (commit-namespaced, clean-tree-gated);
+   * the session just reads/writes the interface. Absent → no caching.
+   */
+  definitionCache?: DefinitionCache;
+  /**
    * Server version, captured upstream (production may pass the
    * discovered version here so the summary line can attribute
    * results to a specific binary). When omitted, the session
@@ -390,8 +404,12 @@ async function defaultDiscoverServers(): Promise<DiscoveredServers> {
  * the session accept test fakes that don't inherit the concrete
  * class.
  */
-function defaultCreateLspClient(repo: ReconciliationRepo, adapter: LanguageAdapter): ReconciliationLspClient {
-  return new LspClient({ workspaceRoot: repo.repoPath, adapter });
+function defaultCreateLspClient(
+  repo: ReconciliationRepo,
+  adapter: LanguageAdapter,
+  maxInFlight?: number,
+): ReconciliationLspClient {
+  return new LspClient({ workspaceRoot: repo.repoPath, adapter, maxInFlight });
 }
 
 /**
@@ -491,7 +509,11 @@ export async function withReconciliationSession<T>(
   // selection).
   const cap = deps.cap ?? DEFAULT_CANDIDATE_CAP;
   const sorted = sortCandidates(candidates ?? []);
-  const selected = sorted.slice(0, cap);
+  // Roadmap lever 6: partition the cap between heritage (IMPLEMENTS/EXTENDS)
+  // and CALLS so the high-volume CALLS feed cannot starve the small-but-
+  // high-value heritage feed out of the deterministic prefix. Byte-identical
+  // to `sorted.slice(0, cap)` when the repo has no heritage candidates.
+  const selected = partitionCandidatesByRelType(sorted, cap);
   const skipped = Math.max(0, sorted.length - selected.length);
 
   // ── 1) Discovery gate (G1) ────────────────────────────────────────
@@ -519,7 +541,7 @@ export async function withReconciliationSession<T>(
   // WI-6: inline the adapter-aware default so the factory closes
   // over the selected adapter (TS or Java) — the module-level
   // `defaultCreateLspClient` now accepts adapter as second arg.
-  const factory = deps.createLspClient ?? ((r: ReconciliationRepo) => defaultCreateLspClient(r, adapter));
+  const factory = deps.createLspClient ?? ((r: ReconciliationRepo) => defaultCreateLspClient(r, adapter, deps.maxInFlight));
   const client = factory(repo);
   try {
     await client.start();
@@ -603,16 +625,30 @@ export async function withReconciliationSession<T>(
           // NO_NODE → keep (I-8-replay invariant preserved).
           return;
         }
-        const result = await fetchDefinitionForCandidate(client, candidate, requestTimeoutMs, uriCache, repo.repoPath);
-        if (result.preFiltered) {
-          // WI-5: isUnindexablePath pre-filter fired — count as
-          // preFilteredExternal (NOT probed).
-          meta.preFilteredExternal++;
-        } else {
-          // WI-5: a `textDocument/definition` request was actually
-          // issued (or would have been, before a position/URI error
-          // short-circuit — those are still not pre-filter).
+        // Lever 14: consult the persisted definition cache before issuing a
+        // live request. A hit replays a prior run's answer (valid because the
+        // cache is commit-namespaced + clean-tree-gated). Absent cache → undefined.
+        const cacheKey = definitionCacheKey(candidate.file, candidate.line, candidate.character);
+        const cached = deps.definitionCache?.get(cacheKey);
+        let result: { locations: Location[]; preFiltered: boolean };
+        if (cached !== undefined) {
+          result = { locations: cached, preFiltered: false };
+          // A cached candidate was answered (no live request); count as probed.
           meta.probed++;
+        } else {
+          result = await fetchDefinitionForCandidate(client, candidate, requestTimeoutMs, uriCache, repo.repoPath);
+          if (result.preFiltered) {
+            // WI-5: isUnindexablePath pre-filter fired — count as
+            // preFilteredExternal (NOT probed).
+            meta.preFilteredExternal++;
+          } else {
+            // WI-5: a `textDocument/definition` request was actually
+            // issued (or would have been, before a position/URI error
+            // short-circuit — those are still not pre-filter).
+            meta.probed++;
+            // Lever 14: cache the live (non-pre-filtered) result for re-runs.
+            deps.definitionCache?.set(cacheKey, result.locations);
+          }
         }
         await handToEngine(candidate, result.locations);
       },
@@ -654,6 +690,37 @@ function sortCandidates(cands: Candidate[]): Candidate[] {
   // Defensive: shallow-copy the caller's array — the cap
   // selection runs on a snapshot so the input stays untouched.
   return [...cands].sort(candidateCompare);
+}
+
+/**
+ * Roadmap lever 6 — partition the deterministic-prefix cap between the
+ * heritage feed (candidates with `relType` = IMPLEMENTS/EXTENDS) and the
+ * CALLS feed (no `relType`). Without this, a large repo's CALLS volume
+ * (tens of thousands) crowds the small-but-high-value heritage feed
+ * (hundreds) out of the `cap`-sized prefix entirely.
+ *
+ * Policy: heritage is reserved up to `floor(cap/2)`; any reserve it does
+ * not use flows to CALLS, and any CALLS slack flows back to heritage — so
+ * the cap is always fully utilized and neither feed starves the other.
+ * `input` is already stable-sorted; we re-sort the chosen union to keep a
+ * deterministic processing order. When there are no heritage candidates
+ * the result is byte-identical to `input.slice(0, cap)` (no regression on
+ * CALLS-only repos).
+ */
+function partitionCandidatesByRelType(input: Candidate[], cap: number): Candidate[] {
+  if (cap <= 0) return [];
+  if (input.length <= cap) return input.slice(); // nothing trimmed
+  const heritage = input.filter((c) => c.relType);
+  if (heritage.length === 0) return input.slice(0, cap); // legacy path
+  const calls = input.filter((c) => !c.relType);
+  const heritageReserve = Math.floor(cap / 2);
+  let heritageTake = Math.min(heritage.length, heritageReserve);
+  let callsTake = Math.min(calls.length, cap - heritageTake);
+  // Reuse leftover budget (e.g. CALLS smaller than its share) for heritage.
+  const leftover = cap - heritageTake - callsTake;
+  if (leftover > 0) heritageTake += Math.min(heritage.length - heritageTake, leftover);
+  const chosen = [...heritage.slice(0, heritageTake), ...calls.slice(0, callsTake)];
+  return sortCandidates(chosen);
 }
 
 /**
@@ -994,6 +1061,37 @@ export const HEURISTIC_GLOBAL_CONFIDENCE = 0.5;
 export const REASON_LSP_CONFIRMED = 'lsp-confirmed';
 export const REASON_LSP_CORRECTED = 'lsp-corrected';
 export const REASON_LSP_RECALL = 'lsp-recall';
+/** Refusal reason: a recall candidate whose call-site token does not
+ *  textually corroborate the LSP-resolved target name (roadmap lever 1). */
+export const REASON_UNCORROBORATED_RECALL = 'uncorroborated_recall';
+
+/**
+ * Name-corroboration gate for `lsp-recall` edges (roadmap lever 1).
+ *
+ * A recall edge is minted from a SINGLE `textDocument/definition` answer
+ * with no heuristic agreement to corroborate it. The structural recall
+ * audit (`scripts/audit-recall-precision.ts`) showed this single-method
+ * trust is reliable on Go/Java (~100%) but over-trusts on TS (65.5%) and
+ * Python (28.6%): the LSP target's name frequently does NOT match the
+ * identifier actually written at the call site. We already hold both
+ * names at decision time — `candidate.calledName` is the call-site token
+ * and the resolved node carries its `name` — so we can gate without any
+ * extra LSP round-trip or file read (unlike the post-hoc audit).
+ *
+ * Returns true iff the call-site token corroborates the target name.
+ * Exact match wins; we additionally tolerate trivial alias artifacts
+ * (leading `_`/`$`, case) the audit observed to be true positives. When
+ * the target name is unknown (empty/missing) the caller skips the gate —
+ * unknown ≠ refuted (mirrors the `targetLabel` null-is-unknown rule).
+ *
+ * Pure; exported for unit tests.
+ */
+export function namesCorroborate(calledName: string, targetName: string): boolean {
+  if (!calledName || !targetName) return false;
+  if (calledName === targetName) return true;
+  const norm = (s: string): string => s.replace(/^[_$]+/, '').toLowerCase();
+  return norm(calledName) === norm(targetName);
+}
 
 /**
  * WI-5 — heritage target-label gates. The decision table
@@ -1023,8 +1121,15 @@ export const REASON_LSP_RECALL = 'lsp-recall';
 export const HERITAGE_TARGET_LABELS: Readonly<
   Record<'IMPLEMENTS' | 'EXTENDS', ReadonlySet<string>>
 > = {
-  IMPLEMENTS: new Set(['Interface']),
-  EXTENDS: new Set(['Class']),
+  // Roadmap lever 5: generalized beyond TS's Interface/Class so the
+  // un-gated multi-language heritage feed (lever 4) resolves correctly.
+  // IMPLEMENTS targets a contract: a TS/Java/Go `Interface` or a Rust
+  // `Trait`. EXTENDS targets a supertype: a `Class` (TS/Java/Python) or
+  // an `Interface` (Java `interface B extends A`). Any other resolved
+  // label (e.g. a Go `Struct` embed) is refused by the gate and the
+  // heuristic edge is kept — so widening here is safe-by-refusal.
+  IMPLEMENTS: new Set(['Interface', 'Trait']),
+  EXTENDS: new Set(['Class', 'Interface']),
 };
 
 /**
@@ -1096,6 +1201,30 @@ export interface Decision {
  * summary line uses these counters; the dry-run report dumps
  * the `decisions` array.
  */
+/**
+ * Diagnostic-only mapped-vs-dropped tally (0-edge lever). Attributes a
+ * 253s/0-edge run: probe never fired (probed≈0), every Location rebased
+ * out-of-repo (outOfRepo dominant → path-mapping bug), every call external
+ * (external dominant → benign), or LSP answered but no node covers the line
+ * (dbMiss → index gap). Without this, all three look identical in the summary.
+ */
+export interface DropReasonTally {
+  /** Location resolved to a graph node. */
+  mapped: number;
+  /** LSP returned no Location at all (empty answer). */
+  noLocation: number;
+  /** Multi-/zero-corroboration AMBIGUOUS refusal. */
+  ambiguous: number;
+  /** NO_NODE: external (stdlib / site-packages / mod-cache). */
+  external: number;
+  /** NO_NODE: containment guard refused (path rebased out-of-repo). */
+  outOfRepo: number;
+  /** NO_NODE: mapped to a repo path but no node covers the line. */
+  dbMiss: number;
+  /** NO_NODE: URI/line uninterpretable. */
+  unmappable: number;
+}
+
 export interface ReconciliationReport {
   /** Every decision the engine made, in dispatch order. */
   decisions: Decision[];
@@ -1133,6 +1262,13 @@ export interface ReconciliationReport {
    * `SessionMeta.preFilteredExternal`.
    */
   preFilteredExternal: number;
+  /**
+   * Diagnostic-only mapped-vs-dropped tally (0-edge lever). Populated by
+   * `reconcileDecisions` from the per-candidate mapper results; surfaced on
+   * the `lsp:` summary line so a 0-edge run is attributable. Optional so
+   * legacy test-path report literals stay valid.
+   */
+  dropReasons?: DropReasonTally;
   /**
    * NOTE: The engine does NOT carry the LSP server version — the
    * session passes it through `SessionMeta` and the pipeline
@@ -1215,6 +1351,15 @@ export interface ReconcileDecisionsDeps {
  */
 export interface ApplyDecisionsOptions {
   dryRun?: boolean;
+  /**
+   * Roadmap lever 2: confidence to stamp on `lsp-recall` edges. The
+   * structural recall audit found single-method recall is ~100% reliable
+   * on Go/Java but only 65.5% (TS) / 28.6% (Python); the language adapter
+   * supplies a per-language value so weak-recall languages sit below the
+   * 0.85 WILL_BREAK impact floor. Defaults to `LSP_RECALL_CONFIDENCE`
+   * (0.90) when omitted, preserving prior behavior.
+   */
+  recallConfidence?: number;
 }
 
 /**
@@ -1275,6 +1420,15 @@ export function decideForCandidate(
     existingRel?: GraphRelationship;
     callableLabels: ReadonlySet<string>;
     targetLabel?: string | null;
+    /**
+     * Roadmap lever 1: the resolved target node's name. When provided
+     * (non-empty), a `lsp-recall` `add` is refused unless the call-site
+     * token (`candidate.calledName`) corroborates it — defusing the
+     * single-method over-trust the recall audit found on TS/Python.
+     * Undefined/null/empty ⇒ gate skipped (unknown ≠ refuted), so every
+     * existing caller that omits it stays byte-identical.
+     */
+    targetName?: string | null;
   },
 ): Decision {
   const from = candidate.sourceId;
@@ -1367,6 +1521,17 @@ export function decideForCandidate(
   // ── No existing edge (recall path) ────────────────────────────────
   // P1∧P2 already enforced above. The candidate had no
   // heuristic edge → LSP found a new target → recall.
+  //
+  // Roadmap lever 1: name-corroboration gate. A recall edge rests on a
+  // single `textDocument/definition` answer with nothing to corroborate
+  // it. When we know the resolved target's name, require the call-site
+  // token to corroborate it before minting — otherwise refuse (the
+  // edge would clear the 0.85 WILL_BREAK impact floor on single-method
+  // evidence the audit showed is only ~29-66% reliable on TS/Python).
+  // `targetName` empty/absent ⇒ gate skipped (unknown ≠ refuted).
+  if (deps.targetName && !namesCorroborate(candidate.calledName, deps.targetName)) {
+    return makeRefuse(candidate, REASON_UNCORROBORATED_RECALL, from);
+  }
   return {
     candidate,
     action: 'add',
@@ -1486,6 +1651,8 @@ export function applyDecisions(
   options: ApplyDecisionsOptions = {},
 ): ApplyResult {
   const dryRun = options.dryRun === true;
+  // Roadmap lever 2: per-language recall confidence (default 0.90).
+  const recallConf = options.recallConfidence ?? LSP_RECALL_CONFIDENCE;
   let added = 0;
   let removed = 0;
 
@@ -1524,7 +1691,7 @@ export function applyDecisions(
           // collision that would create. We always stamp the
           // new id into the in-memory indexes so the post-add
           // belt-and-braces lookup below stays O(1).
-          const rel = makeLspRelationship(d);
+          const rel = makeLspRelationship(d, recallConf);
           graph.addRelationship(rel);
           addToIndex(byId, byKey, rel);
           added++;
@@ -1537,7 +1704,7 @@ export function applyDecisions(
           // can't introspect that directly, so we use the
           // graph's lookup-by-id contract: a post-add lookup
           // that finds the new id means success.
-          const newRel = makeLspRelationship(d);
+          const newRel = makeLspRelationship(d, recallConf);
           // Belt-and-braces: a brand-new id from
           // `generateId` should never collide, but if the
           // graph's `addRelationship` ever no-ops on
@@ -1739,7 +1906,10 @@ function removeFromIndex(
  * byte-identical to the heuristic template minted at
  * `heritage-processor.ts:403` (format-consistent).
  */
-function makeLspRelationship(d: Decision): GraphRelationship {
+function makeLspRelationship(
+  d: Decision,
+  recallConfidence: number = LSP_RECALL_CONFIDENCE,
+): GraphRelationship {
   if (d.to === null) {
     throw new Error(`makeLspRelationship: 'to' is null for action=${d.action}`);
   }
@@ -1784,7 +1954,7 @@ function makeLspRelationship(d: Decision): GraphRelationship {
     // recall edges stay at 0.70 (one-legged evidence — see the
     // LSP_RECALL_CONFIDENCE doc block).
     confidence:
-      d.source === 'lsp-recall' ? LSP_RECALL_CONFIDENCE : LSP_CONFIDENCE,
+      d.source === 'lsp-recall' ? recallConfidence : LSP_CONFIDENCE,
     reason: d.reason,
     source: d.source ?? 'heuristic',
     line: d.candidate.line,
@@ -1958,15 +2128,51 @@ export async function reconcileDecisions(
     ? buildRelIdIndex(graph)
     : new Map();
 
+  // 0-edge diagnostic: tally how each candidate's Location resolved.
+  const dropReasons: DropReasonTally = {
+    mapped: 0,
+    noLocation: 0,
+    ambiguous: 0,
+    external: 0,
+    outOfRepo: 0,
+    dbMiss: 0,
+    unmappable: 0,
+  };
+
   for (const candidate of candidates) {
     const locs = locations.get(candidateLocationKey(candidate)) ?? [];
 
-    // Multi-Location → AMBIGUOUS at the LSP layer.
     let mapperResult: MapperResult;
     if (locs.length === 0) {
       mapperResult = { kind: 'NO_NODE' };
     } else if (locs.length > 1) {
-      mapperResult = { kind: 'AMBIGUOUS' };
+      // Roadmap lever 9: name-aware disambiguation. Rather than blanket-
+      // refusing every multi-Location answer as AMBIGUOUS (which drops
+      // legitimate overload / multi-target sites), map each Location and
+      // keep only targets whose name corroborates the call-site token
+      // (reusing lever 1's `namesCorroborate`). Exactly one DISTINCT
+      // corroborating node resolves the candidate; 0 or >1 stay AMBIGUOUS
+      // (refuse over guess). Locations that point at the same node count
+      // once.
+      const mappedIds: string[] = [];
+      for (const loc of locs) {
+        try {
+          const r = await mapFn(loc, repoId);
+          if (r.kind === 'node') mappedIds.push(r.nodeId);
+        } catch {
+          /* skip a throwing Location */
+        }
+      }
+      const corroborated = new Set(
+        mappedIds.filter((id) => {
+          const nm = graph.getNode(id)?.properties?.name;
+          return typeof nm === 'string' && namesCorroborate(candidate.calledName, nm);
+        }),
+      );
+      mapperResult =
+        corroborated.size === 1
+          ? { kind: 'node', nodeId: [...corroborated][0] }
+          : { kind: 'AMBIGUOUS' };
     } else {
       try {
         mapperResult = await mapFn(locs[0], repoId);
@@ -1976,13 +2182,42 @@ export async function reconcileDecisions(
       }
     }
 
+    // 0-edge diagnostic: bucket this candidate's resolution.
+    if (locs.length === 0) {
+      dropReasons.noLocation++;
+    } else if (mapperResult.kind === 'node') {
+      dropReasons.mapped++;
+    } else if (mapperResult.kind === 'AMBIGUOUS') {
+      dropReasons.ambiguous++;
+    } else {
+      switch (mapperResult.dropReason) {
+        case 'external':
+          dropReasons.external++;
+          break;
+        case 'out-of-repo':
+          dropReasons.outOfRepo++;
+          break;
+        case 'unmappable':
+          dropReasons.unmappable++;
+          break;
+        default:
+          // 'db-miss' or untagged NO_NODE.
+          dropReasons.dbMiss++;
+      }
+    }
+
     // Look up the resolved node's label (P2 gate). The
     // engine cannot query the DB; the label is fetched from
     // the in-memory node list through the graph's node map.
     let targetLabel: string | null = null;
+    // Roadmap lever 1: also surface the resolved node's NAME so the
+    // recall path can corroborate it against the call-site token.
+    let targetName: string | null = null;
     if (mapperResult.kind === 'node') {
       const node = graph.getNode(mapperResult.nodeId);
       targetLabel = node ? node.label : null;
+      const nm = node?.properties?.name;
+      targetName = typeof nm === 'string' && nm ? nm : null;
     }
 
     // Look up the existing edge (for confirm/correct paths).
@@ -2045,6 +2280,7 @@ export async function reconcileDecisions(
       existingRel,
       callableLabels: labelGate,
       targetLabel,
+      targetName,
     });
     decisions.push(decision);
   }
@@ -2078,6 +2314,7 @@ export async function reconcileDecisions(
     // when assembling the final `lspReport`.
     probed: 0,
     preFilteredExternal: 0,
+    dropReasons,
   };
 }
 
@@ -2212,4 +2449,6 @@ export const __engineTest__ = {
   // test bag should mirror actual consumer demand, not be
   // a kitchen-sink backdoor.
   collapseDuplicates,
+  // Roadmap lever 6: budget partition between heritage and CALLS.
+  partitionCandidatesByRelType,
 };

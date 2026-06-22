@@ -40,6 +40,8 @@ import {
   REASON_LSP_CONFIRMED,
   REASON_LSP_CORRECTED,
   REASON_LSP_RECALL,
+  REASON_UNCORROBORATED_RECALL,
+  namesCorroborate,
   __engineTest__ as engineTest,
   type Candidate,
   type Decision,
@@ -132,6 +134,176 @@ describe('WI-4b — decideForCandidate: add (heuristic missed, LSP found it)', (
     expect(decision.from).toBe(cand.sourceId);
     expect(decision.to).toBe('Function:src/b.ts:bar');
     expect(decision.source).toBe('lsp-recall');
+  });
+});
+
+// ─── Roadmap lever 1 — recall name-corroboration gate ─────────────────
+
+describe('namesCorroborate (roadmap lever 1)', () => {
+  it('exact token match corroborates', () => {
+    expect(namesCorroborate('bar', 'bar')).toBe(true);
+  });
+  it('tolerates leading underscore/$ + case (alias artifacts)', () => {
+    expect(namesCorroborate('_enum', 'enum')).toBe(true);
+    expect(namesCorroborate('Render', 'render')).toBe(true);
+    expect(namesCorroborate('$ref', 'ref')).toBe(true);
+  });
+  it('distinct names do NOT corroborate', () => {
+    expect(namesCorroborate('renderHono', 'render')).toBe(false);
+    expect(namesCorroborate('foo', 'bar')).toBe(false);
+  });
+  it('empty inputs do not corroborate (caller treats as unknown→skip)', () => {
+    expect(namesCorroborate('', 'bar')).toBe(false);
+    expect(namesCorroborate('bar', '')).toBe(false);
+  });
+});
+
+describe('WI-4b — decideForCandidate: recall name gate (roadmap lever 1)', () => {
+  it('targetName corroborates calledName → add (lsp-recall)', () => {
+    const cand = mkCandidate({ oldTargetId: undefined, calledName: 'bar' });
+    const decision = decideForCandidate(
+      cand,
+      { kind: 'node', nodeId: 'Function:src/b.ts:bar' },
+      { callableLabels: CALLABLE, targetLabel: 'Function', targetName: 'bar' },
+    );
+    expect(decision.action).toBe('add');
+    expect(decision.source).toBe('lsp-recall');
+  });
+
+  it('targetName does NOT corroborate calledName → refuse (uncorroborated_recall, no edge)', () => {
+    const cand = mkCandidate({ oldTargetId: undefined, calledName: 'renderHono' });
+    const decision = decideForCandidate(
+      cand,
+      { kind: 'node', nodeId: 'Function:src/b.ts:render' },
+      { callableLabels: CALLABLE, targetLabel: 'Function', targetName: 'render' },
+    );
+    expect(decision.action).toBe('refuse');
+    expect(decision.reason).toBe(REASON_UNCORROBORATED_RECALL);
+    expect(decision.to).toBeNull();
+    expect(decision.source).toBeNull();
+  });
+
+  it('targetName absent → gate skipped, byte-identical legacy add (backward compat)', () => {
+    const cand = mkCandidate({ oldTargetId: undefined, calledName: 'foo' });
+    const decision = decideForCandidate(
+      cand,
+      { kind: 'node', nodeId: 'Function:src/b.ts:bar' },
+      { callableLabels: CALLABLE, targetLabel: 'Function' }, // no targetName
+    );
+    expect(decision.action).toBe('add');
+    expect(decision.source).toBe('lsp-recall');
+  });
+
+  it('gate does NOT touch the confirm/correct paths (those have heuristic agreement)', () => {
+    // A confirm: even with a mismatching name, an existing heuristic edge
+    // means this is NOT the single-method recall path → unaffected.
+    const cand = mkCandidate({ oldTargetId: 'Function:src/b.ts:bar', calledName: 'zzz' });
+    const rel = heuristicRel(cand.sourceId, cand.oldTargetId!);
+    const decision = decideForCandidate(
+      cand,
+      { kind: 'node', nodeId: 'Function:src/b.ts:bar' },
+      { existingRel: rel, callableLabels: CALLABLE, targetLabel: 'Function', targetName: 'bar' },
+    );
+    expect(decision.action).toBe('confirm');
+  });
+});
+
+// ─── Roadmap lever 6 — budget partition (heritage vs CALLS) ───────────
+
+describe('partitionCandidatesByRelType (roadmap lever 6)', () => {
+  const part = engineTest.partitionCandidatesByRelType as (i: Candidate[], cap: number) => Candidate[];
+  const mkCall = (i: number) => mkCandidate({ sourceId: `c${i}`, calledName: `call${i}`, line: i });
+  const mkImpl = (i: number) =>
+    mkCandidate({ sourceId: `h${i}`, calledName: `Iface${i}`, line: i, relType: 'IMPLEMENTS', oldTargetId: `Interface:x:Iface${i}` });
+
+  it('no heritage → byte-identical to slice(0, cap) (no regression)', () => {
+    const input = Array.from({ length: 10 }, (_, i) => mkCall(i));
+    const out = part(input, 4);
+    expect(out).toHaveLength(4);
+    expect(out.every((c) => !c.relType)).toBe(true);
+  });
+
+  it('input shorter than cap → all kept', () => {
+    const input = [mkCall(0), mkImpl(1)];
+    expect(part(input, 10)).toHaveLength(2);
+  });
+
+  it('heritage is NOT starved by large CALLS volume', () => {
+    // 100 CALLS + 3 heritage, cap 10: all 3 heritage survive (reserve = cap/2 = 5).
+    const input = [...Array.from({ length: 100 }, (_, i) => mkCall(i)), mkImpl(0), mkImpl(1), mkImpl(2)];
+    const out = part(input, 10);
+    expect(out).toHaveLength(10);
+    expect(out.filter((c) => c.relType).length).toBe(3); // all heritage kept
+    expect(out.filter((c) => !c.relType).length).toBe(7); // CALLS get the rest
+  });
+
+  it('heritage capped at floor(cap/2) when it would otherwise dominate', () => {
+    // 2 CALLS + 100 heritage, cap 4: heritage reserve = 2; leftover from CALLS
+    // (only 2 available, take 2) → heritage gets 2, total 4.
+    const input = [mkCall(0), mkCall(1), ...Array.from({ length: 100 }, (_, i) => mkImpl(i))];
+    const out = part(input, 4);
+    expect(out).toHaveLength(4);
+    expect(out.filter((c) => c.relType).length).toBe(2);
+    expect(out.filter((c) => !c.relType).length).toBe(2);
+  });
+
+  it('unused CALLS budget flows back to heritage', () => {
+    // 1 CALLS + 100 heritage, cap 4: CALLS reserve-complement = 2 but only 1
+    // CALLS exists → heritage reclaims the leftover (2 + 1 = 3 heritage).
+    const input = [mkCall(0), ...Array.from({ length: 100 }, (_, i) => mkImpl(i))];
+    const out = part(input, 4);
+    expect(out).toHaveLength(4);
+    expect(out.filter((c) => c.relType).length).toBe(3);
+    expect(out.filter((c) => !c.relType).length).toBe(1);
+  });
+});
+
+// ─── Roadmap lever 9 — multi-Location name disambiguation ─────────────
+
+describe('reconcileDecisions — multi-Location disambiguation (roadmap lever 9)', () => {
+  const distinctLoc = (line: number) => mkLoc({ range: { start: { line, character: 0 } } });
+  const makeDeps = (over: Partial<ReconcileDecisionsDeps> = {}): ReconcileDecisionsDeps => ({
+    mapLocationToNodeId: over.mapLocationToNodeId ?? (async () => ({ kind: 'NO_NODE' as const })),
+    findExistingRel: over.findExistingRel ?? ((g, s, t) => {
+      for (const r of g.iterRelationships()) if (r.sourceId === s && r.targetId === t) return r;
+      return undefined;
+    }),
+    callableLabels: over.callableLabels ?? CALLABLE,
+    repoId: over.repoId ?? 'repo-1',
+  });
+
+  it('one of N Locations corroborates the call-site token → resolves (add), not AMBIGUOUS', async () => {
+    const graph = createKnowledgeGraph();
+    graph.addNode({ id: 'Function:src/a.ts:foo', label: 'Function', properties: { name: 'foo' } });
+    graph.addNode({ id: 'Function:src/b.ts:bar', label: 'Function', properties: { name: 'bar' } });
+    const cand = mkCandidate({ oldTargetId: undefined, calledName: 'foo' });
+    const locs = new Map<string, Location[]>();
+    const key = `${cand.sourceId}|${cand.calledName}|${cand.line}|${cand.character}`;
+    locs.set(key, [distinctLoc(10), distinctLoc(20)]);
+    const mapFn = async (loc: Location) =>
+      loc.range.start.line === 10
+        ? ({ kind: 'node' as const, nodeId: 'Function:src/a.ts:foo' }) // name 'foo' — corroborates
+        : ({ kind: 'node' as const, nodeId: 'Function:src/b.ts:bar' }); // name 'bar' — does not
+    const report = await reconcileDecisions(graph, [cand], locs as any, makeDeps({ mapLocationToNodeId: mapFn }));
+    expect(report.decisions[0].action).toBe('add');
+    expect(report.decisions[0].to).toBe('Function:src/a.ts:foo');
+  });
+
+  it('two distinct Locations both corroborate → stays AMBIGUOUS (refuse over guess)', async () => {
+    const graph = createKnowledgeGraph();
+    graph.addNode({ id: 'Function:src/a.ts:foo', label: 'Function', properties: { name: 'foo' } });
+    graph.addNode({ id: 'Function:src/b.ts:foo', label: 'Function', properties: { name: 'foo' } });
+    const cand = mkCandidate({ oldTargetId: undefined, calledName: 'foo' });
+    const locs = new Map<string, Location[]>();
+    const key = `${cand.sourceId}|${cand.calledName}|${cand.line}|${cand.character}`;
+    locs.set(key, [distinctLoc(10), distinctLoc(20)]);
+    const mapFn = async (loc: Location) =>
+      loc.range.start.line === 10
+        ? ({ kind: 'node' as const, nodeId: 'Function:src/a.ts:foo' })
+        : ({ kind: 'node' as const, nodeId: 'Function:src/b.ts:foo' });
+    const report = await reconcileDecisions(graph, [cand], locs as any, makeDeps({ mapLocationToNodeId: mapFn }));
+    // No heuristic edge + AMBIGUOUS → refuse (no edge minted).
+    expect(report.decisions[0].action).toBe('refuse');
   });
 });
 
@@ -327,6 +499,24 @@ describe('WI-4b — applyDecisions: mutations', () => {
     expect(rel.confidence).toBe(LSP_RECALL_CONFIDENCE);
     expect(rel.source).toBe('lsp-recall');
     expect(rel.reason).toBe(REASON_LSP_RECALL);
+  });
+
+  it('add: per-language recallConfidence overrides the default on recall edges (roadmap lever 2)', () => {
+    const graph = createKnowledgeGraph();
+    const cand = mkCandidate({ oldTargetId: undefined });
+    const decision: Decision = {
+      candidate: cand,
+      action: 'add',
+      from: cand.sourceId,
+      to: 'Function:src/b.ts:bar',
+      source: 'lsp-recall',
+      reason: REASON_LSP_RECALL,
+    };
+    // Python-tier recall confidence (0.6) — below the 0.85 WILL_BREAK floor.
+    const result = applyDecisions(graph, [decision], { recallConfidence: 0.6 });
+    expect(result.added).toBe(1);
+    expect(graph.relationships[0].confidence).toBe(0.6);
+    expect(graph.relationships[0].source).toBe('lsp-recall');
   });
 
   it('confirm: re-stamps the existing edge in place (id, source, confidence)', () => {
@@ -1030,7 +1220,9 @@ describe('WI-4b — reconcileDecisions: end-to-end dispatch', () => {
     const candidates: Candidate[] = [
       mkCandidate({ oldTargetId: 'Function:src/a.ts:foo', sourceId: 's1' }),
       mkCandidate({ oldTargetId: 'Function:src/a.ts:foo', sourceId: 's2' }),
-      mkCandidate({ oldTargetId: undefined, sourceId: 's3' }),
+      // s3 recall: call-site token must corroborate the resolved target
+      // name ('bar') for the lever-1 name gate to mint the edge.
+      mkCandidate({ oldTargetId: undefined, sourceId: 's3', calledName: 'bar' }),
       mkCandidate({ oldTargetId: undefined, sourceId: 's4' }),
     ];
     // s1 → confirm, s2 → correct, s3 → add, s4 → refuse.
@@ -1071,7 +1263,65 @@ describe('WI-4b — reconcileDecisions: end-to-end dispatch', () => {
     expect(report.decisions[3].action).toBe('refuse');
   });
 
-  it('multi-Location (length>1) is treated as AMBIGUOUS at the LSP layer (refuse over guess)', async () => {
+  it('dropReasons tally buckets each candidate by how its Location resolved (0-edge lever)', async () => {
+    const graph = createKnowledgeGraph();
+    graph.addNode({ id: 'Function:src/a.ts:foo', label: 'Function', properties: { name: 'foo' } });
+    const key = (c: Candidate) => `${c.sourceId}|${c.calledName}|${c.line}|${c.character}`;
+
+    // Each candidate gets a unique line; mapFn switches on it.
+    const cMapped = mkCandidate({ sourceId: 's1', oldTargetId: undefined });
+    const cNoLoc = mkCandidate({ sourceId: 's2', oldTargetId: undefined });
+    const cDbMiss = mkCandidate({ sourceId: 's3', oldTargetId: undefined });
+    const cExternal = mkCandidate({ sourceId: 's4', oldTargetId: undefined });
+    const cOutOfRepo = mkCandidate({ sourceId: 's5', oldTargetId: undefined });
+    const cAmbiguous = mkCandidate({ sourceId: 's6', oldTargetId: undefined });
+
+    const locs = new Map<string, Location[]>();
+    locs.set(key(cMapped), [mkLoc({ range: { start: { line: 1, character: 0 } } })]);
+    // cNoLoc: deliberately absent from the map → noLocation bucket.
+    locs.set(key(cDbMiss), [mkLoc({ range: { start: { line: 3, character: 0 } } })]);
+    locs.set(key(cExternal), [mkLoc({ range: { start: { line: 4, character: 0 } } })]);
+    locs.set(key(cOutOfRepo), [mkLoc({ range: { start: { line: 5, character: 0 } } })]);
+    locs.set(key(cAmbiguous), [
+      mkLoc({ range: { start: { line: 6, character: 0 } } }),
+      mkLoc({ range: { start: { line: 7, character: 0 } } }),
+    ]);
+
+    const mapFn = async (loc: Location) => {
+      switch (loc.range.start.line) {
+        case 1:
+          return { kind: 'node' as const, nodeId: 'Function:src/a.ts:foo' };
+        case 3:
+          return { kind: 'NO_NODE' as const, dropReason: 'db-miss' as const };
+        case 4:
+          return { kind: 'NO_NODE' as const, external: true, dropReason: 'external' as const };
+        case 5:
+          return { kind: 'NO_NODE' as const, dropReason: 'out-of-repo' as const };
+        default:
+          // lines 6/7 (multi-Location) resolve to non-corroborating nodes → AMBIGUOUS.
+          return { kind: 'NO_NODE' as const, dropReason: 'db-miss' as const };
+      }
+    };
+
+    const report = await reconcileDecisions(
+      graph,
+      [cMapped, cNoLoc, cDbMiss, cExternal, cOutOfRepo, cAmbiguous],
+      locs,
+      makeDeps({ mapLocationToNodeId: mapFn }),
+    );
+
+    expect(report.dropReasons).toEqual({
+      mapped: 1,
+      noLocation: 1,
+      ambiguous: 1,
+      external: 1,
+      outOfRepo: 1,
+      dbMiss: 1,
+      unmappable: 0,
+    });
+  });
+
+  it('multi-Location (length>1) with no corroborating target → AMBIGUOUS (refuse over guess)', async () => {
     const graph = createKnowledgeGraph();
     graph.addNode({ id: 'src:1', label: 'Method', properties: { name: 'caller' } });
     const cand = mkCandidate({ oldTargetId: undefined });
@@ -1084,7 +1334,10 @@ describe('WI-4b — reconcileDecisions: end-to-end dispatch', () => {
     const report = await reconcileDecisions(graph, [cand], locs, makeDeps({ mapLocationToNodeId: mapFn }));
     expect(report.decisions[0].action).toBe('refuse');
     expect(report.decisions[0].reason).toBe('ambiguous');
-    expect(mapFn.getCalls()).toBe(0);
+    // Roadmap lever 9: each Location IS now mapped to attempt name-based
+    // disambiguation (the old code blanket-refused without mapping). Here
+    // the no-map mapFn corroborates nothing → still AMBIGUOUS.
+    expect(mapFn.getCalls()).toBe(2);
   });
 
   it('mapper throws → treated as NO_NODE (refuse over guess)', async () => {

@@ -6,6 +6,7 @@ import {
   extractConsumerAccessedKeys,
   processNextjsFetchRoutes,
   buildRefusedFqnHistogram,
+  sampleByRelId,
   type CorrectionFeedItem,
   type RecallFeedItem,
   type ProcessCallsOpts,
@@ -872,6 +873,8 @@ describe('processCallsFromExtracted', () => {
       file: 'src/index.ts',
       line: 42,
       character: 7,
+      // Lever 11/12: the always-fed global tier is now tagged.
+      tier: 'global',
     }]);
     expect(recallFeed).toEqual([]);
   });
@@ -937,6 +940,7 @@ describe('processCallsFromExtracted', () => {
       file: 'src/index.ts',
       line: 100,
       character: 8,
+      tier: 'global',
     }]);
   });
 
@@ -1179,6 +1183,83 @@ describe('processCalls — Mode A candidate feeds (WI-1 / #166)', () => {
     expect(graph.relationships.filter(r => r.type === 'CALLS')).toHaveLength(1);
     expect(cf).toEqual([]);
     expect(rf).toEqual([]);
+  });
+});
+
+describe('sampleByRelId — seeded high-tier sampler (lever 12)', () => {
+  it('rate 0 keeps nothing; rate >= 1 keeps everything', () => {
+    for (const k of ['a', 'b', 'CALLS:x->y:L3', '']) {
+      expect(sampleByRelId(k, 0)).toBe(false);
+      expect(sampleByRelId(k, -0.5)).toBe(false);
+      expect(sampleByRelId(k, 1)).toBe(true);
+      expect(sampleByRelId(k, 2)).toBe(true);
+    }
+  });
+
+  it('is deterministic for the same key + rate (stable across runs)', () => {
+    const k = 'CALLS:Function:src/a.ts:main:foo->Function:src/b.ts:foo:L12';
+    const first = sampleByRelId(k, 0.5);
+    for (let i = 0; i < 20; i++) expect(sampleByRelId(k, 0.5)).toBe(first);
+  });
+
+  it('keeps ~rate fraction over many distinct keys (uniformity)', () => {
+    const N = 4000;
+    let kept = 0;
+    for (let i = 0; i < N; i++) if (sampleByRelId(`CALLS:caller${i}->target:L${i}`, 0.25)) kept++;
+    const frac = kept / N;
+    // 25% target; generous tolerance keeps this non-flaky while still
+    // failing a broken (constant / all-or-nothing) hash.
+    expect(frac).toBeGreaterThan(0.18);
+    expect(frac).toBeLessThan(0.32);
+  });
+
+  it('monotonic: a key kept at rate r is also kept at any rate > r', () => {
+    const k = 'CALLS:caller7->target:L7';
+    const lo = sampleByRelId(k, 0.3);
+    if (lo) expect(sampleByRelId(k, 0.6)).toBe(true);
+  });
+});
+
+describe('processCalls — import-scoped spot-check feed (lever 11/12)', () => {
+  let graph: ReturnType<typeof createKnowledgeGraph>;
+  let ctx: ResolutionContext;
+  beforeEach(() => {
+    graph = createKnowledgeGraph();
+    ctx = createResolutionContext();
+  });
+
+  const files = [
+    { path: 'src/index.ts', content: 'import { format } from "./utils";\nexport function main() { format("hi"); }\n' },
+  ];
+  function setup() {
+    ctx.symbols.add('src/utils.ts', 'format', 'Function:src/utils.ts:format', 'Function');
+    ctx.importMap.set('src/index.ts', new Set(['src/utils.ts']));
+  }
+
+  it('rate 0 (default): import-scoped edge is NOT fed to the correction feed (byte-identical)', async () => {
+    setup();
+    const cf: CorrectionFeedItem[] = [];
+    await processCalls(
+      graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined,
+      { lsp: true, correctionFeed: cf, recallFeed: [] },
+    );
+    const edge = graph.relationships.find(r => r.type === 'CALLS');
+    expect(edge?.reason).toBe('import-resolved');
+    expect(cf).toEqual([]);
+  });
+
+  it('rate 1: the import-scoped edge IS fed, tagged tier import-resolved', async () => {
+    setup();
+    const cf: CorrectionFeedItem[] = [];
+    await processCalls(
+      graph, files, createASTCache(files.length), ctx,
+      undefined, undefined, undefined, undefined, undefined,
+      { lsp: true, correctionFeed: cf, recallFeed: [], highTierSampleRate: 1 },
+    );
+    expect(cf).toHaveLength(1);
+    expect(cf[0].tier).toBe('import-resolved');
+    expect(cf[0].oldTargetId).toBe('Function:src/utils.ts:format');
   });
 });
 

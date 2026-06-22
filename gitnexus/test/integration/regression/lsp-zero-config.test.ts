@@ -109,11 +109,22 @@ beforeAll(() => {
   //    walks it as a regular folder.
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wi9-zero-config-'));
   fs.cpSync(fixtureRoot, tmpDir, { recursive: true });
-  // Strip any pre-existing .gitnexus — we want a true clean
-  // state for the analyze run.
-  const existingGitnexus = path.join(tmpDir, '.gitnexus');
-  if (fs.existsSync(existingGitnexus)) {
-    fs.rmSync(existingGitnexus, { recursive: true, force: true });
+  // Strip GENERATED / gitignored pollution so the indexed-file count is
+  // deterministic across environments. The fixture's agent files
+  // (AGENTS.md, CLAUDE.md, .claude/, .gitignore) and any prior .gitnexus
+  // are GitNexus-generated and gitignored — present on dev disks
+  // (untracked) but absent from a clean CI checkout. cpSync of the raw
+  // directory would therefore index 9 files locally vs 7 in CI. Mirror
+  // the .gitignore block so we always analyze the 7 committed .ts files.
+  for (const entry of fs.readdirSync(tmpDir)) {
+    if (
+      entry === '.claude' ||
+      entry === '.gitnexus' ||
+      entry === '.gitignore' ||
+      entry.endsWith('.md')
+    ) {
+      fs.rmSync(path.join(tmpDir, entry), { recursive: true, force: true });
+    }
   }
   // Init a fresh git repo so analyze's `getCurrentCommit` works.
   // Without .git/, analyze uses the empty-string commit but

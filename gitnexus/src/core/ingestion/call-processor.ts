@@ -694,16 +694,25 @@ export const processCalls = async (
       // heuristic id is carried as `oldRelId` so the engine can target
       // the right row when multiple per-site edges share the same
       // (sourceId, targetId) pair.
-      if (opts?.lsp && opts.correctionFeed && resolved.reason === 'global') {
-        opts.correctionFeed.push({
-          sourceId,
-          calledName,
-          oldTargetId: resolved.nodeId,
-          oldRelId: relId,
-          file: file.path,
-          line: callRow,
-          character: nameNode.startPosition.column,
-        });
+      if (opts?.lsp && opts.correctionFeed) {
+        // Lever 11/12: feed the always-on `global` tier, plus a seeded sample
+        // of the import-scoped (0.90) tier when a spot-check rate is set.
+        const isGlobal = resolved.reason === 'global';
+        const isSampledHighTier =
+          resolved.reason === 'import-resolved' &&
+          sampleByRelId(relId, opts.highTierSampleRate ?? 0);
+        if (isGlobal || isSampledHighTier) {
+          opts.correctionFeed.push({
+            sourceId,
+            calledName,
+            oldTargetId: resolved.nodeId,
+            oldRelId: relId,
+            file: file.path,
+            line: callRow,
+            character: nameNode.startPosition.column,
+            tier: isGlobal ? 'global' : 'import-resolved',
+          });
+        }
       }
 
       graph.addRelationship({
@@ -1383,6 +1392,32 @@ export interface CorrectionFeedItem {
   line: number;
   /** 0-based column of the callee identifier. */
   character: number;
+  /**
+   * Heuristic resolution tier this correction candidate came from (lever 11/12).
+   * `'global'` = the always-fed 0.50 tier (unchanged behaviour). `'import-resolved'`
+   * = the 0.90 import-scoped tier, fed only when sampled in (lever 12 spot-check).
+   * Same-file (0.95) is never fed — confirming it would downgrade it to 0.90.
+   */
+  tier?: 'global' | 'import-resolved';
+}
+
+/**
+ * Deterministic, seeded sampler for the high-tier spot-check feed (lever 12).
+ * Maps a stable key (the per-site CALLS rel id) into [0,1) via FNV-1a and keeps
+ * it when below `rate`. Stable across runs (same repo → same sample) so the
+ * spot-checked subset is reproducible, and uniform so the sample is unbiased.
+ * `rate <= 0` keeps nothing (byte-identical default); `rate >= 1` keeps all.
+ */
+export function sampleByRelId(relId: string, rate: number): boolean {
+  if (!(rate > 0)) return false;
+  if (rate >= 1) return true;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < relId.length; i++) {
+    h ^= relId.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  // >>> 0 → unsigned; divide by 2^32 for a [0,1) fraction.
+  return (h >>> 0) / 0x100000000 < rate;
 }
 
 /**
@@ -1453,6 +1488,14 @@ export interface ProcessCallsOpts {
   correctionFeed?: CorrectionFeedItem[];
   /** Sink for unresolved/ambiguous recall candidates. */
   recallFeed?: RecallFeedItem[];
+  /**
+   * Lever 12 spot-check sample rate for the import-scoped (0.90) tier, in [0,1].
+   * 0/undefined (default) feeds only the `global` tier → byte-identical. A
+   * positive rate additionally feeds a deterministic, seeded sample of
+   * import-scoped winners into the correction feed so the LSP leg re-checks the
+   * confidently-wrong import-scoped edges (Mode C measured this tier at ~60.7%).
+   */
+  highTierSampleRate?: number;
   /**
    * WI-A2 — Index built by import-processor at LSP-analysis time.
    * Maps filePath → simpleClassName → fullyQualifiedName for provably-external Java imports.
@@ -1674,10 +1717,18 @@ export const processCallsFromExtracted = async (
       // heuristic id rides through as `oldRelId` so the engine can target
       // the right row when multiple per-site edges share the same
       // (sourceId, targetId) pair.
-      if (opts?.lsp && opts.correctionFeed && resolved.reason === 'global') {
+      if (opts?.lsp && opts.correctionFeed && (() => {
+        // Lever 11/12: global tier always; import-scoped only when sampled in.
+        const isGlobal = resolved.reason === 'global';
+        const isSampledHighTier =
+          resolved.reason === 'import-resolved' &&
+          sampleByRelId(relId, opts.highTierSampleRate ?? 0);
+        return isGlobal || isSampledHighTier;
+      })()) {
         opts.correctionFeed.push({
           sourceId: effectiveCall.sourceId,
           calledName: effectiveCall.calledName,
+          tier: resolved.reason === 'global' ? 'global' : 'import-resolved',
           oldTargetId: resolved.nodeId,
           oldRelId: relId,
           file: effectiveCall.filePath,

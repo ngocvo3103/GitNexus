@@ -177,7 +177,7 @@ describe('location-mapper — fixture matrix (F-1..F-5)', () => {
     for (const uri of cases) {
       const { deps, execute } = makeDeps([]);
       const result = await mapLocationToNodeId(loc(uri, 0), 'test-repo', deps);
-      expect(result, `expected NO_NODE for ${uri}`).toEqual({ kind: 'NO_NODE' });
+      expect(result, `expected NO_NODE for ${uri}`).toMatchObject({ kind: 'NO_NODE' });
       // The DB should never have been touched.
       expect(execute).not.toHaveBeenCalled();
     }
@@ -190,7 +190,7 @@ describe('location-mapper — fixture matrix (F-1..F-5)', () => {
       'test-repo',
       deps,
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
   });
 });
 
@@ -239,7 +239,7 @@ describe('location-mapper — BVA on line index (0-indexed, invariant #5)', () =
       }),
     ]);
     const result = await mapLocationToNodeId(loc('file:///repo/src/a.ts', 11), 'test-repo', deps);
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
   });
 
   it('line == 0 (smallest valid) matches a function starting at line 0', async () => {
@@ -259,7 +259,7 @@ describe('location-mapper — BVA on line index (0-indexed, invariant #5)', () =
   it('line < 0 → NO_NODE (defensive: refuse over guess)', async () => {
     const { deps, execute } = makeDeps([]);
     const result = await mapLocationToNodeId(loc('file:///repo/src/a.ts', -1), 'test-repo', deps);
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     // A malformed Location must not even hit the DB.
     expect(execute).not.toHaveBeenCalled();
   });
@@ -267,14 +267,14 @@ describe('location-mapper — BVA on line index (0-indexed, invariant #5)', () =
   it('non-integer line → NO_NODE', async () => {
     const { deps, execute } = makeDeps([]);
     const result = await mapLocationToNodeId(loc('file:///repo/src/a.ts', 1.5 as any), 'test-repo', deps);
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect(execute).not.toHaveBeenCalled();
   });
 
   it('NaN line → NO_NODE', async () => {
     const { deps, execute } = makeDeps([]);
     const result = await mapLocationToNodeId(loc('file:///repo/src/a.ts', NaN), 'test-repo', deps);
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -284,7 +284,7 @@ describe('location-mapper — BVA on line index (0-indexed, invariant #5)', () =
       row({ id: 'Function:src/a.ts:foo', name: 'foo', startLine: 1, endLine: 3, filePath: 'src/a.ts' }),
     ]);
     const result = await mapLocationToNodeId(loc('file:///repo/src/a.ts', 999), 'test-repo', deps);
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
   });
 });
 
@@ -560,7 +560,7 @@ describe('location-mapper — empty / error / defensive', () => {
       'test-repo',
       deps,
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
@@ -571,7 +571,7 @@ describe('location-mapper — empty / error / defensive', () => {
       'test-repo',
       { executeParameterized: execute },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
   });
 
   it('DB returns null (defensive) → NO_NODE', async () => {
@@ -581,7 +581,7 @@ describe('location-mapper — empty / error / defensive', () => {
       'test-repo',
       { executeParameterized: execute },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
   });
 
   it('DB returns non-array (defensive) → NO_NODE', async () => {
@@ -591,13 +591,13 @@ describe('location-mapper — empty / error / defensive', () => {
       'test-repo',
       { executeParameterized: execute },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
   });
 
   it('empty URI → NO_NODE', async () => {
     const { deps, execute } = makeDeps([]);
     const result = await mapLocationToNodeId(loc('', 0), 'test-repo', deps);
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -608,7 +608,51 @@ describe('location-mapper — empty / error / defensive', () => {
       'test-repo',
       deps,
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+});
+
+// ─── 0-edge diagnostic: NO_NODE carries a drop-reason discriminant ─────
+
+describe('location-mapper — dropReason discriminant (0-edge lever)', () => {
+  it('db-miss: in-repo path, empty graph → dropReason db-miss', async () => {
+    const { deps } = makeDeps([]);
+    const result = await mapLocationToNodeId(loc('file:///repo/src/x.ts', 3), 'r', deps);
+    expect(result).toEqual({ kind: 'NO_NODE', dropReason: 'db-miss' });
+  });
+
+  it('db-miss: rows returned but none cover the line → dropReason db-miss', async () => {
+    const { deps } = makeDeps([
+      row({ id: 'Function:src/a.ts:foo', name: 'foo', startLine: 1, endLine: 3, filePath: 'src/a.ts' }),
+    ]);
+    const result = await mapLocationToNodeId(loc('file:///repo/src/a.ts', 999), 'r', deps);
+    expect(result).toEqual({ kind: 'NO_NODE', dropReason: 'db-miss' });
+  });
+
+  it('db-miss: DB throws → dropReason db-miss (refuse over guess)', async () => {
+    const execute = vi.fn().mockRejectedValue(new Error('pool down'));
+    const result = await mapLocationToNodeId(loc('file:///repo/src/x.ts', 0), 'r', {
+      executeParameterized: execute,
+    });
+    expect(result).toEqual({ kind: 'NO_NODE', dropReason: 'db-miss' });
+  });
+
+  it('unmappable: non-integer line → dropReason unmappable (DB never hit)', async () => {
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(loc('file:///repo/src/x.ts', 1.5 as any), 'r', deps);
+    expect(result).toEqual({ kind: 'NO_NODE', dropReason: 'unmappable' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('unmappable: node_modules / .d.ts path → dropReason unmappable', async () => {
+    const { deps, execute } = makeDeps([]);
+    const result = await mapLocationToNodeId(
+      loc('file:///repo/node_modules/lodash/index.d.ts', 0),
+      'r',
+      deps,
+    );
+    expect(result).toEqual({ kind: 'NO_NODE', dropReason: 'unmappable' });
     expect(execute).not.toHaveBeenCalled();
   });
 });
@@ -787,7 +831,7 @@ describe('location-mapper — result contract', () => {
   it('NO_NODE has no nodeId field', async () => {
     const { deps } = makeDeps([]);
     const result = await mapLocationToNodeId(loc('file:///repo/src/x.ts', 0), 'test-repo', deps);
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).nodeId).toBeUndefined();
   });
 
@@ -913,7 +957,7 @@ describe('Python external-refusal seam (WI-5)', () => {
       'py-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'python' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     // DB should never be touched — refused before query.
     expect(execute).not.toHaveBeenCalled();
   });
@@ -950,7 +994,7 @@ describe('Python external-refusal seam (WI-5)', () => {
         normalizeFilePath: () => '/injected/absolute/builtins.py',
       },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     // DB must never be touched — isOutOfRepo guard fires before the MATCH.
     expect(execute).not.toHaveBeenCalled();
   });
@@ -966,7 +1010,7 @@ describe('Python external-refusal seam (WI-5)', () => {
       'py-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'python' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -981,7 +1025,7 @@ describe('Python external-refusal seam (WI-5)', () => {
       { ...deps, repoPath: repoRoot },
     );
     // Must be bare NO_NODE (no external flag) — TS path byte-identical to pre-WI-5
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1009,7 +1053,7 @@ describe('Python external-refusal seam (WI-5)', () => {
       },
     );
     // external:true is gated on adapterId === 'python'; classifyUri alone must not trigger it
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1025,7 +1069,7 @@ describe('Python external-refusal seam (WI-5)', () => {
         classifyUri: (u) => (u.startsWith('jdt://') ? 'external' : 'workspace'),
       },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1042,7 +1086,7 @@ describe('Python external-refusal seam (WI-5)', () => {
       // relPath = 'repo/types/api.d.ts' → isUnindexablePath → bare NO_NODE.
       { ...deps, adapterId: 'python' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1060,7 +1104,7 @@ describe('Python external-refusal seam (WI-5)', () => {
       'py-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'python' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1112,7 +1156,7 @@ describe('Python external-refusal seam (WI-5)', () => {
 
       // THEN the isUnindexablePath guard (line 581-587) fires: returns external:true
       // WITHOUT reaching the outer isOutOfRepo guard (lines 593-596).
-      expect(result).toEqual({ kind: 'NO_NODE', external: true });
+      expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
       // The DB must not be queried — the guard short-circuits before the MATCH.
       expect(execute).not.toHaveBeenCalled();
     });
@@ -1143,7 +1187,7 @@ describe('Python realpath-failure refusal — HARD gate (WI-5)', () => {
       { ...deps, repoPath: repoRoot, adapterId: 'python' },
     );
     // MUST be bare {NO_NODE} — NOT external:true
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1162,7 +1206,7 @@ describe('Python realpath-failure refusal — HARD gate (WI-5)', () => {
       { ...deps, repoPath: repoRoot, adapterId: 'python' },
     );
     // MUST be bare {NO_NODE} — NOT external:true
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1196,7 +1240,7 @@ describe('Python realpath-failure refusal — HARD gate (WI-5)', () => {
       { ...deps, ...mapperDeps },
     );
     // Must be external-refusal — the Mode-C external-refusal bucket fires.
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 });
@@ -1236,7 +1280,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'go-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'go' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1250,7 +1294,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'go-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'go' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1264,7 +1308,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'go-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'go' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1277,7 +1321,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'go-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'go' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1291,7 +1335,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'go-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'go' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1325,7 +1369,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'py-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'python' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1339,7 +1383,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       // No adapterId — TS funnel; external:true gate must NOT fire.
       { ...deps, repoPath: repoRoot },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1353,7 +1397,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'java-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'java' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1376,7 +1420,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       },
     );
     // classifyUri('gopls://...') = 'unmappable' → immediate bare NO_NODE (KD-3 block, no external:true).
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1393,7 +1437,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'go-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'go' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1408,7 +1452,7 @@ describe('isExternalRefusalAdapter — Go (adapterId=go)', () => {
       'py-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'python' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 });
@@ -1444,7 +1488,7 @@ describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
       'rust-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'rust' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1458,7 +1502,7 @@ describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
       'rust-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'rust' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1491,7 +1535,7 @@ describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
       'rust-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'rust' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1511,7 +1555,7 @@ describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
         classifyUri: (u: string) => (u.startsWith('file://') ? 'workspace' : 'unmappable'),
       },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1525,7 +1569,7 @@ describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
       'py-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'python' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1538,7 +1582,7 @@ describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
       'go-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'go' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE', external: true });
+    expect(result).toEqual({ kind: 'NO_NODE', external: true, dropReason: 'external' });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -1551,7 +1595,7 @@ describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
       'ts-repo',
       { ...deps, repoPath: repoRoot },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
@@ -1565,7 +1609,7 @@ describe('isExternalRefusalAdapter — Rust (adapterId=rust)', () => {
       'java-repo',
       { ...deps, repoPath: repoRoot, adapterId: 'java' },
     );
-    expect(result).toEqual({ kind: 'NO_NODE' });
+    expect(result).toMatchObject({ kind: 'NO_NODE' });
     expect((result as any).external).toBeUndefined();
     expect(execute).not.toHaveBeenCalled();
   });
