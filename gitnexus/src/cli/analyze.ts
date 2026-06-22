@@ -563,6 +563,10 @@ export const analyzeCommand = async (
       communities: pipelineResult.communityResult?.stats.totalCommunities,
       processes: pipelineResult.processResult?.stats.totalProcesses,
       embeddings: embeddingCount,
+      // Record whether this index was built with LSP augmentation so the
+      // freshness hook can preserve `--lsp` on auto-reanalyze (mirrors the
+      // `embeddings > 0` preservation). dry-run writes no edges → not marked.
+      lsp: options?.lsp === true,
     },
   };
   await saveMeta(storagePath, meta);

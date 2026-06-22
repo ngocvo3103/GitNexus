@@ -53,6 +53,29 @@ description: "Use when the user wants to know what will break if they change som
 | >15 symbols or many processes  | HIGH     |
 | Critical path (auth, payments) | CRITICAL |
 
+## Trusting the Edges (confidence + provenance)
+
+Each dependency carries a **confidence** and a **source** (provenance). Heuristic edges
+are tiered: same-file 0.95, import-scoped 0.90, **global 0.50** (ambiguous cross-module),
+external 0.35. A 0.50 caller might be real or spurious — the heuristic could not prove it.
+
+If the index was built with `analyze --lsp`, language-server edges read `source:
+lsp-confirmed | lsp-corrected` at **0.90**, and `lsp-recall` at a per-language confidence
+(0.90 default, but **TS 0.75 / Python 0.60** — deliberately lower where recall is less
+reliable). By default `impact` returns callers regardless of confidence (`minConfidence`
+defaults to 0), so a 0.50 heuristic caller is *shown but unproven*. Raising `minConfidence`
+is a trade-off: at 0.85 you keep confirmed/corrected edges but also drop TS/Python recall
+edges (0.75/0.60). (Depth `d=1/2/3` is a separate axis from confidence.) For high-stakes
+edits where a missed/wrong caller is costly, prefer an `--lsp` index, or use query-time LSP:
+
+```
+gitnexus_impact({target: "X", direction: "upstream", precision: "lsp"})
+→ augments the d=1 set via textDocument/references
+→ each entry tagged source: lsp | heuristic | both  (silently heuristic-only if no server)
+```
+
+See the **`gitnexus-lsp`** skill for the full provenance model.
+
 ## Tools
 
 **gitnexus_impact** — the primary tool for symbol blast radius:

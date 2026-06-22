@@ -21,8 +21,37 @@ Run from the project root. This parses all source files, builds the knowledge gr
 | -------------- | ---------------------------------------------------------------- |
 | `--force`      | Force full re-index even if up to date                           |
 | `--embeddings` | Enable embedding generation for semantic search (off by default) |
+| `--lsp`        | Augment CALLS resolution via the language server (TS/Java/Go/Python/Rust) — confirm/correct (0.90) + recall (per-language: 0.90 default, TS 0.75 / Python 0.60). Off by default. See `gitnexus-lsp`. |
 
-**When to run:** First time in a project, after major code changes, or when `gitnexus://repo/{name}/context` reports the index is stale. In Claude Code, a PostToolUse hook runs `analyze` automatically after `git commit` and `git merge`, preserving embeddings if previously generated.
+**When to run:** First time in a project, after major code changes, or when `gitnexus://repo/{name}/context` reports the index is stale. In Claude Code, a PostToolUse hook detects staleness after git commit/merge/rebase/pull and **prompts** you to re-run `analyze` (it suggests the command — including `--embeddings`/`--lsp` if the index used them — but does not run it for you).
+
+#### `--lsp` and its levers (opt-in, higher-accuracy call graph)
+
+`--lsp` re-checks the heuristic call graph against a real language server, raising
+trust on ambiguous edges and recovering missed callers. **Requires the matching
+server on `PATH`** (`jdtls`/`gopls`/`rust-analyzer`/`pylsp`/`typescript-language-server`);
+it silently no-ops if absent. Tuning levers — all require `--lsp`:
+`--lsp-budget <n>`, `--lsp-high-tier-sample <r>`, `--lsp-pipeline <n>`,
+`--lsp-changed-since <ref>`, `--lsp-cache`, `--lsp-dry-run`. Full guidance,
+provenance semantics, and per-language notes live in the **`gitnexus-lsp`** skill.
+
+> **Footgun:** re-running `analyze` *without* `--lsp` rebuilds the call graph heuristic-only
+> and drops confirm/correct/recall. (Unlike embeddings, which `analyze` auto-preserves, LSP
+> provenance is only re-derived when the server runs — so it cannot be auto-preserved without
+> `--lsp`.) If your index was built with `--lsp`, keep passing it; the freshness hook reads
+> `meta.json` `stats.lsp` and includes `--lsp` in the re-analyze command it suggests.
+
+### verify — Measure call-graph accuracy (Mode C)
+
+```bash
+npx gitnexus verify --lsp                    # heuristic vs LSP: precision + false-confident rate
+npx gitnexus verify --lsp --max-fc-rate 0.05 # CI gate: fail if false-confident rate > 5%
+npx gitnexus verify --lsp --strict           # boolean: fail only if the LSP server is unavailable
+npx gitnexus verify --lsp --calibrate        # recommend an --lsp-high-tier-sample rate
+```
+
+Compares confident heuristic CALLS edges to LSP go-to-definition. Without `--lsp` it does
+nothing; needs the language server installed. See `gitnexus-lsp` for interpreting the output.
 
 ### status — Check index freshness
 

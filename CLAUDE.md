@@ -115,6 +115,10 @@ This project is indexed by GitNexus as **GitNexus** (4802 symbols, 23060 relatio
 | d=2 | LIKELY AFFECTED — indirect deps | Should test |
 | d=3 | MAY NEED TESTING — transitive | Test if critical path |
 
+## Call-Graph Provenance (optional LSP)
+
+CALLS edges resolve via a tree-sitter **heuristic** by default. Each edge carries a `source`: `heuristic` (confidence tiered 0.95→0.50) or — only in an index built with `npx gitnexus analyze --lsp` — `lsp-confirmed` / `lsp-corrected` / `lsp-recall` (language-server-verified; confirmed/corrected 0.90, recall per-language — see the `gitnexus-lsp` skill). For high-stakes impact/rename where a wrong or missing caller is costly, prefer an `--lsp` index or pass `precision: "lsp"` to `gitnexus_impact` / `gitnexus_rename` (silently falls back to heuristic if no server). Read the `gitnexus-lsp` skill for setup, per-language servers, and tuning.
+
 ## Resources
 
 | Resource | Use for |
@@ -148,7 +152,9 @@ npx gitnexus analyze --embeddings
 
 To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.embeddings` field shows the count (0 means no embeddings). **Running analyze without `--embeddings` will delete any previously generated embeddings.**
 
-> Claude Code users: A PostToolUse hook handles this automatically after `git commit` and `git merge`.
+If the index was built with `--lsp` (`stats.lsp: true` in `meta.json`), keep passing `--lsp` — re-analyzing without it rebuilds the call graph heuristic-only and drops confirm/correct/recall provenance.
+
+> Claude Code users: A PostToolUse hook detects staleness after `git commit` / `git merge` and prompts you to re-run analyze, including `--embeddings` / `--lsp` in the suggested command when the prior index used them.
 
 ## CLI
 
@@ -158,6 +164,7 @@ To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.
 | Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
 | Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
 | Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Higher-accuracy call graph / LSP support | `.claude/skills/gitnexus/gitnexus-lsp/SKILL.md` |
 | Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 

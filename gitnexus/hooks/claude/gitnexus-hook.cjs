@@ -201,16 +201,21 @@ function handlePostToolUse(input) {
 
   let lastCommit = '';
   let hadEmbeddings = false;
+  let hadLsp = false;
   try {
     const meta = JSON.parse(fs.readFileSync(path.join(gitNexusDir, 'meta.json'), 'utf-8'));
     lastCommit = meta.lastCommit || '';
     hadEmbeddings = (meta.stats && meta.stats.embeddings > 0);
+    // Preserve LSP augmentation across reindex. Unlike embeddings (which analyze
+    // auto-preserves), LSP provenance is only re-derived by re-running with --lsp;
+    // omitting it would revert every CALLS edge to heuristic.
+    hadLsp = !!(meta.stats && meta.stats.lsp);
   } catch { /* no meta — treat as stale */ }
 
   // If HEAD matches last indexed commit, no reindex needed
   if (currentHead && currentHead === lastCommit) return;
 
-  const analyzeCmd = `npx gitnexus analyze${hadEmbeddings ? ' --embeddings' : ''}`;
+  const analyzeCmd = `npx gitnexus analyze${hadEmbeddings ? ' --embeddings' : ''}${hadLsp ? ' --lsp' : ''}`;
   sendHookResponse('PostToolUse',
     `GitNexus index is stale (last indexed: ${lastCommit ? lastCommit.slice(0, 7) : 'never'}). ` +
     `Run \`${analyzeCmd}\` to update the knowledge graph.`

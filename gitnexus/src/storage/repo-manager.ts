@@ -22,6 +22,9 @@ export interface RepoMeta {
     communities?: number;
     processes?: number;
     embeddings?: number;
+    /** True when the index was built with `analyze --lsp` (LSP-augmented call
+     *  graph). Lets the freshness hook preserve `--lsp` on auto-reanalyze. */
+    lsp?: boolean;
   };
 }
 

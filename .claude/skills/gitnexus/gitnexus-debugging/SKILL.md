@@ -72,6 +72,11 @@ MATCH path = (a)-[:CodeRelation {type: 'CALLS'}*1..2]->(b:Function {name: "valid
 RETURN [n IN nodes(path) | n.name] AS chain
 ```
 
+> Chasing a missed/wrong call edge? Check its provenance: edges read `r.source`
+> (`heuristic` | `lsp-confirmed` | `lsp-corrected` | `lsp-recall`) and `r.confidence`.
+> A low-confidence `heuristic` global edge (0.50) may be the bad link. An `--lsp` index
+> (skill `gitnexus-lsp`) corrects wrong targets and recalls missed callers.
+
 ## Example: "Payment endpoint returns 500 intermittently"
 
 ```
