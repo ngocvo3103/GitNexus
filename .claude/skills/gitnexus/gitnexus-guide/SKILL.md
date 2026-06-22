@@ -25,6 +25,7 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | Blast radius / "What breaks if I change X?"  | `gitnexus-impact-analysis`   |
 | Trace bugs / "Why is X failing?"             | `gitnexus-debugging`         |
 | Rename / extract / split / refactor          | `gitnexus-refactoring`       |
+| Higher-accuracy call graph / LSP support     | `gitnexus-lsp`               |
 | Tools, resources, schema reference           | `gitnexus-guide` (this file) |
 | Index, status, clean, wiki CLI commands      | `gitnexus-cli`               |
 
@@ -34,9 +35,9 @@ For any task involving code understanding, debugging, impact analysis, or refact
 | ---------------- | ------------------------------------------------------------------------ |
 | `query`          | Process-grouped code intelligence — execution flows related to a concept |
 | `context`        | 360-degree symbol view — categorized refs, processes it participates in  |
-| `impact`         | Symbol blast radius — what breaks at depth 1/2/3 with confidence         |
+| `impact`         | Symbol blast radius — what breaks at depth 1/2/3 with confidence (opt-in `precision:"lsp"` augments d=1 via LSP references) |
 | `detect_changes` | Git-diff impact — what do your current changes affect                    |
-| `rename`         | Multi-file coordinated rename with confidence-tagged edits               |
+| `rename`         | Multi-file coordinated rename with confidence-tagged edits (opt-in `precision:"lsp"` uses LSP rename)               |
 | `cypher`         | Raw graph queries (read `gitnexus://repo/{name}/schema` first)           |
 | `list_repos`     | Discover indexed repos                                                   |
 
@@ -58,7 +59,12 @@ Lightweight reads (~100-500 tokens) for navigation:
 **Nodes:** File, Function, Class, Interface, Method, Community, Process
 **Edges (via CodeRelation.type):** CALLS, IMPORTS, EXTENDS, IMPLEMENTS, DEFINES, MEMBER_OF, STEP_IN_PROCESS
 
+**Edge properties:** `type`, `confidence` (0–1), `reason`, `source`, `sourceLine`, `sourceCol`.
+`source` is the resolution provenance: `heuristic` (tree-sitter only) | `lsp-confirmed` |
+`lsp-corrected` | `lsp-recall` (the last three appear only in an index built with
+`analyze --lsp` — see `gitnexus-lsp`). Filter on it to trust the call graph:
+
 ```cypher
-MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(f:Function {name: "myFunc"})
-RETURN caller.name, caller.filePath
+MATCH (caller)-[r:CodeRelation {type: 'CALLS'}]->(f:Function {name: "myFunc"})
+RETURN caller.name, caller.filePath, r.source, r.confidence
 ```

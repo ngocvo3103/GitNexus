@@ -51,6 +51,12 @@ description: "Use when the user wants to review a pull request, understand what 
 | **Test coverage** | `impact({includeTests: true})` shows which tests touch changed code |
 | **Breaking changes** | d=1 upstream items that aren't updated in the PR = potential breakage |
 
+> **Trusting the blast radius:** heuristic cross-module callers resolve at low confidence
+> (0.50, `source: heuristic`). `impact` shows them by default (no confidence floor), but a
+> shown one may be a wrong guess — and a *real* caller the heuristic never found is simply
+> absent. For a high-stakes PR, add `precision: "lsp"` to `impact` (LSP-verified d=1 set), or
+> gate the branch with `npx gitnexus verify --lsp --max-fc-rate 0.05`. See `gitnexus-lsp`.
+
 ## Risk Assessment
 
 | Signal | Risk |

@@ -64,6 +64,10 @@ gitnexus_context({name: "validateUser"})
 → Processes: LoginFlow (step 2/5), TokenRefresh (step 1/3)
 ```
 
+> Callers/callees come from the heuristic call graph. If some look missing or wrong on
+> cross-module calls, an index built with `analyze --lsp` confirms/corrects/recalls those
+> edges (skill `gitnexus-lsp`).
+
 ## Example: "How does payment processing work?"
 
 ```
