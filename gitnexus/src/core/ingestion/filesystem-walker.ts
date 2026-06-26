@@ -73,6 +73,18 @@ export const walkRepositoryPaths = async (
     console.warn(`  Skipped ${skippedLarge} large files (>${MAX_FILE_SIZE / 1024}KB, likely generated/vendored)`);
   }
 
+  // Deterministic file order. `glob` v11 walks directories in parallel
+  // (path-scurry) and does NOT sort its output — two calls return the SAME set
+  // in a DIFFERENT order. That order propagates into symbol-table insertion
+  // order, so for any globally-ambiguous name `lookupFuzzy(name)[0]` (the
+  // first-inserted definition) can flip between runs, changing a CALLS edge's
+  // resolved target → the community-detection graph topology → the Leiden
+  // partition → MEMBER_OF / STEP_IN_PROCESS edge ids. Sorting here makes the
+  // whole downstream chain reproducible. This is the load-bearing determinism
+  // guarantee; the seeded RNG + node/edge sort in community-processor only fix
+  // the ORDER Leiden processes a fixed set, not the SET itself.
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
   return entries;
 };
 

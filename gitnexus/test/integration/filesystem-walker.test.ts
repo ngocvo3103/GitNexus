@@ -71,6 +71,26 @@ describe('filesystem-walker', () => {
       expect(onProgress).toHaveBeenCalled();
     });
 
+    // ─── Determinism guard (community-detection reproducibility) ──────
+    // `glob` v11 walks directories in parallel and does NOT sort its output,
+    // so two calls return the same SET in a DIFFERENT order. That order
+    // propagates into symbol-table insertion order, so for any globally
+    // ambiguous name `lookupFuzzy(name)[0]` can flip between runs, changing a
+    // CALLS edge's resolved target → the Leiden community partition →
+    // MEMBER_OF / STEP_IN_PROCESS edge ids. walkRepositoryPaths MUST return a
+    // deterministically-sorted list to keep the index reproducible.
+    it('returns paths in deterministic sorted order', async () => {
+      const a = await walkRepositoryPaths(tmpDir);
+      const b = await walkRepositoryPaths(tmpDir);
+      const pa = a.map(f => f.path);
+      const pb = b.map(f => f.path);
+      // Stable across repeated calls
+      expect(pa).toEqual(pb);
+      // Lexicographically sorted
+      const sorted = [...pa].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+      expect(pa).toEqual(sorted);
+    });
+
     // ─── Unhappy paths ────────────────────────────────────────────────
 
     it('throws or returns empty for non-existent directory', async () => {

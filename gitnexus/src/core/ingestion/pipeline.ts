@@ -51,6 +51,12 @@ export interface PipelineOptions {
   /** Skip MRO, community detection, and process extraction for faster test runs. */
   skipGraphPhases?: boolean;
   /**
+   * Run parse workers in parallel (default: true — opt-out). Set to false or
+   * pass GITNEXUS_PARALLEL_PARSE=0 env to force sequential. Useful for
+   * debugging or very memory-constrained environments.
+   */
+  parallelParse?: boolean;
+  /**
    * #50: when provided, unresolved imports whose package maps to an indexed
    * dependency repo create an external File node + CROSS_IMPORTS edge. When
    * omitted (the default), ingestion is single-repo and creates no external nodes.
@@ -109,6 +115,18 @@ export interface PipelineOptions {
      * the git/commit/clean-tree checks). Absent → no caching.
      */
     definitionCache?: DefinitionCache;
+    /**
+     * Adaptive early-bail. When true (default), the reconciler stops the
+     * per-candidate dispatch once it has probed LSP_EARLY_BAIL_SAMPLE
+     * candidates with ZERO resolutions — the server is demonstrably not
+     * resolving this repo (e.g. pylsp on a dynamic-Python tree), so the
+     * remaining probes would only add latency, not edges. Bailed candidates
+     * keep their heuristic edge (identical to probing-and-getting-empty under
+     * the 0-hit observation). `false` forces exhaustive probing. Only ever
+     * triggers on a strict 0/150 sample, so resolving repos are unaffected
+     * (byte-identical).
+     */
+    earlyBail?: boolean;
   };
 }
 
@@ -291,14 +309,17 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: 0, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
     });
 
-    // Don't spawn workers for tiny repos — overhead exceeds benefit
-    const MIN_FILES_FOR_WORKERS = 1000000;
-    const MIN_BYTES_FOR_WORKERS = 1024 * 1024 * 1024;  // 512KB threshold
+    // Don't spawn workers for tiny repos — overhead exceeds benefit.
+    // Default ON (opt-out). Disable via GITNEXUS_PARALLEL_PARSE=0 env or
+    // options.parallelParse===false (--no-parallel-parse CLI flag).
+    const PARALLEL_PARSE_ENABLED = options?.parallelParse !== false && process.env.GITNEXUS_PARALLEL_PARSE !== '0';
+    const MIN_FILES_FOR_WORKERS = 100;
+    const MIN_BYTES_FOR_WORKERS = 512 * 1024;  // 512KB threshold
     const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
 
     // Create worker pool once, reuse across chunks
     let workerPool: WorkerPool | undefined;
-    if (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS) {
+    if (PARALLEL_PARSE_ENABLED && (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS)) {
       try {
         let workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
         // When running under vitest, import.meta.url points to src/ where no .js exists.
@@ -312,7 +333,9 @@ export const runPipelineFromRepo = async (
         }
         workerPool = createWorkerPool(workerUrl);
       } catch (err) {
-        if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
+        // Unconditional user-visible warn: we WANTED workers (above threshold) but
+        // couldn't spawn them. Not emitted for the normal under-threshold sequential path.
+        console.warn(`  Parallel parse unavailable, falling back to sequential (slower): ${(err as Error).message}`);
       }
     }
 
@@ -362,12 +385,20 @@ export const runPipelineFromRepo = async (
     const javaExternalFqnIndex: Map<string, Map<string, string>> | undefined =
       options?.lsp?.enabled ? new Map() : undefined;
 
+    // ADR-002 Lever 10: pythonExternalFqnIndex — same lifecycle as javaExternalFqnIndex.
+    // Allocated ONLY under the lsp gate; absent on the default analyze path (I-9).
+    // Maps filePath → boundName → module (e.g. 'np' → 'numpy', 'getcwd' → 'os').
+    // Populated by both import-processor paths; consumed by both call-processor paths.
+    const pythonExternalFqnIndex: Map<string, Map<string, string>> | undefined =
+      options?.lsp?.enabled ? new Map() : undefined;
+
     const lspFeedsOpt: ProcessCallsOpts | undefined = options?.lsp?.enabled
       ? {
           lsp: true,
           correctionFeed,
           recallFeed,
           javaExternalFqnIndex,
+          pythonExternalFqnIndex,
           highTierSampleRate: options.lsp.highTierSampleRate,
         }
       : undefined;
@@ -392,6 +423,9 @@ export const runPipelineFromRepo = async (
       ? { lsp: true, heritageFeed }
       : undefined;
 
+    // TEMP perf split (GITNEXUS_PHASE_TIMING): accumulate per-step wall time.
+    const _pt = process.env.GITNEXUS_PHASE_TIMING === '1';
+    let _tParse = 0, _tImp = 0, _tHer = 0, _tCall = 0;
     try {
       for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
         const chunkPaths = chunks[chunkIdx];
@@ -403,6 +437,7 @@ export const runPipelineFromRepo = async (
           .map(p => ({ path: p, content: chunkContents.get(p)! }));
 
         // Parse this chunk (workers or sequential fallback)
+        const _sP = _pt ? Date.now() : 0;
         const chunkWorkerData = await processParsing(
           graph, chunkFiles, symbolTable, astCache,
           (current, _total, filePath) => {
@@ -418,12 +453,32 @@ export const runPipelineFromRepo = async (
           },
           workerPool,
         );
+        if (_pt) _tParse += Date.now() - _sP;
 
         const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
 
-        if (workerPool && chunkWorkerData) {
-          // Worker path: use extracted data for imports, heritage, calls, routes
-          // Imports
+        if (workerPool && chunkWorkerData && !chunkWorkerData.workerFailed) {
+          // Worker path (parallel parse, default ON): parallel-parse-only lossless strategy.
+          //
+          // Workers extract nodes/symbols (stored directly in graph/symbolTable by
+          // processParsingWithWorkers). Import edges are resolved here from the extracted
+          // data — those paths are symbolTable-independent and already correct.
+          //
+          // CALLS and HERITAGE are intentionally NOT resolved from extracted data.
+          // The worker's buildTypeEnv() runs without symbolTable/parentMap/importedReturnTypes,
+          // so the extracted receiverTypeName is degraded and would lose ~473 CALLS edges vs
+          // the sequential baseline. Heritage resolution also needs the full globalParentMap
+          // that processCalls builds internally.
+          //
+          // Instead, we push chunkPaths to sequentialChunkPaths so the existing sequential
+          // re-parse path (processHeritage + processCalls below) resolves both with the
+          // complete context — edge-ID-identical to the baseline by construction.
+          //
+          // Net effect: parallel parse (fast) + sequential resolution (correct).
+
+          // Imports: resolve from extracted data (namedImportMap, IMPORTS edges).
+          // This populates ctx so the sequential call resolution pass has import context.
+          const _sI = _pt ? Date.now() : 0;
           await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
             onProgress({
               phase: 'parsing',
@@ -432,62 +487,13 @@ export const runPipelineFromRepo = async (
               detail: `${current}/${total} files`,
               stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
             });
-          }, repoPath, importCtx, options?.crossRepoRegistry, javaExternalFqnIndex);
-          // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
-          // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
-          // and the single-threaded event loop prevents races between synchronous addRelationship calls.
+          }, repoPath, importCtx, options?.crossRepoRegistry, javaExternalFqnIndex, pythonExternalFqnIndex);
+          if (_pt) _tImp += Date.now() - _sI;
 
-          // Heritage MUST run before calls: IMPLEMENTS edges (from heritage) are needed
-          // for D5 call resolution to work correctly. Call resolution depends on
-          // interface/implementation edges being established first.
-          await processHeritageFromExtracted(
-            graph,
-            chunkWorkerData.heritage,
-            ctx,
-            (current, total) => {
-              onProgress({
-                phase: 'parsing',
-                percent: Math.round(chunkBasePercent),
-                message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
-                detail: `${current}/${total} records`,
-                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-              });
-            },
-            lspHeritageOpt,
-          );
+          // Calls + Heritage + Routes: deferred to sequential re-parse path (lossless).
+          sequentialChunkPaths.push(chunkPaths);
+          sequentialChunkRoutes.push(chunkWorkerData.routes ?? []);
 
-          await processCallsFromExtracted(
-            graph,
-            chunkWorkerData.calls,
-            ctx,
-            (current, total) => {
-              onProgress({
-                phase: 'parsing',
-                percent: Math.round(chunkBasePercent),
-                message: `Resolving calls (chunk ${chunkIdx + 1}/${numChunks})...`,
-                detail: `${current}/${total} files`,
-                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-              });
-            },
-            chunkWorkerData.constructorBindings,
-            undefined, // typeEnvBindings — not used in the worker path
-            lspFeedsOpt,
-          );
-
-          await processRoutesFromExtracted(
-            graph,
-            chunkWorkerData.routes ?? [],
-            ctx,
-            (current, total) => {
-              onProgress({
-                phase: 'parsing',
-                percent: Math.round(chunkBasePercent),
-                message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
-                detail: `${current}/${total} routes`,
-                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-              });
-            },
-          );
           // Accumulate expoNavCalls and ormQueries for post-processing after all chunks
           if (chunkWorkerData.expoNavCalls) {
             allExpoNavCalls.push(...chunkWorkerData.expoNavCalls);
@@ -503,6 +509,12 @@ export const runPipelineFromRepo = async (
           if (chunkWorkerData.angularMetadata) {
             allAngularMetadata.push(...chunkWorkerData.angularMetadata);
           }
+          // #31: Angular CALLS extracted by the worker parsing pass.
+          // General calls are deferred to the sequential re-parse path;
+          // chunkWorkerData.calls carries ONLY Angular DI/template calls here.
+          if (chunkWorkerData.calls && chunkWorkerData.calls.length > 0) {
+            allSequentialCalls.push(...chunkWorkerData.calls);
+          }
           // Accumulate fetchCalls for post-processing
           if (chunkWorkerData.fetchCalls) {
             allFetchCalls.push(...chunkWorkerData.fetchCalls);
@@ -512,9 +524,10 @@ export const runPipelineFromRepo = async (
             allToolDefs.push(...chunkWorkerData.toolDefs);
           }
         } else {
+          if (chunkWorkerData?.workerFailed) workerPool = undefined; // dead worker — stop re-dispatching to a broken pool
           // Sequential path: processImports adds symbols, then heritage/calls are resolved
           // in the sequential fallback loop below (lines 351-365)
-          await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths, options?.crossRepoRegistry, javaExternalFqnIndex);
+          await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths, options?.crossRepoRegistry, javaExternalFqnIndex, pythonExternalFqnIndex);
           sequentialChunkPaths.push(chunkPaths);
           sequentialChunkRoutes.push(chunkWorkerData.routes ?? []);
           // Accumulate expoNavCalls and ormQueries for sequential path too
@@ -554,6 +567,9 @@ export const runPipelineFromRepo = async (
       }
     } finally {
       await workerPool?.terminate();
+    }
+    if (_pt) {
+      console.warn(`  [phase-timing] parse=${(_tParse / 1000).toFixed(1)}s imports=${(_tImp / 1000).toFixed(1)}s heritage=${(_tHer / 1000).toFixed(1)}s calls=${(_tCall / 1000).toFixed(1)}s`);
     }
 
     // Sequential fallback chunks: re-read source for call/heritage resolution
@@ -897,10 +913,16 @@ export const runPipelineFromRepo = async (
       // dryRun).
       const locations = new Map<string, Location[]>();
 
+      // Distinct 'lsp' phase (not 'parsing') so the CLI labels this window
+      // "LSP augmentation (Ns)" instead of "Parsing code (Ns)". The whole
+      // warm-up + per-candidate dispatch runs under this single emit (the
+      // reconciler issues no progress callbacks), and the CLI's 1s elapsed
+      // timer keeps the seconds ticking — so a long pylsp/jdtls run reads as
+      // a named, live phase rather than a hung parser.
       onProgress({
-        phase: 'parsing',
+        phase: 'lsp',
         percent: 80,
-        message: dryRun ? 'LSP dry-run: resolving candidates...' : 'LSP reconciliation: resolving candidates...',
+        message: dryRun ? 'LSP dry-run: resolving candidates...' : 'LSP augmentation: resolving call graph via language server (first run can take a while)...',
         stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
       });
 
@@ -1000,6 +1022,9 @@ export const runPipelineFromRepo = async (
           maxInFlight: options?.lsp?.pipeline,
           // Lever 14: persisted definition cache (undefined → no caching).
           definitionCache: options?.lsp?.definitionCache,
+          // Adaptive early-bail (default on): stop probing once a 0/150 sample
+          // shows the server resolves nothing for this repo. undefined → on.
+          earlyBail: options?.lsp?.earlyBail,
           // WI-8: external pre-filter. Uses graph.getNode(oldTargetId)
           // to detect correction candidates whose heuristic target is
           // an external-zone node (NodeProperties.isExternal===true).
@@ -1066,6 +1091,22 @@ export const runPipelineFromRepo = async (
           onGateFailure: (reason, elapsedS) => {
             gateFailureReason = reason;
             gateFailureElapsedS = elapsedS;
+          },
+          onHeartbeat: (elapsedMs) => {
+            onProgress({
+              phase: 'lsp',
+              percent: 80,
+              message: `LSP: waiting for ${lspAdapter?.serverBinary ?? 'server'} to index… ${Math.round(elapsedMs / 1000)}s`,
+              stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+            });
+          },
+          onCandidateProgress: (done, total) => {
+            onProgress({
+              phase: 'lsp',
+              percent: Math.round(80 + (done / total) * 10),
+              message: `LSP: resolved ${done}/${total} candidates`,
+              stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+            });
           },
         },
       );

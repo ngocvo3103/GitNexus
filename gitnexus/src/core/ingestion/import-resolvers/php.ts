@@ -26,11 +26,13 @@ function getSortedPsr4(config: ComposerConfig): readonly [string, string][] {
  * a file. When PSR-4 class-style resolution fails, we fall back to scanning
  * .php files in the namespace directory.
  *
- * NOTE: The function-import fallback returns the first matching .php file in the
- * namespace directory. When multiple files exist in the same namespace directory,
- * resolution is non-deterministic (depends on Set/index iteration order). This is
- * a known limitation — PHP function imports cannot be resolved to a specific file
- * without parsing all candidate files.
+ * Order-independent disambiguation: when multiple .php files live in the same
+ * namespace directory, we pick the file that actually DEFINES the imported
+ * symbol, using `definesSymbol` (backed by the SymbolTable populated by the
+ * parsing phase). This is resolved from symbol definitions, not file-walk
+ * order, so the result no longer depends on which file was indexed first.
+ * Only when no candidate defines the symbol (or no symbol table is available)
+ * do we fall back to the first matching .php file in the directory.
  */
 export function resolvePhpImportInternal(
   importPath: string,
@@ -39,6 +41,7 @@ export function resolvePhpImportInternal(
   normalizedFileList: string[],
   allFileList: string[],
   index?: SuffixIndex,
+  definesSymbol?: (filePath: string, name: string) => boolean,
 ): string | null {
   // Normalize: replace backslashes with forward slashes
   const normalized = importPath.replace(/\\/g, '/');
@@ -62,8 +65,9 @@ export function resolvePhpImportInternal(
         }
 
         // 2. Function/constant fallback: strip last segment (symbol name), scan namespace directory.
-        //    e.g. App\Models\getUser → directory app/Models/, find first .php file in that dir.
+        //    e.g. App\Models\getUser → symbol "getUser" in directory app/Models/.
         const lastSlash = remainder.lastIndexOf('/');
+        const symbolName = lastSlash >= 0 ? remainder.slice(lastSlash + 1) : remainder;
         const nsDir = lastSlash >= 0
           ? dirPrefix + '/' + remainder.slice(0, lastSlash)
           : dirPrefix;
@@ -71,16 +75,27 @@ export function resolvePhpImportInternal(
         // Prefer SuffixIndex directory lookup (O(log n + matches)) over linear scan
         if (index) {
           const candidates = index.getFilesInDir(nsDir, '.php');
-          if (candidates.length > 0) return candidates[0];
+          if (candidates.length > 0) {
+            // Order-independent: pick the candidate that actually defines the symbol.
+            if (definesSymbol && symbolName) {
+              const defining = candidates.find(f => definesSymbol(f, symbolName));
+              if (defining) return defining;
+            }
+            return candidates[0];
+          }
         }
 
         // Fallback: linear scan (only when SuffixIndex unavailable)
         const nsDirPrefix = nsDir.endsWith('/') ? nsDir : nsDir + '/';
+        let firstInDir: string | null = null;
         for (const f of allFiles) {
           if (f.startsWith(nsDirPrefix) && f.endsWith('.php') && !f.slice(nsDirPrefix.length).includes('/')) {
-            return f;
+            // Order-independent: prefer the file that defines the symbol.
+            if (definesSymbol && symbolName && definesSymbol(f, symbolName)) return f;
+            if (firstInDir === null) firstInDir = f;
           }
         }
+        if (firstInDir !== null) return firstInDir;
       }
     }
   }
@@ -96,6 +111,6 @@ export function resolvePhpImport(
   _filePath: string,
   ctx: ResolveCtx,
 ): ImportResult {
-  const resolved = resolvePhpImportInternal(rawImportPath, ctx.configs.composerConfig, ctx.allFilePaths, ctx.normalizedFileList, ctx.allFileList, ctx.index);
+  const resolved = resolvePhpImportInternal(rawImportPath, ctx.configs.composerConfig, ctx.allFilePaths, ctx.normalizedFileList, ctx.allFileList, ctx.index, ctx.definesSymbol);
   return resolved ? { kind: 'files', files: [resolved] } : null;
 }
