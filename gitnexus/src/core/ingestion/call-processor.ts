@@ -337,6 +337,76 @@ export const processCalls = async (
   const logSkipped = isVerboseIngestionEnabled();
   const skippedByLang = logSkipped ? new Map<string, number>() : null;
 
+  // ── Property pre-pass: register all field/property symbols (ownerId + declaredType)
+  //    into the SymbolTable BEFORE the per-file call-resolution loop below.
+  //
+  //    WHY: properties (Ruby `attr_*`) are emitted via the `properties` call-route and,
+  //    historically, were registered into the SymbolTable inside the same per-file loop
+  //    that resolves calls. That makes field-type disambiguation order-dependent: a
+  //    `user.address.save` chain in service.rb resolves `user.address` by looking up the
+  //    `address` field on class User — but if service.rb is processed before user.rb (e.g.
+  //    under the deterministic lexicographic file sort), the `address` field is not yet in
+  //    `fieldByOwner`, the chain breaks, and `.save` falls back to the receiver type
+  //    (User#save) instead of the field type (Address#save). Registering every property
+  //    up-front makes `fieldByOwner` complete when any chain is walked, so resolution is
+  //    file-order-independent by construction. This mirrors the existing deferral done for
+  //    write-access (`pendingWrites`) for the same mid-loop-registration reason.
+  //
+  //    Only Ruby's callRouter produces `kind: 'properties'`, so this loop is a no-op for
+  //    every other language. Graph node/edge emission for properties is intentionally LEFT
+  //    in the main loop (unchanged emission order → byte-identical edge ids); this pre-pass
+  //    touches the SymbolTable only.
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    if (i % 20 === 0) await yieldToEventLoop();
+    const language = getLanguageFromFilename(file.path);
+    if (!language) continue;
+    if (!isLanguageAvailable(language)) continue;
+    const provider = getProvider(language);
+    if (!provider.callRouter) continue;
+    const queryStr = provider.treeSitterQueries;
+    if (!queryStr) continue;
+    await loadLanguage(language, file.path);
+
+    let tree = astCache.get(file.path);
+    if (!tree) {
+      try {
+        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+      } catch {
+        continue;
+      }
+      astCache.set(file.path, tree);
+    }
+
+    let matches;
+    try {
+      const lang = parser.getLanguage();
+      const query = new Parser.Query(lang, queryStr);
+      matches = query.matches(tree.rootNode);
+    } catch {
+      continue;
+    }
+
+    for (const match of matches) {
+      const captureMap: Record<string, any> = {};
+      match.captures.forEach(c => captureMap[c.name] = c.node);
+      const callNode = captureMap['call'];
+      if (!callNode) continue;
+      const nameNode = captureMap['call.name'];
+      if (!nameNode) continue;
+      const routed = provider.callRouter(nameNode.text, callNode);
+      if (!routed || routed.kind !== 'properties') continue;
+      const propEnclosingClassId = findEnclosingClassId(callNode, file.path);
+      for (const item of routed.items) {
+        const nodeId = generateId('Property', `${file.path}:${item.propName}`);
+        ctx.symbols.add(file.path, item.propName, nodeId, 'Property', {
+          ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
+          ...(item.declaredType ? { declaredType: item.declaredType } : {}),
+        });
+      }
+    }
+  }
+
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     onProgress?.(i + 1, files.length);
@@ -507,10 +577,10 @@ export const processCalls = async (
                   description: item.accessorType,
                 },
               });
-              ctx.symbols.add(file.path, item.propName, nodeId, 'Property', {
-                ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
-                ...(item.declaredType ? { declaredType: item.declaredType } : {}),
-              });
+              // Symbol-table registration (ownerId + declaredType) is done in the
+              // property pre-pass above so `fieldByOwner` is complete before any call
+              // is resolved — see the pre-pass comment for the order-dependence rationale.
+              // Only the graph node/edge emission stays here, preserving edge-id order.
               const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
               graph.addRelationship({
                 id: relId, sourceId: fileId, targetId: nodeId,

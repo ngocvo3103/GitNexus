@@ -40,6 +40,16 @@ export interface ImportResolutionContext {
 /** Full context for import resolution: file lookups + language configs. */
 export interface ResolveCtx extends ImportResolutionContext {
   configs: ImportConfigs;
+  /**
+   * Optional: returns true iff `filePath` defines a symbol named `name`.
+   * Backed by the SymbolTable populated by the parsing phase (which runs
+   * before import resolution). Lets a resolver disambiguate which file in a
+   * namespace directory actually defines an imported function/constant —
+   * making resolution order-INDEPENDENT instead of "first file wins".
+   * Absent on resolution paths that have no symbol table yet; resolvers must
+   * treat `undefined` as "no symbol info" and fall back gracefully.
+   */
+  definesSymbol?: (filePath: string, name: string) => boolean;
 }
 
 /** Per-language import resolver -- function alias matching ExportChecker/CallRouter pattern. */

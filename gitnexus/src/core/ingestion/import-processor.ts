@@ -350,7 +350,8 @@ export const processImports = async (
 
   // Load language-specific configs once before the file loop
   const configs = await loadImportConfigs(repoRoot || '');
-  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache, configs };
+  const definesSymbol = (fp: string, name: string) => ctx.symbols.lookupExact(fp, name) !== undefined;
+  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache, configs, definesSymbol };
   const { addImportEdge, addImportGraphEdge, getResolvedCount } = createImportEdgeHelpers(graph, importMap);
 
   for (let i = 0; i < files.length; i++) {
@@ -542,7 +543,8 @@ export const processImportsFromExtracted = async (
   let totalImportsFound = 0;
 
   const configs = await loadImportConfigs(repoRoot || '');
-  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache, configs };
+  const definesSymbol = (fp: string, name: string) => ctx.symbols.lookupExact(fp, name) !== undefined;
+  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache, configs, definesSymbol };
   const { addImportEdge, addImportGraphEdge, getResolvedCount } = createImportEdgeHelpers(graph, importMap);
 
   // Group by file for progress reporting (users see file count, not import count)
