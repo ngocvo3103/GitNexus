@@ -44,6 +44,9 @@ import {
   getDefinitionNodeFromCaptures,
   findEnclosingClassId,
   extractMethodSignature,
+  isPythonClassMethod,
+  isKotlinClassMethod,
+  isCppInsideClassOrStruct,
 } from '../utils/ast-helpers.js';
 import {
   countCallArguments,
@@ -297,7 +300,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: 'DEFINES' | 'HAS_METHOD';
+  type: 'DEFINES' | 'HAS_METHOD' | 'HAS_PROPERTY';
   confidence: number;
   reason: string;
 }
@@ -589,7 +592,7 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
 // Label detection from capture map
 // ============================================================================
 
-const getLabelFromCaptures = (captureMap: Record<string, any>): string | null => {
+const getLabelFromCaptures = (captureMap: Record<string, any>, language?: string): string | null => {
   // Skip imports (handled separately) and calls
   if (captureMap['import'] || captureMap['call']) return null;
   if (!captureMap['name']) return null;
@@ -603,7 +606,14 @@ const getLabelFromCaptures = (captureMap: Record<string, any>): string | null =>
     return 'CodeElement';
   }
 
-  if (captureMap['definition.function']) return 'Function';
+  if (captureMap['definition.function']) {
+    // Mirror the language-provider labelOverride logic so node labels match
+    // the sequential (parsing-processor) path exactly.
+    if (language === 'python' && isPythonClassMethod(captureMap['definition.function'])) return 'Method';
+    if (language === 'kotlin' && isKotlinClassMethod(captureMap['definition.function'])) return 'Method';
+    if ((language === 'c' || language === 'cpp') && isCppInsideClassOrStruct(captureMap['definition.function'])) return null;
+    return 'Function';
+  }
   if (captureMap['definition.class']) return 'Class';
   if (captureMap['definition.interface']) return 'Interface';
   if (captureMap['definition.method']) return 'Method';
@@ -2639,11 +2649,12 @@ const processFileGroup = (
                     reason: '',
                   });
                   if (propEnclosingClassId) {
+                    // Property nodes use HAS_PROPERTY (mirrors parsing-processor.ts:726)
                     result.relationships.push({
-                      id: generateId('HAS_METHOD', `${propEnclosingClassId}->${nodeId}`),
+                      id: generateId('HAS_PROPERTY', `${propEnclosingClassId}->${nodeId}`),
                       sourceId: propEnclosingClassId,
                       targetId: nodeId,
-                      type: 'HAS_METHOD',
+                      type: 'HAS_PROPERTY',
                       confidence: 1.0,
                       reason: '',
                     });
@@ -2792,7 +2803,7 @@ const processFileGroup = (
         }
       }
 
-      const nodeLabel = getLabelFromCaptures(captureMap);
+      const nodeLabel = getLabelFromCaptures(captureMap, language);
       if (!nodeLabel) continue;
 
       const nameNode = captureMap['name'];
@@ -2946,13 +2957,15 @@ const processFileGroup = (
         reason: '',
       });
 
-      // ── HAS_METHOD: link method/constructor/property to enclosing class ──
+      // ── HAS_METHOD / HAS_PROPERTY: link member to enclosing class ──
+      // Mirror parsing-processor.ts: Property nodes use HAS_PROPERTY; all others use HAS_METHOD.
       if (enclosingClassId) {
+        const memberEdgeType = nodeLabel === 'Property' ? 'HAS_PROPERTY' : 'HAS_METHOD';
         result.relationships.push({
-          id: generateId('HAS_METHOD', `${enclosingClassId}->${nodeId}`),
+          id: generateId(memberEdgeType, `${enclosingClassId}->${nodeId}`),
           sourceId: enclosingClassId,
           targetId: nodeId,
-          type: 'HAS_METHOD',
+          type: memberEdgeType,
           confidence: 1.0,
           reason: '',
         });
