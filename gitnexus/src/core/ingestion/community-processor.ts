@@ -24,6 +24,32 @@ const leidenPath = resolve(__dirname, '..', '..', '..', 'vendor', 'leiden', 'ind
 const _require = createRequire(import.meta.url);
 const leiden = _require(leidenPath);
 
+/**
+ * Deterministic PRNG (mulberry32) so Leiden's randomized node-move order is
+ * reproducible. Fresh instance per run from a fixed seed → identical partition
+ * + identical comm_N numbering every run. Replaces the default Math.random,
+ * which made symbol→community MEMBER_OF edges nondeterministic.
+ */
+function makeSeededRng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** FNV-1a → positive 31-bit int. Used for content-derived community numbering. */
+function fnv1a31(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) & 0x7fffffff;
+}
+
 // ============================================================================
 // TYPES
 // ============================================================================
@@ -124,6 +150,11 @@ export const processCommunities = async (
       Promise.resolve((leiden as any).detailed(graph, {
         resolution: isLarge ? 2.0 : 1.0,
         maxIterations: isLarge ? 3 : 0,
+        // Deterministic RNG (default was Math.random) so the partition AND the
+        // comm_N numbering reproduce run-to-run. Without this the symbol→community
+        // MEMBER_OF edges churned by ~1500/run, producing phantom detect_changes
+        // diffs and making any "lossless" verification impossible.
+        rng: makeSeededRng(0x6e657875),
       })),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error('Leiden timeout')), LEIDEN_TIMEOUT_MS)
@@ -142,6 +173,27 @@ export const processCommunities = async (
   }
 
   onProgress?.(`Found ${details.count} communities...`, 60);
+
+  // Content-derived community numbering: number each community by a hash of its
+  // lexicographically-smallest member id. Each community's id depends ONLY on its
+  // own members, so a residual partition difference (Leiden is not 100% reproducible
+  // even seeded) churns just the affected communities — it never cascades the way a
+  // sequential renumber does (which reshuffled every later community's id → ~1684
+  // MEMBER_OF + ~1000 STEP_IN_PROCESS churn/run). Distinct communities have distinct
+  // smallest members → distinct ids (hash collisions ~0 for a few hundred communities).
+  {
+    const rawCommunities = details.communities as Record<string, number>;
+    const minMemberByComm = new Map<number, string>();
+    for (const [nodeId, num] of Object.entries(rawCommunities)) {
+      const cur = minMemberByComm.get(num);
+      if (cur === undefined || nodeId < cur) minMemberByComm.set(num, nodeId);
+    }
+    const remap = new Map<number, number>();
+    for (const [num, minMember] of minMemberByComm) remap.set(num, fnv1a31(minMember));
+    const canonical: Record<string, number> = {};
+    for (const [nodeId, num] of Object.entries(rawCommunities)) canonical[nodeId] = remap.get(num)!;
+    details.communities = canonical;
+  }
 
   // Step 3: Create community nodes with heuristic labels
   const communityNodes = createCommunityNodes(
@@ -204,28 +256,36 @@ const buildGraphologyGraph = (knowledgeGraph: KnowledgeGraph, isLarge: boolean):
     nodeDegree.set(rel.targetId, (nodeDegree.get(rel.targetId) || 0) + 1);
   });
 
+  // Insert nodes + edges in a STABLE (id-sorted) order. graphology iterates in
+  // insertion order, and Leiden's result depends on that order — so a
+  // nondeterministic build order (parallel/async ingestion) produced a different
+  // partition each run. Sorting makes the partition reproducible (with the seeded
+  // rng above), killing the ~1500/run symbol→community MEMBER_OF churn.
+  const nodesToAdd: Array<{ id: string; name: unknown; filePath: unknown; type: NodeLabel }> = [];
   knowledgeGraph.forEachNode(node => {
     if (!symbolTypes.has(node.label) || !connectedNodes.has(node.id)) return;
     // For large graphs, skip degree-1 nodes — they just become singletons or
     // get absorbed into their single neighbor's community, but cost iteration time.
     if (isLarge && (nodeDegree.get(node.id) || 0) < 2) return;
-
-    graph.addNode(node.id, {
-      name: node.properties.name,
-      filePath: node.properties.filePath,
-      type: node.label,
-    });
+    nodesToAdd.push({ id: node.id, name: node.properties.name, filePath: node.properties.filePath, type: node.label });
   });
+  nodesToAdd.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  for (const n of nodesToAdd) {
+    graph.addNode(n.id, { name: n.name, filePath: n.filePath, type: n.type });
+  }
 
+  const edgesToAdd: Array<[string, string]> = [];
   knowledgeGraph.forEachRelationship(rel => {
     if (!clusteringRelTypes.has(rel.type)) return;
     if (isLarge && rel.confidence < MIN_CONFIDENCE_LARGE) return;
     if (graph.hasNode(rel.sourceId) && graph.hasNode(rel.targetId) && rel.sourceId !== rel.targetId) {
-      if (!graph.hasEdge(rel.sourceId, rel.targetId)) {
-        graph.addEdge(rel.sourceId, rel.targetId);
-      }
+      edgesToAdd.push([rel.sourceId, rel.targetId]);
     }
   });
+  edgesToAdd.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+  for (const [s, t] of edgesToAdd) {
+    if (!graph.hasEdge(s, t)) graph.addEdge(s, t);
+  }
 
   return graph;
 };

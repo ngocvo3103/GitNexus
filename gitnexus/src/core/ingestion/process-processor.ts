@@ -128,9 +128,17 @@ export const processProcesses = async (
   
   onProgress?.(`Deduped ${uniqueTraces.length} → ${endpointDeduped.length} unique endpoint pairs`, 70);
   
-  // Step 4: Limit to max processes (prioritize longer traces)
+  // Step 4: Limit to max processes (prioritize longer traces). Total-order sort:
+  // length desc, then full-path lexicographic tie-break — so the proc_<idx>
+  // numbering (and thus STEP_IN_PROCESS ids) is stable run-to-run. The bare
+  // `b.length - a.length` left equal-length traces in unstable input order,
+  // churning ~180 STEP_IN_PROCESS edges per run (phantom detect_changes diffs).
   const limitedTraces = endpointDeduped
-    .sort((a, b) => b.length - a.length)
+    .sort((a, b) => {
+      if (b.length !== a.length) return b.length - a.length;
+      const aj = a.join(''), bj = b.join('');
+      return aj < bj ? -1 : aj > bj ? 1 : 0;
+    })
     .slice(0, cfg.maxProcesses);
   
   onProgress?.(`Creating ${limitedTraces.length} process nodes...`, 80);
