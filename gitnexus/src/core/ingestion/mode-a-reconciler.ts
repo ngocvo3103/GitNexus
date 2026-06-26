@@ -60,7 +60,7 @@ import type { DiscoveredServers } from './lsp/server-discovery.js';
 import type { GraphRelationship, KnowledgeGraph, EdgeSource } from '../graph/types.js';
 import { CALLABLE_SYMBOL_TYPES } from './call-processor.js';
 import { generateId } from '../../lib/utils.js';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { isAbsolute as pathIsAbsolute, resolve as pathResolve } from 'node:path';
 
 // ─── Public types ──────────────────────────────────────────────────────
@@ -155,6 +155,15 @@ export interface SessionMeta {
    * entered the dispatch loop). Populated before calling the work fn.
    */
   preFilteredExternal: number;
+  /**
+   * Count of candidates skipped because adaptive early-bail had already
+   * tripped (LSP_EARLY_BAIL_SAMPLE probed with 0 resolutions). These keep
+   * their heuristic edge — identical to probing-and-getting-empty under the
+   * observed 0-hit rate. 0 when bail never triggers (the common case).
+   */
+  bailed?: number;
+  /** True once early-bail tripped during this session. */
+  earlyBailed?: boolean;
 }
 
 /**
@@ -283,6 +292,14 @@ export interface WithReconciliationSessionDeps {
    */
   definitionCache?: DefinitionCache;
   /**
+   * Adaptive early-bail. `false` forces exhaustive probing; otherwise
+   * (default, undefined) the dispatch stops after probing
+   * LSP_EARLY_BAIL_SAMPLE candidates with 0 resolutions and keeps the
+   * heuristic for the rest. Only trips on a strict 0-hit sample → resolving
+   * repos are byte-identical.
+   */
+  earlyBail?: boolean;
+  /**
    * Server version, captured upstream (production may pass the
    * discovered version here so the summary line can attribute
    * results to a specific binary). When omitted, the session
@@ -380,6 +397,41 @@ export const CONCURRENT_DEFINITION_REQUESTS = 8;
 
 /** Probe request method — kept as a constant for clarity. */
 const TEXT_DOCUMENT_DEFINITION = 'textDocument/definition';
+
+/**
+ * Vendor/stdlib path segments. A `textDocument/definition` that resolves INTO
+ * one of these (e.g. pylsp answering a numpy call with a path under
+ * site-packages, or the Python stdlib under `lib/python3.x/`) never maps to an
+ * indexed node, so it is NOT a useful resolution for early-bail purposes.
+ */
+const VENDOR_SEGMENT_RE = /[/\\](?:site-packages|dist-packages|node_modules|__pycache__|\.venv|venv|lib[/\\]python[0-9.]*)[/\\]/;
+
+/**
+ * Early-bail "useful resolution" predicate. Returns true if the probe resolved
+ * to at least one NON-vendor location (a plausible in-repo definition). This is
+ * a PERFORMANCE heuristic only — it decides WHEN to stop probing, never graph
+ * correctness (bailed candidates keep their heuristic edge regardless). Errs
+ * toward "useful" (no bail) on anything it can't parse, so it never bails a repo
+ * the server is actually resolving.
+ */
+function resolvesUseful(locations: Location[]): boolean {
+  for (const loc of locations) {
+    let p: string;
+    try { p = fileURLToPath(loc.uri); } catch { return true; }
+    if (!VENDOR_SEGMENT_RE.test(p)) return true;
+  }
+  return false;
+}
+
+/**
+ * Adaptive early-bail sample size. Once the dispatch loop has probed this many
+ * candidates with ZERO resolutions (every `textDocument/definition` came back
+ * empty), the server is demonstrably not resolving this repo — continuing would
+ * only add latency, not edges. We stop and keep the heuristic for the rest.
+ * Set high enough to be representative; only a strict 0-hit sample bails, so any
+ * repo the server resolves at all is never affected (byte-identical).
+ */
+export const LSP_EARLY_BAIL_SAMPLE = 150;
 
 // ─── Defaults: real-foundation wiring ─────────────────────────────────
 
@@ -571,7 +623,13 @@ export async function withReconciliationSession<T>(
   // WI-5: probed/preFilteredExternal start at 0 and are incremented
   // in the dispatch loop below. meta is built here so the fields
   // exist; values are written before fn() is called.
-  const meta: SessionMeta = { serverVersion, requestTimeoutMs, cap, probed: 0, preFilteredExternal: 0 };
+  const meta: SessionMeta = { serverVersion, requestTimeoutMs, cap, probed: 0, preFilteredExternal: 0, bailed: 0 };
+  // Adaptive early-bail state. Once we have probed `earlyBailThreshold`
+  // candidates with `hits === 0` (every definition came back empty), stop
+  // dispatching: the server is not resolving this repo. `Infinity` disables it.
+  const earlyBailThreshold = deps.earlyBail === false ? Infinity : LSP_EARLY_BAIL_SAMPLE;
+  let lspHits = 0;
+  let earlyBailed = false;
   // Measure elapsed time from here so the not-ready message can carry
   // a meaningful duration (the probe itself may spin for up to 600s on
   // a slow jdtls workspace build).
@@ -615,6 +673,13 @@ export async function withReconciliationSession<T>(
       selected,
       CONCURRENT_DEFINITION_REQUESTS,
       async (candidate) => {
+        // Adaptive early-bail: once tripped, skip every remaining candidate.
+        // No probe, no handToEngine → locs=[] → NO_NODE → KEEP heuristic,
+        // identical to probing-and-getting-empty under the observed 0-hit rate.
+        if (earlyBailed) {
+          meta.bailed = (meta.bailed ?? 0) + 1;
+          return;
+        }
         // WI-8: external pre-filter seam fires BEFORE the LSP request.
         // Return true ONLY for provably-external correction candidates
         // (I-2c: no false skips). Recall candidates must always probe.
@@ -651,6 +716,27 @@ export async function withReconciliationSession<T>(
           }
         }
         await handToEngine(candidate, result.locations);
+        // Adaptive early-bail accounting: a non-empty Location[] is a "hit".
+        // After a full 0-hit sample, trip the bail so the remaining candidates
+        // are skipped (kept). Only fires on probed candidates (preFiltered ones
+        // never reach here with a probe). `>=` + the `!earlyBailed` guard make
+        // the trip idempotent under concurrency (a few in-flight probes past
+        // the threshold are harmless — they just add to the sample).
+        if (resolvesUseful(result.locations)) lspHits++;
+        // Only trip when candidates actually remain to skip (so a feed sized
+        // exactly at the threshold never bails pointlessly).
+        const processed = meta.probed + (meta.preFilteredExternal ?? 0) + (meta.bailed ?? 0);
+        if (!earlyBailed && lspHits === 0 && meta.probed >= earlyBailThreshold && processed < selected.length) {
+          earlyBailed = true;
+          meta.earlyBailed = true;
+          const bailS = ((Date.now() - sessionStart) / 1000).toFixed(1);
+          console.warn(
+            `  LSP early-bail: 0/${meta.probed} candidates resolved after ${bailS}s — ` +
+            `server not resolving this repo; keeping heuristic for the remaining ` +
+            `~${Math.max(0, selected.length - meta.probed - (meta.preFilteredExternal ?? 0))} candidates ` +
+            `(disable with --lsp-no-early-bail).`,
+          );
+        }
       },
     );
     return await fn(selected, meta, skipped);

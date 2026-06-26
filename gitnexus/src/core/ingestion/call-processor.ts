@@ -658,9 +658,13 @@ export const processCalls = async (
           // WI-A2 — inject calleeExternalFqn when the receiver type is a provably-external
           // Java class. Slow site uses `file.path` (not `filePath`) and the bare local
           // variable `receiverTypeName` (not effectiveCall — not in scope here).
-          const calleeExternalFqn =
-            file.path.endsWith('.java') && receiverTypeName
-              ? opts.javaExternalFqnIndex?.get(file.path)?.get(receiverTypeName)
+          // ADR-002 Lever 10: for Python, look up the receiver name first (covers
+          // `np.array()` → receiverName='np'), then fall back to calledName (covers
+          // free-function calls like `getcwd()` where receiverName is undefined).
+          const calleeExternalFqn = file.path.endsWith('.java') && receiverTypeName
+            ? opts.javaExternalFqnIndex?.get(file.path)?.get(receiverTypeName)
+            : file.path.endsWith('.py')
+              ? (opts.pythonExternalFqnIndex?.get(file.path)?.get(receiverName ?? calledName))
               : undefined;
           opts.recallFeed.push({
             sourceId,
@@ -1502,6 +1506,13 @@ export interface ProcessCallsOpts {
    * Absent on the default analyze path (I-9: default path stays byte-identical).
    */
   javaExternalFqnIndex?: Map<string, Map<string, string>>;
+  /**
+   * ADR-002 Lever 10 — Index built by import-processor at LSP-analysis time for Python.
+   * Maps filePath → boundName → module for provably-external Python imports.
+   * Examples: 'np' → 'numpy', 'getcwd' → 'os', 'os' → 'os'.
+   * Absent on the default analyze path (I-9: byte-identical).
+   */
+  pythonExternalFqnIndex?: Map<string, Map<string, string>>;
 }
 
 /**
@@ -1674,9 +1685,15 @@ export const processCallsFromExtracted = async (
           // WI-A2 — inject calleeExternalFqn when the receiver type is a provably-external
           // Java class (JDK/Spring/Jackson). Gate: .java file + receiverTypeName present.
           // ?.get(undefined) is safe — Map.get(undefined) returns undefined without error.
-          const calleeExternalFqn =
-            effectiveCall.filePath.endsWith('.java') && effectiveCall.receiverTypeName
-              ? opts.javaExternalFqnIndex?.get(effectiveCall.filePath)?.get(effectiveCall.receiverTypeName)
+          // ADR-002 Lever 10: for Python, look up receiver name first (covers
+          // `np.array()` → effectiveCall.receiverName='np'), then fall back to
+          // calledName (covers free-function calls like `getcwd()`).
+          const calleeExternalFqn = effectiveCall.filePath.endsWith('.java') && effectiveCall.receiverTypeName
+            ? opts.javaExternalFqnIndex?.get(effectiveCall.filePath)?.get(effectiveCall.receiverTypeName)
+            : effectiveCall.filePath.endsWith('.py')
+              ? (opts.pythonExternalFqnIndex?.get(effectiveCall.filePath)?.get(
+                  effectiveCall.receiverName ?? effectiveCall.calledName,
+                ))
               : undefined;
           opts.recallFeed.push({
             sourceId: effectiveCall.sourceId,

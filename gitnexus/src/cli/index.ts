@@ -37,6 +37,7 @@ program
    .option('--lsp-pipeline <n>', 'Allow n LSP requests in flight concurrently (default 1 = serial); speeds up dispatch on jdtls/tsserver; requires --lsp', (v) => Number(v))
    .option('--lsp-changed-since <ref>', 'Scope LSP augmentation to call/heritage sites in files changed since <ref> (git diff); requires --lsp')
    .option('--lsp-cache', 'Cache textDocument/definition results across runs (clean working tree only); speeds re-indexing; requires --lsp')
+   .option('--lsp-no-early-bail', 'Disable adaptive early-bail; probe every candidate even when the language server resolves none (default: bail after 150 unresolved probes); requires --lsp')
    .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 

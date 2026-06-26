@@ -98,6 +98,13 @@ export interface AnalyzeOptions {
    * on a clean working tree (results are keyed to the HEAD commit). Requires `--lsp`.
    */
   lspCache?: boolean;
+  /**
+   * Disable adaptive early-bail. By default the LSP dispatch stops after 150
+   * consecutive unresolved probes (the server isn't resolving this repo) and
+   * keeps the heuristic for the rest. This flag forces exhaustive probing.
+   * Requires `--lsp`.
+   */
+  lspNoEarlyBail?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -135,6 +142,19 @@ export function shouldCacheEmbeddings(
   return shouldPreserveExistingEmbeddings(existingMeta, options) || !!options?.embeddings;
 }
 
+/**
+ * Default LSP request-pipelining concurrency when `--lsp` is on and
+ * `--lsp-pipeline` is not given. Activates the already-present 8-way dispatch
+ * pool (`CONCURRENT_DEFINITION_REQUESTS`) that was previously throttled to
+ * serial by the `maxInFlight=1` client default. Byte-identical to serial
+ * (results are content-keyed; `textDocument/definition` is a pure query
+ * post-readiness) — proven by the mode-A golden suite. `--lsp-pipeline 1`
+ * forces the old strictly-serial behaviour. 4 (not 8) keeps single-threaded
+ * servers (pylsp/tsserver) from thrashing while capturing most round-trip
+ * overlap.
+ */
+const DEFAULT_LSP_PIPELINE = 4;
+
 const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
   structure: 'Building structure',
@@ -142,6 +162,7 @@ const PHASE_LABELS: Record<string, string> = {
   imports: 'Resolving imports',
   calls: 'Tracing calls',
   heritage: 'Extracting inheritance',
+  lsp: 'LSP augmentation',
   communities: 'Detecting communities',
   processes: 'Detecting processes',
   complete: 'Pipeline complete',
@@ -395,6 +416,12 @@ export const analyzeCommand = async (
   if (options?.lspCache && !options?.lsp && !options?.lspDryRun) {
     console.warn('  Warning: --lsp-cache ignored: --lsp not enabled');
   }
+  // Non-git tree: the commit-namespaced cache and changed-since scoping both
+  // need git, so they silently no-op here. Say so once, up front, so the user
+  // isn't surprised the speed levers had no effect.
+  if ((options?.lsp || options?.lspDryRun) && !repoHasGit) {
+    console.warn('  Note: --lsp-cache and --lsp-changed-since need git and have no effect on a non-git tree.');
+  }
 
   // ── Phase 1: Full Pipeline (0–60%) ─────────────────────────────────
   // WI-5 (#159 P3 Mode A): thread `lsp` + `lspDryRun` through to
@@ -403,9 +430,22 @@ export const analyzeCommand = async (
   // true; the default `analyze` (no flag) takes the byte-identical
   // path. The pipeline prints the dry-run report or the summary
   // line itself (single source of truth).
+  // Opt-in per-phase wall-clock timing (GITNEXUS_PHASE_TIMING=1). Zero impact
+  // on default runs — purely a profiling aid for tuning analyze performance.
+  const phaseTiming = process.env.GITNEXUS_PHASE_TIMING === '1';
+  let timedPhase: string | null = null;
+  let timedPhaseStart = Date.now();
   const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
     const scaled = Math.round(progress.percent * 0.6);
+    if (phaseTiming && progress.phase !== timedPhase) {
+      const now = Date.now();
+      if (timedPhase !== null) {
+        console.warn(`  [phase-timing] ${timedPhase}: ${((now - timedPhaseStart) / 1000).toFixed(1)}s`);
+      }
+      timedPhase = progress.phase;
+      timedPhaseStart = now;
+    }
     updateBar(scaled, phaseLabel);
   }, {
     lsp: {
@@ -417,14 +457,33 @@ export const analyzeCommand = async (
       budget: options?.lspBudget,
       // Lever 12: validated spot-check rate (undefined → off in the pipeline).
       highTierSampleRate: options?.lspHighTierSample,
-      // Lever 13: validated request-pipelining concurrency (undefined → serial).
-      pipeline: options?.lspPipeline,
+      // Lever 13: request-pipelining concurrency. Defaults to
+      // DEFAULT_LSP_PIPELINE (activates the existing 8-way dispatch pool;
+      // byte-identical to serial, golden-gated). `--lsp-pipeline 1` forces
+      // the old strictly-serial path; an explicit value overrides the default.
+      pipeline: options?.lspPipeline ?? DEFAULT_LSP_PIPELINE,
       // Lever 15: changed-file scoping set (undefined → full feed).
       changedFiles: lspChangedFiles,
       // Lever 14: definition cache (undefined → no caching).
       definitionCache: lspDefinitionCache,
+      // Adaptive early-bail (default on): stop probing after 150 unresolved
+      // candidates. --lsp-no-early-bail forces exhaustive probing.
+      earlyBail: !options?.lspNoEarlyBail,
     },
   });
+  if (phaseTiming && timedPhase !== null) {
+    console.warn(`  [phase-timing] ${timedPhase}: ${((Date.now() - timedPhaseStart) / 1000).toFixed(1)}s`);
+  }
+  // Edge-ID dump for lossless verification (GITNEXUS_DUMP_EDGES=<path>): writes
+  // sorted `type<TAB>id` lines so two runs can be diffed at the edge-ID level
+  // (counts alone hide overshoot+loss canceling out). Zero default impact.
+  if (process.env.GITNEXUS_DUMP_EDGES) {
+    const _ids: string[] = [];
+    pipelineResult.graph.forEachRelationship((r) => _ids.push(`${r.type}\t${r.id}`));
+    _ids.sort();
+    await fs.writeFile(process.env.GITNEXUS_DUMP_EDGES, _ids.join('\n') + '\n');
+    console.warn(`  [dump-edges] ${_ids.length} relationships → ${process.env.GITNEXUS_DUMP_EDGES}`);
+  }
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────────
   updateBar(60, 'Loading into LadybugDB...');

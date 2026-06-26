@@ -327,6 +327,7 @@ export const processImports = async (
   allPaths?: string[],
   crossRepoRegistry?: CrossRepoRegistry,
   javaExternalFqnIndex?: Map<string, Map<string, string>>,
+  pythonExternalFqnIndex?: Map<string, Map<string, string>>,
 ) => {
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
@@ -451,6 +452,36 @@ export const processImports = async (
           if (!fileMap) { fileMap = new Map(); javaExternalFqnIndex.set(file.path, fileMap); }
           fileMap.set(simple, rawImportPath);
         }
+        // ADR-002 Lever 10: populate pythonExternalFqnIndex for provably-external Python imports.
+        // "Provably external" = non-relative AND the resolver found no in-repo file.
+        // Relative imports (.helpers, ..utils) always have in-repo intent — never classify them
+        // external regardless of whether the resolver found them.  "Unknown ≠ external" (I-2c).
+        //
+        // Bound-name extraction:
+        //   import numpy as np        → binding { local:'np', exported:'numpy', isModuleAlias:true }
+        //                             → record pythonExternalFqnIndex[file.path]['np'] = 'numpy'
+        //   from os import getcwd     → binding { local:'getcwd', exported:'getcwd' }
+        //                             → record pythonExternalFqnIndex[file.path]['getcwd'] = 'os'
+        //   import os                 → no bindings → record ['os'] = 'os'
+        if (
+          !result &&
+          pythonExternalFqnIndex &&
+          language === SupportedLanguages.Python &&
+          !rawImportPath.startsWith('.')
+        ) {
+          let fileMap = pythonExternalFqnIndex.get(file.path);
+          if (!fileMap) { fileMap = new Map(); pythonExternalFqnIndex.set(file.path, fileMap); }
+          if (bindings && bindings.length > 0) {
+            for (const b of bindings) {
+              fileMap.set(b.local, rawImportPath);
+            }
+          } else {
+            // Bare `import <module>` with no alias — bound name IS the top-level module name.
+            // Use the first dotted segment (import os.path → bound name 'os').
+            const topLevel = rawImportPath.split('.')[0];
+            fileMap.set(topLevel, rawImportPath);
+          }
+        }
       }
 
       // ---- Language-specific call-as-import routing (Ruby require, etc.) ----
@@ -499,6 +530,7 @@ export const processImportsFromExtracted = async (
   prebuiltCtx?: ImportResolutionContext,
   crossRepoRegistry?: CrossRepoRegistry,
   javaExternalFqnIndex?: Map<string, Map<string, string>>,
+  pythonExternalFqnIndex?: Map<string, Map<string, string>>,
 ) => {
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
@@ -558,6 +590,27 @@ export const processImportsFromExtracted = async (
         let fileMap = javaExternalFqnIndex.get(filePath);
         if (!fileMap) { fileMap = new Map(); javaExternalFqnIndex.set(filePath, fileMap); }
         fileMap.set(simple, imp.rawImportPath);
+      }
+      // ADR-002 Lever 10: populate pythonExternalFqnIndex for provably-external Python imports.
+      // Fast path: imp.namedBindings lacks isModuleAlias — treat all bindings uniformly
+      // (module alias and named imports map the same: local → rawImportPath).
+      // No bindings → bare `import <module>` → bound name is the top-level segment.
+      if (
+        !result &&
+        pythonExternalFqnIndex &&
+        imp.language === SupportedLanguages.Python &&
+        !imp.rawImportPath.startsWith('.')
+      ) {
+        let fileMap = pythonExternalFqnIndex.get(filePath);
+        if (!fileMap) { fileMap = new Map(); pythonExternalFqnIndex.set(filePath, fileMap); }
+        if (imp.namedBindings && imp.namedBindings.length > 0) {
+          for (const b of imp.namedBindings) {
+            fileMap.set(b.local, imp.rawImportPath);
+          }
+        } else {
+          const topLevel = imp.rawImportPath.split('.')[0];
+          fileMap.set(topLevel, imp.rawImportPath);
+        }
       }
     }
   }
