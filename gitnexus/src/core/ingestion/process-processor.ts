@@ -10,7 +10,7 @@
  * Processes help agents understand how features work through the codebase.
  */
 
-import { KnowledgeGraph, GraphNode, GraphRelationship, NodeLabel } from '../graph/types.js';
+import { KnowledgeGraph, GraphNode, NodeLabel } from '../graph/types.js';
 import { CommunityMembership } from './community-processor.js';
 import { calculateEntryPointScore, isTestFile } from './entry-point-scoring.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
@@ -239,6 +239,14 @@ const buildCallsGraph = (graph: KnowledgeGraph): AdjacencyList => {
     }
   }
 
+  // Canonicalize callee order by targetId. iterRelationships() yields edges in
+  // graph INSERTION order, which differs between the sequential and parallel-parse
+  // (GITNEXUS_PARALLEL_PARSE) paths even though the edge SET is identical.
+  // traceFromEntryPoint slices callees to maxBranching, so an insertion-order-
+  // dependent list would pick different callees → different traces. Sorting by id
+  // makes tracing insertion-order-independent (parity + run-to-run determinism).
+  for (const callees of adj.values()) callees.sort();
+
   return adj;
 };
 
@@ -315,8 +323,14 @@ const findEntryPoints = (
     }
   }
   
-  // Sort by score descending and return top candidates
-  const sorted = entryPointCandidates.sort((a, b) => b.score - a.score);
+  // Sort by score descending and return top candidates. Total order: equal
+  // scores tie-break by node id so the slice(200) cap below selects the SAME
+  // candidate set regardless of iterNodes() (insertion-order) traversal —
+  // `b.score - a.score` alone left ties in insertion order (worker-vs-seq drift).
+  const sorted = entryPointCandidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
   
   // DEBUG: Log top candidates with new scoring details
   if (sorted.length > 0 && isDev) {
@@ -404,8 +418,14 @@ const traceFromEntryPoint = (
 const deduplicateTraces = (traces: string[][]): string[][] => {
   if (traces.length === 0) return [];
   
-  // Sort by length descending
-  const sorted = [...traces].sort((a, b) => b.length - a.length);
+  // Sort by length descending. Total order: equal-length traces tie-break by
+  // full-path lexicographic so the subset-dedup keeps a canonical trace
+  // independent of the order traces were collected (worker-vs-seq drift).
+  const sorted = [...traces].sort((a, b) => {
+    if (b.length !== a.length) return b.length - a.length;
+    const aj = a.join(''), bj = b.join('');
+    return aj < bj ? -1 : aj > bj ? 1 : 0;
+  });
   const unique: string[][] = [];
   
   for (const trace of sorted) {
@@ -436,8 +456,14 @@ const deduplicateByEndpoints = (traces: string[][]): string[][] => {
   if (traces.length === 0) return [];
   
   const byEndpoints = new Map<string, string[]>();
-  // Sort longest first so the first seen per key is the longest
-  const sorted = [...traces].sort((a, b) => b.length - a.length);
+  // Sort longest first so the first seen per key is the longest. Total order:
+  // equal-length traces tie-break by full-path lexicographic so the trace kept
+  // per endpoint pair is canonical regardless of collection order.
+  const sorted = [...traces].sort((a, b) => {
+    if (b.length !== a.length) return b.length - a.length;
+    const aj = a.join(''), bj = b.join('');
+    return aj < bj ? -1 : aj > bj ? 1 : 0;
+  });
   
   for (const trace of sorted) {
     const key = `${trace[0]}::${trace[trace.length - 1]}`;
