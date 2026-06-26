@@ -649,13 +649,28 @@ const setLanguage = (language: SupportedLanguages, filePath: string): void => {
 // ============================================================================
 
 /** Walk up AST to find enclosing function, return its generateId or null for top-level */
-const findEnclosingFunctionId = (node: any, filePath: string): string | null => {
+const findEnclosingFunctionId = (node: any, filePath: string, language?: SupportedLanguages): string | null => {
   let current = node.parent;
   while (current) {
     if (FUNCTION_NODE_TYPES.has(current.type)) {
       const { funcName, label } = extractFunctionName(current);
       if (funcName) {
-        return generateId(label, `${filePath}:${funcName}`);
+        // Mirror the language-provider `labelOverride` (and the worker's own
+        // `getLabelFromCaptures` definition-labeling at :690-694) so the enclosing
+        // function's sourceId matches the `Method:` node id minted by the definition
+        // phase. `extractFunctionName` returns `'Function'` for Python/Kotlin class
+        // methods because their method node type is identical to a free function's;
+        // without this override the worker attributes calls/assignments inside a class
+        // method to a non-existent `Function:` node, diverging from the AST path's
+        // `findEnclosingFunction` (call-processor.ts) which applies the same override.
+        // L2-only: both call sites feed allGeneralCalls/allAssignments, consumed solely
+        // under L2_EXTRACTED_RESOLVE — the default/sequential graph is unaffected.
+        let finalLabel = label;
+        if (finalLabel === 'Function') {
+          if (language === SupportedLanguages.Python && isPythonClassMethod(current)) finalLabel = 'Method';
+          else if (language === SupportedLanguages.Kotlin && isKotlinClassMethod(current)) finalLabel = 'Method';
+        }
+        return generateId(finalLabel, `${filePath}:${funcName}`);
       }
     }
     current = current.parent;
@@ -2685,7 +2700,7 @@ const processFileGroup = (
       if (captureMap['assignment'] && captureMap['assignment.receiver'] && captureMap['assignment.property']) {
         const asnReceiverText: string = captureMap['assignment.receiver'].text;
         const asnPropertyName: string = captureMap['assignment.property'].text;
-        const asnSourceId = findEnclosingFunctionId(captureMap['assignment'], file.path)
+        const asnSourceId = findEnclosingFunctionId(captureMap['assignment'], file.path, language)
           || generateId('File', file.path);
         const asnReceiverType = asnReceiverText
           ? typeEnv.lookup(asnReceiverText, captureMap['assignment'])
@@ -2789,7 +2804,7 @@ const processFileGroup = (
 
           if (!isBuiltInOrNoise(calledName)) {
             const callNode = captureMap['call'];
-            const sourceId = findEnclosingFunctionId(callNode, file.path)
+            const sourceId = findEnclosingFunctionId(callNode, file.path, language)
               || generateId('File', file.path);
             const callForm = inferCallForm(callNode, callNameNode);
             let receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;

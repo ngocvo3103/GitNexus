@@ -392,6 +392,10 @@ export const runPipelineFromRepo = async (
     const allTypeEnvBindings: import('./workers/parse-worker.js').FileTypeEnvBindings[] = [];
     // P2 (#perf) write-ACCESS: worker-extracted member-field assignment sites.
     const allAssignments: import('./workers/parse-worker.js').ExtractedAssignment[] = [];
+    // P4 (#perf): worker-extracted heritage (EXTENDS/IMPLEMENTS/mixin). Accumulated
+    // across chunks and fed into processHeritageFromExtracted post-loop under L2,
+    // eliminating the AST processHeritage re-parse for worker chunks.
+    const allL2Heritage: import('./workers/parse-worker.js').ExtractedHeritage[] = [];
 
     // WI-5 (#159 P3 Mode A): the candidate feed arrays. We pass them
     // as sinks into `processCallsFromExtracted` ONLY when
@@ -552,6 +556,9 @@ export const runPipelineFromRepo = async (
             if (chunkWorkerData.constructorBindings) for (const b of chunkWorkerData.constructorBindings) allConstructorBindings.push(b);
             if (chunkWorkerData.typeEnvBindings) for (const b of chunkWorkerData.typeEnvBindings) allTypeEnvBindings.push(b);
             if (chunkWorkerData.assignments) for (const a of chunkWorkerData.assignments) allAssignments.push(a);
+            // P4 (#perf): accumulate worker heritage; resolved post-loop via
+            // processHeritageFromExtracted — no AST re-parse needed.
+            if (chunkWorkerData.heritage) for (const h of chunkWorkerData.heritage) allL2Heritage.push(h);
           }
           // Accumulate fetchCalls for post-processing
           if (chunkWorkerData.fetchCalls) {
@@ -612,11 +619,23 @@ export const runPipelineFromRepo = async (
     }
 
     // Sequential fallback chunks: re-read source for call/heritage resolution.
-    // L2 (#perf): when enabled, the general call graph is resolved from the
-    // worker-extracted call sites in a single post-loop pass below, so the
-    // per-chunk `processCalls` re-parse is skipped. Heritage still re-parses here
-    // (moved to extracted in P4). When L2 is off this loop is byte-identical to L1.
+    // L2 (#perf): when enabled, both the general call graph AND heritage are
+    // resolved from worker-extracted data in post-loop passes, so the entire
+    // re-parse block (re-read + createASTCache + processHeritage + processCalls)
+    // is skipped for worker chunks. Routes are still processed (no AST needed).
+    // Sequential-fallback chunks (worker died) and L2-off runs are unchanged.
     for (let chunkIdx = 0; chunkIdx < sequentialChunkPaths.length; chunkIdx++) {
+      // P4 (#perf): for L2 worker chunks, skip the entire AST re-parse block.
+      // Heritage is resolved post-loop via processHeritageFromExtracted;
+      // calls are resolved post-loop via processCallsFromExtracted (P1-P3).
+      // Routes are processed here — already extracted by the worker; no AST needed.
+      if (L2_EXTRACTED_RESOLVE && sequentialChunkFromWorker[chunkIdx]) {
+        const chunkRoutes = sequentialChunkRoutes[chunkIdx];
+        if (chunkRoutes.length > 0) {
+          await processRoutesFromExtracted(graph, chunkRoutes, ctx);
+        }
+        continue;
+      }
       const chunkPaths = sequentialChunkPaths[chunkIdx];
       const chunkContents = await readFileContents(repoPath, chunkPaths);
       const chunkFiles = chunkPaths
@@ -627,14 +646,9 @@ export const runPipelineFromRepo = async (
       // `processHeritage` populates the shared heritage feed
       // (mirrors the worker-path threading at `:388-403`).
       await processHeritage(graph, chunkFiles, astCache, ctx, undefined, lspHeritageOpt);
-      // L2: skip the re-parse processCalls only for worker-extracted chunks (their
-      // general calls are resolved by the post-loop processCallsFromExtracted).
-      // Sequential-fallback chunks (and the whole sequential path) always run it.
-      if (!(L2_EXTRACTED_RESOLVE && sequentialChunkFromWorker[chunkIdx])) {
-        const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx, undefined, undefined, undefined, undefined, undefined, lspFeedsOpt);
-        if (rubyHeritage.length > 0) {
-          await processHeritageFromExtracted(graph, rubyHeritage, ctx, undefined, lspHeritageOpt);
-        }
+      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx, undefined, undefined, undefined, undefined, undefined, lspFeedsOpt);
+      if (rubyHeritage.length > 0) {
+        await processHeritageFromExtracted(graph, rubyHeritage, ctx, undefined, lspHeritageOpt);
       }
       const chunkRoutes = sequentialChunkRoutes[chunkIdx];
       if (chunkRoutes.length > 0) {
@@ -643,13 +657,23 @@ export const runPipelineFromRepo = async (
       astCache.clear();
     }
 
+    // P4 (#perf): heritage from worker-extracted data — no AST re-parse.
+    // Processed before general calls to match L1 order (processHeritage ran before
+    // processCalls in the sequential loop). Sort by filePath+line for determinism.
+    if (L2_EXTRACTED_RESOLVE && allL2Heritage.length > 0) {
+      allL2Heritage.sort((a, b) =>
+        a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 :
+        (a.line ?? 0) - (b.line ?? 0),
+      );
+      await processHeritageFromExtracted(graph, allL2Heritage, ctx, undefined, lspHeritageOpt);
+    }
+
     // L2 (#perf): resolve the general call graph from the worker-extracted call
     // sites over the now-fully-merged symbol table + import context (ctx), instead
     // of the per-chunk `processCalls` re-parse skipped above. Deterministic order
     // (file path, then call-site position) so ambiguous lookupFuzzy[0] tiebreaks
     // are stable across worker scheduling. The same lspFeedsOpt the AST path gets
-    // is threaded so LSP mode is unaffected. ACCESSES (write/field) and heritage
-    // are intentionally NOT covered here — P2/P3/P4.
+    // is threaded so LSP mode is unaffected.
     if (L2_EXTRACTED_RESOLVE && allGeneralCalls.length > 0) {
       allGeneralCalls.sort((a, b) =>
         a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 :
