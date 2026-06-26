@@ -103,6 +103,11 @@ export interface LspClientOptions {
    */
   maxInFlight?: number;
   /**
+   * WI-1 (heartbeat): forwarded to `AdapterReadyCtx.onHeartbeat` so adapters
+   * can report warm-up progress. Optional — omitting it preserves existing behaviour.
+   */
+  onHeartbeat?: (elapsedMs: number) => void;
+  /**
    * Optional factory hook used by tests to inject a fake
    * subprocess + a fake JSON-RPC connection. Production code
    * leaves this undefined. When set, the client does not
@@ -359,6 +364,7 @@ export class LspClient {
   private readonly maxRestarts: number;
   private readonly inject: LspClientOptions['_inject'];
   private readonly adapter: LanguageAdapter;
+  private readonly onHeartbeat: ((elapsedMs: number) => void) | undefined;
 
   /**
    * Realpath-resolved workspace root, computed once lazily.
@@ -391,6 +397,7 @@ export class LspClient {
     this.maxRestarts = opts.maxRestarts ?? MAX_RESTARTS;
     this.inject = opts._inject;
     this.adapter = opts.adapter ?? TYPESCRIPT_ADAPTER;
+    this.onHeartbeat = opts.onHeartbeat;
     // Lever 13: clamp to a sane positive integer; default 1 (serial).
     this.maxInFlight = Math.max(1, Math.floor(opts.maxInFlight ?? 1));
     this.slots = this.maxInFlight;
@@ -1071,6 +1078,7 @@ export class LspClient {
         // deadlineMs omitted → adapter default (120 000 ms for jdtls)
         ...progressSeam,
         ...serverStatusSeam,
+        onHeartbeat: this.onHeartbeat,
       };
       if (!(await this.adapter.awaitReady(ctx))) {
         this.cleanupAfterFailure();

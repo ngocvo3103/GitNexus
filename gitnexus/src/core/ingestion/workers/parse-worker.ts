@@ -47,6 +47,7 @@ import {
   isPythonClassMethod,
   isKotlinClassMethod,
   isCppInsideClassOrStruct,
+  CLASS_CONTAINER_TYPES,
 } from '../utils/ast-helpers.js';
 import {
   countCallArguments,
@@ -85,6 +86,23 @@ import { typeConfig as phpTypeConfig } from '../type-extractors/php.js';
 import { typeConfig as rubyTypeConfig } from '../type-extractors/ruby.js';
 import { typeConfig as swiftTypeConfig } from '../type-extractors/swift.js';
 import { typeConfig as dartTypeConfig } from '../type-extractors/dart.js';
+// Field extractors — mirror the sequential parsing-processor.ts `provider.fieldExtractor`
+// wiring so the worker emits the same Property `declaredType` (needed to type `this.<field>`).
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import type { FieldExtractor } from '../field-extractor.js';
+import type { FieldInfo as ExtractedFieldInfo, FieldExtractorContext } from '../field-types.js';
+import { typescriptFieldExtractor } from '../field-extractors/typescript.js';
+import { javascriptConfig } from '../field-extractors/configs/typescript-javascript.js';
+import { javaConfig, kotlinConfig } from '../field-extractors/configs/jvm.js';
+import { pythonConfig } from '../field-extractors/configs/python.js';
+import { goConfig } from '../field-extractors/configs/go.js';
+import { rustConfig } from '../field-extractors/configs/rust.js';
+import { csharpConfig } from '../field-extractors/configs/csharp.js';
+import { cConfig, cppConfig } from '../field-extractors/configs/c-cpp.js';
+import { phpConfig } from '../field-extractors/configs/php.js';
+import { rubyConfig } from '../field-extractors/configs/ruby.js';
+import { swiftConfig } from '../field-extractors/configs/swift.js';
+import { dartConfig } from '../field-extractors/configs/dart.js';
 import { generateId } from '../../../lib/utils.js';
 import { appendKotlinWildcard } from '../import-resolvers/jvm.js';
 import type { CallRouter } from '../call-routing.js';
@@ -141,6 +159,68 @@ const typeConfigs: Record<string, any> = {
   [SupportedLanguages.Ruby]: rubyTypeConfig,
   [SupportedLanguages.Swift]: swiftTypeConfig,
   [SupportedLanguages.Dart]: dartTypeConfig,
+};
+
+/**
+ * Map languages to their field extractors. Identical wiring to LanguageProvider
+ * (languages/*.ts): TypeScript uses the bespoke `typescriptFieldExtractor`, every
+ * other language is config-driven. The worker has no provider registry, so it
+ * builds the same extractors directly — this is what lets the worker emit the same
+ * Property `declaredType` the sequential parsing-processor path does.
+ */
+const fieldExtractors: Record<string, FieldExtractor> = {
+  [SupportedLanguages.TypeScript]: typescriptFieldExtractor,
+  [SupportedLanguages.JavaScript]: createFieldExtractor(javascriptConfig),
+  [SupportedLanguages.Java]: createFieldExtractor(javaConfig),
+  [SupportedLanguages.Kotlin]: createFieldExtractor(kotlinConfig),
+  [SupportedLanguages.Python]: createFieldExtractor(pythonConfig),
+  [SupportedLanguages.Go]: createFieldExtractor(goConfig),
+  [SupportedLanguages.Rust]: createFieldExtractor(rustConfig),
+  [SupportedLanguages.CSharp]: createFieldExtractor(csharpConfig),
+  [SupportedLanguages.C]: createFieldExtractor(cConfig),
+  [SupportedLanguages.CPlusPlus]: createFieldExtractor(cppConfig),
+  [SupportedLanguages.PHP]: createFieldExtractor(phpConfig),
+  [SupportedLanguages.Ruby]: createFieldExtractor(rubyConfig),
+  [SupportedLanguages.Swift]: createFieldExtractor(swiftConfig),
+  [SupportedLanguages.Dart]: createFieldExtractor(dartConfig),
+};
+
+/** No-op SymbolTable stub for FieldExtractorContext — mirrors NOOP_SYMBOL_TABLE_SEQ
+ *  in parsing-processor.ts (the symbol table is incomplete during parsing). */
+const NOOP_SYMBOL_TABLE_FIELDS: any = {
+  lookupExactAll: () => [],
+  lookupExact: () => undefined,
+  lookupExactFull: () => undefined,
+};
+
+/** Walk up from a field declaration to its enclosing class/struct/interface node.
+ *  Mirrors seqFindEnclosingClassNode in parsing-processor.ts. */
+const findEnclosingClassNode = (node: any): any | null => {
+  let current = node?.parent;
+  while (current) {
+    if (CLASS_CONTAINER_TYPES.has(current.type)) return current;
+    current = current.parent;
+  }
+  return null;
+};
+
+/** Cached per-class field-info lookup. Mirrors seqGetFieldInfo + seqFieldInfoCache.
+ *  The cache is passed in per file so `startIndex` keys never collide across files. */
+const getFieldInfoCached = (
+  classNode: any,
+  fieldExtractor: FieldExtractor,
+  context: FieldExtractorContext,
+  cache: Map<number, Map<string, ExtractedFieldInfo>>,
+): Map<string, ExtractedFieldInfo> | undefined => {
+  const cacheKey = classNode.startIndex;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+  const extracted = fieldExtractor.extract(classNode, context);
+  if (!extracted?.fields?.length) return undefined;
+  const map = new Map<string, ExtractedFieldInfo>();
+  for (const field of extracted.fields) map.set(field.name, field);
+  cache.set(cacheKey, map);
+  return map;
 };
 
 /** Map languages to their named binding extractors */
@@ -287,6 +367,8 @@ interface ParsedNode {
     /** Array of parameter type names for method overloading */
     parameterTypes?: string; // JSON array of parameter type names
     returnType?: string;
+    /** Declared/inferred type of a Property node (mirrors the sequential path). */
+    declaredType?: string;
     /** JSON array of annotations on method/class: [{name: "@Transactional", attrs?: {key: value}}] */
     annotations?: string;
     /** JSON array of field info for DTO/Entity classes: [{name, type, annotations[]}] */
@@ -493,6 +575,7 @@ export interface ParseWorkerResult {
   symbols: ParsedSymbol[];
   imports: ExtractedImport[];
   calls: ExtractedCall[];
+  angularCalls: ExtractedCall[];
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
@@ -652,6 +735,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     symbols: [],
     imports: [],
     calls: [],
+    angularCalls: [],
     heritage: [],
     routes: [],
     constructorBindings: [],
@@ -2387,6 +2471,8 @@ const processFileGroup = (
     // Build per-file type environment + constructor bindings in a single AST walk.
     // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
     const typeEnv = buildTypeEnv(tree, language);
+    // Per-file cache for Property declaredType extraction (keyed by class node startIndex).
+    const fieldInfoCache = new Map<number, Map<string, ExtractedFieldInfo>>();
     const routerForLanguage = callRouters[language];
 
     // Extract FILE_SCOPE bindings for field/local variable type resolution
@@ -2453,13 +2539,22 @@ const processFileGroup = (
       if (captureMap['express_route'] && captureMap['express_route.method'] && captureMap['express_route.path']) {
         const method = captureMap['express_route.method'].text;
         const routePath = captureMap['express_route.path'].text;
-        result.decoratorRoutes.push({
-          filePath: file.path,
-          decorator: method,
-          path: routePath,
-          lineNumber: captureMap['express_route'].startPosition.row,
-        });
-        continue;
+        // Guard: reject non-route strings (header names, cache keys, etc.).
+        // Valid Express/Hono paths always start with '/'. This matches the
+        // NON_EXPRESS_OBJECTS guard in the procedural extractExpressRoutes used
+        // by the sequential path — without it the tree-sitter query is too
+        // broad and captures e.g. `.get('Content-Length')` / `cache.get('b.ts')`.
+        const cleanPath = routePath.replace(/^['"`]|['"`]$/g, '');
+        if (cleanPath.startsWith('/')) {
+          result.decoratorRoutes.push({
+            filePath: file.path,
+            decorator: method,
+            path: routePath,
+            lineNumber: captureMap['express_route'].startPosition.row,
+          });
+          continue;
+        }
+        // Not a route path — fall through to general call processing
       }
 
       // Extract HTTP decorators: @Get('/path'), @Post('/path'), @RequestMapping('/path')
@@ -2905,6 +3000,28 @@ const processFileGroup = (
         }
       }
 
+      // ── Declared type for Property nodes (mirrors parsing-processor.ts:671-694) ──
+      // The sequential path stores declaredType on each Property symbol. The worker must
+      // too, or processCalls' resolveFieldAccessType cannot type `this.<field>` — which
+      // drops field-read ACCESSES and misresolves chained calls on typed fields.
+      let declaredType: string | undefined;
+      if (nodeLabel === 'Property' && definitionNode) {
+        const fieldExtractor = fieldExtractors[language];
+        if (fieldExtractor) {
+          const classNode = findEnclosingClassNode(definitionNode);
+          if (classNode) {
+            const fieldMap = getFieldInfoCached(
+              classNode,
+              fieldExtractor,
+              { typeEnv, symbolTable: NOOP_SYMBOL_TABLE_FIELDS, filePath: file.path, language },
+              fieldInfoCache,
+            );
+            const info = fieldMap?.get(nodeName);
+            if (info) declaredType = info.type ?? undefined;
+          }
+        }
+      }
+
       result.nodes.push({
         id: nodeId,
         label: nodeLabel,
@@ -2922,6 +3039,7 @@ const processFileGroup = (
           ...(description !== undefined ? { description } : {}),
           ...(parameterCount !== undefined ? { parameterCount } : {}),
           ...(returnType !== undefined ? { returnType } : {}),
+          ...(declaredType !== undefined ? { declaredType } : {}),
           ...(parameterTypes !== undefined ? { parameterTypes: JSON.stringify(parameterTypes) } : {}),
           ...(annotations !== undefined ? { annotations } : {}),
           ...(fields !== undefined ? { fields } : {}),
@@ -2943,6 +3061,7 @@ const processFileGroup = (
         ...(requiredParameterCount !== undefined ? { requiredParameterCount } : {}),
         ...(parameterTypes !== undefined ? { parameterTypes } : {}),
         ...(returnType !== undefined ? { returnType } : {}),
+        ...(declaredType !== undefined ? { declaredType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
 
@@ -3000,17 +3119,27 @@ const processFileGroup = (
 
     // Extract FastAPI routes from Python files (Issues #79, #5, #78)
     if (language === SupportedLanguages.Python) {
-      const fastApiRoutes = extractFastApiRoutes(tree, file.path);
-      if (fastApiRoutes.length > 0) {
-        result.routes.push(...fastApiRoutes);
+      for (const r of extractFastApiRoutes(tree, file.path)) {
+        result.decoratorRoutes.push({
+          filePath: r.filePath,
+          decorator: r.httpMethod,
+          path: r.routePath,
+          lineNumber: r.lineNumber,
+          handlerName: r.methodName ?? undefined,
+        });
       }
     }
 
     // Extract Gin routes from Go files (Issues #80, #6)
     if (language === SupportedLanguages.Go) {
-      const ginRoutes = extractGinRoutes(tree, file.path);
-      if (ginRoutes.length > 0) {
-        result.routes.push(...ginRoutes);
+      for (const r of extractGinRoutes(tree, file.path)) {
+        result.decoratorRoutes.push({
+          filePath: r.filePath,
+          decorator: r.httpMethod,
+          path: r.routePath,
+          lineNumber: r.lineNumber,
+          handlerName: r.methodName ?? undefined,
+        });
       }
     }
 
@@ -3018,9 +3147,14 @@ const processFileGroup = (
     // or use `RouterModule` / `provideRouter`. Emits `ExtractedRoute` records
     // (client-side Angular routes have no HTTP method — we use GET).
     if (language === SupportedLanguages.TypeScript && isAngularFile(file.path, file.content)) {
-      const angularRoutes = extractAngularRoutes(tree, file.path);
-      if (angularRoutes.length > 0) {
-        result.routes.push(...angularRoutes);
+      for (const r of extractAngularRoutes(tree, file.path)) {
+        result.decoratorRoutes.push({
+          filePath: r.filePath,
+          decorator: r.httpMethod,
+          path: r.routePath,
+          lineNumber: r.lineNumber,
+          handlerName: r.methodName ?? undefined,
+        });
       }
     }
 
@@ -3042,7 +3176,7 @@ const processFileGroup = (
     if (language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript) {
       const angularCalls = extractAngularCalls(tree, file.path);
       for (const ac of angularCalls) {
-        result.calls.push({
+        result.angularCalls.push({
           filePath: ac.filePath,
           calledName: ac.calledName,
           sourceId: ac.sourceId,
@@ -3126,7 +3260,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], angularCalls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
   ormQueries: [],
   fetchCalls: [],
   expoNavCalls: [],
@@ -3140,6 +3274,7 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.symbols.push(...src.symbols);
   target.imports.push(...src.imports);
   target.calls.push(...src.calls);
+  target.angularCalls.push(...src.angularCalls);
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
@@ -3189,7 +3324,7 @@ if (parentPort) {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0, ormQueries: [] };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], angularCalls: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0, ormQueries: [] };
       cumulativeProcessed = 0;
       return;
     }

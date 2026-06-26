@@ -51,6 +51,12 @@ export interface PipelineOptions {
   /** Skip MRO, community detection, and process extraction for faster test runs. */
   skipGraphPhases?: boolean;
   /**
+   * Run parse workers in parallel (default: true — opt-out). Set to false or
+   * pass GITNEXUS_PARALLEL_PARSE=0 env to force sequential. Useful for
+   * debugging or very memory-constrained environments.
+   */
+  parallelParse?: boolean;
+  /**
    * #50: when provided, unresolved imports whose package maps to an indexed
    * dependency repo create an external File node + CROSS_IMPORTS edge. When
    * omitted (the default), ingestion is single-repo and creates no external nodes.
@@ -304,9 +310,9 @@ export const runPipelineFromRepo = async (
     });
 
     // Don't spawn workers for tiny repos — overhead exceeds benefit.
-    // Gate on GITNEXUS_PARALLEL_PARSE=1 so the default analyze path stays
-    // byte-identical to the sequential baseline (STEP 0).
-    const PARALLEL_PARSE_ENABLED = process.env.GITNEXUS_PARALLEL_PARSE === '1';
+    // Default ON (opt-out). Disable via GITNEXUS_PARALLEL_PARSE=0 env or
+    // options.parallelParse===false (--no-parallel-parse CLI flag).
+    const PARALLEL_PARSE_ENABLED = options?.parallelParse !== false && process.env.GITNEXUS_PARALLEL_PARSE !== '0';
     const MIN_FILES_FOR_WORKERS = 100;
     const MIN_BYTES_FOR_WORKERS = 512 * 1024;  // 512KB threshold
     const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
@@ -327,7 +333,9 @@ export const runPipelineFromRepo = async (
         }
         workerPool = createWorkerPool(workerUrl);
       } catch (err) {
-        if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
+        // Unconditional user-visible warn: we WANTED workers (above threshold) but
+        // couldn't spawn them. Not emitted for the normal under-threshold sequential path.
+        console.warn(`  Parallel parse unavailable, falling back to sequential (slower): ${(err as Error).message}`);
       }
     }
 
@@ -449,8 +457,8 @@ export const runPipelineFromRepo = async (
 
         const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
 
-        if (workerPool && chunkWorkerData) {
-          // Worker path (GITNEXUS_PARALLEL_PARSE=1): parallel-parse-only lossless strategy.
+        if (workerPool && chunkWorkerData && !chunkWorkerData.workerFailed) {
+          // Worker path (parallel parse, default ON): parallel-parse-only lossless strategy.
           //
           // Workers extract nodes/symbols (stored directly in graph/symbolTable by
           // processParsingWithWorkers). Import edges are resolved here from the extracted
@@ -516,6 +524,7 @@ export const runPipelineFromRepo = async (
             allToolDefs.push(...chunkWorkerData.toolDefs);
           }
         } else {
+          if (chunkWorkerData?.workerFailed) workerPool = undefined; // dead worker — stop re-dispatching to a broken pool
           // Sequential path: processImports adds symbols, then heritage/calls are resolved
           // in the sequential fallback loop below (lines 351-365)
           await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths, options?.crossRepoRegistry, javaExternalFqnIndex, pythonExternalFqnIndex);
@@ -1082,6 +1091,22 @@ export const runPipelineFromRepo = async (
           onGateFailure: (reason, elapsedS) => {
             gateFailureReason = reason;
             gateFailureElapsedS = elapsedS;
+          },
+          onHeartbeat: (elapsedMs) => {
+            onProgress({
+              phase: 'lsp',
+              percent: 80,
+              message: `LSP: waiting for ${lspAdapter?.serverBinary ?? 'server'} to index… ${Math.round(elapsedMs / 1000)}s`,
+              stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+            });
+          },
+          onCandidateProgress: (done, total) => {
+            onProgress({
+              phase: 'lsp',
+              percent: Math.round(80 + (done / total) * 10),
+              message: `LSP: resolved ${done}/${total} candidates`,
+              stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+            });
           },
         },
       );

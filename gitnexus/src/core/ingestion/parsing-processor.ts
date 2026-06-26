@@ -44,11 +44,124 @@ export interface WorkerExtractedData {
   constructorBindings: FileConstructorBindings[];
   typeEnvBindings: FileTypeEnvBindings[];
   angularMetadata: import('./workers/parse-worker.js').ExtractedAngularEdge[];
+  /**
+   * Set to true when processParsingWithWorkers threw and sequential fallback was
+   * used for this chunk. The pipeline checks this to call processImports (which
+   * reads files directly) instead of processImportsFromExtracted (which would
+   * receive empty imports and silently drop all import edges for the chunk).
+   */
+  workerFailed?: true;
 }
 
 // ============================================================================
 // Worker-based parallel parsing
 // ============================================================================
+
+/**
+ * Recompute the Laravel + Spring route channel for a chunk on the WORKER path so
+ * it is byte-identical to what `processParsingSequential` produces for the same
+ * chunk. Workers extract Spring routes per-file in isolation via the 2-arg
+ * `extractSpringRoutes(tree, path)` — they cannot resolve constant-based mapping
+ * paths (no repo-wide `javaConstants`) and cannot see base controllers declared
+ * in other files (no cross-file inherited pass). That divergence drops every
+ * constant-path route and every cross-file inherited route (WI-90) on the worker
+ * path. This helper mirrors the sequential route logic exactly:
+ *   1. pre-pass: collect `javaConstants` + parsed Java trees (chunk-scoped, same
+ *      scope the sequential path uses since both run per 20MB chunk);
+ *   2. per-file pass in `files` order: Laravel (PHP route files) + constant-aware
+ *      3-arg `extractSpringRoutes(tree, path, javaConstants)` (Java controllers);
+ *   3. repo/chunk-wide inherited pass (`buildSpringClassRegistry` +
+ *      `extractInheritedSpringRoutes`), deduped with the SAME key the sequential
+ *      path uses.
+ * It intentionally duplicates `processParsingSequential`'s route extraction (kept
+ * inline there so the sequential path is not perturbed). The `result.routes`
+ * emitted by the workers is discarded in favour of this output. Determinism: the
+ * per-file order follows `files`; the inherited pass follows registry insertion
+ * (= file walk) order — identical to the sequential path.
+ */
+const extractSpringRoutesForWorkerParity = async (
+  files: { path: string; content: string }[],
+  parser: Parser,
+): Promise<ExtractedRoute[]> => {
+  const allRoutes: ExtractedRoute[] = [];
+  const javaConstants = new Map<string, string>();
+  const javaFileMap = new Map<string, { tree: Parser.Tree }>();
+
+  // ── Pre-pass: parse Java files, collect constants + trees (mirror seq 262-290) ──
+  for (const file of files) {
+    const language = getLanguageFromFilename(file.path);
+    if (language !== SupportedLanguages.Java) continue;
+    try {
+      await loadLanguage(language, file.path);
+    } catch {
+      continue;
+    }
+    if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
+    let tree;
+    try {
+      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+    } catch {
+      continue;
+    }
+    javaFileMap.set(file.path, { tree });
+    const fileConstants = collectFileConstants(tree.rootNode);
+    for (const [k, v] of fileConstants) {
+      if (!javaConstants.has(k)) javaConstants.set(k, v);
+    }
+  }
+
+  // ── Per-file pass in file order: Laravel + Spring only (mirror seq 343-355) ──
+  for (const file of files) {
+    const language = getLanguageFromFilename(file.path);
+    if (!language) continue;
+    if (!isLanguageAvailable(language)) continue;
+    if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
+
+    // Laravel routes from PHP route files
+    if (language === SupportedLanguages.PHP && (file.path.includes('/routes/') || file.path.startsWith('routes/')) && file.path.endsWith('.php')) {
+      try {
+        await loadLanguage(language, file.path);
+      } catch {
+        continue;
+      }
+      let tree;
+      try {
+        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+      } catch {
+        continue;
+      }
+      allRoutes.push(...extractLaravelRoutes(tree, file.path));
+    }
+
+    // Spring routes from Java controller files (constant-aware, reuse pre-pass tree)
+    if (language === SupportedLanguages.Java && (file.content.includes('@Controller') || file.content.includes('@RestController'))) {
+      const entry = javaFileMap.get(file.path);
+      if (!entry) continue;
+      allRoutes.push(...extractSpringRoutes(entry.tree, file.path, javaConstants));
+    }
+  }
+
+  // ── Repo/chunk-wide cross-file @RequestMapping inheritance (mirror seq 760-776) ──
+  if (javaFileMap.size > 0) {
+    const springRegistry = buildSpringClassRegistry(
+      Array.from(javaFileMap.entries()).map(([filePath, { tree }]) => ({ filePath, tree })),
+      javaConstants,
+    );
+    const inheritedRoutes = extractInheritedSpringRoutes(springRegistry);
+    if (inheritedRoutes.length > 0) {
+      const seenRouteKeys = new Set(allRoutes.map(r => `${r.filePath}:${r.httpMethod}:${r.routePath}`));
+      for (const r of inheritedRoutes) {
+        const key = `${r.filePath}:${r.httpMethod}:${r.routePath}`;
+        if (!seenRouteKeys.has(key)) {
+          seenRouteKeys.add(key);
+          allRoutes.push(r);
+        }
+      }
+    }
+  }
+
+  return allRoutes;
+};
 
 const processParsingWithWorkers = async (
   graph: KnowledgeGraph,
@@ -69,6 +182,10 @@ const processParsingWithWorkers = async (
 
   const total = files.length;
 
+  // Main-thread parser for the Spring/Laravel route parity recompute below — the
+  // worker's per-file `result.routes` are discarded for the route channel (R-parity).
+  const parser = await loadParser();
+
   // Dispatch to worker pool — pool handles splitting into chunks and sub-batching
   const chunkResults = await workerPool.dispatch<ParseWorkerInput, ParseWorkerResult>(
     parseableFiles,
@@ -79,7 +196,7 @@ const processParsingWithWorkers = async (
 
   // Merge results from all workers into graph and symbol table
   const allImports: ExtractedImport[] = [];
-  const allCalls: ExtractedCall[] = [];
+  const allAngularCalls: ExtractedCall[] = [];
   const allAssignments: ExtractedAssignment[] = [];
   const allHeritage: ExtractedHeritage[] = [];
   const allRoutes: ExtractedRoute[] = [];
@@ -120,10 +237,15 @@ const processParsingWithWorkers = async (
     }
 
     allImports.push(...result.imports);
-    allCalls.push(...result.calls);
+    // #31: Angular DI/template CALLS — the only calls the worker path emits
+    // here (general calls are resolved separately via processCalls re-extraction).
+    allAngularCalls.push(...(result.angularCalls ?? []));
     if (result.assignments) allAssignments.push(...result.assignments);
     allHeritage.push(...result.heritage);
-    allRoutes.push(...result.routes);
+    // result.routes (per-file 2-arg Spring + Laravel) is intentionally NOT merged
+    // here — the Spring/Laravel route channel is recomputed below via
+    // extractSpringRoutesForWorkerParity so it matches the sequential path
+    // (constant resolution + cross-file inherited routes). See helper doc.
     if (result.fetchCalls) allFetchCalls.push(...result.fetchCalls);
     if (result.expoNavCalls) allExpoNavCalls.push(...result.expoNavCalls);
     if (result.decoratorRoutes) allDecoratorRoutes.push(...result.decoratorRoutes);
@@ -133,6 +255,13 @@ const processParsingWithWorkers = async (
     if (result.typeEnvBindings) allTypeEnvBindings.push(...result.typeEnvBindings);
     if (result.angularMetadata) allAngularMetadata.push(...result.angularMetadata);
   }
+
+  // Recompute the Laravel + Spring route channel on the main thread so the worker
+  // path is byte-identical to the sequential path: workers cannot resolve
+  // constant-based mapping paths (no repo-wide javaConstants) nor emit cross-file
+  // inherited routes (WI-90), which dropped ~137 Route DEFINES + CALLS on large
+  // Spring repos. Mirrors processParsingSequential's route logic per chunk.
+  allRoutes.push(...(await extractSpringRoutesForWorkerParity(files, parser)));
 
   // Count nodes by label
   const nodesByLabel: Record<string, number> = {};
@@ -164,7 +293,7 @@ const processParsingWithWorkers = async (
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return { imports: allImports, calls: allCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, fetchCalls: allFetchCalls, expoNavCalls: allExpoNavCalls, decoratorRoutes: allDecoratorRoutes, toolDefs: allToolDefs, ormQueries: allORMQueries, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings, angularMetadata: allAngularMetadata };
+  return { imports: allImports, calls: allAngularCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, fetchCalls: allFetchCalls, expoNavCalls: allExpoNavCalls, decoratorRoutes: allDecoratorRoutes, toolDefs: allToolDefs, ormQueries: allORMQueries, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings, angularMetadata: allAngularMetadata };
 };
 
 // ============================================================================
@@ -802,9 +931,14 @@ export const processParsing = async (
       return await processParsingWithWorkers(graph, files, symbolTable, astCache, workerPool, onFileProgress);
     } catch (err) {
       console.warn('Worker pool parsing failed, falling back to sequential:', err instanceof Error ? err.message : err);
+      // Signal the fallback via workerFailed so the pipeline takes the sequential
+      // branch (processImports) instead of processImportsFromExtracted — otherwise
+      // imports: [] would silently drop all import edges for this chunk (R5).
+      const result = await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
+      return { ...result, workerFailed: true };
     }
   }
 
-  // Fallback: sequential parsing
+  // Fallback: sequential parsing (no worker pool or explicit opt-out)
   return processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
 };

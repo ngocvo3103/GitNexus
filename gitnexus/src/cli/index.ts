@@ -34,11 +34,12 @@ program
    .option('--lsp-dry-run', 'Preview every LSP reconciliation decision and write nothing; implies --lsp')
    .option('--lsp-budget <n>', 'Limit LSP candidate cap to n (positive integer; default 2000); requires --lsp', (v) => Number(v))
    .option('--lsp-high-tier-sample <rate>', 'Spot-check fraction [0,1] of import-scoped (0.90) CALLS edges via LSP to catch confidently-wrong edges (default 0 = off); requires --lsp', (v) => Number(v))
-   .option('--lsp-pipeline <n>', 'Allow n LSP requests in flight concurrently (default 1 = serial); speeds up dispatch on jdtls/tsserver; requires --lsp', (v) => Number(v))
+   .option('--lsp-pipeline <n>', 'Allow n LSP requests in flight concurrently (default 4); speeds up dispatch on jdtls/tsserver; requires --lsp', (v) => Number(v))
    .option('--lsp-changed-since <ref>', 'Scope LSP augmentation to call/heritage sites in files changed since <ref> (git diff); requires --lsp')
-   .option('--lsp-cache', 'Cache textDocument/definition results across runs (clean working tree only); speeds re-indexing; requires --lsp')
+   .option('--no-lsp-cache', 'Disable the definition cache (on by default when --lsp is active on a clean git tree); cache is commit-namespaced so stale hits are impossible')
    .option('--lsp-no-early-bail', 'Disable adaptive early-bail; probe every candidate even when the language server resolves none (default: bail after 150 unresolved probes); requires --lsp')
-   .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
+   .option('--no-parallel-parse', 'Disable parallel parse workers (only affects repos above the 100-file / 512KB threshold; for debugging or memory-constrained environments)')
+   .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)\n  GITNEXUS_PARALLEL_PARSE=0  Disable parallel parse workers (same as --no-parallel-parse)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program

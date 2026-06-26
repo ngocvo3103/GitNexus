@@ -105,6 +105,13 @@ export interface AnalyzeOptions {
    * Requires `--lsp`.
    */
   lspNoEarlyBail?: boolean;
+  /**
+   * When false (or when GITNEXUS_PARALLEL_PARSE=0 env is set), disable parallel
+   * parse workers and use sequential parsing. Default: true (parallel ON).
+   * Set via --no-parallel-parse CLI flag; Commander populates this as false when
+   * --no-parallel-parse is passed, true otherwise.
+   */
+  parallelParse?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -404,7 +411,7 @@ export const analyzeCommand = async (
   // cache whenever caching would be unsound (dirty tree / unknown commit), so
   // a stale hit is impossible by construction.
   const lspDefinitionCache =
-    options?.lspCache && (options?.lsp || options?.lspDryRun)
+    options?.lspCache !== false && (options?.lsp || options?.lspDryRun)
       ? buildDefinitionCache({
           enabled: true,
           commit: getCurrentCommit(repoPath) || null,
@@ -413,9 +420,6 @@ export const analyzeCommand = async (
           repoId: repoPath,
         })
       : undefined;
-  if (options?.lspCache && !options?.lsp && !options?.lspDryRun) {
-    console.warn('  Warning: --lsp-cache ignored: --lsp not enabled');
-  }
   // Non-git tree: the commit-namespaced cache and changed-since scoping both
   // need git, so they silently no-op here. Say so once, up front, so the user
   // isn't surprised the speed levers had no effect.
@@ -436,7 +440,9 @@ export const analyzeCommand = async (
   let timedPhase: string | null = null;
   let timedPhaseStart = Date.now();
   const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
-    const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
+    const phaseLabel = (progress.phase === 'lsp' && progress.message)
+      ? progress.message
+      : (PHASE_LABELS[progress.phase] || progress.phase);
     const scaled = Math.round(progress.percent * 0.6);
     if (phaseTiming && progress.phase !== timedPhase) {
       const now = Date.now();
@@ -448,6 +454,7 @@ export const analyzeCommand = async (
     }
     updateBar(scaled, phaseLabel);
   }, {
+    parallelParse: options?.parallelParse !== false,
     lsp: {
       enabled: options?.lsp === true || options?.lspDryRun === true,
       dryRun: options?.lspDryRun === true,

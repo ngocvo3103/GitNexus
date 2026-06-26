@@ -370,6 +370,17 @@ export interface WithReconciliationSessionDeps {
    * exactly, so all existing tests that never pass this dep are unaffected.
    */
   onGateFailure?: (reason: 'no-server' | 'not-ready' | 'dispatch-error', elapsedS: string) => void;
+  /**
+   * WI-1 (heartbeat): forwarded to `LspClientOptions.onHeartbeat` so the
+   * language adapter can emit live readiness progress. Absent → no heartbeat.
+   */
+  onHeartbeat?: (elapsedMs: number) => void;
+  /**
+   * WI-2 (candidate progress): called after each `handToEngine` completion,
+   * throttled to every 25 calls. `done` is the number of completed
+   * `handToEngine` calls; `total` is `selected.length`. Absent → no callback.
+   */
+  onCandidateProgress?: (done: number, total: number) => void;
 }
 
 // ─── Defaults (KD-9, KD-10) ────────────────────────────────────────────
@@ -460,8 +471,9 @@ function defaultCreateLspClient(
   repo: ReconciliationRepo,
   adapter: LanguageAdapter,
   maxInFlight?: number,
+  onHeartbeat?: (elapsedMs: number) => void,
 ): ReconciliationLspClient {
-  return new LspClient({ workspaceRoot: repo.repoPath, adapter, maxInFlight });
+  return new LspClient({ workspaceRoot: repo.repoPath, adapter, maxInFlight, onHeartbeat });
 }
 
 /**
@@ -593,7 +605,7 @@ export async function withReconciliationSession<T>(
   // WI-6: inline the adapter-aware default so the factory closes
   // over the selected adapter (TS or Java) — the module-level
   // `defaultCreateLspClient` now accepts adapter as second arg.
-  const factory = deps.createLspClient ?? ((r: ReconciliationRepo) => defaultCreateLspClient(r, adapter, deps.maxInFlight));
+  const factory = deps.createLspClient ?? ((r: ReconciliationRepo) => defaultCreateLspClient(r, adapter, deps.maxInFlight, deps.onHeartbeat));
   const client = factory(repo);
   try {
     await client.start();
@@ -669,6 +681,7 @@ export async function withReconciliationSession<T>(
     // files. Cache the file→uri mapping for the lifetime of
     // this dispatch loop; the cache dies with the session.
     const uriCache = new Map<string, string>();
+    let _candidateDone = 0;
     await runWithConcurrency(
       selected,
       CONCURRENT_DEFINITION_REQUESTS,
@@ -716,6 +729,10 @@ export async function withReconciliationSession<T>(
           }
         }
         await handToEngine(candidate, result.locations);
+        _candidateDone++;
+        if (deps.onCandidateProgress && _candidateDone % 25 === 0) {
+          try { deps.onCandidateProgress(_candidateDone, selected.length); } catch { /* progress callback must never break the session */ }
+        }
         // Adaptive early-bail accounting: a non-empty Location[] is a "hit".
         // After a full 0-hit sample, trip the bail so the remaining candidates
         // are skipped (kept). Only fires on probed candidates (preFiltered ones

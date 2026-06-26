@@ -189,6 +189,14 @@ export interface AdapterReadyCtx {
    *   sub?.dispose();
    */
   onServerStatus?: (cb: (payload: { quiescent: boolean; health: string }) => void) => { dispose(): void };
+
+  /**
+   * WI-1 (heartbeat): optional callback fired every ~2 s while the adapter
+   * is waiting in `awaitReady`. Callers use it to emit live progress messages
+   * so a long warm-up does not look hung. `elapsedMs` is measured from the
+   * start of the `awaitReady` call. Never throws — callers must guard.
+   */
+  onHeartbeat?: (elapsedMs: number) => void;
 }
 
 // ─── ClientCapabilities ───────────────────────────────────────────────
@@ -510,6 +518,18 @@ export const JAVA_ADAPTER: LanguageAdapter = {
       let quietTimer: ReturnType<typeof setTimeout> | null = null;
       let canaryTimer: ReturnType<typeof setTimeout> | null = null;
       let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+      let _heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const _heartbeatStart = Date.now();
+      function _scheduleHeartbeat(): void {
+        if (settled) return;
+        _heartbeatTimer = setTimeout(() => {
+          if (settled) return;
+          try { ctx.onHeartbeat?.(Date.now() - _heartbeatStart); } catch { /* progress callback must never break readiness */ }
+          _scheduleHeartbeat();
+        }, 2000);
+        _heartbeatTimer.unref?.();
+      }
 
       function dispose(): void {
         if (langStatusHandler !== null) {
@@ -523,6 +543,7 @@ export const JAVA_ADAPTER: LanguageAdapter = {
         if (quietTimer !== null) { clearTimeout(quietTimer); quietTimer = null; }
         if (canaryTimer !== null) { clearTimeout(canaryTimer); canaryTimer = null; }
         if (deadlineTimer !== null) { clearTimeout(deadlineTimer); deadlineTimer = null; }
+        if (_heartbeatTimer !== null) { clearTimeout(_heartbeatTimer); _heartbeatTimer = null; }
       }
 
       function settle(value: boolean): void {
@@ -669,6 +690,7 @@ export const JAVA_ADAPTER: LanguageAdapter = {
       schedulePeriodicCanary();
 
       // ── Step 4: hard deadline ──────────────────────────────────────────
+      _scheduleHeartbeat();
       deadlineTimer = setTimeout(() => {
         settle(false);
       }, deadline);
@@ -775,6 +797,18 @@ export const PYTHON_ADAPTER: LanguageAdapter = {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
 
+      const _heartbeatStart = Date.now();
+      let _heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+      function _scheduleHeartbeat(): void {
+        if (settled) return;
+        _heartbeatTimer = setTimeout(() => {
+          if (settled) return;
+          try { ctx.onHeartbeat?.(Date.now() - _heartbeatStart); } catch { /* progress callback must never break readiness */ }
+          _scheduleHeartbeat();
+        }, 2000);
+        _heartbeatTimer.unref?.();
+      }
+
       function settle(value: boolean): void {
         if (settled) return;
         settled = true;
@@ -782,11 +816,13 @@ export const PYTHON_ADAPTER: LanguageAdapter = {
           clearTimeout(timer);
           timer = null;
         }
+        if (_heartbeatTimer !== null) { clearTimeout(_heartbeatTimer); _heartbeatTimer = null; }
         resolve(value);
       }
 
       // Set the hard deadline — resolves false if the probe loop does not
       // produce a ready signal before it elapses.
+      _scheduleHeartbeat();
       timer = setTimeout(() => {
         settle(false);
       }, deadline);
@@ -1005,10 +1041,23 @@ export const GO_ADAPTER: LanguageAdapter = {
       let progressSub: { dispose(): void } | null = null;
       let timer: ReturnType<typeof setTimeout> | null = null;
 
+      const _heartbeatStart = Date.now();
+      let _heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+      function _scheduleHeartbeat(): void {
+        if (settled) return;
+        _heartbeatTimer = setTimeout(() => {
+          if (settled) return;
+          try { ctx.onHeartbeat?.(Date.now() - _heartbeatStart); } catch { /* progress callback must never break readiness */ }
+          _scheduleHeartbeat();
+        }, 2000);
+        _heartbeatTimer.unref?.();
+      }
+
       function settle(value: boolean): void {
         if (settled) return;
         settled = true;
         if (timer !== null) { clearTimeout(timer); timer = null; }
+        if (_heartbeatTimer !== null) { clearTimeout(_heartbeatTimer); _heartbeatTimer = null; }
         try { progressSub?.dispose(); } catch { /* ignore */ }
         resolve(value);
       }
@@ -1043,6 +1092,7 @@ export const GO_ADAPTER: LanguageAdapter = {
       }
 
       // Step 3: deadline backstop — canary probe (mirrors JAVA_ADAPTER path B).
+      _scheduleHeartbeat();
       timer = setTimeout(() => {
         if (settled) return;
         void (async () => {
@@ -1216,10 +1266,23 @@ export const RUST_ADAPTER: LanguageAdapter = {
       let statusSub: { dispose(): void } | null = null;
       let timer: ReturnType<typeof setTimeout> | null = null;
 
+      const _heartbeatStart = Date.now();
+      let _heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+      function _scheduleHeartbeat(): void {
+        if (settled) return;
+        _heartbeatTimer = setTimeout(() => {
+          if (settled) return;
+          try { ctx.onHeartbeat?.(Date.now() - _heartbeatStart); } catch { /* progress callback must never break readiness */ }
+          _scheduleHeartbeat();
+        }, 2000);
+        _heartbeatTimer.unref?.();
+      }
+
       function settle(value: boolean): void {
         if (settled) return;
         settled = true;
         if (timer !== null) { clearTimeout(timer); timer = null; }
+        if (_heartbeatTimer !== null) { clearTimeout(_heartbeatTimer); _heartbeatTimer = null; }
         try { statusSub?.dispose(); } catch { /* ignore */ }
         resolve(value);
       }
@@ -1253,6 +1316,7 @@ export const RUST_ADAPTER: LanguageAdapter = {
 
       // Step 3: deadline backstop — canary probe (mirrors GO_ADAPTER path B,
       // but zero samples → true is a deliberate deviation from GO_ADAPTER).
+      _scheduleHeartbeat();
       timer = setTimeout(() => {
         if (settled) return;
         void (async () => {
