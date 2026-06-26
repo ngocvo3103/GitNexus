@@ -7,7 +7,7 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutesWithRepoId, processExpoRouterNavigations, processDecoratorRoutesWithRepoId, processPHPRoutesWithRepoId, processNextjsRoutesWithRepoId, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted, buildRefusedFqnHistogram, type ProcessCallsOpts, type CorrectionFeedItem, type RecallFeedItem } from './call-processor.js';
+import { processCalls, processCallsFromExtracted, detectLowConfidenceFiles, processAssignmentsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutesWithRepoId, processExpoRouterNavigations, processDecoratorRoutesWithRepoId, processPHPRoutesWithRepoId, processNextjsRoutesWithRepoId, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted, buildRefusedFqnHistogram, type ProcessCallsOpts, type CorrectionFeedItem, type RecallFeedItem } from './call-processor.js';
 import type { ExtractedRoute, ExtractedExpoNav, ExtractedORMQuery, ExtractedDecoratorRoute, ExtractedFetchCall, ExtractedToolDef } from './workers/parse-worker.js';
 import type { CrossRepoRegistry } from './cross-repo-registry.js';
 import { processHeritage, processHeritageFromExtracted, type ProcessHeritageOpts, type HeritageFeedItem } from './heritage-processor.js';
@@ -326,6 +326,12 @@ export const runPipelineFromRepo = async (
     // instead of the sequential `processCalls` re-parse. Opt-in (default OFF) and
     // only effective on the worker path (the sequential fallback path is untouched).
     const L2_EXTRACTED_RESOLVE = options?.l2ExtractedResolve === true || process.env.GITNEXUS_L2 === '1';
+    // L2 hybrid fallback (#perf): when L2 is on, route files whose extracted call
+    // resolution is low-confidence (Java overloads / same-name receivers that need
+    // AST-only info) through the AST `processCalls` re-parse, keeping every other
+    // file on the fast extracted path. ON whenever L2 is on; set GITNEXUS_L2_HYBRID=0
+    // to disable (e.g. to measure the pure-extracted residual).
+    const L2_HYBRID_FALLBACK = L2_EXTRACTED_RESOLVE && process.env.GITNEXUS_L2_HYBRID !== '0';
     const MIN_FILES_FOR_WORKERS = 100;
     const MIN_BYTES_FOR_WORKERS = 512 * 1024;  // 512KB threshold
     const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
@@ -674,6 +680,15 @@ export const runPipelineFromRepo = async (
     // (file path, then call-site position) so ambiguous lookupFuzzy[0] tiebreaks
     // are stable across worker scheduling. The same lspFeedsOpt the AST path gets
     // is threaded so LSP mode is unaffected.
+    //
+    // L2 hybrid fallback: detect the (small) set of files whose extracted call
+    // resolution is low-confidence — Java overloads / same-name receivers that the
+    // worker cannot disambiguate without AST-only info (overloadHints, the richer
+    // typeEnv). Those files are EXCLUDED from the extracted emit and re-parsed via
+    // the AST `processCalls` below (byte-identical to L1); every other file stays
+    // on the fast extracted path. `deferredFiles` is shared with the write-ACCESS
+    // pass so deferred files are not double-emitted.
+    const deferredFiles = new Set<string>();
     if (L2_EXTRACTED_RESOLVE && allGeneralCalls.length > 0) {
       allGeneralCalls.sort((a, b) =>
         a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 :
@@ -681,23 +696,64 @@ export const runPipelineFromRepo = async (
         (a.character ?? 0) - (b.character ?? 0) ||
         (a.calledName < b.calledName ? -1 : a.calledName > b.calledName ? 1 : 0),
       );
+      if (L2_HYBRID_FALLBACK) {
+        for (const f of detectLowConfidenceFiles(
+          allGeneralCalls, ctx, graph, allConstructorBindings, allTypeEnvBindings,
+        )) {
+          deferredFiles.add(f);
+        }
+        if (deferredFiles.size > 0) {
+          console.warn(`  [l2-hybrid] deferred ${deferredFiles.size} low-confidence file(s) to AST re-parse`);
+        }
+      }
+      const extractedCalls = deferredFiles.size > 0
+        ? allGeneralCalls.filter(c => !deferredFiles.has(c.filePath))
+        : allGeneralCalls;
       await processCallsFromExtracted(
         graph,
-        allGeneralCalls,
+        extractedCalls,
         ctx,
         undefined,
         allConstructorBindings,
         allTypeEnvBindings,
         lspFeedsOpt,
       );
+
+      // Hybrid AST fallback: re-parse the deferred low-confidence files so their
+      // CALLS + read/write-ACCESS come out byte-identical to L1. Mirrors the
+      // sequential re-parse block exactly (same processCalls positional args +
+      // ruby-heritage handling). Static EXTENDS/IMPLEMENTS heritage is NOT re-run
+      // here — it was already emitted for every file by processHeritageFromExtracted
+      // above. Deterministic (sorted) so the re-parse is reproducible.
+      if (deferredFiles.size > 0) {
+        const deferredPaths = [...deferredFiles].sort();
+        const deferredContents = await readFileContents(repoPath, deferredPaths);
+        const deferredFileObjs = deferredPaths
+          .filter(p => deferredContents.has(p))
+          .map(p => ({ path: p, content: deferredContents.get(p)! }));
+        const deferredAstCache = createASTCache(deferredFileObjs.length);
+        const rubyHeritage = await processCalls(
+          graph, deferredFileObjs, deferredAstCache, ctx,
+          undefined, undefined, undefined, undefined, undefined, lspFeedsOpt,
+        );
+        if (rubyHeritage.length > 0) {
+          await processHeritageFromExtracted(graph, rubyHeritage, ctx, undefined, lspHeritageOpt);
+        }
+        deferredAstCache.clear();
+      }
     }
 
     // P2 (#perf) write-ACCESS: resolve worker-extracted member-field assignments
     // (`this.field = x`) to ACCESSES {reason:'write'} edges over the merged symbol
     // table — the extracted-path equivalent of the AST `pendingWrites` pass. The
     // edge id matches the AST path exactly (`${sourceId}:${fieldOwner}:write`).
+    // Hybrid: deferred files are excluded — their write-ACCESS is emitted by the
+    // AST re-parse above (which runs its own `pendingWrites` pass).
     if (L2_EXTRACTED_RESOLVE && allAssignments.length > 0) {
-      processAssignmentsFromExtracted(graph, allAssignments, ctx, allConstructorBindings);
+      const extractedAssignments = deferredFiles.size > 0
+        ? allAssignments.filter(a => !deferredFiles.has(a.filePath))
+        : allAssignments;
+      processAssignmentsFromExtracted(graph, extractedAssignments, ctx, allConstructorBindings);
     }
 
     // Post-processing: Expo routes and ORM queries (accumulated across all chunks)
