@@ -58,6 +58,7 @@ import {
 } from '../utils/call-analysis.js';
 import { extractAnnotations } from '../annotation-extractor.js';
 import { buildTypeEnv } from '../type-env.js';
+import { getProvider } from '../languages/index.js';
 import type { ConstructorBinding } from '../type-env.js';
 import {
   tsExportChecker,
@@ -240,35 +241,14 @@ const extractNamedBindings = (importNode: any, language: SupportedLanguages): Na
   return extractor ? extractor(importNode) : undefined;
 };
 
-/** Built-in names that should be excluded from call graphs (noise reduction) */
-const BUILTIN_NOISE = new Set([
-  // JavaScript/TypeScript
-  'console', 'window', 'document', 'Math', 'JSON', 'Object', 'Array', 'String', 'Number', 'Boolean',
-  'Promise', 'Symbol', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Date', 'RegExp', 'Error', 'Function',
-  'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-  'require', 'module', 'exports', '__dirname', '__filename', 'process',
-  // Python
-  'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple', 'bool', 'None',
-  'True', 'False', 'type', 'isinstance', 'hasattr', 'getattr', 'setattr', 'open', 'input',
-  // Java
-  'System', 'String', 'Integer', 'Long', 'Double', 'Float', 'Boolean', 'Object', 'Class',
-  'List', 'Map', 'Set', 'Arrays', 'Collections', 'Optional',
-  // Go
-  'fmt', 'log', 'os', 'io', 'strings', 'strconv', 'time', 'context',
-  // Rust
-  'println', 'vec', 'Option', 'Result', 'String', 'Box', 'Rc', 'Arc', 'Cell', 'RefCell',
-  // C#
-  'Console', 'String', 'Int32', 'Int64', 'Double', 'Boolean', 'Object', 'Task', 'Enumerable',
-  // PHP
-  'echo', 'print', 'var_dump', 'die', 'exit', 'isset', 'empty', 'array', 'string', 'int',
-  // Ruby
-  'puts', 'print', 'p', 'raise', 'fail', 'require', 'include', 'extend', 'attr_reader', 'attr_writer', 'attr_accessor',
-  // Swift
-  'print', 'debugPrint', 'fatalError', 'preconditionFailure', 'assertionFailure',
-]);
-
-/** Check if a name is a built-in or noise symbol (excluded from call graph) */
-const isBuiltInOrNoise = (name: string): boolean => BUILTIN_NOISE.has(name);
+// Note: the L2 call-extraction noise filter now uses the per-language
+// `provider.isBuiltInName` (see processFileGroup, where `providerForLanguage`
+// is resolved) to mirror the AST path exactly. The former language-agnostic
+// `BUILTIN_NOISE` Set was removed because it both over- and under-filtered
+// relative to the AST: it dropped names that are not builtins in the file's
+// language (e.g. Java `process`/`isNaN`) and kept language builtins it did not
+// list (e.g. Python `update`). Per-language filtering is the tested, intended
+// design (see test/unit/noise-filter.test.ts).
 
 // Ruby call router for import/heritage/property dispatch
 const rubyCallRouter: CallRouter = (calledName: string, callNode: any) => {
@@ -2489,6 +2469,18 @@ const processFileGroup = (
     // Per-file cache for Property declaredType extraction (keyed by class node startIndex).
     const fieldInfoCache = new Map<number, Map<string, ExtractedFieldInfo>>();
     const routerForLanguage = callRouters[language];
+    // L2 call-extraction noise filter: mirror the AST path's per-language
+    // `provider.isBuiltInName` (call-processor.ts processCalls) instead of the
+    // global BUILTIN_NOISE set. BUILTIN_NOISE mixed every language's builtins, so it
+    // (a) over-filtered names that are NOT builtins in the file's language — e.g. Java
+    // `process`/`isNaN` (Java provider has no builtInNames) — dropping real CALLS the AST
+    // keeps, and (b) under-filtered language builtins absent from the set — e.g. Python
+    // `update` (in Python builtInNames) — emitting CALLS the AST drops. Using the same
+    // predicate as the AST makes the extracted call set match. L2-only in effect:
+    // result.calls feeds allGeneralCalls (parsing-processor.ts:254), consumed solely
+    // under L2_EXTRACTED_RESOLVE (pipeline.ts:554) — the default/sequential graph is
+    // unaffected.
+    const providerForLanguage = getProvider(language);
 
     // Extract FILE_SCOPE bindings for field/local variable type resolution
     // This enables resolution of receiver types for calls like `cashService.unholdMoney()`
@@ -2802,7 +2794,7 @@ const processFileGroup = (
             }
           }
 
-          if (!isBuiltInOrNoise(calledName)) {
+          if (!providerForLanguage.isBuiltInName(calledName)) {
             const callNode = captureMap['call'];
             const sourceId = findEnclosingFunctionId(callNode, file.path, language)
               || generateId('File', file.path);

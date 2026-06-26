@@ -1665,7 +1665,32 @@ export const processCallsFromExtracted = async (
     }
 
     for (const call of calls) {
-      let effectiveCall = call;
+      // RC-3 — sourceId re-attribution. The AST path computes the enclosing
+      // caller via findEnclosingFunction (call-processor.ts), whose Tier-1 branch
+      // returns `ctx.resolve(funcName, file).candidates[0].nodeId` whenever the
+      // enclosing name resolves same-file — carrying the symbol table's exact node
+      // id (its label AND any `:N` overload suffix). The worker's
+      // findEnclosingFunctionId (parse-worker.ts) cannot do this at parse time (no
+      // SymbolTable), so it mints `generateId(label, file:funcName)` with no `:N`
+      // and a best-effort label. Re-run the SAME Tier-1 resolve here so the
+      // enclosing id matches the AST byte-for-byte (e.g. a call enclosed by a field
+      // initializer resolves to `Property:…` not `Method:…`; an overloaded enclosing
+      // method gets its `:N`). File-scoped sources have no enclosing function — the
+      // worker already emits `File:…` and the same-file lookup of a path string
+      // no-ops, so they pass through unchanged. Used for BOTH the receiver-lookup
+      // scope key (Step 1) and the emitted edge sourceId, exactly as the AST uses
+      // its single findEnclosingFunction result for both.
+      let reattributedSourceId = call.sourceId;
+      if (!call.sourceId.startsWith('File:')) {
+        const enclFuncName = extractFuncNameFromSourceId(call.sourceId);
+        const enclResolved = ctx.resolve(enclFuncName, call.filePath);
+        if (enclResolved?.tier === 'same-file' && enclResolved.candidates.length > 0) {
+          reattributedSourceId = enclResolved.candidates[0].nodeId;
+        }
+      }
+      let effectiveCall: ExtractedCall = reattributedSourceId === call.sourceId
+        ? call
+        : { ...call, sourceId: reattributedSourceId };
 
       // Step 0: resolve receiver type from FILE_SCOPE bindings (field declarations)
       // This handles Spring DI pattern: @Autowired private CashService cashService;
@@ -1676,7 +1701,8 @@ export const processCallsFromExtracted = async (
           if (logVerbose && filePath.includes('Controller')) {
             console.debug(`[call-resolution] Step 0: resolved receiver '${call.receiverName}' to type '${resolvedType}' from FILE_SCOPE`);
           }
-          effectiveCall = { ...call, receiverTypeName: resolvedType };
+          // Spread effectiveCall (not call) so the RC-3 re-attributed sourceId is preserved.
+          effectiveCall = { ...effectiveCall, receiverTypeName: resolvedType };
         } else if (logVerbose && filePath.includes('Controller') && call.receiverName) {
           // DEBUG: Log when receiver is not found in FILE_SCOPE
           console.debug(`[call-resolution] Step 0: receiver '${call.receiverName}' NOT FOUND in FILE_SCOPE for ${filePath}`);
@@ -1685,10 +1711,13 @@ export const processCallsFromExtracted = async (
 
       // Step 1: resolve receiver type from constructor bindings (var x = new Type())
       if (!effectiveCall.receiverTypeName && call.receiverName && receiverMap) {
-        const callFuncName = extractFuncNameFromSourceId(call.sourceId);
+        // Use the re-attributed sourceId so the scope funcName matches the AST's
+        // (which keys receiver lookup off findEnclosingFunction's resolved id).
+        const callFuncName = extractFuncNameFromSourceId(effectiveCall.sourceId);
         const resolvedType = lookupReceiverType(receiverMap, callFuncName, call.receiverName);
         if (resolvedType) {
-          effectiveCall = { ...call, receiverTypeName: resolvedType };
+          // Spread effectiveCall (not call) so the RC-3 re-attributed sourceId is preserved.
+          effectiveCall = { ...effectiveCall, receiverTypeName: resolvedType };
         }
       }
 
@@ -1729,6 +1758,23 @@ export const processCallsFromExtracted = async (
             effectiveCall = { ...effectiveCall, receiverTypeName: walkedType };
           }
         }
+      }
+
+      // RC-2 — callForm parity for receiver-less calls. The worker ships
+      // callForm=undefined for some bare `Name(...)` calls whose captured `call`
+      // node differs from the AST's (notably Python `async with ClassName() as x`,
+      // where the callee identifier's parent call node is not the captured @call).
+      // The AST's inferCallForm returns 'free' for a bare call with no receiver,
+      // which lets resolveCallTarget run its free→constructor retry and resolve the
+      // class. Mirror that: when callForm is absent AND there is no receiver
+      // (no receiverName, no mixed chain), treat it as 'free'. Receiver-bearing
+      // calls are untouched, so member-call classification never changes.
+      if (
+        effectiveCall.callForm === undefined &&
+        !effectiveCall.receiverName &&
+        !effectiveCall.receiverMixedChain
+      ) {
+        effectiveCall = { ...effectiveCall, callForm: 'free' };
       }
 
       const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx, undefined, widenCache);
