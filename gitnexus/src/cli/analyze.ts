@@ -112,6 +112,12 @@ export interface AnalyzeOptions {
    * --no-parallel-parse is passed, true otherwise.
    */
   parallelParse?: boolean;
+  /**
+   * L2 (#perf): resolve the general call graph from worker-extracted call sites
+   * (`processCallsFromExtracted`) instead of the sequential `processCalls`
+   * re-parse. Default false (opt-in via --l2 or GITNEXUS_L2=1). Worker-path only.
+   */
+  l2?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -455,6 +461,8 @@ export const analyzeCommand = async (
     updateBar(scaled, phaseLabel);
   }, {
     parallelParse: options?.parallelParse !== false,
+    // L2 (#perf): opt-in. Pipeline also honours GITNEXUS_L2=1.
+    l2ExtractedResolve: options?.l2 === true,
     lsp: {
       enabled: options?.lsp === true || options?.lspDryRun === true,
       dryRun: options?.lspDryRun === true,

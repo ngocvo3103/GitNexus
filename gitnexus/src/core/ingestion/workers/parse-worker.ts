@@ -54,8 +54,7 @@ import {
   inferCallForm,
   extractReceiverName,
   extractReceiverNode,
-  CALL_EXPRESSION_TYPES,
-  extractCallChain,
+  extractMixedChain,
 } from '../utils/call-analysis.js';
 import { extractAnnotations } from '../annotation-extractor.js';
 import { buildTypeEnv } from '../type-env.js';
@@ -747,6 +746,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     fetchCalls: [],
     decoratorRoutes: [],
     angularMetadata: [],
+    assignments: [], // L2 (#perf): member-field write sites for processAssignmentsFromExtracted
   };
 
   // Group by language to minimize setLanguage calls
@@ -2676,6 +2676,31 @@ const processFileGroup = (
         continue;
       }
 
+      // L2 (#perf) write-ACCESS: capture member-field assignments (`this.x = ...`)
+      // into result.assignments for processAssignmentsFromExtracted. Mirrors the AST
+      // capture at call-processor.ts:432-463. Purely additive (no short-circuit) so
+      // a match that is also a definition/call is still processed below. The receiver
+      // type is resolved at resolution time over the merged symbol table; here we ship
+      // the receiver text + property and a best-effort worker-typeEnv type.
+      if (captureMap['assignment'] && captureMap['assignment.receiver'] && captureMap['assignment.property']) {
+        const asnReceiverText: string = captureMap['assignment.receiver'].text;
+        const asnPropertyName: string = captureMap['assignment.property'].text;
+        const asnSourceId = findEnclosingFunctionId(captureMap['assignment'], file.path)
+          || generateId('File', file.path);
+        const asnReceiverType = asnReceiverText
+          ? typeEnv.lookup(asnReceiverText, captureMap['assignment'])
+          : undefined;
+        result.assignments!.push({
+          filePath: file.path,
+          lhs: asnReceiverText ? `${asnReceiverText}.${asnPropertyName}` : asnPropertyName,
+          rhs: '',
+          sourceId: asnSourceId,
+          receiverText: asnReceiverText,
+          propertyName: asnPropertyName,
+          ...(asnReceiverType !== undefined ? { receiverTypeName: asnReceiverType } : {}),
+        });
+      }
+
       // Extract call sites
       if (captureMap['call']) {
         const callNameNode = captureMap['call.name'];
@@ -2781,27 +2806,23 @@ const processFileGroup = (
               }
             }
 
-            let receiverCallChain: string[] | undefined;
+            let receiverMixedChain: Array<{ kind: 'field' | 'call'; name: string }> | undefined;
 
-            // When the receiver is a call_expression (e.g. svc.getUser().save()),
-            // extractReceiverName returns undefined because it refuses complex expressions.
-            // Instead, walk the receiver node to build a call chain for deferred resolution.
-            // We capture the base receiver name so processCallsFromExtracted can look it up
-            // from constructor bindings. receiverTypeName is intentionally left unset here —
-            // the chain resolver in processCallsFromExtracted needs the base type as input and
-            // produces the final receiver type as output.
+            // When the receiver is a complex expression (field chain, call chain, or
+            // interleaved — e.g. user.address.save() or svc.getUser().save()),
+            // extractReceiverName returns undefined. Build a MIXED chain so L2's
+            // processCallsFromExtracted Step 1c can walk it — resolving the final
+            // receiver type AND emitting field read-ACCESS edges. Mirrors the AST path
+            // at call-processor.ts:599-630 (which uses extractMixedChain, not the
+            // call-only extractCallChain). The base receiver name is shipped as
+            // receiverName so Step 1 can seed the chain's starting type.
             if (callForm === 'member' && receiverName === undefined && !receiverTypeName) {
               const receiverNode = extractReceiverNode(callNameNode);
-              if (receiverNode && CALL_EXPRESSION_TYPES.has(receiverNode.type)) {
-                const extracted = extractCallChain(receiverNode);
-                if (extracted) {
-                  receiverCallChain = extracted.chain;
-                  // Set receiverName to the base object so Step 1 in processCallsFromExtracted
-                  // can resolve it via constructor bindings to a base type for the chain.
+              if (receiverNode) {
+                const extracted = extractMixedChain(receiverNode);
+                if (extracted && extracted.chain.length > 0) {
+                  receiverMixedChain = extracted.chain;
                   receiverName = extracted.baseReceiverName;
-                  // Also try the type environment immediately (covers explicitly-typed locals
-                  // and annotated parameters like `fn process(svc: &UserService)`).
-                  // This sets a base type that chain resolution (Step 2) will use as input.
                   if (receiverName) {
                     receiverTypeName = typeEnv.lookup(receiverName, callNode);
                   }
@@ -2817,7 +2838,7 @@ const processFileGroup = (
               ...(callForm !== undefined ? { callForm } : {}),
               ...(receiverName !== undefined ? { receiverName } : {}),
               ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
-              ...(receiverCallChain !== undefined ? { receiverCallChain } : {}),
+              ...(receiverMixedChain !== undefined ? { receiverMixedChain } : {}),
               // WI-2: thread callee-identifier position (callNameNode), not the
               // call-expression start — member-call recall depends on it.
               line: callNameNode.startPosition.row,
@@ -3289,6 +3310,10 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   if (src.fetchCalls) {
     if (!target.fetchCalls) target.fetchCalls = [];
     target.fetchCalls.push(...src.fetchCalls);
+  }
+  if (src.assignments) {
+    if (!target.assignments) target.assignments = [];
+    target.assignments.push(...src.assignments);
   }
   if (src.expoNavCalls) {
     if (!target.expoNavCalls) target.expoNavCalls = [];

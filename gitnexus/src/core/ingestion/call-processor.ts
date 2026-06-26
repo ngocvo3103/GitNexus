@@ -1900,9 +1900,26 @@ export const processAssignmentsFromExtracted = (
     if (!receiverTypeName) continue;
     const fieldOwner = resolveFieldOwnership(receiverTypeName, asn.propertyName, asn.filePath, ctx);
     if (!fieldOwner) continue;
+    // Match the AST path's enclosing-scope id. findEnclosingFunction (the AST path,
+    // call-processor.ts:199-202) re-resolves the enclosing function name via ctx
+    // (same-file tier): a constructor's name collides with its class name, so the
+    // write is attributed to the Class node, not the Constructor. The worker emits
+    // the raw Method/Constructor id (no ctx available), so re-resolve here for parity.
+    // Only function-scoped sites are re-resolved — File-scoped field initialisers,
+    // like the AST path, keep their File id (findEnclosingFunction returns null there).
+    let sourceId = asn.sourceId;
+    if (!sourceId.startsWith('File:')) {
+      const enclosingName = extractFuncNameFromSourceId(asn.sourceId);
+      if (enclosingName) {
+        const resolvedSrc = ctx.resolve(enclosingName, asn.filePath);
+        if (resolvedSrc?.tier === 'same-file' && resolvedSrc.candidates.length > 0) {
+          sourceId = resolvedSrc.candidates[0].nodeId;
+        }
+      }
+    }
     graph.addRelationship({
-      id: generateId('ACCESSES', `${asn.sourceId}:${fieldOwner.nodeId}:write`),
-      sourceId: asn.sourceId,
+      id: generateId('ACCESSES', `${sourceId}:${fieldOwner.nodeId}:write`),
+      sourceId,
       targetId: fieldOwner.nodeId,
       type: 'ACCESSES',
       confidence: 1.0,
