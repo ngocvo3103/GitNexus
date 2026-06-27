@@ -414,6 +414,15 @@ export interface ExtractedCall {
   /** Mixed chain of field and call expressions for complex receivers */
   receiverMixedChain?: Array<{ kind: 'field' | 'call'; name: string }>;
   /**
+   * L2 hybrid only: set when the worker could NOT type this receiver/base BUT it has an
+   * UNRESOLVED Tier-2 typeEnv binding (callResult / methodCallResult / fieldAccess / copy)
+   * — one needing the SymbolTable the worker lacks. The merge-time AST typeEnv MAY resolve
+   * it, so the detector must defer such receivers (a typed-by-AST receiver the extracted
+   * path leaves unset would diverge). Absent ⇒ either typed, or no binding at all (in which
+   * case the AST cannot type it either → resolving by name is identical → safe).
+   */
+  receiverUnresolvedBinding?: boolean;
+  /**
    * 0-based line of the callee identifier (`callNameNode.startPosition.row`).
    * For `a.b.c()` this is the line of `c`, not the start of the call expression.
    * Optional: when the worker did not capture a `call.name` node, the field is absent.
@@ -2837,6 +2846,14 @@ const processFileGroup = (
               }
             }
 
+            // L2 hybrid: when the worker could not type the receiver/base, record whether
+            // it has an unresolved Tier-2 binding the SymbolTable-backed AST typeEnv might
+            // resolve. Lets the merge-time detector defer ONLY those receivers (a no-binding
+            // receiver is untypeable in the AST too → by-name resolution is identical → safe).
+            const receiverUnresolvedBinding = (receiverName !== undefined && receiverTypeName === undefined)
+              ? typeEnv.hasUnresolvedBinding(receiverName, callNode)
+              : false;
+
             result.calls.push({
               filePath: file.path,
               calledName,
@@ -2846,6 +2863,7 @@ const processFileGroup = (
               ...(receiverName !== undefined ? { receiverName } : {}),
               ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
               ...(receiverMixedChain !== undefined ? { receiverMixedChain } : {}),
+              ...(receiverUnresolvedBinding ? { receiverUnresolvedBinding: true } : {}),
               // WI-2: thread callee-identifier position (callNameNode), not the
               // call-expression start — member-call recall depends on it.
               line: callNameNode.startPosition.row,

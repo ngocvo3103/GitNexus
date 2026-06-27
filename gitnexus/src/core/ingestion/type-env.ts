@@ -58,6 +58,13 @@ export interface TypeEnvironment {
    *  Populated when a variable has BOTH a declared base type AND a more specific
    *  constructor type (e.g., `Animal a = new Dog()` → key maps to 'Dog'). */
   readonly constructorTypeMap: ReadonlyMap<string, string>;
+  /** True when `varName` (at `callNode`'s scope) has a Tier-2 pending binding
+   *  (callResult / copy / fieldAccess / methodCallResult) that THIS environment could
+   *  NOT resolve — i.e. one that needs the SymbolTable. The merge-time L2 path has the
+   *  full SymbolTable and MAY resolve it, so such a receiver is exactly one the AST
+   *  typeEnv could type while a no-SymbolTable worker could not. A receiver with no
+   *  binding at all is untypeable in BOTH paths (no divergence). */
+  hasUnresolvedBinding(varName: string, callNode: SyntaxNode): boolean;
 }
 
 /**
@@ -1131,12 +1138,29 @@ export const buildTypeEnv = (
     }
   }
 
+  // Collect (scope\0lhs) keys for Tier-2 pending bindings the fixpoint could NOT resolve
+  // (they needed the SymbolTable this worker lacks). Consumed by hasUnresolvedBinding so
+  // the L2 hybrid detector can defer ONLY receivers the merge-time AST typeEnv might type.
+  const unresolvedKeys = new Set<string>();
+  for (const item of pendingItems) {
+    const scopeEnv = env.get(item.scope);
+    if (!scopeEnv || !scopeEnv.has(item.lhs)) {
+      unresolvedKeys.add(`${item.scope}\0${item.lhs}`);
+    }
+  }
+
   return {
     lookup: (varName, callNode) => lookupInEnv(env, varName, callNode, patternOverrides, options?.enclosingFunctionFinder),
     constructorBindings: bindings,
     fileScope: () => env.get(FILE_SCOPE) ?? EMPTY_FILE_SCOPE,
     allScopes: () => env as ReadonlyMap<string, ReadonlyMap<string, string>>,
     constructorTypeMap,
+    hasUnresolvedBinding: (varName, callNode) => {
+      if (unresolvedKeys.size === 0) return false;
+      const scopeKey = findEnclosingScopeKey(callNode, options?.enclosingFunctionFinder);
+      if (scopeKey && unresolvedKeys.has(`${scopeKey}\0${varName}`)) return true;
+      return unresolvedKeys.has(`${FILE_SCOPE}\0${varName}`);
+    },
   };
 };
 

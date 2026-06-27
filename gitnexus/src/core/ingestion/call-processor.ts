@@ -1817,23 +1817,42 @@ export const detectLowConfidenceFiles = (
       : false;
 
     for (const call of calls) {
-      // (a) Mixed-chain receivers walk a degraded field-type chain (and emit
-      // read-ACCESS along the way); their typing is inherently fragile vs the AST
-      // typeEnv → defer.
-      if (call.receiverMixedChain?.length) { deferred.add(filePath); break; }
-
       const flags = { narrowedAmongMany: false, overloadSurvivors: false, finalMany: false };
       const { effectiveCall, receiverFragile } =
         computeEffectiveCall(call, ctx, receiverMap, typeEnvMap, null, true);
       resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx, undefined, widenCache, flags);
 
+      // (c) finalMany defer. Hint languages (Java/Kotlin/C#/C++) can split same-name
+      // free/member candidates via inferLiteralType arg-types the extracted path lacks,
+      // so ANY finalMany defers there. Otherwise a MEMBER call defers only when the AST
+      // typeEnv could plausibly type the receiver differently than the extracted path:
+      // it is already typed here, or it has an unresolved Tier-2 binding the SymbolTable-
+      // backed AST may resolve (call/method/field-result). A member receiver with NO binding
+      // is untypeable in the AST too → both paths resolve the method by name identically →
+      // NOT deferred (this recovers the member_UNTYPED over-mark, dominant on Python).
+      const finalManyMemberDefer = flags.finalMany && (
+        langHasHints
+        || (!!call.receiverName
+            && (effectiveCall.receiverTypeName !== undefined || !!call.receiverUnresolvedBinding))
+      );
+      // (a) Mixed-chain call whose FINAL receiver type is unresolved after the walk AND whose
+      // chain contains a FIELD step. Field steps resolve via field declaredTypes, which the
+      // worker's symbol extraction can MISS where the AST's buildTypeEnv infers them (notably
+      // Python instance attributes) — so the AST walk may succeed (different/no target + chain
+      // read-ACCESS edges) where the extracted walk fails → divergence → defer. Pure-CALL
+      // chains resolve via method return types, extracted identically in both paths, so an
+      // unresolved-target call chain fails the SAME way under L1 and L2 (by-name) → safe to
+      // keep. When the walk DOES produce a type it matches the AST (same walkMixedChain over
+      // the same merged symbols). Was: ALL mixed-chain files — a ~15-40x over-mark.
+      const mixedChainUnresolvedTarget =
+        !!call.receiverMixedChain?.length && effectiveCall.receiverTypeName === undefined
+        && call.receiverMixedChain.some(s => s.kind === 'field');
       if (
-        // (b) >1 candidate survives receiver-type narrowing — a genuine overload
-        // only AST arg-type hints could split.
-        flags.overloadSurvivors
-        // (c) member call the worker could not type but the AST may (its typeEnv
-        // is symbol-table-backed); or a free/implicit overload in a hint language.
-        || (flags.finalMany && (!!call.receiverName || langHasHints))
+        mixedChainUnresolvedTarget
+        // (b) >1 candidate survives receiver-type narrowing — a genuine overload.
+        || flags.overloadSurvivors
+        // (c) see finalManyMemberDefer above.
+        || finalManyMemberDefer
         // (d) a fragile (worker-degraded) receiver type was the tiebreaker among
         // >1 same-name candidate.
         || (flags.narrowedAmongMany && receiverFragile)
