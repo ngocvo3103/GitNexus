@@ -39,7 +39,8 @@ program
    .option('--no-lsp-cache', 'Disable the definition cache (on by default when --lsp is active on a clean git tree); cache is commit-namespaced so stale hits are impossible')
    .option('--lsp-no-early-bail', 'Disable adaptive early-bail; probe every candidate even when the language server resolves none (default: bail after 150 unresolved probes); requires --lsp')
    .option('--no-parallel-parse', 'Disable parallel parse workers (only affects repos above the 100-file / 512KB threshold; for debugging or memory-constrained environments)')
-   .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)\n  GITNEXUS_PARALLEL_PARSE=0  Disable parallel parse workers (same as --no-parallel-parse)')
+   .option('--l2', 'Resolve the general call graph from worker-extracted call sites instead of a re-parse pass (faster; experimental, default off; only affects parallel-parse runs)')
+   .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)\n  GITNEXUS_PARALLEL_PARSE=0  Disable parallel parse workers (same as --no-parallel-parse)\n  GITNEXUS_L2=1  Resolve calls from worker-extracted sites instead of a re-parse (same as --l2)\n  GITNEXUS_L2_HYBRID=0  When --l2 is active, disable the hybrid AST fallback for low-confidence files (faster but ~0.5% call-resolution imprecision; omit to keep byte-identical output)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program

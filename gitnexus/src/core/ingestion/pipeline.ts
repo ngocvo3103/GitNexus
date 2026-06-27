@@ -7,7 +7,7 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutesWithRepoId, processExpoRouterNavigations, processDecoratorRoutesWithRepoId, processPHPRoutesWithRepoId, processNextjsRoutesWithRepoId, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted, buildRefusedFqnHistogram, type ProcessCallsOpts, type CorrectionFeedItem, type RecallFeedItem } from './call-processor.js';
+import { processCalls, processCallsFromExtracted, detectLowConfidenceFiles, processAssignmentsFromExtracted, processRoutesFromExtracted, processORMQueriesFromExtracted, processExpoRoutesWithRepoId, processExpoRouterNavigations, processDecoratorRoutesWithRepoId, processPHPRoutesWithRepoId, processNextjsRoutesWithRepoId, processNextjsFetchRoutes, processNextjsMiddleware, processToolDefsFromExtracted, buildRefusedFqnHistogram, type ProcessCallsOpts, type CorrectionFeedItem, type RecallFeedItem } from './call-processor.js';
 import type { ExtractedRoute, ExtractedExpoNav, ExtractedORMQuery, ExtractedDecoratorRoute, ExtractedFetchCall, ExtractedToolDef } from './workers/parse-worker.js';
 import type { CrossRepoRegistry } from './cross-repo-registry.js';
 import { processHeritage, processHeritageFromExtracted, type ProcessHeritageOpts, type HeritageFeedItem } from './heritage-processor.js';
@@ -56,6 +56,15 @@ export interface PipelineOptions {
    * debugging or very memory-constrained environments.
    */
   parallelParse?: boolean;
+  /**
+   * L2 (#perf): resolve the general call graph from the worker-extracted call
+   * sites (`processCallsFromExtracted`) instead of the sequential re-parse pass
+   * (`processCalls`). Eliminates the dominant re-parse-loop cost (AST query +
+   * buildTypeEnv) on the parallel-parse path. Default OFF (opt-in) — set true or
+   * GITNEXUS_L2=1. Only applies on the worker path (meaningless when sequential).
+   * Heritage still re-parses (P4 will move it to extracted too).
+   */
+  l2ExtractedResolve?: boolean;
   /**
    * #50: when provided, unresolved imports whose package maps to an indexed
    * dependency repo create an external File node + CROSS_IMPORTS edge. When
@@ -313,6 +322,16 @@ export const runPipelineFromRepo = async (
     // Default ON (opt-out). Disable via GITNEXUS_PARALLEL_PARSE=0 env or
     // options.parallelParse===false (--no-parallel-parse CLI flag).
     const PARALLEL_PARSE_ENABLED = options?.parallelParse !== false && process.env.GITNEXUS_PARALLEL_PARSE !== '0';
+    // L2 (#perf): resolve the general call graph from worker-extracted call sites
+    // instead of the sequential `processCalls` re-parse. Opt-in (default OFF) and
+    // only effective on the worker path (the sequential fallback path is untouched).
+    const L2_EXTRACTED_RESOLVE = options?.l2ExtractedResolve === true || process.env.GITNEXUS_L2 === '1';
+    // L2 hybrid fallback (#perf): when L2 is on, route files whose extracted call
+    // resolution is low-confidence (Java overloads / same-name receivers that need
+    // AST-only info) through the AST `processCalls` re-parse, keeping every other
+    // file on the fast extracted path. ON whenever L2 is on; set GITNEXUS_L2_HYBRID=0
+    // to disable (e.g. to measure the pure-extracted residual).
+    const L2_HYBRID_FALLBACK = L2_EXTRACTED_RESOLVE && process.env.GITNEXUS_L2_HYBRID !== '0';
     const MIN_FILES_FOR_WORKERS = 100;
     const MIN_BYTES_FOR_WORKERS = 512 * 1024;  // 512KB threshold
     const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
@@ -356,6 +375,11 @@ export const runPipelineFromRepo = async (
     // 200-400MB less memory — critical for Linux-kernel-scale repos.
     const sequentialChunkPaths: string[][] = [];
     const sequentialChunkRoutes: ExtractedRoute[][] = [];
+    // L2 (#perf): true for chunks whose general calls were worker-extracted (and
+    // thus accumulated into allGeneralCalls). The re-parse `processCalls` is
+    // skipped only for these; sequential-fallback chunks (worker died) still run
+    // it, so the sequential path is never affected by the L2 flag.
+    const sequentialChunkFromWorker: boolean[] = [];
     // Accumulate expoNavCalls, ormQueries, fetchCalls across chunks for processing after all chunks
     const allExpoNavCalls: ExtractedExpoNav[] = [];
     const allORMQueries: ExtractedORMQuery[] = [];
@@ -365,6 +389,19 @@ export const runPipelineFromRepo = async (
     const allAngularMetadata: import('./workers/parse-worker.js').ExtractedAngularEdge[] = [];
     // #31: Angular CALLS extracted in the sequential parsing pass (DI/template).
     const allSequentialCalls: import('./workers/parse-worker.js').ExtractedCall[] = [];
+    // L2 (#perf): the worker's GENERAL (non-Angular) calls + the per-file
+    // constructor/typeEnv bindings, accumulated across chunks. Consumed by a
+    // single post-parse `processCallsFromExtracted` when L2 is enabled; otherwise
+    // these stay empty and the sequential `processCalls` re-parse resolves calls.
+    const allGeneralCalls: import('./workers/parse-worker.js').ExtractedCall[] = [];
+    const allConstructorBindings: import('./workers/parse-worker.js').FileConstructorBindings[] = [];
+    const allTypeEnvBindings: import('./workers/parse-worker.js').FileTypeEnvBindings[] = [];
+    // P2 (#perf) write-ACCESS: worker-extracted member-field assignment sites.
+    const allAssignments: import('./workers/parse-worker.js').ExtractedAssignment[] = [];
+    // P4 (#perf): worker-extracted heritage (EXTENDS/IMPLEMENTS/mixin). Accumulated
+    // across chunks and fed into processHeritageFromExtracted post-loop under L2,
+    // eliminating the AST processHeritage re-parse for worker chunks.
+    const allL2Heritage: import('./workers/parse-worker.js').ExtractedHeritage[] = [];
 
     // WI-5 (#159 P3 Mode A): the candidate feed arrays. We pass them
     // as sinks into `processCallsFromExtracted` ONLY when
@@ -493,6 +530,7 @@ export const runPipelineFromRepo = async (
           // Calls + Heritage + Routes: deferred to sequential re-parse path (lossless).
           sequentialChunkPaths.push(chunkPaths);
           sequentialChunkRoutes.push(chunkWorkerData.routes ?? []);
+          sequentialChunkFromWorker.push(true); // L2: worker-extracted → calls in allGeneralCalls
 
           // Accumulate expoNavCalls and ormQueries for post-processing after all chunks
           if (chunkWorkerData.expoNavCalls) {
@@ -510,10 +548,23 @@ export const runPipelineFromRepo = async (
             allAngularMetadata.push(...chunkWorkerData.angularMetadata);
           }
           // #31: Angular CALLS extracted by the worker parsing pass.
-          // General calls are deferred to the sequential re-parse path;
-          // chunkWorkerData.calls carries ONLY Angular DI/template calls here.
+          // chunkWorkerData.calls carries ONLY Angular DI/template calls;
+          // general calls ride separately in chunkWorkerData.generalCalls.
           if (chunkWorkerData.calls && chunkWorkerData.calls.length > 0) {
             allSequentialCalls.push(...chunkWorkerData.calls);
+          }
+          // L2 (#perf): accumulate the worker's general calls + per-file bindings.
+          // Loop-append (NOT spread) — push(...bigArray) overflows the stack on
+          // large chunks. Only consumed when L2_EXTRACTED_RESOLVE is on; harmless
+          // (small memory) otherwise.
+          if (L2_EXTRACTED_RESOLVE) {
+            if (chunkWorkerData.generalCalls) for (const c of chunkWorkerData.generalCalls) allGeneralCalls.push(c);
+            if (chunkWorkerData.constructorBindings) for (const b of chunkWorkerData.constructorBindings) allConstructorBindings.push(b);
+            if (chunkWorkerData.typeEnvBindings) for (const b of chunkWorkerData.typeEnvBindings) allTypeEnvBindings.push(b);
+            if (chunkWorkerData.assignments) for (const a of chunkWorkerData.assignments) allAssignments.push(a);
+            // P4 (#perf): accumulate worker heritage; resolved post-loop via
+            // processHeritageFromExtracted — no AST re-parse needed.
+            if (chunkWorkerData.heritage) for (const h of chunkWorkerData.heritage) allL2Heritage.push(h);
           }
           // Accumulate fetchCalls for post-processing
           if (chunkWorkerData.fetchCalls) {
@@ -530,6 +581,7 @@ export const runPipelineFromRepo = async (
           await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths, options?.crossRepoRegistry, javaExternalFqnIndex, pythonExternalFqnIndex);
           sequentialChunkPaths.push(chunkPaths);
           sequentialChunkRoutes.push(chunkWorkerData.routes ?? []);
+          sequentialChunkFromWorker.push(false); // L2: not worker-extracted → processCalls must run for this chunk
           // Accumulate expoNavCalls and ormQueries for sequential path too
           if (chunkWorkerData.expoNavCalls) {
             allExpoNavCalls.push(...chunkWorkerData.expoNavCalls);
@@ -572,8 +624,24 @@ export const runPipelineFromRepo = async (
       console.warn(`  [phase-timing] parse=${(_tParse / 1000).toFixed(1)}s imports=${(_tImp / 1000).toFixed(1)}s heritage=${(_tHer / 1000).toFixed(1)}s calls=${(_tCall / 1000).toFixed(1)}s`);
     }
 
-    // Sequential fallback chunks: re-read source for call/heritage resolution
+    // Sequential fallback chunks: re-read source for call/heritage resolution.
+    // L2 (#perf): when enabled, both the general call graph AND heritage are
+    // resolved from worker-extracted data in post-loop passes, so the entire
+    // re-parse block (re-read + createASTCache + processHeritage + processCalls)
+    // is skipped for worker chunks. Routes are still processed (no AST needed).
+    // Sequential-fallback chunks (worker died) and L2-off runs are unchanged.
     for (let chunkIdx = 0; chunkIdx < sequentialChunkPaths.length; chunkIdx++) {
+      // P4 (#perf): for L2 worker chunks, skip the entire AST re-parse block.
+      // Heritage is resolved post-loop via processHeritageFromExtracted;
+      // calls are resolved post-loop via processCallsFromExtracted (P1-P3).
+      // Routes are processed here — already extracted by the worker; no AST needed.
+      if (L2_EXTRACTED_RESOLVE && sequentialChunkFromWorker[chunkIdx]) {
+        const chunkRoutes = sequentialChunkRoutes[chunkIdx];
+        if (chunkRoutes.length > 0) {
+          await processRoutesFromExtracted(graph, chunkRoutes, ctx);
+        }
+        continue;
+      }
       const chunkPaths = sequentialChunkPaths[chunkIdx];
       const chunkContents = await readFileContents(repoPath, chunkPaths);
       const chunkFiles = chunkPaths
@@ -593,6 +661,99 @@ export const runPipelineFromRepo = async (
         await processRoutesFromExtracted(graph, chunkRoutes, ctx);
       }
       astCache.clear();
+    }
+
+    // P4 (#perf): heritage from worker-extracted data — no AST re-parse.
+    // Processed before general calls to match L1 order (processHeritage ran before
+    // processCalls in the sequential loop). Sort by filePath+line for determinism.
+    if (L2_EXTRACTED_RESOLVE && allL2Heritage.length > 0) {
+      allL2Heritage.sort((a, b) =>
+        a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 :
+        (a.line ?? 0) - (b.line ?? 0),
+      );
+      await processHeritageFromExtracted(graph, allL2Heritage, ctx, undefined, lspHeritageOpt);
+    }
+
+    // L2 (#perf): resolve the general call graph from the worker-extracted call
+    // sites over the now-fully-merged symbol table + import context (ctx), instead
+    // of the per-chunk `processCalls` re-parse skipped above. Deterministic order
+    // (file path, then call-site position) so ambiguous lookupFuzzy[0] tiebreaks
+    // are stable across worker scheduling. The same lspFeedsOpt the AST path gets
+    // is threaded so LSP mode is unaffected.
+    //
+    // L2 hybrid fallback: detect the (small) set of files whose extracted call
+    // resolution is low-confidence — Java overloads / same-name receivers that the
+    // worker cannot disambiguate without AST-only info (overloadHints, the richer
+    // typeEnv). Those files are EXCLUDED from the extracted emit and re-parsed via
+    // the AST `processCalls` below (byte-identical to L1); every other file stays
+    // on the fast extracted path. `deferredFiles` is shared with the write-ACCESS
+    // pass so deferred files are not double-emitted.
+    const deferredFiles = new Set<string>();
+    if (L2_EXTRACTED_RESOLVE && allGeneralCalls.length > 0) {
+      allGeneralCalls.sort((a, b) =>
+        a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 :
+        (a.line ?? 0) - (b.line ?? 0) ||
+        (a.character ?? 0) - (b.character ?? 0) ||
+        (a.calledName < b.calledName ? -1 : a.calledName > b.calledName ? 1 : 0),
+      );
+      if (L2_HYBRID_FALLBACK) {
+        for (const f of detectLowConfidenceFiles(
+          allGeneralCalls, ctx, graph, allConstructorBindings, allTypeEnvBindings,
+        )) {
+          deferredFiles.add(f);
+        }
+        if (deferredFiles.size > 0) {
+          console.warn(`  [l2-hybrid] deferred ${deferredFiles.size} low-confidence file(s) to AST re-parse`);
+        }
+      }
+      const extractedCalls = deferredFiles.size > 0
+        ? allGeneralCalls.filter(c => !deferredFiles.has(c.filePath))
+        : allGeneralCalls;
+      await processCallsFromExtracted(
+        graph,
+        extractedCalls,
+        ctx,
+        undefined,
+        allConstructorBindings,
+        allTypeEnvBindings,
+        lspFeedsOpt,
+      );
+
+      // Hybrid AST fallback: re-parse the deferred low-confidence files so their
+      // CALLS + read/write-ACCESS come out byte-identical to L1. Mirrors the
+      // sequential re-parse block exactly (same processCalls positional args +
+      // ruby-heritage handling). Static EXTENDS/IMPLEMENTS heritage is NOT re-run
+      // here — it was already emitted for every file by processHeritageFromExtracted
+      // above. Deterministic (sorted) so the re-parse is reproducible.
+      if (deferredFiles.size > 0) {
+        const deferredPaths = [...deferredFiles].sort();
+        const deferredContents = await readFileContents(repoPath, deferredPaths);
+        const deferredFileObjs = deferredPaths
+          .filter(p => deferredContents.has(p))
+          .map(p => ({ path: p, content: deferredContents.get(p)! }));
+        const deferredAstCache = createASTCache(deferredFileObjs.length);
+        const rubyHeritage = await processCalls(
+          graph, deferredFileObjs, deferredAstCache, ctx,
+          undefined, undefined, undefined, undefined, undefined, lspFeedsOpt,
+        );
+        if (rubyHeritage.length > 0) {
+          await processHeritageFromExtracted(graph, rubyHeritage, ctx, undefined, lspHeritageOpt);
+        }
+        deferredAstCache.clear();
+      }
+    }
+
+    // P2 (#perf) write-ACCESS: resolve worker-extracted member-field assignments
+    // (`this.field = x`) to ACCESSES {reason:'write'} edges over the merged symbol
+    // table — the extracted-path equivalent of the AST `pendingWrites` pass. The
+    // edge id matches the AST path exactly (`${sourceId}:${fieldOwner}:write`).
+    // Hybrid: deferred files are excluded — their write-ACCESS is emitted by the
+    // AST re-parse above (which runs its own `pendingWrites` pass).
+    if (L2_EXTRACTED_RESOLVE && allAssignments.length > 0) {
+      const extractedAssignments = deferredFiles.size > 0
+        ? allAssignments.filter(a => !deferredFiles.has(a.filePath))
+        : allAssignments;
+      processAssignmentsFromExtracted(graph, extractedAssignments, ctx, allConstructorBindings);
     }
 
     // Post-processing: Expo routes and ORM queries (accumulated across all chunks)

@@ -1026,6 +1026,21 @@ const resolveCallTarget = (
   ctx: ResolutionContext,
   overloadHints?: OverloadHints,
   widenCache?: WidenCache,
+  /**
+   * L2 hybrid pre-scan sink. When provided, the flags record *why* a resolution
+   * is AST-dependent, so the detector can route only genuinely-divergent files
+   * through the AST re-parse:
+   *   - narrowedAmongMany: >1 same-name candidate fed receiver-type narrowing
+   *     (the receiver type is the deciding factor — divergent iff that type is
+   *     fragile, judged by the caller).
+   *   - overloadSurvivors: >1 candidate SURVIVED receiver narrowing (a genuine
+   *     overload only AST arg-type hints could split).
+   *   - finalMany: >1 candidate at the final (no-receiver) tier (free/implicit
+   *     calls — divergent only for languages with overload hints).
+   * The emit path and the AST path never pass this (it stays undefined), so their
+   * behaviour is byte-identical; only `detectLowConfidenceFiles` reads the flags.
+   */
+  ambiguityOut?: { narrowedAmongMany: boolean; overloadSurvivors: boolean; finalMany: boolean },
 ): ResolveResult | null => {
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
@@ -1105,6 +1120,11 @@ const resolveCallTarget = (
         ? filterCallableCandidates(ctx.symbols.lookupFuzzy(call.calledName), call.argCount, call.callForm)
         : filteredCandidates;
 
+      // L2 hybrid detection: >1 candidate in the method pool means the receiver
+      // type is the deciding factor among same-name methods (divergent iff that
+      // type is fragile — the detector decides).
+      if (ambiguityOut && methodPool.length > 1) ambiguityOut.narrowedAmongMany = true;
+
       // D3. File-based: prefer candidates whose filePath matches the resolved type's file
       const fileFiltered = methodPool.filter(c => typeFiles.has(c.filePath));
       if (fileFiltered.length === 1) {
@@ -1142,7 +1162,13 @@ const resolveCallTarget = (
         const disambiguated = tryOverloadDisambiguation(overloadPool, overloadHints);
         if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
       }
-      if (fileFiltered.length > 1 || ownerFiltered.length > 1) return null;
+      // L2 hybrid detection: >1 candidate survives receiver-type narrowing — a
+      // genuine overload that only AST arg-type hints could split. The extracted
+      // path has no hints, so flag this file for the AST re-parse fallback.
+      if (fileFiltered.length > 1 || ownerFiltered.length > 1) {
+        if (ambiguityOut) ambiguityOut.overloadSurvivors = true;
+        return null;
+      }
     }
   }
 
@@ -1165,6 +1191,10 @@ const resolveCallTarget = (
         const sorted = [...filteredCandidates].sort((a, b) => a.filePath.length - b.filePath.length);
         return toResolveResult(sorted[0], tiered.tier);
       }
+      // L2 hybrid detection: >1 candidate at the final no-receiver tier (free /
+      // implicit calls). Divergent only for languages with overload hints — the
+      // detector applies that gate.
+      if (ambiguityOut) ambiguityOut.finalMany = true;
     }
     return null;
   }
@@ -1589,6 +1619,255 @@ export interface ProcessCallsOpts {
  * Fast path: resolve pre-extracted call sites from workers.
  * No AST parsing — workers already extracted calledName + sourceId.
  */
+/** No-op field-access sink for the L2 hybrid detector (keeps detection graph-pure). */
+const NOOP_FIELD_RESOLVED: OnFieldResolved = () => {};
+
+/**
+ * Compute the "effective call" for extracted-path resolution: RC-3 sourceId
+ * re-attribution + receiver-type resolution (Steps 0/1/1b/1c) + RC-2 callForm
+ * default. Shared by `processCallsFromExtracted` (emit) and
+ * `detectLowConfidenceFiles` (the L2 hybrid pre-scan) so the detector narrows
+ * receiver types byte-identically to the emitter — no logic drift between the
+ * "is this file divergent?" decision and the actual emission.
+ *
+ * `graph` is the ACCESS sink for Step 1c mixed-chain field reads: pass the real
+ * graph on the emit path; pass `null` in detect mode to suppress ACCESS emission
+ * (keeping detection side-effect-free).
+ */
+const computeEffectiveCall = (
+  call: ExtractedCall,
+  ctx: ResolutionContext,
+  receiverMap: ReceiverTypeIndex | undefined,
+  typeEnvMap: Map<string, string> | undefined,
+  graph: KnowledgeGraph | null,
+  needFragility = false,
+): { effectiveCall: ExtractedCall; receiverFragile: boolean } => {
+  // RC-3 — sourceId re-attribution: match the AST findEnclosingFunction id
+  // (carries the symbol table's exact label + any `:N` overload suffix).
+  let reattributedSourceId = call.sourceId;
+  if (!call.sourceId.startsWith('File:')) {
+    const enclFuncName = extractFuncNameFromSourceId(call.sourceId);
+    const enclResolved = ctx.resolve(enclFuncName, call.filePath);
+    if (enclResolved?.tier === 'same-file' && enclResolved.candidates.length > 0) {
+      reattributedSourceId = enclResolved.candidates[0].nodeId;
+    }
+  }
+
+  // Hybrid fragility shadow (detector only): the receiver type derivable from
+  // worker-RELIABLE sources — field declarations (Step 0), constructor bindings
+  // (Step 1), class-as-receiver (Step 1b) — which the AST computes from the same
+  // data. When the worker pre-set a receiver type that this shadow CANNOT confirm,
+  // the worker typed it via its degraded parse-time typeEnv (scoped locals, this/
+  // self) and the AST may type it differently → fragile. Skipped on the emit path
+  // (needFragility=false) so it adds zero hot-path cost.
+  let reliableType: string | undefined;
+  if (needFragility && call.receiverName) {
+    reliableType = typeEnvMap?.get(call.receiverName);
+    if (!reliableType && receiverMap) {
+      reliableType = lookupReceiverType(
+        receiverMap, extractFuncNameFromSourceId(reattributedSourceId), call.receiverName,
+      );
+    }
+    if (!reliableType && call.callForm === 'member') {
+      const tr = ctx.resolve(call.receiverName, call.filePath);
+      if (tr?.candidates.some(d =>
+        d.type === 'Class' || d.type === 'Interface' || d.type === 'Struct' || d.type === 'Enum',
+      )) {
+        reliableType = call.receiverName;
+      }
+    }
+  }
+  let effectiveCall: ExtractedCall = reattributedSourceId === call.sourceId
+    ? call
+    : { ...call, sourceId: reattributedSourceId };
+
+  // Step 0: FILE_SCOPE field declarations (e.g. @Autowired private CashService x).
+  if (!call.receiverTypeName && call.receiverName && typeEnvMap) {
+    const resolvedType = typeEnvMap.get(call.receiverName);
+    if (resolvedType) {
+      effectiveCall = { ...effectiveCall, receiverTypeName: resolvedType };
+    }
+  }
+
+  // Step 1: constructor bindings (var x = new Type()).
+  if (!effectiveCall.receiverTypeName && call.receiverName && receiverMap) {
+    const callFuncName = extractFuncNameFromSourceId(effectiveCall.sourceId);
+    const resolvedType = lookupReceiverType(receiverMap, callFuncName, call.receiverName);
+    if (resolvedType) {
+      effectiveCall = { ...effectiveCall, receiverTypeName: resolvedType };
+    }
+  }
+
+  // Step 1b: class-as-receiver for static method calls (UserService.find_user()).
+  if (!effectiveCall.receiverTypeName && effectiveCall.receiverName && effectiveCall.callForm === 'member') {
+    const typeResolved = ctx.resolve(effectiveCall.receiverName, effectiveCall.filePath);
+    if (typeResolved && typeResolved.candidates.some(
+      d => d.type === 'Class' || d.type === 'Interface' || d.type === 'Struct' || d.type === 'Enum',
+    )) {
+      effectiveCall = { ...effectiveCall, receiverTypeName: effectiveCall.receiverName };
+    }
+  }
+
+  // Step 1c: mixed chain resolution (svc.getUser().address.save()).
+  if (effectiveCall.receiverMixedChain?.length) {
+    let currentType: string | undefined = effectiveCall.receiverTypeName;
+    if (!currentType && effectiveCall.receiverName && receiverMap) {
+      const callFuncName = extractFuncNameFromSourceId(effectiveCall.sourceId);
+      currentType = lookupReceiverType(receiverMap, callFuncName, effectiveCall.receiverName);
+    }
+    if (!currentType && effectiveCall.receiverName) {
+      const typeResolved = ctx.resolve(effectiveCall.receiverName, effectiveCall.filePath);
+      if (typeResolved?.candidates.some(d =>
+        d.type === 'Class' || d.type === 'Interface' || d.type === 'Struct' || d.type === 'Enum',
+      )) {
+        currentType = effectiveCall.receiverName;
+      }
+    }
+    if (currentType) {
+      const walkedType = walkMixedChain(
+        effectiveCall.receiverMixedChain, currentType, effectiveCall.filePath, ctx,
+        graph ? makeAccessEmitter(graph, effectiveCall.sourceId) : NOOP_FIELD_RESOLVED,
+      );
+      if (walkedType) {
+        effectiveCall = { ...effectiveCall, receiverTypeName: walkedType };
+      }
+    }
+  }
+
+  // RC-2 — callForm parity: bare receiver-less calls default to 'free' so the
+  // free->constructor retry in resolveCallTarget can fire (Python async-with etc.).
+  if (
+    effectiveCall.callForm === undefined &&
+    !effectiveCall.receiverName &&
+    !effectiveCall.receiverMixedChain
+  ) {
+    effectiveCall = { ...effectiveCall, callForm: 'free' };
+  }
+
+  // Fragile iff the worker pre-set a receiver type that the reliable shadow could
+  // not reproduce (or reproduced as a different type). Unset receivers and reliably-
+  // derived ones are not fragile; mixed chains are handled by the detector directly.
+  const receiverFragile = needFragility && call.receiverTypeName !== undefined
+    && (reliableType === undefined || reliableType !== call.receiverTypeName);
+
+  return { effectiveCall, receiverFragile };
+};
+
+/**
+ * L2 hybrid pre-scan. Returns the set of files whose worker-extracted calls
+ * cannot be resolved byte-identically to the AST `processCalls` path, because
+ * resolution hinges on AST-only information:
+ *   - Java overload arg-types (passed as `overloadHints` only on the AST path), or
+ *   - a receiver type that disambiguates among >1 same-name candidate (the AST
+ *     typeEnv — scoped locals, virtual dispatch — is more complete than the
+ *     worker's merge-time typing).
+ * Such files are routed through the AST re-parse fallback; every other file stays
+ * on the fast extracted path.
+ *
+ * The returned set is a SUPERSET of the truly-divergent files: over-marking is
+ * correctness-safe (the AST path is byte-identical to L1 regardless) and only
+ * costs a re-parse, so the predicate errs toward inclusion but is kept tight by
+ * reusing the emitter's exact receiver typing. Pure: reads ctx/graph, never
+ * mutates the graph.
+ */
+export const detectLowConfidenceFiles = (
+  extractedCalls: ExtractedCall[],
+  ctx: ResolutionContext,
+  graph: KnowledgeGraph,
+  constructorBindings?: FileConstructorBindings[],
+  typeEnvBindings?: FileTypeEnvBindings[],
+): Set<string> => {
+  const deferred = new Set<string>();
+
+  // Rebuild the same per-file receiver indices the emitter uses, so detection
+  // narrows receiver types identically (graph is read-only here).
+  const fileReceiverTypes = new Map<string, ReceiverTypeIndex>();
+  if (constructorBindings) {
+    for (const { filePath, bindings } of constructorBindings) {
+      const verified = verifyConstructorBindings(bindings, filePath, ctx, graph);
+      if (verified.size > 0) {
+        fileReceiverTypes.set(filePath, buildReceiverTypeIndex(verified));
+      }
+    }
+  }
+  const fileTypeEnv = new Map<string, Map<string, string>>();
+  if (typeEnvBindings) {
+    for (const { filePath, bindings } of typeEnvBindings) {
+      fileTypeEnv.set(filePath, bindings);
+    }
+  }
+
+  const byFile = new Map<string, ExtractedCall[]>();
+  for (const call of extractedCalls) {
+    let list = byFile.get(call.filePath);
+    if (!list) { list = []; byFile.set(call.filePath, list); }
+    list.push(call);
+  }
+
+  for (const [filePath, calls] of byFile) {
+    ctx.enableCache(filePath);
+    const widenCache: WidenCache = new Map();
+    const receiverMap = fileReceiverTypes.get(filePath);
+    const typeEnvMap = fileTypeEnv.get(filePath);
+    // Languages with overload arg-type hints (Java/Kotlin/C#/C++): the AST splits
+    // same-name free/implicit calls via inferLiteralType; the extracted path cannot.
+    const language = getLanguageFromFilename(filePath);
+    const langHasHints = language && isLanguageAvailable(language)
+      ? !!getProvider(language).typeConfig?.inferLiteralType
+      : false;
+
+    for (const call of calls) {
+      const flags = { narrowedAmongMany: false, overloadSurvivors: false, finalMany: false };
+      const { effectiveCall, receiverFragile } =
+        computeEffectiveCall(call, ctx, receiverMap, typeEnvMap, null, true);
+      resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx, undefined, widenCache, flags);
+
+      // (c) finalMany defer. Hint languages (Java/Kotlin/C#/C++) can split same-name
+      // free/member candidates via inferLiteralType arg-types the extracted path lacks,
+      // so ANY finalMany defers there. Otherwise a MEMBER call defers only when the AST
+      // typeEnv could plausibly type the receiver differently than the extracted path:
+      // it is already typed here, or it has an unresolved Tier-2 binding the SymbolTable-
+      // backed AST may resolve (call/method/field-result). A member receiver with NO binding
+      // is untypeable in the AST too → both paths resolve the method by name identically →
+      // NOT deferred (this recovers the member_UNTYPED over-mark, dominant on Python).
+      const finalManyMemberDefer = flags.finalMany && (
+        langHasHints
+        || (!!call.receiverName
+            && (effectiveCall.receiverTypeName !== undefined || !!call.receiverUnresolvedBinding))
+      );
+      // (a) Mixed-chain call whose FINAL receiver type is unresolved after the walk AND whose
+      // chain contains a FIELD step. Field steps resolve via field declaredTypes, which the
+      // worker's symbol extraction can MISS where the AST's buildTypeEnv infers them (notably
+      // Python instance attributes) — so the AST walk may succeed (different/no target + chain
+      // read-ACCESS edges) where the extracted walk fails → divergence → defer. Pure-CALL
+      // chains resolve via method return types, extracted identically in both paths, so an
+      // unresolved-target call chain fails the SAME way under L1 and L2 (by-name) → safe to
+      // keep. When the walk DOES produce a type it matches the AST (same walkMixedChain over
+      // the same merged symbols). Was: ALL mixed-chain files — a ~15-40x over-mark.
+      const mixedChainUnresolvedTarget =
+        !!call.receiverMixedChain?.length && effectiveCall.receiverTypeName === undefined
+        && call.receiverMixedChain.some(s => s.kind === 'field');
+      if (
+        mixedChainUnresolvedTarget
+        // (b) >1 candidate survives receiver-type narrowing — a genuine overload.
+        || flags.overloadSurvivors
+        // (c) see finalManyMemberDefer above.
+        || finalManyMemberDefer
+        // (d) a fragile (worker-degraded) receiver type was the tiebreaker among
+        // >1 same-name candidate.
+        || (flags.narrowedAmongMany && receiverFragile)
+      ) {
+        deferred.add(filePath);
+        break;
+      }
+    }
+
+    ctx.clearCache();
+  }
+
+  return deferred;
+};
+
 export const processCallsFromExtracted = async (
   graph: KnowledgeGraph,
   extractedCalls: ExtractedCall[],
@@ -1665,71 +1944,10 @@ export const processCallsFromExtracted = async (
     }
 
     for (const call of calls) {
-      let effectiveCall = call;
-
-      // Step 0: resolve receiver type from FILE_SCOPE bindings (field declarations)
-      // This handles Spring DI pattern: @Autowired private CashService cashService;
-      // Fields are captured in FILE_SCOPE and should resolve before constructor bindings.
-      if (!call.receiverTypeName && call.receiverName && typeEnvMap) {
-        const resolvedType = typeEnvMap.get(call.receiverName);
-        if (resolvedType) {
-          if (logVerbose && filePath.includes('Controller')) {
-            console.debug(`[call-resolution] Step 0: resolved receiver '${call.receiverName}' to type '${resolvedType}' from FILE_SCOPE`);
-          }
-          effectiveCall = { ...call, receiverTypeName: resolvedType };
-        } else if (logVerbose && filePath.includes('Controller') && call.receiverName) {
-          // DEBUG: Log when receiver is not found in FILE_SCOPE
-          console.debug(`[call-resolution] Step 0: receiver '${call.receiverName}' NOT FOUND in FILE_SCOPE for ${filePath}`);
-        }
-      }
-
-      // Step 1: resolve receiver type from constructor bindings (var x = new Type())
-      if (!effectiveCall.receiverTypeName && call.receiverName && receiverMap) {
-        const callFuncName = extractFuncNameFromSourceId(call.sourceId);
-        const resolvedType = lookupReceiverType(receiverMap, callFuncName, call.receiverName);
-        if (resolvedType) {
-          effectiveCall = { ...call, receiverTypeName: resolvedType };
-        }
-      }
-
-      // Step 1b: class-as-receiver for static method calls (e.g. UserService.find_user())
-      if (!effectiveCall.receiverTypeName && effectiveCall.receiverName && effectiveCall.callForm === 'member') {
-        const typeResolved = ctx.resolve(effectiveCall.receiverName, effectiveCall.filePath);
-        if (typeResolved && typeResolved.candidates.some(
-          d => d.type === 'Class' || d.type === 'Interface' || d.type === 'Struct' || d.type === 'Enum',
-        )) {
-          effectiveCall = { ...effectiveCall, receiverTypeName: effectiveCall.receiverName };
-        }
-      }
-
-      // Step 1c: mixed chain resolution (field, call, or interleaved — e.g. svc.getUser().address.save()).
-      // Runs whenever receiverMixedChain is present. Steps 1/1b may have resolved the base receiver
-      // type already; that type is used as the chain's starting point.
-      if (effectiveCall.receiverMixedChain?.length) {
-        // Use the already-resolved base type (from Steps 1/1b) or look it up now.
-        let currentType: string | undefined = effectiveCall.receiverTypeName;
-        if (!currentType && effectiveCall.receiverName && receiverMap) {
-          const callFuncName = extractFuncNameFromSourceId(effectiveCall.sourceId);
-          currentType = lookupReceiverType(receiverMap, callFuncName, effectiveCall.receiverName);
-        }
-        if (!currentType && effectiveCall.receiverName) {
-          const typeResolved = ctx.resolve(effectiveCall.receiverName, effectiveCall.filePath);
-          if (typeResolved?.candidates.some(d =>
-            d.type === 'Class' || d.type === 'Interface' || d.type === 'Struct' || d.type === 'Enum',
-          )) {
-            currentType = effectiveCall.receiverName;
-          }
-        }
-        if (currentType) {
-          const walkedType = walkMixedChain(
-            effectiveCall.receiverMixedChain, currentType, effectiveCall.filePath, ctx,
-            makeAccessEmitter(graph, effectiveCall.sourceId),
-          );
-          if (walkedType) {
-            effectiveCall = { ...effectiveCall, receiverTypeName: walkedType };
-          }
-        }
-      }
+      // Per-call resolution prep — RC-3 sourceId re-attribution, receiver typing
+      // (Steps 0/1/1b/1c) and RC-2 callForm default — is shared with the L2
+      // hybrid detector via computeEffectiveCall (graph = ACCESS sink for 1c).
+      const { effectiveCall } = computeEffectiveCall(call, ctx, receiverMap, typeEnvMap, graph);
 
       const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx, undefined, widenCache);
       totalCalls++;
@@ -1900,9 +2118,26 @@ export const processAssignmentsFromExtracted = (
     if (!receiverTypeName) continue;
     const fieldOwner = resolveFieldOwnership(receiverTypeName, asn.propertyName, asn.filePath, ctx);
     if (!fieldOwner) continue;
+    // Match the AST path's enclosing-scope id. findEnclosingFunction (the AST path,
+    // call-processor.ts:199-202) re-resolves the enclosing function name via ctx
+    // (same-file tier): a constructor's name collides with its class name, so the
+    // write is attributed to the Class node, not the Constructor. The worker emits
+    // the raw Method/Constructor id (no ctx available), so re-resolve here for parity.
+    // Only function-scoped sites are re-resolved — File-scoped field initialisers,
+    // like the AST path, keep their File id (findEnclosingFunction returns null there).
+    let sourceId = asn.sourceId;
+    if (!sourceId.startsWith('File:')) {
+      const enclosingName = extractFuncNameFromSourceId(asn.sourceId);
+      if (enclosingName) {
+        const resolvedSrc = ctx.resolve(enclosingName, asn.filePath);
+        if (resolvedSrc?.tier === 'same-file' && resolvedSrc.candidates.length > 0) {
+          sourceId = resolvedSrc.candidates[0].nodeId;
+        }
+      }
+    }
     graph.addRelationship({
-      id: generateId('ACCESSES', `${asn.sourceId}:${fieldOwner.nodeId}:write`),
-      sourceId: asn.sourceId,
+      id: generateId('ACCESSES', `${sourceId}:${fieldOwner.nodeId}:write`),
+      sourceId,
       targetId: fieldOwner.nodeId,
       type: 'ACCESSES',
       confidence: 1.0,

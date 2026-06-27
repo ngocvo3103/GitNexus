@@ -54,11 +54,11 @@ import {
   inferCallForm,
   extractReceiverName,
   extractReceiverNode,
-  CALL_EXPRESSION_TYPES,
-  extractCallChain,
+  extractMixedChain,
 } from '../utils/call-analysis.js';
 import { extractAnnotations } from '../annotation-extractor.js';
 import { buildTypeEnv } from '../type-env.js';
+import { getProvider } from '../languages/index.js';
 import type { ConstructorBinding } from '../type-env.js';
 import {
   tsExportChecker,
@@ -241,35 +241,14 @@ const extractNamedBindings = (importNode: any, language: SupportedLanguages): Na
   return extractor ? extractor(importNode) : undefined;
 };
 
-/** Built-in names that should be excluded from call graphs (noise reduction) */
-const BUILTIN_NOISE = new Set([
-  // JavaScript/TypeScript
-  'console', 'window', 'document', 'Math', 'JSON', 'Object', 'Array', 'String', 'Number', 'Boolean',
-  'Promise', 'Symbol', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Date', 'RegExp', 'Error', 'Function',
-  'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-  'require', 'module', 'exports', '__dirname', '__filename', 'process',
-  // Python
-  'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple', 'bool', 'None',
-  'True', 'False', 'type', 'isinstance', 'hasattr', 'getattr', 'setattr', 'open', 'input',
-  // Java
-  'System', 'String', 'Integer', 'Long', 'Double', 'Float', 'Boolean', 'Object', 'Class',
-  'List', 'Map', 'Set', 'Arrays', 'Collections', 'Optional',
-  // Go
-  'fmt', 'log', 'os', 'io', 'strings', 'strconv', 'time', 'context',
-  // Rust
-  'println', 'vec', 'Option', 'Result', 'String', 'Box', 'Rc', 'Arc', 'Cell', 'RefCell',
-  // C#
-  'Console', 'String', 'Int32', 'Int64', 'Double', 'Boolean', 'Object', 'Task', 'Enumerable',
-  // PHP
-  'echo', 'print', 'var_dump', 'die', 'exit', 'isset', 'empty', 'array', 'string', 'int',
-  // Ruby
-  'puts', 'print', 'p', 'raise', 'fail', 'require', 'include', 'extend', 'attr_reader', 'attr_writer', 'attr_accessor',
-  // Swift
-  'print', 'debugPrint', 'fatalError', 'preconditionFailure', 'assertionFailure',
-]);
-
-/** Check if a name is a built-in or noise symbol (excluded from call graph) */
-const isBuiltInOrNoise = (name: string): boolean => BUILTIN_NOISE.has(name);
+// Note: the L2 call-extraction noise filter now uses the per-language
+// `provider.isBuiltInName` (see processFileGroup, where `providerForLanguage`
+// is resolved) to mirror the AST path exactly. The former language-agnostic
+// `BUILTIN_NOISE` Set was removed because it both over- and under-filtered
+// relative to the AST: it dropped names that are not builtins in the file's
+// language (e.g. Java `process`/`isNaN`) and kept language builtins it did not
+// list (e.g. Python `update`). Per-language filtering is the tested, intended
+// design (see test/unit/noise-filter.test.ts).
 
 // Ruby call router for import/heritage/property dispatch
 const rubyCallRouter: CallRouter = (calledName: string, callNode: any) => {
@@ -434,6 +413,15 @@ export interface ExtractedCall {
   receiverCallChain?: string[];
   /** Mixed chain of field and call expressions for complex receivers */
   receiverMixedChain?: Array<{ kind: 'field' | 'call'; name: string }>;
+  /**
+   * L2 hybrid only: set when the worker could NOT type this receiver/base BUT it has an
+   * UNRESOLVED Tier-2 typeEnv binding (callResult / methodCallResult / fieldAccess / copy)
+   * — one needing the SymbolTable the worker lacks. The merge-time AST typeEnv MAY resolve
+   * it, so the detector must defer such receivers (a typed-by-AST receiver the extracted
+   * path leaves unset would diverge). Absent ⇒ either typed, or no binding at all (in which
+   * case the AST cannot type it either → resolving by name is identical → safe).
+   */
+  receiverUnresolvedBinding?: boolean;
   /**
    * 0-based line of the callee identifier (`callNameNode.startPosition.row`).
    * For `a.b.c()` this is the line of `c`, not the start of the call expression.
@@ -650,13 +638,28 @@ const setLanguage = (language: SupportedLanguages, filePath: string): void => {
 // ============================================================================
 
 /** Walk up AST to find enclosing function, return its generateId or null for top-level */
-const findEnclosingFunctionId = (node: any, filePath: string): string | null => {
+const findEnclosingFunctionId = (node: any, filePath: string, language?: SupportedLanguages): string | null => {
   let current = node.parent;
   while (current) {
     if (FUNCTION_NODE_TYPES.has(current.type)) {
       const { funcName, label } = extractFunctionName(current);
       if (funcName) {
-        return generateId(label, `${filePath}:${funcName}`);
+        // Mirror the language-provider `labelOverride` (and the worker's own
+        // `getLabelFromCaptures` definition-labeling at :690-694) so the enclosing
+        // function's sourceId matches the `Method:` node id minted by the definition
+        // phase. `extractFunctionName` returns `'Function'` for Python/Kotlin class
+        // methods because their method node type is identical to a free function's;
+        // without this override the worker attributes calls/assignments inside a class
+        // method to a non-existent `Function:` node, diverging from the AST path's
+        // `findEnclosingFunction` (call-processor.ts) which applies the same override.
+        // L2-only: both call sites feed allGeneralCalls/allAssignments, consumed solely
+        // under L2_EXTRACTED_RESOLVE — the default/sequential graph is unaffected.
+        let finalLabel = label;
+        if (finalLabel === 'Function') {
+          if (language === SupportedLanguages.Python && isPythonClassMethod(current)) finalLabel = 'Method';
+          else if (language === SupportedLanguages.Kotlin && isKotlinClassMethod(current)) finalLabel = 'Method';
+        }
+        return generateId(finalLabel, `${filePath}:${funcName}`);
       }
     }
     current = current.parent;
@@ -747,6 +750,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     fetchCalls: [],
     decoratorRoutes: [],
     angularMetadata: [],
+    assignments: [], // L2 (#perf): member-field write sites for processAssignmentsFromExtracted
   };
 
   // Group by language to minimize setLanguage calls
@@ -2474,6 +2478,18 @@ const processFileGroup = (
     // Per-file cache for Property declaredType extraction (keyed by class node startIndex).
     const fieldInfoCache = new Map<number, Map<string, ExtractedFieldInfo>>();
     const routerForLanguage = callRouters[language];
+    // L2 call-extraction noise filter: mirror the AST path's per-language
+    // `provider.isBuiltInName` (call-processor.ts processCalls) instead of the
+    // global BUILTIN_NOISE set. BUILTIN_NOISE mixed every language's builtins, so it
+    // (a) over-filtered names that are NOT builtins in the file's language — e.g. Java
+    // `process`/`isNaN` (Java provider has no builtInNames) — dropping real CALLS the AST
+    // keeps, and (b) under-filtered language builtins absent from the set — e.g. Python
+    // `update` (in Python builtInNames) — emitting CALLS the AST drops. Using the same
+    // predicate as the AST makes the extracted call set match. L2-only in effect:
+    // result.calls feeds allGeneralCalls (parsing-processor.ts:254), consumed solely
+    // under L2_EXTRACTED_RESOLVE (pipeline.ts:554) — the default/sequential graph is
+    // unaffected.
+    const providerForLanguage = getProvider(language);
 
     // Extract FILE_SCOPE bindings for field/local variable type resolution
     // This enables resolution of receiver types for calls like `cashService.unholdMoney()`
@@ -2676,6 +2692,31 @@ const processFileGroup = (
         continue;
       }
 
+      // L2 (#perf) write-ACCESS: capture member-field assignments (`this.x = ...`)
+      // into result.assignments for processAssignmentsFromExtracted. Mirrors the AST
+      // capture at call-processor.ts:432-463. Purely additive (no short-circuit) so
+      // a match that is also a definition/call is still processed below. The receiver
+      // type is resolved at resolution time over the merged symbol table; here we ship
+      // the receiver text + property and a best-effort worker-typeEnv type.
+      if (captureMap['assignment'] && captureMap['assignment.receiver'] && captureMap['assignment.property']) {
+        const asnReceiverText: string = captureMap['assignment.receiver'].text;
+        const asnPropertyName: string = captureMap['assignment.property'].text;
+        const asnSourceId = findEnclosingFunctionId(captureMap['assignment'], file.path, language)
+          || generateId('File', file.path);
+        const asnReceiverType = asnReceiverText
+          ? typeEnv.lookup(asnReceiverText, captureMap['assignment'])
+          : undefined;
+        result.assignments!.push({
+          filePath: file.path,
+          lhs: asnReceiverText ? `${asnReceiverText}.${asnPropertyName}` : asnPropertyName,
+          rhs: '',
+          sourceId: asnSourceId,
+          receiverText: asnReceiverText,
+          propertyName: asnPropertyName,
+          ...(asnReceiverType !== undefined ? { receiverTypeName: asnReceiverType } : {}),
+        });
+      }
+
       // Extract call sites
       if (captureMap['call']) {
         const callNameNode = captureMap['call.name'];
@@ -2762,9 +2803,9 @@ const processFileGroup = (
             }
           }
 
-          if (!isBuiltInOrNoise(calledName)) {
+          if (!providerForLanguage.isBuiltInName(calledName)) {
             const callNode = captureMap['call'];
-            const sourceId = findEnclosingFunctionId(callNode, file.path)
+            const sourceId = findEnclosingFunctionId(callNode, file.path, language)
               || generateId('File', file.path);
             const callForm = inferCallForm(callNode, callNameNode);
             let receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
@@ -2781,33 +2822,37 @@ const processFileGroup = (
               }
             }
 
-            let receiverCallChain: string[] | undefined;
+            let receiverMixedChain: Array<{ kind: 'field' | 'call'; name: string }> | undefined;
 
-            // When the receiver is a call_expression (e.g. svc.getUser().save()),
-            // extractReceiverName returns undefined because it refuses complex expressions.
-            // Instead, walk the receiver node to build a call chain for deferred resolution.
-            // We capture the base receiver name so processCallsFromExtracted can look it up
-            // from constructor bindings. receiverTypeName is intentionally left unset here —
-            // the chain resolver in processCallsFromExtracted needs the base type as input and
-            // produces the final receiver type as output.
+            // When the receiver is a complex expression (field chain, call chain, or
+            // interleaved — e.g. user.address.save() or svc.getUser().save()),
+            // extractReceiverName returns undefined. Build a MIXED chain so L2's
+            // processCallsFromExtracted Step 1c can walk it — resolving the final
+            // receiver type AND emitting field read-ACCESS edges. Mirrors the AST path
+            // at call-processor.ts:599-630 (which uses extractMixedChain, not the
+            // call-only extractCallChain). The base receiver name is shipped as
+            // receiverName so Step 1 can seed the chain's starting type.
             if (callForm === 'member' && receiverName === undefined && !receiverTypeName) {
               const receiverNode = extractReceiverNode(callNameNode);
-              if (receiverNode && CALL_EXPRESSION_TYPES.has(receiverNode.type)) {
-                const extracted = extractCallChain(receiverNode);
-                if (extracted) {
-                  receiverCallChain = extracted.chain;
-                  // Set receiverName to the base object so Step 1 in processCallsFromExtracted
-                  // can resolve it via constructor bindings to a base type for the chain.
+              if (receiverNode) {
+                const extracted = extractMixedChain(receiverNode);
+                if (extracted && extracted.chain.length > 0) {
+                  receiverMixedChain = extracted.chain;
                   receiverName = extracted.baseReceiverName;
-                  // Also try the type environment immediately (covers explicitly-typed locals
-                  // and annotated parameters like `fn process(svc: &UserService)`).
-                  // This sets a base type that chain resolution (Step 2) will use as input.
                   if (receiverName) {
                     receiverTypeName = typeEnv.lookup(receiverName, callNode);
                   }
                 }
               }
             }
+
+            // L2 hybrid: when the worker could not type the receiver/base, record whether
+            // it has an unresolved Tier-2 binding the SymbolTable-backed AST typeEnv might
+            // resolve. Lets the merge-time detector defer ONLY those receivers (a no-binding
+            // receiver is untypeable in the AST too → by-name resolution is identical → safe).
+            const receiverUnresolvedBinding = (receiverName !== undefined && receiverTypeName === undefined)
+              ? typeEnv.hasUnresolvedBinding(receiverName, callNode)
+              : false;
 
             result.calls.push({
               filePath: file.path,
@@ -2817,7 +2862,8 @@ const processFileGroup = (
               ...(callForm !== undefined ? { callForm } : {}),
               ...(receiverName !== undefined ? { receiverName } : {}),
               ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
-              ...(receiverCallChain !== undefined ? { receiverCallChain } : {}),
+              ...(receiverMixedChain !== undefined ? { receiverMixedChain } : {}),
+              ...(receiverUnresolvedBinding ? { receiverUnresolvedBinding: true } : {}),
               // WI-2: thread callee-identifier position (callNameNode), not the
               // call-expression start — member-call recall depends on it.
               line: callNameNode.startPosition.row,
@@ -3289,6 +3335,10 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   if (src.fetchCalls) {
     if (!target.fetchCalls) target.fetchCalls = [];
     target.fetchCalls.push(...src.fetchCalls);
+  }
+  if (src.assignments) {
+    if (!target.assignments) target.assignments = [];
+    target.assignments.push(...src.assignments);
   }
   if (src.expoNavCalls) {
     if (!target.expoNavCalls) target.expoNavCalls = [];

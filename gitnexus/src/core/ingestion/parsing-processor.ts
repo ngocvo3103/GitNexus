@@ -32,7 +32,15 @@ export type FileProgressCallback = (current: number, total: number, filePath: st
 
 export interface WorkerExtractedData {
   imports: ExtractedImport[];
+  /** Angular DI/template CALLS only (resolved via processCallsFromExtracted). */
   calls: ExtractedCall[];
+  /**
+   * L2 (#perf): the worker's GENERAL (non-Angular) calls. Empty on the sequential
+   * path. Consumed by the pipeline's post-parse processCallsFromExtracted only
+   * when L2 is enabled; otherwise the sequential processCalls re-parse resolves
+   * the general call graph and these are ignored.
+   */
+  generalCalls: ExtractedCall[];
   assignments: ExtractedAssignment[];
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
@@ -178,7 +186,7 @@ const processParsingWithWorkers = async (
     if (lang) parseableFiles.push({ path: file.path, content: file.content });
   }
 
-  if (parseableFiles.length === 0) return { imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], expoNavCalls: [], decoratorRoutes: [], toolDefs: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [], angularMetadata: [] };
+  if (parseableFiles.length === 0) return { imports: [], calls: [], generalCalls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], expoNavCalls: [], decoratorRoutes: [], toolDefs: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [], angularMetadata: [] };
 
   const total = files.length;
 
@@ -197,6 +205,7 @@ const processParsingWithWorkers = async (
   // Merge results from all workers into graph and symbol table
   const allImports: ExtractedImport[] = [];
   const allAngularCalls: ExtractedCall[] = [];
+  const allGeneralCalls: ExtractedCall[] = []; // L2 (#perf): worker's general (non-Angular) calls
   const allAssignments: ExtractedAssignment[] = [];
   const allHeritage: ExtractedHeritage[] = [];
   const allRoutes: ExtractedRoute[] = [];
@@ -240,6 +249,9 @@ const processParsingWithWorkers = async (
     // #31: Angular DI/template CALLS — the only calls the worker path emits
     // here (general calls are resolved separately via processCalls re-extraction).
     allAngularCalls.push(...(result.angularCalls ?? []));
+    // L2 (#perf): collect the worker's general calls (loop-append, not spread —
+    // push(...bigArray) overflows the stack on large per-file call sets).
+    if (result.calls) for (const c of result.calls) allGeneralCalls.push(c);
     if (result.assignments) allAssignments.push(...result.assignments);
     allHeritage.push(...result.heritage);
     // result.routes (per-file 2-arg Spring + Laravel) is intentionally NOT merged
@@ -293,7 +305,7 @@ const processParsingWithWorkers = async (
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return { imports: allImports, calls: allAngularCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, fetchCalls: allFetchCalls, expoNavCalls: allExpoNavCalls, decoratorRoutes: allDecoratorRoutes, toolDefs: allToolDefs, ormQueries: allORMQueries, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings, angularMetadata: allAngularMetadata };
+  return { imports: allImports, calls: allAngularCalls, generalCalls: allGeneralCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, fetchCalls: allFetchCalls, expoNavCalls: allExpoNavCalls, decoratorRoutes: allDecoratorRoutes, toolDefs: allToolDefs, ormQueries: allORMQueries, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings, angularMetadata: allAngularMetadata };
 };
 
 // ============================================================================
@@ -900,6 +912,9 @@ const processParsingSequential = async (
     // #31: Angular DI/template CALLS — the only calls the sequential path emits
     // here (general calls are resolved separately via processCalls re-extraction).
     calls: allAngularCalls,
+    // L2 (#perf): the sequential path does not pre-extract general calls; they are
+    // resolved by the processCalls re-parse, so this is empty (L2 is worker-only).
+    generalCalls: [],
     assignments: [],
     heritage: [],
     routes: allRoutes,
